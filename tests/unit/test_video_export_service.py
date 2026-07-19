@@ -281,3 +281,33 @@ def test_existing_manifest_cannot_substitute_source_channel_facts(tmp_path: Path
         SixCameraVideoExportService(_FakeExporter()).export_local(request)
 
     assert caught.value.code is VideoExportRunErrorCode.OUTPUT_EXISTS
+
+
+def test_parallel_export_preserves_manifest_and_artifact_order(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    serial_request = replace(request, output_directory=tmp_path / "serial")
+    parallel_request = replace(request, output_directory=tmp_path / "parallel")
+
+    serial = SixCameraVideoExportService(_FakeExporter()).export_local(serial_request)
+    parallel = SixCameraVideoExportService(
+        _FakeExporter(),
+        max_parallel_exports=6,
+    ).export_local(parallel_request)
+
+    assert parallel.manifest == serial.manifest
+    assert parallel.manifest_sha256 == serial.manifest_sha256
+    assert tuple(record.camera_id for record in parallel.manifest.cameras) == CAMERA_IDS
+    for camera_id in CAMERA_IDS:
+        assert (parallel.output_directory / f"{camera_id.value}.mp4").read_bytes() == (
+            serial.output_directory / f"{camera_id.value}.mp4"
+        ).read_bytes()
+        assert (parallel.output_directory / f"{camera_id.value}.timestamps.jsonl").read_bytes() == (
+            serial.output_directory / f"{camera_id.value}.timestamps.jsonl"
+        ).read_bytes()
+
+
+def test_parallel_export_worker_count_is_bounded() -> None:
+    with pytest.raises(ValueError, match="six camera"):
+        SixCameraVideoExportService(_FakeExporter(), max_parallel_exports=7)
+    with pytest.raises(ValueError, match="positive"):
+        SixCameraVideoExportService(_FakeExporter(), max_parallel_exports=0)

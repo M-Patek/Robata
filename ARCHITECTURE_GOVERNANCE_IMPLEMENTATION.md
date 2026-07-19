@@ -1,269 +1,96 @@
 # Architecture Governance Implementation Plan
 
-**Status:** Draft  
-**Version:** 1.0  
-**Date:** 2026-07-19  
-**Scope:** Concrete implementation steps for throughput optimization  
-**Authority:** ARCHITECTURE_GOVERNANCE.md
+**Status:** Draft
+**Version:** 1.0
+**Date:** 2026-07-19
+**Scope:** Concrete implementation steps for non-normative throughput tracks T1/T2
+**Authority:** ARCHITECTURE_GOVERNANCE.md, Architecture V1.1, ADRs 0001-0008
+**Phase note:** T1/T2 are optimization tracks. They do not redefine normative Architecture V1.1 Phase 1B/2 gates or permit production promotion.
 
 ---
 
 ## 1. Overview
 
-This document translates the architecture governance framework into concrete, actionable implementation steps. Each phase has defined deliverables, acceptance criteria, and estimated effort.
+This document translates the throughput roadmap into concrete, actionable implementation steps. Each track has deliverables, evidence requirements, and estimated effort. Timing and throughput values below are hypotheses until a governed benchmark corpus exists; current repository reports mark capacity as `NOT_MEASURED`.
 
-### Phase Timeline
+### Track Timeline
 
 ```
-Week 1-2:  Phase 1B Parallel Local
-Week 3-4:  Phase 1B Optimization & Benchmarking
-Week 5-8:  Phase 2 Distributed Infrastructure
-Week 9-12: Phase 2 Worker Pool & Scaling
-Week 13+: Phase 2+ Production Hardening
+Week 1-2:  Track T1 parallel-local experiment
+Week 3-4:  Track T1 optimization & benchmarking
+Week 5-8:  Track T2 distributed-infrastructure design/PoC
+Week 9-12: Track T2 worker-pool & scaling PoC
+Week 13+: Track T2+ production hardening after normative gates
 ```
 
 ---
 
-## 2. Phase 1B: Parallel Local Execution
+## 2. Track T1: Parallel Local Execution (not normative Phase 1B)
 
 ### 2.1 Epic: Parallelize 6-Camera Video Export
 
-**Story:** As a pipeline operator, I want 6-camera video export to run in parallel so that export time is reduced by 5-6x.
+**Story:** As a pipeline operator, I want independent camera exports to overlap while preserving the
+serial publication contract.
+
+**Implemented local path (2026-07-19):**
+
+- `src/robata/application/video_export.py::SixCameraVideoExportService` accepts
+  `max_parallel_exports` (default `1`). Values greater than one use a bounded local
+  `ThreadPoolExecutor`; each camera writes unique files into the existing private staging tree.
+- `src/robata/adapters/parallel_video_export.py::ParallelSixCameraVideoExportService` is a small
+  opt-in adapter that selects the bounded path (default six workers).
+- `RegisteredSixCameraVideoExportService` forwards the worker bound, and
+  `scripts/run_local_mainline.py` exposes `--parallel-video-export` plus
+  `--max-video-export-workers`.
+- Results are collected in canonical `CAMERA_IDS` order regardless of completion order. Source
+  revalidation, sidecar/MP4 verification, manifest construction, registry publication, and atomic
+  cleanup are unchanged.
 
 **Acceptance Criteria:**
-- [ ] Export time for 6-camera recording < 12 seconds (was ~66s)
-- [ ] Output is bit-exact identical to serial execution
-- [ ] All existing tests pass
-- [ ] New contract tests cover parallel execution
 
-**Tasks:**
+- [x] Serial remains the default compatibility path.
+- [x] Parallel manifest and all six MP4/sidecar bytes match serial unit evidence.
+- [x] Worker count is bounded to the six camera slots and invalid values fail closed.
+- [ ] Capture serial and parallel wall time on a governed workload; no speedup claim is made yet.
+- [ ] Evaluate a ProcessPool design only after a Windows-spawn PoC and resource measurements.
 
-#### Task 1.1.1: Create Parallel Export Service
-
-**File:** `src/robata/adapters/parallel_video_export.py` (new)
-
-```python
-"""Parallel video export adapter using ProcessPoolExecutor."""
-
-from __future__ import annotations
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from pathlib import Path
-    from robata.contracts.video_export import CameraSlot, LocalVideoExportRequest
-    from robata.contracts.artifacts import PublishedVideoExport
-
-
-def _export_camera_worker(
-    request: LocalVideoExportRequest,
-    camera_id: CameraSlot,
-    staging_directory: Path,
-) -> tuple[CameraSlot, CameraVideoExportFacts]:
-    """Worker function for parallel camera export.
-
-    Must be a module-level function for ProcessPoolExecutor pickling.
-    """
-    from robata.adapters.pyav_mp4_exporter import PyAvH264Mp4Exporter
-
-    exporter = PyAvH264Mp4Exporter()
-    facts = exporter.export(request, camera_id, staging_directory)
-    return camera_id, facts
-
-
-class ParallelSixCameraVideoExportService:
-    """Parallel video export service with deterministic ordering."""
-
-    def __init__(self, max_workers: int = 6) -> None:
-        self._max_workers = max_workers
-
-    def export_local(
-        self,
-        request: LocalVideoExportRequest,
-        staging_directory: Path,
-    ) -> PublishedVideoExport:
-        """Export 6 cameras in parallel, return deterministically ordered results."""
-        with ProcessPoolExecutor(max_workers=self._max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _export_camera_worker,
-                    request,
-                    camera_id,
-                    staging_directory,
-                ): camera_id
-                for camera_id in CAMERA_IDS
-            }
-
-            facts: dict[CameraSlot, CameraVideoExportFacts] = {}
-            for future in as_completed(futures):
-                camera_id, camera_facts = future.result()
-                facts[camera_id] = camera_facts
-
-        # Deterministic ordering by canonical camera slot
-        ordered_facts = tuple(facts[cid] for cid in sorted(CAMERA_IDS))
-        # ... rest of publish logic
-```
-
-**Effort:** 1 day  
-**Dependencies:** None
-
-#### Task 1.1.2: Add Parallel Export Tests
-
-**File:** `tests/unit/test_parallel_video_export.py` (new)
-
-```python
-"""Tests for parallel video export."""
-
-import pytest
-from robata.adapters.parallel_video_export import ParallelSixCameraVideoExportService
-
-
-class TestParallelVideoExport:
-    """Parallel export must match serial export output exactly."""
-
-    def test_parallel_export_matches_serial_output(self, sample_mcap: Path) -> None:
-        """Parallel and serial export produce identical artifacts."""
-        # ... setup request
-
-        serial_service = SixCameraVideoExportService()
-        parallel_service = ParallelSixCameraVideoExportService()
-
-        serial_result = serial_service.export_local(request)
-        parallel_result = parallel_service.export_local(request)
-
-        # Bit-exact comparison
-        assert serial_result.manifest == parallel_result.manifest
-        for cid in CAMERA_IDS:
-            assert serial_result.camera_sha256[cid] == parallel_result.camera_sha256[cid]
-
-    def test_parallel_export_faster_than_serial(self, sample_mcap: Path) -> None:
-        """Parallel export is at least 4x faster than serial."""
-        import time
-
-        serial_service = SixCameraVideoExportService()
-        parallel_service = ParallelSixCameraVideoExportService()
-
-        serial_start = time.perf_counter()
-        serial_service.export_local(request)
-        serial_time = time.perf_counter() - serial_start
-
-        parallel_start = time.perf_counter()
-        parallel_service.export_local(request)
-        parallel_time = time.perf_counter() - parallel_start
-
-        assert parallel_time < serial_time / 4
-```
-
-**Effort:** 1 day  
-**Dependencies:** Task 1.1.1
+**Evidence:** ADR 0008 and `tests/unit/test_video_export_service.py`.
 
 ### 2.2 Epic: Parallelize Frame Materialization
 
-**Story:** As a pipeline operator, I want frame materialization to run in parallel across 6 cameras so that materialization time is reduced by 5-6x.
+**Story:** As a pipeline operator, I want independent camera decode/render plans to overlap while
+preserving immutable package identity.
+
+**Implemented local path (2026-07-19):**
+
+- `PyAvFrameMaterializer` accepts `max_parallel_cameras` (default `1`). Values greater than one
+  use a bounded local `ThreadPoolExecutor` for `_decode_and_render` calls.
+- `ParallelPyAvFrameMaterializer` in `src/robata/adapters/parallel_frame_materializer.py` selects
+  the opt-in six-worker path.
+- Every camera writes to its own staging subdirectory. Results are resolved in canonical
+  `CAMERA_IDS` order before content projection, package ID, and publication.
+- `scripts/run_local_mainline.py` exposes `--parallel-frame-materialization` and
+  `--max-frame-materialization-workers` while keeping serial behavior as the default.
 
 **Acceptance Criteria:**
-- [ ] Materialization time for 6-camera recording < 5 seconds (was ~30s)
-- [ ] Output PNGs are bit-exact identical to serial execution
-- [ ] All existing tests pass
 
-**Tasks:**
+- [x] Parallel scheduling and deterministic merge are implemented without provider dependencies.
+- [x] Existing PTS/sidecar verification and atomic cleanup remain on the shared path.
+- [ ] Capture serial and parallel wall time on a governed workload; no speedup claim is made yet.
+- [ ] Add Windows-spawn ProcessPool PoC if thread scheduling is insufficient.
+- [ ] Optimize PNG encoder reuse only after bit-exact PyAV evidence is available.
 
-#### Task 1.2.1: Create Parallel Frame Materializer
-
-**File:** `src/robata/adapters/parallel_frame_materializer.py` (new)
-
-```python
-"""Parallel frame materialization adapter."""
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-
-def _decode_and_render_worker(
-    plan: FrameMaterializationPlan,
-    staging: Path,
-    max_width: int,
-) -> tuple[CameraSlot, RenderedCameraFrames]:
-    """Worker for parallel frame decoding and rendering."""
-    from robata.adapters.pyav_frame_materializer import _decode_and_render
-
-    rendered = _decode_and_render(plan, staging, max_width=max_width)
-    return plan.ledger.record.camera_id, rendered
-
-
-class ParallelPyAvFrameMaterializer(FrameMaterializer):
-    """Parallel frame materializer with deterministic ordering."""
-
-    def __init__(self, max_workers: int = 6) -> None:
-        self._max_workers = max_workers
-
-    def materialize(self, request: FrameMaterializationRequest) -> TemporalVisualPackage:
-        """Materialize frames for all 6 cameras in parallel."""
-        plans = self._build_plans(request)
-
-        with ProcessPoolExecutor(max_workers=self._max_workers) as executor:
-            futures = {
-                executor.submit(
-                    _decode_and_render_worker,
-                    plan,
-                    staging,
-                    self._max_width,
-                ): plan.ledger.record.camera_id
-                for plan in plans
-            }
-
-            rendered: dict[CameraSlot, RenderedCameraFrames] = {}
-            for future in as_completed(futures):
-                camera_id, frames = future.result()
-                rendered[camera_id] = frames
-
-        # Deterministic ordering
-        ordered = tuple(rendered[cid] for cid in sorted(CAMERA_IDS))
-        return TemporalVisualPackage(frames=ordered)
-```
-
-**Effort:** 1 day  
-**Dependencies:** None
-
-#### Task 1.2.2: Optimize PNG Encoder Reuse
-
-**File:** `src/robata/adapters/pyav_frame_materializer.py` (modify)
-
-```python
-@contextmanager
-def _png_encoder() -> Iterator[av.CodecContext]:
-    """Reusable PNG encoder context.
-
-    Creating a CodecContext per frame is expensive. Reuse across
-    all frames in a single camera's materialization.
-    """
-    codec = av.CodecContext.create("png", "w")
-    try:
-        yield codec
-    finally:
-        codec.close()
-
-
-def _encode_frame(
-    frame: av.VideoFrame,
-    codec: av.CodecContext,
-) -> bytes:
-    """Encode a single frame using a reusable codec context."""
-    packets = codec.encode(frame)
-    return b"".join(bytes(packet) for packet in packets)
-```
-
-**Effort:** 0.5 days  
-**Dependencies:** None
+**Evidence:** `src/robata/adapters/parallel_frame_materializer.py`, ADR 0008, and existing
+materializer contract tests.
 
 ### 2.3 Epic: Parallelize Inference Pipeline
 
 **Story:** As a pipeline operator, I want independent inference stages to run in parallel so that overall pipeline latency is reduced.
 
 **Acceptance Criteria:**
-- [ ] Independent inference stages (QA Coarse, Event Proposal, etc.) run in parallel
-- [ ] Pipeline latency reduced by 2-3x
-- [ ] Deterministic ordering of results preserved
+- [x] Only the proven independent pair (`QA_DENSE` and `ACTION_EVIDENCE`) runs in parallel after event proposal
+- [ ] Pipeline latency is measured and reported; `2-3x` remains a candidate hypothesis
+- [x] Deterministic ordering of results preserved
 
 **Tasks:**
 
@@ -320,70 +147,63 @@ boundary_request, boundary_outcome = self._infer(...)
 fused = self._fuse(...)
 ```
 
-**Effort:** 1 day  
+**Effort:** 1 day
 **Dependencies:** None
 
 ### 2.4 Epic: Benchmarking Infrastructure
 
-**Story:** As a pipeline operator, I want automated benchmarks so that throughput improvements are measured and tracked.
+The repository now contains dependency-free accounting primitives in `src/robata/runtime/benchmark.py`
+and a repeatable local CLI at `scripts/benchmark_local_mainline.py`. Both throughput units are
+reported. Reports remain `NOT_MEASURED` until an approved corpus, resource instrumentation, and
+normative O-01 evidence exist.
+
+**Implemented local path (2026-07-19):**
+
+- `run_repeated` records warmups and timed iterations without interpreting results as capacity.
+- `benchmark_local_mainline.py` executes the fake-model CLI in isolated output directories, records
+  cache mode and parallel flags, derives recording duration from the V2 manifest, and enforces
+  `provider_requests=0` / `production_eligible=false`.
 
 **Acceptance Criteria:**
-- [ ] pytest-benchmark integrated
-- [ ] Benchmarks run in CI
-- [ ] Results published to reports/
 
-**Tasks:**
+- [x] Dependency-free benchmark report emits recording-hours and camera-video-hours.
+- [x] Warmups are excluded from sample summaries; cache mode is explicit.
+- [ ] Optional pytest benchmark plugins and CI publication remain pending dependency approval.
+- [ ] Governed corpus/resource instrumentation and certifying capacity report remain pending.
 
-#### Task 1.4.1: Add Benchmark Dependencies
+**Evidence:** `tests/unit/test_benchmark.py`, ADR 0008, and the generated
+`benchmark-report.json` artifact.
 
-**File:** `pyproject.toml` (modify)
+#### Task 1.4.1: Optional Benchmark Plugins (pending approval)
 
-```toml
-[dependency-groups]
-dev = [
-    # ... existing deps ...
-    "pytest-benchmark>=4.0,<5",
-    "pytest-timeout>=2.3,<3",
-]
-```
+The repository intentionally does not add `pytest-benchmark` or `pytest-timeout` yet. Adding
+those dependencies requires a separate dependency review and CI policy decision. The current
+runner is dependency-free.
 
-#### Task 1.4.2: Create Benchmark Suite
+#### Task 1.4.2: Dependency-Free Benchmark Runner (implemented)
 
-**File:** `tests/benchmark/test_throughput.py` (new)
+**Files:** `src/robata/runtime/benchmark.py`, `scripts/benchmark_local_mainline.py`
 
-```python
-"""Throughput benchmarks for the Robata pipeline."""
+The runner executes isolated local fake-model runs, records warmups/iterations, derives recording
+duration from the V2 manifest, and emits both throughput units. It never asserts a capacity target.
+The emitted summary remains `measurement_status=NOT_MEASURED` until a governed corpus and O-01
+evidence are approved.
 
-import pytest
-from pytest_benchmark.fixture import BenchmarkFixture
-
-
-@pytest.mark.benchmark(group="video_export")
-@pytest.mark.parametrize("camera_count", [1, 3, 6])
-def test_video_export_throughput(
-    benchmark: BenchmarkFixture,
-    camera_count: int,
-    sample_mcap: Path,
-) -> None:
-    """Benchmark video export throughput for varying camera counts."""
-    service = ParallelSixCameraVideoExportService(max_workers=camera_count)
-
-    result = benchmark(service.export_local, request)
-
-    # Assert throughput target
-    recording_seconds = 120  # 2-minute recording
-    wall_seconds = result.stats.mean
-    recording_hours_per_wall_hour = (recording_seconds / wall_seconds) * 3600
-
-    assert recording_hours_per_wall_hour > 20  # Phase 1B target
-```
-
-**Effort:** 1 day  
-**Dependencies:** Task 1.1.1, Task 1.2.1
+**Evidence:** `tests/unit/test_benchmark.py` and
+`reports/local-mainline-t1-benchmark-smoke-2026-07-19.md`.
 
 ---
 
-## 3. Phase 2: Distributed Infrastructure
+## 3. Track T2: Distributed Infrastructure (not normative Phase 2)
+
+All T2 components below are design/PoC backlog items. Do not add Redis, PostgreSQL, S3,
+Kafka, Celery, or other external dependencies until the corresponding port contract and
+infrastructure ADR are accepted. The current local path remains offline and dependency-free.
+
+The provider-neutral `TaskQueue` port and deterministic `InMemoryTaskQueue` scaffold are now
+implemented for local contract tests (`src/robata/ports/task_queue.py`,
+`src/robata/adapters/in_memory_task_queue.py`, ADR 0007). Durable queue/worker integration is
+still open.
 
 ### 3.1 Epic: Task Queue and Scheduler
 
@@ -470,8 +290,18 @@ class TaskQueue(Protocol):
         ...
 ```
 
-**Effort:** 2 days  
+**Effort:** 2 days
 **Dependencies:** None
+
+**Local scaffold status (2026-07-19):** `src/robata/ports/task_queue.py` now
+contains the frozen provider-neutral contract and stable error/status values.
+`src/robata/adapters/in_memory_task_queue.py` provides a deterministic,
+clock-injectable fake covering priority ordering, lease heartbeat/expiry,
+exponential retry, bounded backpressure, completion, and dead-letter capture.
+The claimed task carries queue-issued lease metadata so callers can safely pass
+`lease_id` to heartbeat/complete/fail. This implementation is process-local
+and intentionally does not provide Redis/network/credential traffic; Task 2.1.2
+remains the governed production-adapter task.
 
 #### Task 2.1.2: Implement Redis Task Queue Adapter
 
@@ -504,7 +334,7 @@ class RedisTaskQueue(TaskQueue):
         ...
 ```
 
-**Effort:** 2 days  
+**Effort:** 2 days
 **Dependencies:** Task 2.1.1
 
 ### 3.2 Epic: Distributed Artifact Registry
@@ -557,7 +387,7 @@ class PostgresArtifactRegistry(ArtifactRegistry):
             ...
 ```
 
-**Effort:** 3 days  
+**Effort:** 3 days
 **Dependencies:** None
 
 #### Task 2.2.2: Implement S3 Blob Storage
@@ -591,7 +421,7 @@ class S3BlobStorage(BlobStorage):
             return key
 ```
 
-**Effort:** 2 days  
+**Effort:** 2 days
 **Dependencies:** None
 
 ### 3.3 Epic: Worker Pool
@@ -683,12 +513,12 @@ class PipelineWorker:
         self._shutdown.set()
 ```
 
-**Effort:** 2 days  
+**Effort:** 2 days
 **Dependencies:** Task 2.1.1
 
 ---
 
-## 4. Testing Strategy
+## 4. Testing Strategy for T1/T2
 
 ### 4.1 Unit Tests
 
@@ -722,13 +552,13 @@ def test_capacity_scaling(benchmark, worker_count):
 
 ---
 
-## 5. Monitoring and Observability
+## 5. Monitoring and Observability (future T2 work)
 
 ### 5.1 Metrics
 
 | Metric | Type | Alert Threshold |
 |--------|------|----------------|
-| `pipeline.throughput` | Gauge | < 20 rec-hrs/wall-hr (1B), < 500 (2) |
+| `pipeline.throughput` | Gauge | report both units; candidate T1/T2 thresholds remain NOT_MEASURED |
 | `pipeline.latency` | Histogram | p99 > 60s |
 | `worker.tasks_completed` | Counter | - |
 | `worker.tasks_failed` | Counter | > 1% of completed |
@@ -771,7 +601,7 @@ def test_capacity_scaling(benchmark, worker_count):
 
 ### A. Dependency Versions
 
-| Component | Current | Phase 1B | Phase 2 |
+| Component | Current | Track T1 | Track T2 |
 |-----------|---------|----------|---------|
 | Python | 3.12 | 3.12 | 3.12+ |
 | PyAV | 14.x | 14.x | 14.x |
@@ -783,7 +613,7 @@ def test_capacity_scaling(benchmark, worker_count):
 
 ### B. Environment Variables
 
-| Variable | Phase 1B | Phase 2 | Description |
+| Variable | Track T1 | Track T2 | Description |
 |----------|----------|---------|-------------|
 | `ROBATA_WORKERS` | 6 | 12+ | Number of parallel workers |
 | `ROBATA_REDIS_URL` | - | Required | Redis connection string |

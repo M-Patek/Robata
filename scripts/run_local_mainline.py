@@ -138,6 +138,42 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NUM[/DEN]",
         help="dense sampling rate in frames per second (default: 2)",
     )
+    parser.add_argument(
+        "--parallel-independent-inference",
+        action="store_true",
+        help=(
+            "opt in to concurrent QA_DENSE and ACTION_EVIDENCE calls; "
+            "BOUNDARY_REFINEMENT remains serial and adapters must declare thread safety"
+        ),
+    )
+    parser.add_argument(
+        "--parallel-video-export",
+        action="store_true",
+        help=(
+            "opt in to concurrent six-camera export; outputs are merged in canonical camera order"
+        ),
+    )
+    parser.add_argument(
+        "--max-video-export-workers",
+        type=int,
+        default=6,
+        metavar="N",
+        help="bounded worker count for --parallel-video-export (default: 6)",
+    )
+    parser.add_argument(
+        "--parallel-frame-materialization",
+        action="store_true",
+        help=(
+            "opt in to concurrent per-camera frame materialization; package merge remains canonical"
+        ),
+    )
+    parser.add_argument(
+        "--max-frame-materialization-workers",
+        type=int,
+        default=6,
+        metavar="N",
+        help="bounded worker count for --parallel-frame-materialization (default: 6)",
+    )
     return parser
 
 
@@ -185,6 +221,10 @@ def _validate_output_paths(
     canonical_registry = registry_root.resolve(strict=False)
     if canonical_registry.is_relative_to(canonical_output):
         raise CliArgumentError("registry root must not be inside the output root")
+    if registry_root.is_symlink():
+        raise CliArgumentError("registry root must not be a symlink")
+    if registry_root.exists() and not registry_root.is_dir():
+        raise CliArgumentError("registry root must be a directory when it already exists")
     return registry_root
 
 
@@ -323,9 +363,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         analysis_output = staging_root / "analysis"
 
         stage = "video_export"
+        service_kwargs = {}
+        if args.parallel_video_export:
+            if args.max_video_export_workers <= 0 or args.max_video_export_workers > 6:
+                raise CliArgumentError("max-video-export-workers must be between 1 and 6")
+            service_kwargs["max_parallel_exports"] = args.max_video_export_workers
         video = RegisteredSixCameraVideoExportService(
             PyAvH264Mp4Exporter(),
             LocalArtifactRegistry(registry_root),
+            **service_kwargs,
         ).export_local(
             LocalVideoExportRequest(
                 source=args.source,
@@ -340,15 +386,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         stage = "analysis"
+        if args.parallel_frame_materialization:
+            if (
+                args.max_frame_materialization_workers <= 0
+                or args.max_frame_materialization_workers > 6
+            ):
+                raise CliArgumentError("max-frame-materialization-workers must be between 1 and 6")
+            frame_materializer = PyAvFrameMaterializer(
+                max_parallel_cameras=args.max_frame_materialization_workers,
+            )
+        else:
+            frame_materializer = PyAvFrameMaterializer()
         model = DeterministicFakeVisionModelAdapter(no_event=args.no_event)
         analysis = LocalMainlinePipeline(
-            PyAvFrameMaterializer(),
+            frame_materializer,
             model,
             config=LocalMainlineConfig(
                 coarse_rate_num=args.coarse_rate.numerator,
                 coarse_rate_den=args.coarse_rate.denominator,
                 dense_rate_num=args.dense_rate.numerator,
                 dense_rate_den=args.dense_rate.denominator,
+                parallel_independent_inference=args.parallel_independent_inference,
             ),
         ).run(video, analysis_output)
 

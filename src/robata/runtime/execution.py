@@ -13,8 +13,9 @@ import json
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Any
+from enum import Enum
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, TypeGuard
 
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 
@@ -39,6 +40,10 @@ class PublishedExecutionEvidence:
 
 
 def _json_value(value: Any) -> Any:
+    # StrEnum values are also instances of str; handle Enum first so they do not
+    # fall through to __dict__ and serialize as an empty object.
+    if isinstance(value, Enum):
+        return _json_value(value.value)
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     if hasattr(value, "value") and not isinstance(value, (str, bytes, bytearray)):
@@ -68,14 +73,22 @@ def _artifact_entries(root: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     excluded = {EXECUTION_MANIFEST_FILENAME, EXECUTION_AUDIT_FILENAME}
     for path in sorted(root.rglob("*")):
+        # Check the symlink bit before ``is_file``: on both POSIX and Windows a
+        # symlink to a regular file reports ``is_file() == True`` and would
+        # otherwise be read through to an untrusted target.
+        if path.is_symlink():
+            raise ExecutionEvidenceError(f"symlink is not allowed in execution output: {path}")
         if not path.is_file():
-            if path.is_symlink():
-                raise ExecutionEvidenceError(f"symlink is not allowed in execution output: {path}")
             continue
         relative = path.relative_to(root).as_posix()
         if relative in excluded:
             continue
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise ExecutionEvidenceError(
+                f"cannot read execution artifact {path}: {error}"
+            ) from error
         entries.append(
             {
                 "path": relative,
@@ -319,11 +332,32 @@ def write_execution_evidence(
     )
 
 
+def _is_sha256(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _safe_relative_path(value: object) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or "\x00" in value:
         raise ExecutionEvidenceError("manifest artifact path must be a nonempty string")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "\\" in value:
+    windows_path = PureWindowsPath(value)
+    # Manifest paths are canonical POSIX-style paths relative to the output
+    # root.  Reject drive-relative paths (for example ``C:foo``), UNC/rooted
+    # paths, separators that would be interpreted differently on Windows, and
+    # non-canonical spellings such as ``./foo`` or ``foo//bar``.
+    if (
+        path.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+        or ".." in path.parts
+        or "\\" in value
+        or path.as_posix() != value
+        or not path.parts
+    ):
         raise ExecutionEvidenceError(f"manifest artifact path is not safely relative: {value!r}")
     return value
 
@@ -331,8 +365,17 @@ def _safe_relative_path(value: object) -> str:
 def verify_execution_evidence(output_root: Path) -> dict[str, Any]:
     """Verify manifest hashes, artifact inventory, and canonical audit records."""
 
+    if not output_root.is_dir() or output_root.is_symlink():
+        raise ExecutionEvidenceError(f"execution root is not a regular directory: {output_root}")
     manifest_path = output_root / EXECUTION_MANIFEST_FILENAME
     audit_path = output_root / EXECUTION_AUDIT_FILENAME
+    if (
+        manifest_path.is_symlink()
+        or audit_path.is_symlink()
+        or not manifest_path.is_file()
+        or not audit_path.is_file()
+    ):
+        raise ExecutionEvidenceError("execution manifest and audit must be regular files")
     try:
         manifest_bytes = manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)
@@ -341,9 +384,21 @@ def verify_execution_evidence(output_root: Path) -> dict[str, Any]:
         raise ExecutionEvidenceError(f"cannot read execution evidence: {error}") from error
     if not isinstance(manifest, dict):
         raise ExecutionEvidenceError("execution manifest must be a JSON object")
+    if canonical_json_bytes(manifest) != manifest_bytes:
+        raise ExecutionEvidenceError("execution manifest is not canonical JSON")
     if manifest.get("schema_version") != EXECUTION_SCHEMA_VERSION:
         raise ExecutionEvidenceError("unsupported execution manifest schema version")
-    expected_semantic = execution_manifest_semantic_sha256(manifest)
+    if manifest.get("execution_mode") != EXECUTION_MODE:
+        raise ExecutionEvidenceError("unsupported local execution mode")
+    accounting = manifest.get("accounting")
+    if not isinstance(accounting, dict) or accounting.get("provider_request_count") != 0:
+        raise ExecutionEvidenceError("local execution manifest must record zero provider requests")
+    try:
+        expected_semantic = execution_manifest_semantic_sha256(manifest)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ExecutionEvidenceError(
+            f"execution manifest has invalid semantic fields: {error}"
+        ) from error
     if manifest.get("semantic_sha256") != expected_semantic:
         raise ExecutionEvidenceError("execution manifest semantic hash does not match contents")
 
@@ -357,17 +412,23 @@ def verify_execution_evidence(output_root: Path) -> dict[str, Any]:
         relative = _safe_relative_path(raw_artifact.get("path"))
         size = raw_artifact.get("size_bytes")
         digest = raw_artifact.get("sha256")
-        if not isinstance(size, int) or size < 0 or not isinstance(digest, str):
+        if type(size) is not int or size < 0 or not _is_sha256(digest):
             raise ExecutionEvidenceError(f"invalid artifact entry for {relative!r}")
         if relative in listed:
             raise ExecutionEvidenceError(f"duplicate artifact path: {relative!r}")
         listed[relative] = (size, digest)
-        path = output_root / Path(relative)
-        if not path.is_file() or path.is_symlink():
+        try:
+            path = output_root / Path(relative)
+            regular_file = path.is_file() and not path.is_symlink()
+            data = path.read_bytes() if regular_file else None
+        except (OSError, ValueError) as error:
+            raise ExecutionEvidenceError(
+                f"cannot read manifest artifact {relative!r}: {error}"
+            ) from error
+        if not regular_file or data is None:
             raise ExecutionEvidenceError(
                 f"manifest artifact is missing or not regular: {relative!r}"
             )
-        data = path.read_bytes()
         if len(data) != size or exact_bytes_sha256(data) != digest:
             raise ExecutionEvidenceError(f"artifact hash mismatch: {relative!r}")
 
@@ -376,6 +437,11 @@ def verify_execution_evidence(output_root: Path) -> dict[str, Any]:
         raise ExecutionEvidenceError("manifest artifact inventory does not match output files")
 
     lines = audit_bytes.splitlines()
+    stages = manifest.get("stages")
+    if not isinstance(stages, list):
+        raise ExecutionEvidenceError("execution manifest stages must be an array")
+    if len(lines) != len(stages) + 2:
+        raise ExecutionEvidenceError("execution audit does not cover exactly the manifest stages")
     if not lines:
         raise ExecutionEvidenceError("execution audit is empty")
     for index, line in enumerate(lines):
@@ -387,6 +453,24 @@ def verify_execution_evidence(output_root: Path) -> dict[str, Any]:
             raise ExecutionEvidenceError(f"audit line {index} is not canonical JSON")
         if not isinstance(event, dict) or event.get("sequence") != index:
             raise ExecutionEvidenceError(f"audit line {index} has an invalid sequence")
+        if event.get("run_id") != manifest.get("run_id"):
+            raise ExecutionEvidenceError(f"audit line {index} has a mismatched run_id")
+        if "provider_requests" in event and event["provider_requests"] != 0:
+            raise ExecutionEvidenceError(f"audit line {index} records provider traffic")
+        if index == 0:
+            if event.get("event") != "run_started":
+                raise ExecutionEvidenceError("execution audit must start with run_started")
+        elif index == len(lines) - 1:
+            if event.get("event") != "run_completed":
+                raise ExecutionEvidenceError("execution audit must end with run_completed")
+            if event.get("execution_manifest_semantic_sha256") != manifest.get("semantic_sha256"):
+                raise ExecutionEvidenceError("run_completed semantic hash does not match manifest")
+        else:
+            stage = stages[index - 1]
+            if not isinstance(stage, dict) or event.get("event") != "stage_completed":
+                raise ExecutionEvidenceError(f"audit line {index} is not a stage completion")
+            if event.get("stage") != stage.get("stage"):
+                raise ExecutionEvidenceError(f"audit line {index} stage does not match manifest")
     return manifest
 
 

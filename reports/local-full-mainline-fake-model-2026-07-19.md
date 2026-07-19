@@ -1,21 +1,22 @@
-# Local Full Mainline — Deterministic Fake Model
+# Local Full Mainline ? Deterministic Fake Model
 
 ## Scope
 
 This report records a local development-only run of the complete MCAP-to-action vertical
 slice. It validates real MCAP inspection, six-camera registered video export, strict frame
 materialization, provider-neutral package construction, deterministic fake QA/proposal/action/
-boundary inference, lineage validation, deterministic fusion, and atomic publication. It does
-not validate a real model, provider policy, production capacity, or promotion eligibility.
+boundary inference, lineage validation, deterministic fusion, execution evidence, and atomic
+publication. It does not validate a real model, provider policy, production capacity, or
+promotion eligibility.
 
 ## Command
 
 ```powershell
 uv run --locked python scripts/run_local_mainline.py `
   data/source/sample-medium.mcap `
-  tmp/local-full-mainline-real-20260719-a `
+  tmp/local-mainline-final2-20260719 `
   --allow-unapproved `
-  --registry-root tmp/local-mainline-real-registry-20260719-a
+  --registry-root tmp/local-mainline-final-registry-20260719
 ```
 
 Source file: `data/source/sample-medium.mcap` (130,303,923 bytes). The checked-in mapping
@@ -23,7 +24,7 @@ profile is observed/unapproved and was enabled explicitly with `--allow-unapprov
 
 ## Result
 
-The command returned exit code `0` and the following machine result:
+The command returned exit code `0` and produced the following machine result:
 
 | Field | Value |
 |---|---|
@@ -37,20 +38,22 @@ The command returned exit code `0` and the following machine result:
 | event interval | `16213599687` to `24619866312` ns (half-open) |
 | event status | `FINAL` |
 | `production_eligible` | `false` |
-| analysis duration | `55,416` ms |
+| analysis duration | `48,991` ms |
 
 The final output root was atomically published at
-`tmp/local-full-mainline-real-20260719-a`:
+`tmp/local-mainline-final2-20260719`:
 
-- `video/`: exactly 13 files — six MP4s, six canonical timestamp sidecars, and one V2
-  camera-video manifest.
+- `video/`: exactly 13 files ? six MP4s, six canonical timestamp sidecars, and one V2
+  `camera-video-export-manifest.json`.
 - `analysis/frames/`: 510 selected PNG frames across the two coarse/dense packages.
-- `analysis/inferences/`: 10 files — five canonical request/outcome pairs.
+- `analysis/inferences/`: 10 files ? five canonical request/outcome pairs.
 - `analysis/qa-aggregates.json`: both coarse and dense recording-level QA aggregates.
 - `analysis/candidates.json`: one candidate event.
 - `analysis/action-events.json`: one fused action event.
 - `analysis/run-report.json` and `analysis/mainline-bundle.json`: complete accounting and
   connected lineage bundle.
+- `execution-manifest.json` and `execution-audit.ndjson`: exact artifact inventory and
+  canonical stage audit.
 
 ### Source and artifact lineage
 
@@ -59,18 +62,26 @@ The final output root was atomically published at
 | source recording identity | `d6ce6673fa1c6a35736cedb16b181b0b4a80a741d84961d416ba50e39e5ad7bc` |
 | source content SHA-256 | `9fd5094bf29cd4ee50cd8c7d8c053e89d1c93660a0f4e57daaa726bae2b6156c` |
 | video manifest artifact ID | `170ec194-a6af-d619-aead-d6294b284264` |
-| video manifest exact SHA-256 | `430bef5b3ba53de72450709d7639124f283bbb23d788ac92c7a40cff365af391` |
+| video manifest exact SHA-256 | `0b6a8f68f38cb3257ef3251b5331ff09633cf6d1c1588c12014c7e44ed7ecf63` |
 | video manifest semantic SHA-256 | `8dd872d9dab06cd62048b61443d81119a2f86db339e1df2c89d0e11e218e29ae` |
-| analysis bundle SHA-256 | `b82bfb37d69365ca9d6c52b14dfacb4fd9f19f76a5ef8e0a618e74b6a0a0f011` |
+| execution manifest semantic SHA-256 | `d2107fac168eb4e0106df34fcb2e92a5e3c844e3d4bd394e41b0b9d55a754522` |
+| analysis bundle SHA-256 | `46dfba3d1bd0bac54ee92170ac872ee8fff02c366dfe50faf0493212bc1498f7` |
 
 ## Verification
 
-The implementation was checked with the locked environment:
+The published root passed the offline verifier:
 
-- full pytest suite: `467 passed, 3 skipped in 39.50s`;
-- Ruff lint: passed;
-- Ruff format check: passed;
-- mypy: passed for 40 source files.
+```powershell
+uv run --locked python scripts/verify_local_mainline.py `
+  tmp/local-mainline-final2-20260719
+```
+
+The locked development gates also passed after the runtime/preflight hardening:
+
+- full pytest suite: `472 passed, 3 skipped`;
+- Ruff format and lint: passed;
+- strict mypy: passed for 44 source files;
+- offline schema registry: 16 pinned documents verified.
 
 The real sample used no network or provider call. The fake adapter is deterministic and its
 event is intentionally not production eligible. Alignment is unverified, the mapping is

@@ -115,6 +115,36 @@ def test_cli_rejects_an_existing_output_root_before_mapping_access(
     }
 
 
+def test_cli_rejects_an_existing_registry_file(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "run"
+    registry = tmp_path / "registry-file"
+    registry.write_text("not a directory", encoding="utf-8")
+
+    assert (
+        cli.main(
+            [
+                str(tmp_path / "never-opened.mcap"),
+                str(output),
+                "--allow-unapproved",
+                "--registry-root",
+                str(registry),
+            ]
+        )
+        == 2
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stage"] == "arguments"
+    assert payload["error"] == {
+        "code": "INVALID_ARGUMENT",
+        "message": "registry root must be a directory when it already exists",
+    }
+    assert not output.exists()
+
+
 def test_cli_rejects_an_explicit_registry_nested_in_the_output(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,

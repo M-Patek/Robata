@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -127,8 +128,15 @@ class PublishedVideoExport:
 class SixCameraVideoExportService:
     """Export all six slots into a private staging directory, then publish once."""
 
-    def __init__(self, exporter: CameraVideoExporter) -> None:
+    def __init__(self, exporter: CameraVideoExporter, *, max_parallel_exports: int = 1) -> None:
+        if isinstance(max_parallel_exports, bool) or not isinstance(max_parallel_exports, int):
+            raise TypeError("max_parallel_exports must be an integer")
+        if max_parallel_exports <= 0:
+            raise ValueError("max_parallel_exports must be positive")
+        if max_parallel_exports > len(CAMERA_IDS):
+            raise ValueError("max_parallel_exports cannot exceed the six camera slots")
         self._exporter = exporter
+        self._max_parallel_exports = max_parallel_exports
 
     def export_local(self, request: LocalVideoExportRequest) -> PublishedVideoExport:
         self._validate_request(request)
@@ -160,10 +168,7 @@ class SixCameraVideoExportService:
             ) from exc
         published = False
         try:
-            facts = tuple(
-                self._export_camera(request, camera_id, staging_directory)
-                for camera_id in CAMERA_IDS
-            )
+            facts = self._export_all_cameras(request, staging_directory)
             self._verify_source_unchanged(request)
             manifest = self._build_manifest(request, facts)
             manifest_bytes = canonical_json_bytes(manifest)
@@ -199,6 +204,36 @@ class SixCameraVideoExportService:
         finally:
             if not published and staging_directory.exists():
                 shutil.rmtree(staging_directory)
+
+    def _export_all_cameras(
+        self,
+        request: LocalVideoExportRequest,
+        staging_directory: Path,
+    ) -> tuple[ExportedCameraVideoFacts, ...]:
+        """Export camera slots, preserving canonical order regardless of completion order."""
+
+        if self._max_parallel_exports == 1:
+            return tuple(
+                self._export_camera(request, camera_id, staging_directory)
+                for camera_id in CAMERA_IDS
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=self._max_parallel_exports,
+            thread_name_prefix="robata-export",
+        ) as executor:
+            futures = {
+                camera_id: executor.submit(
+                    self._export_camera,
+                    request,
+                    camera_id,
+                    staging_directory,
+                )
+                for camera_id in CAMERA_IDS
+            }
+            # Calling ``result`` in canonical order makes the tuple deterministic while
+            # still allowing independent camera work to overlap.
+            return tuple(futures[camera_id].result() for camera_id in CAMERA_IDS)
 
     def _export_camera(
         self,

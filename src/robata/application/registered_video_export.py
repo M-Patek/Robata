@@ -142,8 +142,12 @@ class RegisteredSixCameraVideoExportService:
         schema_registry: SchemaRegistry | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
+        max_parallel_exports: int = 1,
     ) -> None:
-        self._verified_export = SixCameraVideoExportService(exporter)
+        self._verified_export = SixCameraVideoExportService(
+            exporter,
+            max_parallel_exports=max_parallel_exports,
+        )
         self._artifact_registry = artifact_registry
         self._schema_registry = schema_registry or SchemaRegistry()
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -227,13 +231,9 @@ class RegisteredSixCameraVideoExportService:
             prefix=f".{output_directory.name}.artifacts-",
         )
         try:
-            facts = tuple(
-                self._verified_export._export_camera(
-                    request,
-                    camera_id,
-                    staging_directory,
-                )
-                for camera_id in CAMERA_IDS
+            facts = self._verified_export._export_all_cameras(
+                request,
+                staging_directory,
             )
             SixCameraVideoExportService._verify_source_unchanged(request)
             built = self._build_derivation(

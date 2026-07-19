@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from robata.contracts.mainline import RunStatus
 from robata.runtime.execution import (
     ExecutionEvidenceError,
     execution_manifest_semantic_sha256,
@@ -17,7 +18,7 @@ from robata.runtime.execution import (
 def _report(*, duration_ms: int = 10) -> SimpleNamespace:
     return SimpleNamespace(
         run_id="11111111-1111-1111-1111-111111111111",
-        status="PRIMARY_COMPLETE",
+        status=RunStatus.PRIMARY_COMPLETE,
         source_mcap_id="22222222-2222-2222-2222-222222222222",
         source_recording_identity="a" * 64,
         source_content_sha256="b" * 64,
@@ -72,6 +73,7 @@ def test_execution_evidence_is_canonical_and_verifiable(tmp_path: Path) -> None:
     manifest = json.loads(manifest_bytes)
     assert evidence.manifest_sha256
     assert manifest["semantic_sha256"] == execution_manifest_semantic_sha256(manifest)
+    assert manifest["accounting"]["status"] == "PRIMARY_COMPLETE"
     assert verify_execution_evidence(root)["run_id"] == manifest["run_id"]
     assert all(json.loads(line) for line in audit_path.read_bytes().splitlines())
     assert str(root) not in audit_path.read_text(encoding="utf-8")
@@ -99,3 +101,27 @@ def test_execution_evidence_rejects_provider_requests(tmp_path: Path) -> None:
     root.mkdir()
     with pytest.raises(ExecutionEvidenceError, match="zero provider requests"):
         write_execution_evidence(root, report=_report(), provider_requests=1)
+
+
+def test_execution_evidence_rejects_noncanonical_manifest_and_misaligned_audit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    write_execution_evidence(root, report=_report())
+
+    manifest_path = root / "execution-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with pytest.raises(ExecutionEvidenceError, match="canonical JSON"):
+        verify_execution_evidence(root)
+
+    audit_root = tmp_path / "audit-run"
+    audit_root.mkdir()
+    write_execution_evidence(audit_root, report=_report())
+    audit_path = audit_root / "execution-audit.ndjson"
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[-1]
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ExecutionEvidenceError, match="invalid sequence"):
+        verify_execution_evidence(audit_root)

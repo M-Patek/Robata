@@ -7,6 +7,7 @@ import pytest
 
 from robata.adapters.fake_vision_model import DeterministicFakeVisionModelAdapter
 from robata.application.mainline import (
+    LocalMainlineConfig,
     LocalMainlinePipeline,
     MainlineRunError,
     MainlineRunErrorCode,
@@ -265,10 +266,13 @@ def _published_video_export(tmp_path: Path) -> PublishedRegisteredVideoExport:
 def _pipeline(
     materializer: _StubFrameMaterializer,
     adapter: _CountingFakeAdapter,
+    *,
+    config=None,
 ) -> LocalMainlinePipeline:
     return LocalMainlinePipeline(
         materializer,
         adapter,
+        config=config,
         clock=lambda: FIXED_NOW,
         monotonic=lambda: 100.0,
     )
@@ -467,3 +471,52 @@ def test_same_input_produces_the_same_key_ids_and_event_semantics(tmp_path: Path
     assert (first.output_directory / "mainline-bundle.json").read_bytes() == (
         second.output_directory / "mainline-bundle.json"
     ).read_bytes()
+
+
+def test_parallel_independent_inference_preserves_canonical_results(tmp_path: Path) -> None:
+    video_export = _published_video_export(tmp_path)
+    serial = _pipeline(_StubFrameMaterializer(), _CountingFakeAdapter()).run(
+        video_export, tmp_path / "mainline-serial"
+    )
+    parallel = _pipeline(
+        _StubFrameMaterializer(),
+        _CountingFakeAdapter(),
+        config=LocalMainlineConfig(parallel_independent_inference=True),
+    ).run(video_export, tmp_path / "mainline-parallel")
+
+    assert tuple(request.task for request in parallel.bundle.inference_requests) == (
+        VisionTask.QA_COARSE,
+        VisionTask.EVENT_PROPOSAL,
+        VisionTask.QA_DENSE,
+        VisionTask.ACTION_EVIDENCE,
+        VisionTask.BOUNDARY_REFINEMENT,
+    )
+    assert parallel.bundle.inference_requests == serial.bundle.inference_requests
+    assert parallel.bundle.inference_outcomes == serial.bundle.inference_outcomes
+    assert parallel.bundle.events == serial.bundle.events
+    assert parallel.bundle_sha256 == serial.bundle_sha256
+
+
+class _SerialOnlyFakeAdapter(_CountingFakeAdapter):
+    supports_parallel_inference = False
+
+
+def test_parallel_inference_requires_adapter_capability(tmp_path: Path) -> None:
+    with pytest.raises(MainlineRunError) as caught:
+        _pipeline(
+            _StubFrameMaterializer(),
+            _SerialOnlyFakeAdapter(),
+            config=LocalMainlineConfig(parallel_independent_inference=True),
+        ).run(_published_video_export(tmp_path), tmp_path / "mainline-unsupported-parallel")
+
+    assert caught.value.code is MainlineRunErrorCode.INVALID_REQUEST
+    assert "capability declaration" in str(caught.value)
+    assert not (tmp_path / "mainline-unsupported-parallel").exists()
+
+
+def test_parallel_config_requires_two_workers() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        LocalMainlineConfig(
+            parallel_independent_inference=True,
+            max_parallel_inference_workers=1,
+        )

@@ -46,3 +46,21 @@ def test_preflight_accepts_explicit_local_override_and_rejects_nested_registry(
     assert any(
         check["name"] == "registry_root" and check["ok"] is False for check in result["checks"]
     )
+
+
+def test_preflight_rejects_registry_file(tmp_path: Path) -> None:
+    source = tmp_path / "source.mcap"
+    source.write_bytes(b"not decoded by preflight")
+    registry = tmp_path / "registry"
+    registry.write_text("not a directory", encoding="utf-8")
+    result = run_preflight(
+        source,
+        tmp_path / "output",
+        mapping_config=MAPPING,
+        registry_root=registry,
+        allow_unapproved=True,
+    )
+    assert result["ok"] is False
+    assert any(
+        check["name"] == "registry_root" and check["ok"] is False for check in result["checks"]
+    )

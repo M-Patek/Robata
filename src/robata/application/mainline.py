@@ -6,6 +6,7 @@ import os
 import shutil
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -102,6 +103,8 @@ class LocalMainlineConfig:
     prompt_version: str = "local-fake-prompt-v0"
     output_contract_version: str = "1.0"
     timeout_ms: int = 30_000
+    parallel_independent_inference: bool = False
+    max_parallel_inference_workers: int = 2
 
     def __post_init__(self) -> None:
         positive = (
@@ -111,12 +114,15 @@ class LocalMainlineConfig:
             self.dense_rate_den,
             self.max_candidates,
             self.timeout_ms,
+            self.max_parallel_inference_workers,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in positive
         ):
-            raise ValueError("rates, max_candidates, and timeout_ms must be positive integers")
+            raise ValueError(
+                "rates, max_candidates, timeout_ms, and worker count must be positive integers"
+            )
         nonnegative = (
             self.coarse_selection_tolerance_ns,
             self.dense_selection_tolerance_ns,
@@ -127,6 +133,13 @@ class LocalMainlineConfig:
             for value in nonnegative
         ):
             raise ValueError("tolerances and padding must be nonnegative integers")
+        if not isinstance(self.parallel_independent_inference, bool):
+            raise ValueError("parallel_independent_inference must be a bool")
+        if self.parallel_independent_inference and self.max_parallel_inference_workers < 2:
+            raise ValueError(
+                "max_parallel_inference_workers must be at least 2 when "
+                "parallel inference is enabled"
+            )
         if not self.prompt_version or not self.output_contract_version:
             raise ValueError("prompt and output contract versions must be nonempty")
 
@@ -411,34 +424,64 @@ class LocalMainlinePipeline:
             packages.append(dense_package)
             durations[MainlineStage.SAMPLING] += _elapsed_ms(started, self._monotonic)
 
-            started = self._monotonic()
-            dense_qa_request, dense_qa_outcome = self._infer(
-                run_id=run_id,
-                package=dense_package,
-                artifact_root=staging,
-                task=VisionTask.QA_DENSE,
-                candidate_id=None,
-            )
+            if self._config.parallel_independent_inference:
+                if not getattr(self._model, "supports_parallel_inference", False):
+                    _raise(
+                        MainlineRunErrorCode.INVALID_REQUEST,
+                        "parallel independent inference requires an adapter capability declaration",
+                    )
+                (
+                    (
+                        dense_qa_request,
+                        dense_qa_outcome,
+                        dense_qa_duration_ms,
+                    ),
+                    (
+                        action_request,
+                        action_outcome,
+                        action_duration_ms,
+                    ),
+                ) = self._infer_dense_and_action(
+                    run_id=run_id,
+                    package=dense_package,
+                    artifact_root=staging,
+                    candidate_id=candidate.candidate_event_id,
+                )
+                durations[MainlineStage.QA_INFERENCE] += dense_qa_duration_ms
+                durations[MainlineStage.ACTION_EVIDENCE] += action_duration_ms
+            else:
+                started = self._monotonic()
+                dense_qa_request, dense_qa_outcome = self._infer(
+                    run_id=run_id,
+                    package=dense_package,
+                    artifact_root=staging,
+                    task=VisionTask.QA_DENSE,
+                    candidate_id=None,
+                )
+                durations[MainlineStage.QA_INFERENCE] += _elapsed_ms(started, self._monotonic)
+
+            # Append results in canonical task order, never completion order.
             requests.append(dense_qa_request)
             outcomes.append(dense_qa_outcome)
-            durations[MainlineStage.QA_INFERENCE] += _elapsed_ms(started, self._monotonic)
 
             started = self._monotonic()
             qa_aggregate = self._aggregate_qa(dense_package, dense_qa_outcome)
             qa_aggregates.append(qa_aggregate)
             durations[MainlineStage.QA_AGGREGATION] += _elapsed_ms(started, self._monotonic)
 
-            started = self._monotonic()
-            action_request, action_outcome = self._infer(
-                run_id=run_id,
-                package=dense_package,
-                artifact_root=staging,
-                task=VisionTask.ACTION_EVIDENCE,
-                candidate_id=candidate.candidate_event_id,
-            )
+            if not self._config.parallel_independent_inference:
+                started = self._monotonic()
+                action_request, action_outcome = self._infer(
+                    run_id=run_id,
+                    package=dense_package,
+                    artifact_root=staging,
+                    task=VisionTask.ACTION_EVIDENCE,
+                    candidate_id=candidate.candidate_event_id,
+                )
+                durations[MainlineStage.ACTION_EVIDENCE] += _elapsed_ms(started, self._monotonic)
+
             requests.append(action_request)
             outcomes.append(action_outcome)
-            durations[MainlineStage.ACTION_EVIDENCE] += _elapsed_ms(started, self._monotonic)
 
             started = self._monotonic()
             boundary_request, boundary_outcome = self._infer(
@@ -575,6 +618,54 @@ class LocalMainlinePipeline:
                 "materialized package does not match its requested window",
             )
         return package
+
+    def _infer_dense_and_action(
+        self,
+        *,
+        run_id: str,
+        package: TemporalVisualPackage,
+        artifact_root: Path,
+        candidate_id: str,
+    ) -> tuple[
+        tuple[VisionInferenceRequest, VisionInferenceSuccess, int],
+        tuple[VisionInferenceRequest, VisionInferenceSuccess, int],
+    ]:
+        """Infer dense QA and action evidence concurrently with deterministic merging.
+
+        This path is opt-in and requires the adapter to explicitly advertise that concurrent
+        calls are safe. Futures are submitted in canonical task order and results are returned
+        in that same order regardless of completion order. Boundary refinement remains serial
+        because it consumes the action-evidence result.
+        """
+
+        def run_task(
+            task: VisionTask,
+            task_candidate_id: str | None,
+        ) -> tuple[VisionInferenceRequest, VisionInferenceSuccess, int]:
+            started = self._monotonic()
+            request, outcome = self._infer(
+                run_id=run_id,
+                package=package,
+                artifact_root=artifact_root,
+                task=task,
+                candidate_id=task_candidate_id,
+            )
+            return request, outcome, _elapsed_ms(started, self._monotonic)
+
+        with ThreadPoolExecutor(
+            max_workers=self._config.max_parallel_inference_workers,
+            thread_name_prefix="robata-infer",
+        ) as executor:
+            futures = tuple(
+                executor.submit(run_task, task, task_candidate_id)
+                for task, task_candidate_id in (
+                    (VisionTask.QA_DENSE, None),
+                    (VisionTask.ACTION_EVIDENCE, candidate_id),
+                )
+            )
+            # Calling result() in submission order is intentional: it defines the canonical
+            # merge order while still allowing both adapter calls to execute concurrently.
+            return futures[0].result(), futures[1].result()
 
     def _infer(
         self,

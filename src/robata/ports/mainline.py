@@ -97,6 +97,10 @@ class VisionModelAdapter(Protocol):
     def model_version(self) -> str:
         """Pinned provider model version recorded in inference evidence."""
 
+    @property
+    def supports_parallel_inference(self) -> bool:
+        """Whether concurrent local calls are safe for this adapter instance."""
+
     def infer(
         self,
         request: VisionInferenceRequest,

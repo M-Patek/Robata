@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -684,6 +685,7 @@ class PyAvFrameMaterializer:
         *,
         max_width: int | None = 320,
         clock: Callable[[], datetime] = _utc_now,
+        max_parallel_cameras: int = 1,
     ) -> None:
         if max_width is not None:
             if isinstance(max_width, bool) or not isinstance(max_width, int):
@@ -692,8 +694,51 @@ class PyAvFrameMaterializer:
                 raise ValueError("max_width must be positive")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if isinstance(max_parallel_cameras, bool) or not isinstance(max_parallel_cameras, int):
+            raise TypeError("max_parallel_cameras must be an integer")
+        if max_parallel_cameras <= 0:
+            raise ValueError("max_parallel_cameras must be positive")
+        if max_parallel_cameras > len(CAMERA_IDS):
+            raise ValueError("max_parallel_cameras cannot exceed the six camera slots")
         self._max_width = max_width
         self._clock = clock
+        self._max_parallel_cameras = max_parallel_cameras
+
+    def _render_all_cameras(
+        self,
+        plans: tuple[_CameraPlan, ...],
+        staging: Path,
+    ) -> dict[CameraId, tuple[_RenderedFrame, ...]]:
+        if self._max_parallel_cameras == 1:
+            return {
+                plan.ledger.record.camera_id: _decode_and_render(
+                    plan,
+                    staging,
+                    max_width=self._max_width,
+                )
+                for plan in plans
+            }
+
+        with ThreadPoolExecutor(
+            max_workers=self._max_parallel_cameras,
+            thread_name_prefix="robata-frame",
+        ) as executor:
+            futures = {
+                plan.ledger.record.camera_id: executor.submit(
+                    _decode_and_render,
+                    plan,
+                    staging,
+                    max_width=self._max_width,
+                )
+                for plan in plans
+            }
+            # Resolve in canonical camera order so content projections never depend on
+            # completion order. Each camera owns a distinct staging subdirectory.
+            return {
+                camera_id: futures[camera_id].result()
+                for camera_id in CAMERA_IDS
+                if camera_id in futures
+            }
 
     def materialize(self, request: FrameMaterializationRequest) -> TemporalVisualPackage:
         """Verify, sample, decode, and atomically materialize one visual package."""
@@ -733,14 +778,7 @@ class PyAvFrameMaterializer:
 
         published = False
         try:
-            rendered = {
-                plan.ledger.record.camera_id: _decode_and_render(
-                    plan,
-                    staging,
-                    max_width=self._max_width,
-                )
-                for plan in plans
-            }
+            rendered = self._render_all_cameras(plans, staging)
             content_sha256 = semantic_sha256(
                 _content_projection(manifest, request, plans, rendered)
             )

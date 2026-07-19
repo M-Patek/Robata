@@ -16,15 +16,19 @@ covers the executable local path and the evidence needed to hand off the final a
 - [x] Connected run report/mainline bundle with complete camera evidence lineage.
 - [x] Atomic top-level publication and cleanup of failed staging trees.
 - [x] Explicit no-event path with candidate-dependent stages marked `SKIPPED`.
+- [x] Opt-in deterministic local parallel inference for `QA_DENSE` + `ACTION_EVIDENCE`, with capability gating and canonical merge ordering.
+- [x] Provider-neutral T2 TaskQueue contract and deterministic in-memory lease/retry/dead-letter scaffold (no external broker).
 - [x] Deterministic execution manifest with exact hashes for every published regular artifact.
 - [x] Canonical append-only local audit NDJSON without source paths, credentials, or raw frames.
 - [x] Offline preflight for runtime, imports, mapping, source, output, registry, and spec hash.
 - [x] Replay/verification commands documented in the local runbook.
-- [x] Full locked pytest/static/schema verification performed for the local slice.
+- [x] Full locked pytest/static/schema verification performed for the local slice (`488 passed, 3 skipped` after the T1/T2 preparation changes).
 
 ## Not completed by design
 
 - [ ] Real model/provider adapter and provider SDK integration.
+- [ ] T1 export/materialization parallelism and benchmark workload suite; throughput remains `NOT_MEASURED`.
+- [ ] Durable T2 queue/worker/registry adapters and infrastructure selection.
 - [ ] Provider credentials, network policy, retries, rate limits, and cost accounting.
 - [ ] Real-model quality/latency/capacity evaluation.
 - [ ] Production mapping/alignment approval and governed promotion.

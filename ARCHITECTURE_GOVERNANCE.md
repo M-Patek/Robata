@@ -1,26 +1,27 @@
-# Architecture Governance: Throughput Optimization Roadmap
+# Architecture Governance: Throughput Optimization Roadmap (Tracks T1/T2)
 
-**Status:** Proposed  
-**Version:** 1.0  
-**Date:** 2026-07-19  
-**Scope:** Architecture governance for achieving 500 hours/day throughput target  
-**Authority:** Architecture V1.1, ADRs 0001-0005, Execution Spec V1
+**Status:** Proposed
+**Version:** 1.0
+**Date:** 2026-07-19
+**Scope:** Non-normative throughput optimization tracks supporting the authoritative Architecture V1.1 phases
+**Authority:** Architecture V1.1, ADRs 0001-0007, Execution Spec V1
+**Phase note:** This document uses **T1 (parallel local)** and **T2 (distributed execution)**. It does not redefine normative Phase 0/1A/1B/2 numbering or close O-01/O-03/O-04/O-10 gates.
 
 ---
 
 ## 1. Executive Summary
 
-This document defines the architecture governance framework for transforming Robata from its current single-threaded local execution into a high-throughput distributed pipeline capable of processing **500 recording hours per day** (3,000 camera-video hours).
+This document defines a staged governance framework for throughput experiments and future scale-out. The product objective is expressed as **500 recording hours/day**, equivalent to **3,000 camera-video hours/day** for six cameras, but Architecture V1.1 leaves the operational interpretation open. Until O-01 is resolved, all benchmark reports must publish both recording-hours and camera-video-hours and must label capacity as `NOT_MEASURED` unless a governed corpus and workload exist.
 
 ### Current State vs. Target
 
 | Metric | Current | Target | Gap |
 |--------|---------|--------|-----|
-| Recording hours/wall-clock hour | ~0.62 | 20.83 | **33x** |
-| Camera-video hours/wall-clock hour | ~3.69 | 125.0 | **33x** |
-| Architecture | Modular monolith | Distributed pipeline | Event-driven |
-| Concurrency | None | Parallel per-camera | Worker pools |
-| Storage | Local SQLite | Distributed | PostgreSQL + S3 |
+| Recording hours/wall-clock hour | NOT_MEASURED | 20.83 candidate | pending O-01 |
+| Camera-video hours/wall-clock hour | NOT_MEASURED | 125.0 candidate | pending O-01 |
+| Architecture | Modular monolith (verified local) | Distributed pipeline (candidate) | pending ADR/PoC |
+| Concurrency | Serial default; T1 opt-in stage parallelism | Parallel per-camera/worker pools (candidate) | pending benchmark |
+| Storage | Local SQLite + filesystem (verified local) | PostgreSQL/S3 candidates | no infrastructure decision yet |
 
 ### Governance Principles
 
@@ -52,8 +53,8 @@ MCAP → Export cam_01 → Export cam_02 → ...          MCAP → [Export cam_0
 
 | Operation | CPU | I/O | Memory | Parallel Potential | Current Pattern |
 |-----------|-----|-----|--------|-------------------|-----------------|
-| H.264 remux (6 cameras) | High | Medium | Low | **Very High** | Serial loop |
-| Frame decode (6 cameras) | Very High | Low | Medium | **Very High** | Serial loop |
+| H.264 remux (6 cameras) | High | Medium | Low | **Very High** | Serial default; opt-in bounded threads |
+| Frame decode (6 cameras) | Very High | Low | Medium | **Very High** | Serial default; opt-in bounded threads |
 | PNG encoding | High | Low | Medium | **High** | Per-frame create |
 | SHA-256 hashing | Medium | High | Low | **Medium** | Sequential |
 | Model inference | High | Network | Medium | **High** | Sequential calls |
@@ -61,7 +62,7 @@ MCAP → Export cam_01 → Export cam_02 → ...          MCAP → [Export cam_0
 
 ### 2.3 Critical Path Analysis
 
-For a typical 2-minute recording:
+The following values are planning estimates only; they are not measurements and cannot satisfy a gate until a governed corpus, instrumentation, and replay report exist. For a typical 2-minute recording:
 
 ```
 Phase                    Current Time    Optimized Time    Speedup
@@ -81,7 +82,7 @@ Total                    ~120s           ~28s              **4.3x**
 
 ---
 
-## 3. Target Architecture (Phase 2)
+## 3. Target Architecture (Throughput Track T2; normative Phase 2 remains separate)
 
 ### 3.1 Layered Architecture
 
@@ -279,10 +280,10 @@ class InferenceWorkerPool(Protocol):
 
 ## 4. Phase-Gated Evolution
 
-### 4.1 Phase 1A → Phase 1B (Current → Near-term)
+### 4.1 Throughput Track T1 (local parallel experiments)
 
-**Duration:** 1-2 weeks  
-**Goal:** Achieve 5-10x throughput improvement through local parallelism  
+**Duration:** 1-2 weeks
+**Goal:** Measure and, if justified, improve local throughput without changing semantic contracts; 5-10x is an unverified hypothesis.
 **Exit Criteria:**
 - [ ] 6-camera export parallelized (ProcessPoolExecutor)
 - [ ] 6-camera frame materialization parallelized
@@ -301,6 +302,9 @@ class InferenceWorkerPool(Protocol):
 | Preserve deterministic output ordering | Sort results by camera slot after parallel execution |
 
 **Code Changes:**
+
+The snippet below is a design sketch, not a drop-in implementation: ProcessPool workers must
+be module-level picklable functions and both V1 and V2 publication paths must be covered.
 
 ```python
 # src/robata/application/video_export.py
@@ -328,10 +332,10 @@ class ParallelSixCameraVideoExportService:
         # ...
 ```
 
-### 4.2 Phase 1B → Phase 2 (Near-term → Medium-term)
+### 4.2 Throughput Track T1 -> T2 (near-term -> medium-term)
 
-**Duration:** 1-2 months  
-**Goal:** Achieve 500 hours/day through distributed execution  
+**Duration:** 1-2 months
+**Goal:** Evaluate distributed execution against the unresolved 500/day objective; no sustained-capacity claim is valid before O-01 and governed replay evidence.
 **Exit Criteria:**
 - [ ] Task queue and scheduler implemented
 - [ ] Worker pool with lease/heartbeat management
@@ -340,22 +344,20 @@ class ParallelSixCameraVideoExportService:
 - [ ] Redis cache for intermediate results
 - [ ] Kafka/RabbitMQ for inter-stage messaging
 - [ ] Horizontal scaling: multiple worker nodes
-- [ ] Benchmarks show 500 hours/day sustained throughput
+- [ ] Benchmarks report both units and show the approved O-01 interpretation sustained
 
-**Technical Decisions:**
+**Candidate infrastructure options (not decisions):**
 
-| Decision | Rationale |
-|----------|-----------|
-| PostgreSQL for metadata | ACID, JSON support, mature, team familiarity |
-| S3/MinIO for blobs | Content-addressed, infinite scale, cost-effective |
-| Redis for caching | Fast lookups, TTL support, session storage |
-| Kafka for messaging | Durability, replay, backpressure, partitioning by mcap_id |
-| Celery for task scheduling | Mature, Python-native, retry/dead-letter support |
+The following options require an explicit ADR, compatibility proof against existing ports,
+and a measured PoC before implementation. They must not be interpreted as approved production
+choices: PostgreSQL or another metadata store; S3/MinIO or another blob store; Redis or another
+cache; Kafka/RabbitMQ or another broker; and Celery or another scheduler. The current local
+baseline remains SQLite/local filesystem with no external service dependency.
 
-### 4.3 Phase 2+ (Future)
+### 4.3 Throughput Track T2+ (future scale-out)
 
-**Duration:** 3-6 months  
-**Goal:** Production-grade distributed pipeline  
+**Duration:** 3-6 months
+**Goal:** Production-grade distributed pipeline
 **Potential Enhancements:**
 - GPU-accelerated decoding (NVENC/VAAPI)
 - Hardware-accelerated inference (TensorRT, ONNX Runtime)
@@ -448,13 +450,13 @@ Per Architecture V1.1 Section 16, all performance claims must be backed by measu
 
 | Benchmark | Metric | Target | Phase |
 |-----------|--------|--------|-------|
-| Single-recording throughput | Recording hours / wall-clock hour | >20 | 1B |
-| Sustained throughput | Recording hours / wall-clock hour | >500 | 2 |
-| Latency (p50) | Seconds per 2-minute recording | <30 | 1B |
-| Latency (p99) | Seconds per 2-minute recording | <60 | 1B |
-| Resource utilization | CPU % during processing | >70% | 1B |
-| Resource utilization | Memory GB per recording | <4 | 1B |
-| Error rate | Failed recordings / total | <0.1% | 2 |
+| Single-recording throughput | Recording hours / wall-clock hour | candidate 20.83; NOT_MEASURED until governed replay | T1 |
+| Sustained throughput | Recording hours / wall-clock hour | candidate 20.83 for 500/day interpretation; NOT_MEASURED | T2 |
+| Latency (p50) | Seconds per 2-minute recording | candidate <30; NOT_MEASURED | T1 |
+| Latency (p99) | Seconds per 2-minute recording | candidate <60; NOT_MEASURED | T1 |
+| Resource utilization | CPU % during processing | candidate >70%; NOT_MEASURED | T1 |
+| Resource utilization | Memory GB per recording | candidate <4; NOT_MEASURED | T1 |
+| Error rate | Failed recordings / total | candidate <0.1%; NOT_MEASURED | T2 |
 | Determinism | Bit-exact output on replay | 100% | All |
 
 ### 6.2 Benchmark Infrastructure
@@ -485,7 +487,7 @@ For 2-minute recordings:
   Recordings per minute = 0.347 * 60 / 2 = 10.4 recordings/minute
   Recordings per hour = 625 recordings/hour
 
-Worker Requirements (Phase 2):
+Worker Requirements (Throughput Track T2):
   Assume 30 seconds per recording with parallelization
   Throughput per worker = 120 recordings/hour
   Workers needed = 625 / 120 ≈ 6 workers
@@ -525,7 +527,7 @@ Phase 1A (Current)
     └── Single Process ──► ProcessPool (local parallel)
             │
             ▼
-    Phase 1B (Parallel Local)
+    Track T1 (Parallel Local)
             │
             ├── Add Task Queue (Celery/RQ)
             │
@@ -536,7 +538,7 @@ Phase 1A (Current)
             └── Add Object Storage
                     │
                     ▼
-            Phase 2 (Distributed)
+            Track T2 (Distributed)
 ```
 
 ### 7.3 Compatibility Testing
@@ -565,7 +567,7 @@ Phase 1A (Current)
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | Parallel execution non-determinism | Medium | High | Seeded RNG, logical clock, content-addressing |
-| PyAV thread safety issues | High | Medium | ProcessPool (not ThreadPool), isolated contexts |
+| PyAV thread safety issues | High | Medium | Opt-in bounded threads only for local evidence; ProcessPool/Windows-spawn PoC before promotion |
 | Memory exhaustion | Medium | High | Bounded queues, streaming, backpressure |
 | Schema version conflicts | Low | High | Registry pinning, compatibility tests |
 | Worker node failures | Medium | Medium | Lease timeout, retry, dead-letter queue |
@@ -584,20 +586,20 @@ Phase 1A (Current)
 
 ## 9. Governance Checklist
 
-### Before Phase 1B Exit
+### Before Throughput Track T1 Exit (not normative Phase 1B exit)
 
-- [ ] All Phase 1A tests pass
-- [ ] Parallel benchmarks show 5-10x improvement
-- [ ] Determinism tests pass (replay produces identical output)
-- [ ] Contract tests cover parallel execution paths
-- [ ] ADR documenting parallelization decision
-- [ ] Updated IMPLEMENTATION_PLAN.md
+- [ ] Normative predecessor gates remain explicitly open/closed in the evidence record
+- [ ] Parallel benchmarks show measured improvement on a governed/approved workload (5-10x remains a hypothesis)
+- [x] Determinism tests pass for local serial/parallel semantic replay (wall-clock bytes remain observational)
+- [x] Contract/unit tests cover the implemented local parallel execution paths
+- [x] ADR documenting parallelization decisions (ADR 0006 and ADR 0008)
+- [x] Updated governance implementation/task documents
 
-### Before Phase 2 Exit
+### Before Throughput Track T2 Exit (not normative Phase 2 exit)
 
-- [ ] Distributed benchmarks show 500 hours/day sustained
+- [ ] Distributed benchmarks report both units and satisfy the approved O-01 interpretation
 - [ ] Fault tolerance tests (worker failure, network partition)
-- [ ] Security review (Phase 0 controls applied to distributed system)
+- [ ] Security review confirms normative Phase 0 controls before any governed production data
 - [ ] Cost analysis and optimization
 - [ ] Operational runbooks (monitoring, alerting, incident response)
 - [ ] ADR documenting distributed architecture decisions
@@ -614,6 +616,9 @@ Phase 1A (Current)
 - ADR 0003: Artifact Registry and Schema Evolution
 - ADR 0004: Run-Independent Logical Nodes
 - ADR 0005: Immutable Revisions and Current Selection
+- ADR 0006: Opt-In Deterministic Parallel Inference for Throughput Track T1
+- ADR 0007: Provider-Neutral Task Queue Contract and In-Memory T2 Scaffold
+- ADR 0008: Opt-In Local Camera Export/Materialization Parallelism and Benchmark Accounting
 
 ---
 

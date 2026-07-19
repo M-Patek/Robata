@@ -22,15 +22,25 @@ Project and architecture inputs are intentionally split by authority:
 - [ADR 0005](docs/adr/0005-immutable-revisions-and-current-selection.md) defines
   node-scoped immutable revisions, append-only selection decisions, atomic current
   selection, and deterministic projection rebuild.
+- [ADR 0006](docs/adr/0006-throughput-track-local-parallel-inference.md) records the opt-in
+  deterministic T1 inference experiment, [ADR 0007](docs/adr/0007-provider-neutral-task-queue-scaffold.md)
+  records the provider-neutral T2 queue scaffold, and [ADR 0008](docs/adr/0008-throughput-track-local-camera-parallelism.md)
+  records opt-in camera export/materialization parallelism and benchmark accounting.
 - [ADR 0001](docs/adr/0001-executable-baseline.md), Architecture V1.1 Section 25, and
   registered schemas govern the executable security, identity, time, status, and wire
   contracts.
-- [Architecture Governance](ARCHITECTURE_GOVERNANCE.md) defines the throughput optimization
-  roadmap and governance framework for achieving 500 hours/day.
+- [Architecture Governance](ARCHITECTURE_GOVERNANCE.md) defines non-normative throughput
+  optimization tracks T1/T2; it does not redefine Architecture V1.1 phases or close capacity gates.
 - [Architecture Governance Implementation](ARCHITECTURE_GOVERNANCE_IMPLEMENTATION.md) provides
-  concrete implementation steps for the governance framework.
-- [Architecture Governance Tasks](ARCHITECTURE_GOVERNANCE_TASKS.md) tracks the implementation
-  progress of Phase 1B and Phase 2.
+  concrete T1/T2 implementation steps and evidence requirements.
+- [Architecture Governance Tasks](ARCHITECTURE_GOVERNANCE_TASKS.md) tracks the local fake slice
+  separately from the unpromoted T1/T2 backlog.
+- [ADR 0006](docs/adr/0006-throughput-track-local-parallel-inference.md) records the opt-in
+  deterministic parallel inference decision.
+- [Governance evaluation](reports/architecture-governance-evaluation-2026-07-19.md) records
+  the phase taxonomy, unit, interface, and gate review.
+- [Task queue scaffold runbook](docs/operations/task-queue-scaffold.md) documents the local T2
+  contract and its no-network scope.
 
 The current baseline is deliberately contract-first. It provides strict domain values,
 canonical six-camera collections, a 16-document exact schema catalog, authoritative JSON
@@ -114,6 +124,27 @@ uv run --locked python scripts/preflight_local_mainline.py `
   --allow-unapproved
 ```
 
+After publication, verify the complete output root without model/provider access:
+
+```powershell
+uv run --locked python scripts/verify_local_mainline.py `
+  tmp/local-full-mainline
+```
+
+For a local T1 experiment only, opt into concurrent `QA_DENSE` and `ACTION_EVIDENCE` calls:
+
+```powershell
+uv run --locked python scripts/run_local_mainline.py `
+  data/source/sample-medium.mcap `
+  tmp/local-mainline-t1-parallel `
+  --allow-unapproved `
+  --parallel-independent-inference `
+  --registry-root tmp/local-mainline-t1-registry
+```
+
+The flag is disabled by default, requires an adapter capability declaration, preserves canonical
+request ordering, and does not constitute a throughput or production-readiness claim.
+
 A real model can replace the `VisionModelAdapter` at the application port; no real provider
 adapter or model-quality claim is included in this slice. The completed local sample evidence
 is recorded in [`reports/local-full-mainline-fake-model-2026-07-19.md`](reports/local-full-mainline-fake-model-2026-07-19.md),
@@ -152,3 +183,32 @@ IEEE-754 safe integer range.
 Real MCAP samples and extracted source corpora are local-only and are not committed under
 `data/source/`. Small derived documentation or explicitly curated synthetic fixtures may be
 kept separately when they contain no source media.
+
+### T1 local parallel controls
+
+The local CLI keeps serial execution as the default. The following flags are opt-in engineering
+experiments only; they do not enable a real provider or change `production_eligible=false`:
+
+```powershell
+uv run --locked python scripts/run_local_mainline.py `
+  data/source/sample-medium.mcap `
+  tmp/local-mainline-t1-all-parallel `
+  --allow-unapproved `
+  --parallel-video-export `
+  --parallel-frame-materialization `
+  --parallel-independent-inference `
+  --registry-root tmp/local-mainline-t1-all-parallel-registry
+```
+
+Use `scripts/benchmark_local_mainline.py` for dependency-free local timing evidence. Its report
+contains both recording-hours/wall-hour and camera-video-hours/wall-hour, but remains
+`measurement_status=NOT_MEASURED` until a governed corpus and normative benchmark evidence are
+approved:
+
+```powershell
+uv run --locked python scripts/benchmark_local_mainline.py `
+  data/source/sample-medium.mcap `
+  tmp/local-mainline-benchmark `
+  --allow-unapproved `
+  --iterations 1
+```

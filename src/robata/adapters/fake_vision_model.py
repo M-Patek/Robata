@@ -52,6 +52,8 @@ class DeterministicFakeVisionModelAdapter:
     provider = FAKE_PROVIDER
     model_name = FAKE_MODEL_NAME
     model_version = FAKE_MODEL_VERSION
+    # The adapter is stateless and safe for the local opt-in parallel stage path.
+    supports_parallel_inference = True
 
     def __init__(self, *, no_event: bool = False) -> None:
         if type(no_event) is not bool:

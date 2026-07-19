@@ -128,16 +128,26 @@ def run_preflight(
         )
     except OSError:
         registry_inside_output = True
-    registry_ok = not registry_inside_output and not effective_registry.is_symlink()
-    checks.append(
-        _check(
-            "registry_root",
-            registry_ok,
-            "outside output and not a symlink"
+    if registry_inside_output or effective_registry.is_symlink():
+        registry_ok = False
+        registry_detail = "must be outside output and not a symlink"
+    elif effective_registry.exists():
+        registry_ok = effective_registry.is_dir() and os.access(effective_registry, os.W_OK)
+        registry_detail = (
+            "existing writable directory"
             if registry_ok
-            else "must be outside output and not a symlink",
+            else "existing registry root must be a writable directory"
         )
-    )
+    else:
+        registry_ok = effective_registry.parent.is_dir() and os.access(
+            effective_registry.parent, os.W_OK
+        )
+        registry_detail = (
+            "absent; writable parent directory"
+            if registry_ok
+            else "registry parent is missing or not writable"
+        )
+    checks.append(_check("registry_root", registry_ok, registry_detail))
 
     if verify_spec_hash:
         checked_spec = (
