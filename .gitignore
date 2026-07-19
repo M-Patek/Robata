@@ -25,3 +25,4 @@ tmp/
 *.log
 /file.zip
 /data/source/
+.claude/
