@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/mcap-validation-report.schema.json",
+  "title": "Robata V1 MCAP validation report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "validation_report_id",
+    "mcap_id",
+    "recording_identity",
+    "source",
+    "mapping_policy",
+    "verdict",
+    "discovered_video_stream_count",
+    "mapped_camera_count",
+    "errors",
+    "validated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.schema.json#/$defs/schemaVersion"
+    },
+    "validation_report_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "mcap_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "recording_identity": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "mapping_policy": {
+      "$ref": "#/$defs/mappingPolicy"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["VALID", "INVALID", "INCONCLUSIVE"]
+    },
+    "discovered_video_stream_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mapped_camera_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 6
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/validationError"
+      }
+    },
+    "validated_at": {
+      "$ref": "common.schema.json#/$defs/rfc3339"
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "version", "sha256", "bytes"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": ["string", "null"]
+        },
+        "sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "mappingPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "digest"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        }
+      }
+    },
+    "validationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "path", "camera_id", "stream_id"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": ["string", "null"]
+        },
+        "camera_id": {
+          "oneOf": [
+            {
+              "$ref": "common.schema.json#/$defs/cameraId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream_id": {
+          "oneOf": [
+            {
+              "$ref": "common.schema.json#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

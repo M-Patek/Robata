@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/alignment-manifest.schema.json",
+  "title": "Robata V1 alignment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "alignment_id",
+    "mcap_id",
+    "camera_mapping_run_id",
+    "reference_timebase",
+    "canonical_origin",
+    "method",
+    "algorithm_version",
+    "status",
+    "cameras",
+    "policy_version",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.schema.json#/$defs/schemaVersion"
+    },
+    "alignment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "mcap_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "camera_mapping_run_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "reference_timebase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "canonical_origin": {
+      "$ref": "#/$defs/canonicalOrigin"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "hardware_sync",
+        "sensor_clock",
+        "mcap_log_time",
+        "cross_correlation",
+        "manual"
+      ]
+    },
+    "algorithm_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "$ref": "#/$defs/alignmentStatus"
+    },
+    "cameras": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "properties": {
+        "cam_01": {"$ref": "#/$defs/cameraAlignment"},
+        "cam_02": {"$ref": "#/$defs/cameraAlignment"},
+        "cam_03": {"$ref": "#/$defs/cameraAlignment"},
+        "cam_04": {"$ref": "#/$defs/cameraAlignment"},
+        "cam_05": {"$ref": "#/$defs/cameraAlignment"},
+        "cam_06": {"$ref": "#/$defs/cameraAlignment"}
+      }
+    },
+    "policy_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "$ref": "common.schema.json#/$defs/rfc3339"
+    }
+  },
+  "$defs": {
+    "alignmentStatus": {
+      "type": "string",
+      "enum": ["VALID", "DEGRADED", "INVALID", "UNVERIFIED"]
+    },
+    "canonicalOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "reference_timestamp_ns", "utc"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reference_timestamp_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "utc": {
+          "oneOf": [
+            {"$ref": "common.schema.json#/$defs/rfc3339"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "cameraAlignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_clock_id",
+        "source_timestamp_unit",
+        "derived_drift_ppm",
+        "residual_p95_ns",
+        "max_error_ns",
+        "coverage",
+        "segments",
+        "status"
+      ],
+      "properties": {
+        "source_clock_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_timestamp_unit": {
+          "const": "ns"
+        },
+        "derived_drift_ppm": {
+          "type": "number"
+        },
+        "residual_p95_ns": {
+          "$ref": "common.schema.json#/$defs/nonnegativeInt64Nanoseconds"
+        },
+        "max_error_ns": {
+          "$ref": "common.schema.json#/$defs/nonnegativeInt64Nanoseconds"
+        },
+        "coverage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/segment"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/alignmentStatus"
+        }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "source_epoch_id",
+        "source_order_start",
+        "source_order_end",
+        "source_start_ns",
+        "source_end_ns",
+        "source_anchor_ns",
+        "canonical_anchor_ns",
+        "rate_numerator",
+        "rate_denominator",
+        "rounding"
+      ],
+      "properties": {
+        "segment_id": {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        "source_epoch_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_order_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_order_end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_start_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_end_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_anchor_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "canonical_anchor_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "rate_numerator": {
+          "$ref": "common.schema.json#/$defs/positiveInt64String"
+        },
+        "rate_denominator": {
+          "$ref": "common.schema.json#/$defs/positiveInt64String"
+        },
+        "rounding": {
+          "const": "HALF_EVEN"
+        }
+      }
+    }
+  }
+}

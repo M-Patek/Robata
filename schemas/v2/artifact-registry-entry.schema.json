@@ -1,0 +1,552 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v2/artifact-registry-entry.schema.json",
+  "title": "Robata Artifact Registry Entry V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "artifact_type",
+    "semantic_sha256",
+    "locator",
+    "sha256",
+    "bytes",
+    "media_type",
+    "producer",
+    "lifecycle",
+    "parents",
+    "payload_schema_ref",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "2.0"
+    },
+    "artifact_id": {
+      "$ref": "#/$defs/artifactId"
+    },
+    "artifact_type": {
+      "enum": [
+        "CAMERA_VIDEO_EXPORT_MANIFEST",
+        "CAMERA_VIDEO_MP4",
+        "CAMERA_VIDEO_TIMESTAMP_MAP",
+        "EXPORT_CONFIG",
+        "JSON_SCHEMA",
+        "MAPPING_PROFILE",
+        "RAW_MCAP"
+      ]
+    },
+    "semantic_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "locator": {
+      "$ref": "#/$defs/artifactLocator"
+    },
+    "sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "media_type": {
+      "$ref": "#/$defs/mediaType"
+    },
+    "producer": {
+      "$ref": "#/$defs/artifactProducer"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/artifactLifecycle"
+    },
+    "parents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifactParent"
+      },
+      "uniqueItems": true
+    },
+    "payload_schema_ref": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/schemaArtifactReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "enum": [
+              "JSON_SCHEMA",
+              "RAW_MCAP"
+            ]
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "maxItems": 0
+          },
+          "payload_schema_ref": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "enum": [
+              "MAPPING_PROFILE",
+              "EXPORT_CONFIG"
+            ]
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "maxItems": 0
+          },
+          "payload_schema_ref": {
+            "$ref": "#/$defs/schemaArtifactReference"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "CAMERA_VIDEO_MP4"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "$ref": "#/$defs/threeInputParents"
+          },
+          "payload_schema_ref": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "CAMERA_VIDEO_TIMESTAMP_MAP"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "$ref": "#/$defs/threeInputParents"
+          },
+          "payload_schema_ref": {
+            "$ref": "#/$defs/schemaArtifactReference"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "CAMERA_VIDEO_EXPORT_MANIFEST"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "parents": {
+            "$ref": "#/$defs/manifestParents"
+          },
+          "payload_schema_ref": {
+            "$ref": "#/$defs/schemaArtifactReference"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "JSON_SCHEMA"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media_type": {
+            "const": "application/schema+json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "RAW_MCAP"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media_type": {
+            "const": "application/x-mcap"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "enum": [
+              "MAPPING_PROFILE",
+              "EXPORT_CONFIG",
+              "CAMERA_VIDEO_EXPORT_MANIFEST"
+            ]
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media_type": {
+            "const": "application/json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "CAMERA_VIDEO_MP4"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media_type": {
+            "const": "video/mp4"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {
+            "const": "CAMERA_VIDEO_TIMESTAMP_MAP"
+          }
+        },
+        "required": [
+          "artifact_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "media_type": {
+            "const": "application/x-ndjson"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "artifactId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "artifactUri": {
+      "type": "string",
+      "minLength": 4,
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$"
+    },
+    "mediaType": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+    },
+    "artifactLocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "object_version"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/artifactUri"
+        },
+        "object_version": {
+          "$ref": "#/$defs/schemaVersion"
+        }
+      }
+    },
+    "artifactProducer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "canonical_config_sha256"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "canonical_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifactLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "policy_version"
+      ],
+      "properties": {
+        "state": {
+          "const": "ACTIVE"
+        },
+        "policy_version": {
+          "$ref": "#/$defs/schemaVersion"
+        }
+      }
+    },
+    "artifactParent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "relation"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/artifactId"
+        },
+        "relation": {
+          "enum": [
+            "EXPORT_CONFIG",
+            "MAPPING_PROFILE",
+            "SOURCE_CONTENT",
+            "TIMESTAMP_OUTPUT",
+            "VIDEO_OUTPUT"
+          ]
+        }
+      }
+    },
+    "schemaArtifactReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "properties": {
+        "schema_id": {
+          "$ref": "#/$defs/artifactUri"
+        },
+        "version": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/artifactId"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "threeInputParents": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "EXPORT_CONFIG"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "MAPPING_PROFILE"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "SOURCE_CONTENT"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "manifestParents": {
+      "type": "array",
+      "minItems": 15,
+      "maxItems": 15,
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "EXPORT_CONFIG"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "MAPPING_PROFILE"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "SOURCE_CONTENT"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "TIMESTAMP_OUTPUT"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 6,
+          "maxContains": 6
+        },
+        {
+          "contains": {
+            "properties": {
+              "relation": {
+                "const": "VIDEO_OUTPUT"
+              }
+            },
+            "required": [
+              "relation"
+            ]
+          },
+          "minContains": 6,
+          "maxContains": 6
+        }
+      ]
+    }
+  }
+}

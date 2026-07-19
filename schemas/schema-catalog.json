@@ -1,0 +1,294 @@
+{
+  "catalog_version": "1.0",
+  "schemas": [
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/alignment-manifest",
+        "version": "1.0.0",
+        "artifact_id": "ae1f46c4-dec5-96d3-a4a4-da2503685ec5",
+        "sha256": "965cfd82aa6254de4cfac698193d975b4c23e14f307e54c773c2cda3a5613766"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/alignment-manifest.schema.json",
+      "artifact_path": "v1/alignment-manifest.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "alignment-manifest-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/camera-video-export-manifest",
+        "version": "1.0.0",
+        "artifact_id": "fa17edf9-9f0b-cea8-a3bf-b6fac1728151",
+        "sha256": "26673b72357f6ed6a52327ad62e5c5b69316750cc6829e317d2d8938becdca82"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/camera-video-export-manifest.schema.json",
+      "artifact_path": "v1/camera-video-export-manifest.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "camera-video-export-manifest-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/camera-video-timestamp-row",
+        "version": "1.0.0",
+        "artifact_id": "6ab8bd8d-42ee-5369-57a3-f47c615a7564",
+        "sha256": "ea300bc18de291999a5acd6fcec43d331ef571c72be77dd1edec992e0c1d5136"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/camera-video-timestamp-row.schema.json",
+      "artifact_path": "v1/camera-video-timestamp-row.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "camera-video-timestamp-row-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/common",
+        "version": "1.0.0",
+        "artifact_id": "cd87b5b5-3feb-19e9-0c7f-e1d02656c4fb",
+        "sha256": "52fbf96c2ff2b4502a202a16ed5ea39a6f9aa427aab6c9d3a1dce9875d348bdd"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/common.schema.json",
+      "artifact_path": "v1/common.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "common-wire-definitions-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mcap-manifest",
+        "version": "1.0.0",
+        "artifact_id": "065cd8a6-7400-a21e-befe-c837ad5de4a3",
+        "sha256": "f4e86a91387ed007a6a01464d48f247314bf187fe544f1160b0e18b79f16725c"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/mcap-manifest.schema.json",
+      "artifact_path": "v1/mcap-manifest.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mcap-ready-manifest-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mcap-validation-report",
+        "version": "1.0.0",
+        "artifact_id": "9d0c232f-158d-26ec-4075-3bedefd5bfd1",
+        "sha256": "0b497fa3f64784bdaa90d7b00073cba643f28ca095fc474d8f18ccc9ce5adae3"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/mcap-validation-report.schema.json",
+      "artifact_path": "v1/mcap-validation-report.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mcap-validation-report-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/logical-node",
+        "version": "1.0.0",
+        "artifact_id": "b4cbbe14-96cd-5018-5111-32834707feb2",
+        "sha256": "fa5562e212d5834d932c237b84ea1864bb1d222d348ea90c31129bec38076e40"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/logical-node.schema.json",
+      "artifact_path": "v1/logical-node.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "logical-node-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/processing-run-node-membership",
+        "version": "1.0.0",
+        "artifact_id": "c55ccc4d-89b6-7845-9e31-7d55e0a427db",
+        "sha256": "8a472d73825e581bb2fea948db4f3613272c95717f0a2787d232d0fc5e03033e"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/processing-run-node-membership.schema.json",
+      "artifact_path": "v1/processing-run-node-membership.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "processing-run-node-membership-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/immutable-node-revision",
+        "version": "1.0.0",
+        "artifact_id": "b32fe5ed-da66-ec11-9149-c8b5ebc34442",
+        "sha256": "2fe93c147d1290d7ca980bb9cdd0addfdb8dfff5398489cb5a23cfc1d8920dd6"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/immutable-node-revision.schema.json",
+      "artifact_path": "v1/immutable-node-revision.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "immutable-node-revision-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/selection-decision",
+        "version": "1.0.0",
+        "artifact_id": "83f8a99d-0e04-f365-e323-9a04bcb18830",
+        "sha256": "2098d47dfddf58705e47ef9f1a149a1455e0bb5c918879587de6a10b488092b8"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/selection-decision.schema.json",
+      "artifact_path": "v1/selection-decision.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "selection-decision-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/current-selection",
+        "version": "1.0.0",
+        "artifact_id": "c7cb333b-1e64-a38b-3401-87229bf97457",
+        "sha256": "71c819d7f14f3b16f6a5f50c60e15cdfb4e5cab44b716fa1a35d0cb853c1c625"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/current-selection.schema.json",
+      "artifact_path": "v1/current-selection.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "current-selection-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/artifact-registry-entry",
+        "version": "2.0.0",
+        "artifact_id": "388ff8ae-a1e5-9e2b-d47b-92144dc8ee57",
+        "sha256": "1633dbd1f6e0437aeed55680e256b5163b3948807b12f5f288dfca5cf15a69cb"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/artifact-registry-entry.schema.json",
+      "artifact_path": "v2/artifact-registry-entry.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "artifact-registry-entry-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/artifact-registry-snapshot",
+        "version": "2.0.0",
+        "artifact_id": "8c4cdf80-5d44-0487-1bca-b8d638d28211",
+        "sha256": "55f8ff6847a222e225c85a74e22e904207b10597bbe1f7ab9de185dd7b63c152"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/artifact-registry-snapshot.schema.json",
+      "artifact_path": "v2/artifact-registry-snapshot.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "artifact-registry-snapshot-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/camera-video-export-manifest",
+        "version": "2.0.0",
+        "artifact_id": "bd1ecbc1-a5c2-86f4-0a7c-ebfbc0ae6524",
+        "sha256": "d3f688cff9e7e27c2be1d6424e03fdb35aabb0f0428c7e310040fbed62844ec2"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/camera-video-export-manifest.schema.json",
+      "artifact_path": "v2/camera-video-export-manifest.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "camera-video-export-manifest-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/export-config",
+        "version": "2.0.0",
+        "artifact_id": "cdfd7395-236c-0dba-7a3f-101831f94e9b",
+        "sha256": "1d4d0bb3713f13f1448cc8be791efeeb3536eae02f196ccb2c48844c1beaafb2"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/export-config.schema.json",
+      "artifact_path": "v2/export-config.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "export-config-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mapping-profile",
+        "version": "2.0.0",
+        "artifact_id": "03fc23ae-f53a-e324-d98c-62d226de798e",
+        "sha256": "e333920d3f52ff2acd5f3d8c059e4d59a3cc69724f5d215a276e10243ace4874"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/mapping-profile.schema.json",
+      "artifact_path": "v2/mapping-profile.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mapping-profile-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    }
+  ],
+  "upcasters": []
+}

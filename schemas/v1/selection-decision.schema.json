@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/selection-decision.schema.json",
+  "title": "Append-only current-selection decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "selection_decision_id",
+    "selection_key_namespace",
+    "selection_decision_logical_key",
+    "semantic_sha256",
+    "subject_type",
+    "subject_id",
+    "selected_revision_id",
+    "selected_revision_logical_key",
+    "previous_selection_decision_id",
+    "previous_selection_decision_logical_key",
+    "selection_sequence",
+    "selection_policy_version",
+    "projection_version",
+    "selected_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "selection_decision_id": {
+      "$ref": "#/$defs/opaqueUuid"
+    },
+    "selection_key_namespace": {
+      "$ref": "#/$defs/keyNamespace"
+    },
+    "selection_decision_logical_key": {
+      "$ref": "#/$defs/logicalKey"
+    },
+    "semantic_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "subject_type": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "subject_id": {
+      "$ref": "#/$defs/logicalKey"
+    },
+    "selected_revision_id": {
+      "$ref": "#/$defs/opaqueUuid"
+    },
+    "selected_revision_logical_key": {
+      "$ref": "#/$defs/logicalKey"
+    },
+    "previous_selection_decision_id": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/opaqueUuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "previous_selection_decision_logical_key": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/logicalKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "selection_sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "selection_policy_version": {
+      "$ref": "#/$defs/schemaVersion"
+    },
+    "projection_version": {
+      "$ref": "#/$defs/schemaVersion"
+    },
+    "selected_at": {
+      "$ref": "#/$defs/rfc3339Timestamp"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "previous_selection_decision_id": {
+          "type": "null"
+        },
+        "previous_selection_decision_logical_key": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "previous_selection_decision_id": {
+          "$ref": "#/$defs/opaqueUuid"
+        },
+        "previous_selection_decision_logical_key": {
+          "$ref": "#/$defs/logicalKey"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "upperToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"
+    },
+    "keyNamespace": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*$"
+    },
+    "logicalKey": {
+      "type": "string",
+      "minLength": 66,
+      "maxLength": 193,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$"
+    },
+    "opaqueUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "rfc3339Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "profile_id": "genrobot-observed-v0",
+  "version": "genrobot-observed-v0",
+  "profile_kind": "OBSERVED",
+  "approval_status": "UNAPPROVED",
+  "approved": false,
+  "mapping_policy": "EXACT_TOPIC",
+  "required_schema": "foxglove.CompressedImage",
+  "topics": {
+    "cam_01": "/robot0/sensor/camera0/compressed",
+    "cam_02": "/robot0/sensor/camera1/compressed",
+    "cam_03": "/robot0/sensor/camera2/compressed",
+    "cam_04": "/robot0/sensor/camera3/compressed",
+    "cam_05": "/robot0/sensor/camera4/compressed",
+    "cam_06": "/robot0/sensor/camera5/compressed"
+  }
+}

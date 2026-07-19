@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.venv/
+.env
+.env.*
+!.env.example
+
+# Build and editor output
+build/
+dist/
+.idea/
+.vscode/
+
+# Worker-local data and artifacts
+tmp/
+*.log
+/file.zip
+/data/source/

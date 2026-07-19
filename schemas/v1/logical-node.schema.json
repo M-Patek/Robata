@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/logical-node.schema.json",
+  "title": "Run-independent logical node",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "node_type",
+    "key_namespace",
+    "node_logical_key",
+    "semantic_sha256",
+    "identity_policy_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "node_type": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "key_namespace": {
+      "$ref": "#/$defs/keyNamespace"
+    },
+    "node_logical_key": {
+      "$ref": "#/$defs/nodeLogicalKey"
+    },
+    "semantic_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "identity_policy_version": {
+      "$ref": "#/$defs/schemaVersion"
+    }
+  },
+  "$defs": {
+    "upperToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"
+    },
+    "keyNamespace": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*$"
+    },
+    "nodeLogicalKey": {
+      "type": "string",
+      "minLength": 66,
+      "maxLength": 193,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    }
+  }
+}

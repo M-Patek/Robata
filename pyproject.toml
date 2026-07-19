@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robata"
+version = "0.1.0"
+description = "Executable contract foundation for the Robata six-camera pipeline"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "jsonschema>=4.23,<5",
+  "pydantic>=2.10,<3",
+  "rfc8785>=0.1.4,<1",
+]
+
+[project.optional-dependencies]
+mcap = [
+  "av>=14,<19",
+  "mcap>=1.3,<2",
+  "mcap-protobuf-support>=0.5,<1",
+]
+
+[dependency-groups]
+dev = [
+  "av>=14,<19",
+  "hypothesis>=6.120,<7",
+  "mcap>=1.3,<2",
+  "mcap-protobuf-support>=0.5,<1",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+  "types-jsonschema>=4.23,<5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robata"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = [
+  "acceptance: exercises optional dependencies and local real-data samples",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+  ".agents",
+  ".codex",
+  "data",
+  "tmp",
+  "pytest-cache-files-*",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/robata"]

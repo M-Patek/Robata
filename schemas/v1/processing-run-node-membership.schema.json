@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/processing-run-node-membership.schema.json",
+  "title": "Processing run logical-node membership",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "node_type",
+    "node_logical_key",
+    "role",
+    "disposition",
+    "first_work_item_id",
+    "attached_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "run_id": {
+      "$ref": "#/$defs/opaqueUuid"
+    },
+    "node_type": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "node_logical_key": {
+      "$ref": "#/$defs/nodeLogicalKey"
+    },
+    "role": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "disposition": {
+      "enum": [
+        "CREATED",
+        "REUSED",
+        "INVALIDATED",
+        "OBSERVED"
+      ]
+    },
+    "first_work_item_id": {
+      "$ref": "#/$defs/opaqueUuid"
+    },
+    "attached_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  },
+  "$defs": {
+    "upperToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"
+    },
+    "nodeLogicalKey": {
+      "type": "string",
+      "minLength": 66,
+      "maxLength": 193,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$"
+    },
+    "opaqueUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  }
+}

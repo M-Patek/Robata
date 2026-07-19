@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/camera-video-export-manifest.schema.json",
+  "title": "Robata V1 CameraVideoExportManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "execution_mode",
+    "recording_identity",
+    "source_content_sha256",
+    "source_size_bytes",
+    "mapping_profile",
+    "ready_manifest_id",
+    "alignment_id",
+    "alignment_status",
+    "exporter",
+    "cameras"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.schema.json#/$defs/schemaVersion"
+    },
+    "execution_mode": {
+      "enum": ["GOVERNED_READY", "LOCAL_DEVELOPMENT_OVERRIDE"]
+    },
+    "recording_identity": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "source_content_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "source_size_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "mapping_profile": {
+      "$ref": "#/$defs/mappingProfile"
+    },
+    "ready_manifest_id": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/uuid"},
+        {"type": "null"}
+      ]
+    },
+    "alignment_id": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/uuid"},
+        {"type": "null"}
+      ]
+    },
+    "alignment_status": {
+      "enum": ["UNVERIFIED", "VALID"]
+    },
+    "exporter": {
+      "$ref": "#/$defs/exporter"
+    },
+    "cameras": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_01"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_02"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_03"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_04"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_05"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/camera"},
+            {"properties": {"camera_id": {"const": "cam_06"}}}
+          ]
+        }
+      ],
+      "items": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "execution_mode": {"const": "LOCAL_DEVELOPMENT_OVERRIDE"}
+        },
+        "required": ["execution_mode"]
+      },
+      "then": {
+        "properties": {
+          "ready_manifest_id": {"type": "null"},
+          "mapping_profile": {
+            "properties": {"approved": {"const": false}}
+          },
+          "alignment_status": {"const": "UNVERIFIED"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution_mode": {"const": "GOVERNED_READY"}
+        },
+        "required": ["execution_mode"]
+      },
+      "then": {
+        "properties": {
+          "ready_manifest_id": {"$ref": "common.schema.json#/$defs/uuid"},
+          "mapping_profile": {
+            "properties": {"approved": {"const": true}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "alignment_status": {"const": "VALID"}
+        },
+        "required": ["alignment_status"]
+      },
+      "then": {
+        "properties": {
+          "alignment_id": {"$ref": "common.schema.json#/$defs/uuid"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "mappingProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "digest", "approved"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+        },
+        "digest": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "approved": {
+          "type": "boolean"
+        }
+      }
+    },
+    "exporter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "mode",
+        "export_profile_id",
+        "profile_version",
+        "canonical_config_sha256"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+        },
+        "mode": {"enum": ["REMUX", "TRANSCODE"]},
+        "export_profile_id": {"type": "string", "minLength": 1},
+        "profile_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+        },
+        "canonical_config_sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "channel_id", "schema_name", "codec"],
+      "properties": {
+        "topic": {"type": "string", "minLength": 1},
+        "channel_id": {"type": "integer", "minimum": 0},
+        "schema_name": {"type": "string", "minLength": 1},
+        "codec": {"type": "string", "minLength": 1}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "sha256", "bytes", "media_type"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$"
+        },
+        "sha256": {"$ref": "common.schema.json#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "media_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+        }
+      }
+    },
+    "timestampSidecarArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "sha256", "bytes", "row_count", "media_type"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$"
+        },
+        "sha256": {"$ref": "common.schema.json#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "row_count": {"type": "integer", "minimum": 1},
+        "media_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+        }
+      }
+    },
+    "dropProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "reason_code", "first_source_ns", "last_source_ns"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "reason_code": {
+          "enum": [
+            "NONE",
+            "BEFORE_FIRST_DECODABLE_KEYFRAME",
+            "AFTER_LAST_COMPLETE_SAMPLE",
+            "EXPORT_POLICY_EXCLUSION"
+          ]
+        },
+        "first_source_ns": {
+          "oneOf": [
+            {"$ref": "common.schema.json#/$defs/int64Nanoseconds"},
+            {"type": "null"}
+          ]
+        },
+        "last_source_ns": {
+          "oneOf": [
+            {"$ref": "common.schema.json#/$defs/int64Nanoseconds"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"reason_code": {"const": "NONE"}},
+            "required": ["reason_code"]
+          },
+          "then": {
+            "properties": {
+              "count": {"const": 0},
+              "first_source_ns": {"type": "null"},
+              "last_source_ns": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "count": {"type": "integer", "minimum": 1},
+              "first_source_ns": {
+                "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+              },
+              "last_source_ns": {
+                "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "mediaTimeMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zero_source_ns",
+        "time_base_numerator",
+        "time_base_denominator",
+        "first_pts",
+        "last_pts",
+        "last_duration",
+        "tail_duration_policy",
+        "rounding",
+        "max_rounding_error_ns"
+      ],
+      "properties": {
+        "zero_source_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "time_base_numerator": {"type": "integer", "minimum": 1},
+        "time_base_denominator": {"type": "integer", "minimum": 1},
+        "first_pts": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "last_pts": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "last_duration": {"type": "integer", "minimum": 1},
+        "tail_duration_policy": {
+          "enum": ["OBSERVED_NEXT_TIMESTAMP", "MEDIAN_POSITIVE_INTERVAL"]
+        },
+        "rounding": {"const": "HALF_EVEN"},
+        "max_rounding_error_ns": {
+          "$ref": "common.schema.json#/$defs/nonnegativeInt64Nanoseconds"
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "camera_id",
+        "source",
+        "input_message_count",
+        "source_first_observed_message_ns",
+        "source_last_observed_message_ns",
+        "export_first_observed_source_message_ns",
+        "export_last_observed_source_message_ns",
+        "leading_drops",
+        "trailing_drops",
+        "exported_packet_count",
+        "exported_frame_count",
+        "keyframe_count",
+        "width",
+        "height",
+        "video_artifact",
+        "timestamp_sidecar_artifact",
+        "media_time_mapping"
+      ],
+      "properties": {
+        "camera_id": {"$ref": "common.schema.json#/$defs/cameraId"},
+        "source": {"$ref": "#/$defs/source"},
+        "input_message_count": {"type": "integer", "minimum": 1},
+        "source_first_observed_message_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_last_observed_message_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "export_first_observed_source_message_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "export_last_observed_source_message_ns": {
+          "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "leading_drops": {"$ref": "#/$defs/dropProvenance"},
+        "trailing_drops": {"$ref": "#/$defs/dropProvenance"},
+        "exported_packet_count": {"type": "integer", "minimum": 1},
+        "exported_frame_count": {"type": "integer", "minimum": 1},
+        "keyframe_count": {"type": "integer", "minimum": 0},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "video_artifact": {"$ref": "#/$defs/artifact"},
+        "timestamp_sidecar_artifact": {
+          "$ref": "#/$defs/timestampSidecarArtifact"
+        },
+        "media_time_mapping": {"$ref": "#/$defs/mediaTimeMapping"}
+      }
+    }
+  }
+}

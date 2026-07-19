@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/immutable-node-revision.schema.json",
+  "title": "Immutable logical-node revision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision_id",
+    "subject_type",
+    "subject_id",
+    "revision_key_namespace",
+    "revision_logical_key",
+    "semantic_sha256",
+    "payload_sha256",
+    "lineage_sha256",
+    "status_at_publication",
+    "eligibility_at_publication",
+    "revision_policy_version",
+    "supersedes_revision_id",
+    "supersedes_revision_logical_key",
+    "published_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "revision_id": {
+      "$ref": "#/$defs/opaqueUuid"
+    },
+    "subject_type": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "subject_id": {
+      "$ref": "#/$defs/logicalKey"
+    },
+    "revision_key_namespace": {
+      "$ref": "#/$defs/keyNamespace"
+    },
+    "revision_logical_key": {
+      "$ref": "#/$defs/logicalKey"
+    },
+    "semantic_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "payload_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "lineage_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "status_at_publication": {
+      "$ref": "#/$defs/upperToken"
+    },
+    "eligibility_at_publication": {
+      "enum": [
+        "ELIGIBLE",
+        "INELIGIBLE"
+      ]
+    },
+    "revision_policy_version": {
+      "$ref": "#/$defs/schemaVersion"
+    },
+    "supersedes_revision_id": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/opaqueUuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "supersedes_revision_logical_key": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/logicalKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "published_at": {
+      "$ref": "#/$defs/rfc3339Timestamp"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "supersedes_revision_id": {
+          "type": "null"
+        },
+        "supersedes_revision_logical_key": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "supersedes_revision_id": {
+          "$ref": "#/$defs/opaqueUuid"
+        },
+        "supersedes_revision_logical_key": {
+          "$ref": "#/$defs/logicalKey"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "upperToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"
+    },
+    "keyNamespace": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*$"
+    },
+    "logicalKey": {
+      "type": "string",
+      "minLength": 66,
+      "maxLength": 193,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$"
+    },
+    "opaqueUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "rfc3339Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  }
+}
