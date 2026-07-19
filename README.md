@@ -25,6 +25,12 @@ Project and architecture inputs are intentionally split by authority:
 - [ADR 0001](docs/adr/0001-executable-baseline.md), Architecture V1.1 Section 25, and
   registered schemas govern the executable security, identity, time, status, and wire
   contracts.
+- [Architecture Governance](ARCHITECTURE_GOVERNANCE.md) defines the throughput optimization
+  roadmap and governance framework for achieving 500 hours/day.
+- [Architecture Governance Implementation](ARCHITECTURE_GOVERNANCE_IMPLEMENTATION.md) provides
+  concrete implementation steps for the governance framework.
+- [Architecture Governance Tasks](ARCHITECTURE_GOVERNANCE_TASKS.md) tracks the implementation
+  progress of Phase 1B and Phase 2.
 
 The current baseline is deliberately contract-first. It provides strict domain values,
 canonical six-camera collections, a 16-document exact schema catalog, authoritative JSON
