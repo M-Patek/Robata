@@ -1,0 +1,135 @@
+{
+  "annotation": {
+    "draft_count": 2,
+    "skipped_fail": [
+      "fail"
+    ]
+  },
+  "capacity": {
+    "measurement_status": "NOT_MEASURED",
+    "planned_gpu_hours_per_day": 32.0,
+    "production_eligible": false,
+    "target_recording_hours_per_day": 500.0
+  },
+  "capacity_scenarios": [
+    {
+      "annotation_gpu_hours_per_day": 30.0,
+      "fits": false,
+      "h100_count": 1,
+      "headroom_hours_per_day": -8.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "7B",
+      "planned_gpu_hours_per_day": 32.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 24.0
+    },
+    {
+      "annotation_gpu_hours_per_day": 100.0,
+      "fits": false,
+      "h100_count": 1,
+      "headroom_hours_per_day": -78.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "32B",
+      "planned_gpu_hours_per_day": 102.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 24.0
+    },
+    {
+      "annotation_gpu_hours_per_day": 30.0,
+      "fits": true,
+      "h100_count": 2,
+      "headroom_hours_per_day": 16.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "7B",
+      "planned_gpu_hours_per_day": 32.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 48.0
+    },
+    {
+      "annotation_gpu_hours_per_day": 100.0,
+      "fits": false,
+      "h100_count": 2,
+      "headroom_hours_per_day": -54.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "32B",
+      "planned_gpu_hours_per_day": 102.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 48.0
+    },
+    {
+      "annotation_gpu_hours_per_day": 30.0,
+      "fits": true,
+      "h100_count": 4,
+      "headroom_hours_per_day": 64.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "7B",
+      "planned_gpu_hours_per_day": 32.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 96.0
+    },
+    {
+      "annotation_gpu_hours_per_day": 100.0,
+      "fits": false,
+      "h100_count": 4,
+      "headroom_hours_per_day": -6.0,
+      "measurement_status": "ASSUMPTION",
+      "model_size": "32B",
+      "planned_gpu_hours_per_day": 102.0,
+      "production_eligible": false,
+      "qa_gpu_hours_per_day": 2.0,
+      "total_gpu_capacity_hours_per_day": 96.0
+    }
+  ],
+  "execution_mode": "LOCAL_DEVELOPMENT_FAKE_MODEL",
+  "frame_cache": {
+    "decode_attempts": 1,
+    "feed_once": true
+  },
+  "frame_cache_stress": {
+    "cache_hits": 6,
+    "cache_misses": 3,
+    "callers": 9,
+    "decode_attempts": 3,
+    "manifests_equal": true,
+    "passed": true,
+    "video_count": 3
+  },
+  "production_eligible": false,
+  "provider_requests": 0,
+  "qa": {
+    "fail": "fail",
+    "pass": "pass",
+    "warning": "warning"
+  },
+  "qa_matrix": {
+    "issue_count": 21,
+    "passed": true
+  },
+  "search": {
+    "result_count": 2,
+    "zero_gpu": true
+  },
+  "synthetic_benchmark": {
+    "certifying": false,
+    "measurement_status": "NOT_MEASURED",
+    "output_hash_equal": true
+  },
+  "worker_integration": {
+    "annotation_draft_count": 4,
+    "completed_count": 3,
+    "passed": true,
+    "qa_status": "pass",
+    "search_hit_count": 4,
+    "statuses": [
+      "COMPLETED",
+      "COMPLETED",
+      "COMPLETED"
+    ],
+    "task_count": 3
+  }
+}

@@ -27,9 +27,9 @@ from robata.contracts.video_export import (
     VideoExportExecutionMode,
 )
 
-type NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
-type PositiveInt = Annotated[int, Field(strict=True, ge=1)]
-type NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
+NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 
 
 class TimestampSidecarArtifactV2(StrictModel):

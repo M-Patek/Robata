@@ -87,16 +87,16 @@ class _NanosecondsAnnotation:
         )
 
 
-type Nanoseconds = Annotated[int, _NanosecondsAnnotation]
+Nanoseconds = Annotated[int, _NanosecondsAnnotation]
 """Signed int64 nanoseconds internally and canonical decimal strings on JSON wires."""
 
-type Sha256Digest = Annotated[
+Sha256Digest = Annotated[
     str,
     StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
 ]
 """A lowercase hexadecimal SHA-256 digest."""
 
-type SchemaVersion = Annotated[
+SchemaVersion = Annotated[
     str,
     StringConstraints(
         strict=True,

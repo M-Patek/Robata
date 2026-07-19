@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import time
+import tracemalloc
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -61,6 +62,39 @@ class ThroughputSample:
             "recording_hours_per_wall_hour": self.recording_hours_per_wall_hour,
             "camera_video_hours_per_wall_hour": self.camera_video_hours_per_wall_hour,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSample:
+    """A throughput sample with portable CPU and traced-allocation observations."""
+
+    throughput: ThroughputSample
+    cpu_time_ms: float
+    peak_tracemalloc_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.throughput, ThroughputSample):
+            raise TypeError("throughput must be a ThroughputSample")
+        if isinstance(self.cpu_time_ms, bool) or not isinstance(self.cpu_time_ms, (int, float)):
+            raise TypeError("cpu_time_ms must be numeric")
+        if not math.isfinite(self.cpu_time_ms) or self.cpu_time_ms < 0:
+            raise ValueError("cpu_time_ms must be finite and nonnegative")
+        if isinstance(self.peak_tracemalloc_bytes, bool) or not isinstance(
+            self.peak_tracemalloc_bytes, int
+        ):
+            raise TypeError("peak_tracemalloc_bytes must be an integer")
+        if self.peak_tracemalloc_bytes < 0:
+            raise ValueError("peak_tracemalloc_bytes must be nonnegative")
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = self.throughput.as_dict()
+        payload.update(
+            {
+                "cpu_time_ms": self.cpu_time_ms,
+                "peak_tracemalloc_bytes": self.peak_tracemalloc_bytes,
+            }
+        )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +194,41 @@ def measure_callable(
     )
 
 
+def measure_callable_with_resources(
+    workload: Callable[[], object],
+    *,
+    recording_duration_ns: int,
+    camera_count: int = 6,
+    clock: Callable[[], float] = time.perf_counter,
+    cpu_clock: Callable[[], float] = time.process_time,
+) -> ResourceSample:
+    """Measure wall throughput plus portable CPU/traced-allocation observations."""
+
+    tracing_was_active = tracemalloc.is_tracing()
+    if not tracing_was_active:
+        tracemalloc.start()
+    try:
+        started_cpu = cpu_clock()
+        sample = measure_callable(
+            workload,
+            recording_duration_ns=recording_duration_ns,
+            camera_count=camera_count,
+            clock=clock,
+        )
+        cpu_elapsed_ms = max(0.0, (cpu_clock() - started_cpu) * 1_000)
+        _current, peak_bytes = tracemalloc.get_traced_memory()
+        return ResourceSample(
+            throughput=sample,
+            cpu_time_ms=cpu_elapsed_ms,
+            peak_tracemalloc_bytes=peak_bytes,
+        )
+    finally:
+        # Never leak tracing state when the workload or either clock raises.  If the caller
+        # had tracing enabled already, ownership remains with the caller.
+        if not tracing_was_active:
+            tracemalloc.stop()
+
+
 def run_repeated(
     workload: Callable[[], object],
     *,
@@ -232,8 +301,10 @@ def _nearest_rank(values: tuple[int, ...], quantile: float) -> int:
 
 __all__ = [
     "BenchmarkSummary",
+    "ResourceSample",
     "ThroughputSample",
     "measure_callable",
+    "measure_callable_with_resources",
     "run_repeated",
     "summarize_samples",
 ]

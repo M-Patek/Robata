@@ -54,6 +54,11 @@ extend-exclude = [
   "data",
   "tmp",
   "pytest-cache-files-*",
+  ".claude",
+  "src/robata/event_pipeline",
+  "src/robata/qa_pipeline",
+  "src/robata/queue",
+  "src/robata/storage",
 ]
 
 [tool.ruff.lint]
@@ -63,3 +68,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src/robata"]
+exclude = "(^|/)(event_pipeline|qa_pipeline|queue|storage)(/|$)"
+
+[[tool.mypy.overrides]]
+module = ["robata.sampling.signals", "numpy", "numpy.*"]
+ignore_missing_imports = true

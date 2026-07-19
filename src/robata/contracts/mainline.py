@@ -18,12 +18,12 @@ from robata.contracts.common import (
 )
 from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
 
-type NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
-type NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
-type PositiveInt = Annotated[int, Field(strict=True, ge=1)]
-type PositiveFiniteFloat = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
-type NonNegativeFiniteFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
-type UnitInterval = Annotated[
+NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
+NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+PositiveFiniteFloat = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+NonNegativeFiniteFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
+UnitInterval = Annotated[
     float,
     Field(strict=True, ge=0, le=1, allow_inf_nan=False),
 ]
@@ -784,7 +784,7 @@ class VisionInferenceFailure(StrictModel):
     failure: InferenceFailureDetail
 
 
-type VisionInferenceOutcome = Annotated[
+VisionInferenceOutcome = Annotated[
     VisionInferenceSuccess | VisionInferenceFailure,
     Field(discriminator="status"),
 ]

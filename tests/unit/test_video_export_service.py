@@ -306,6 +306,19 @@ def test_parallel_export_preserves_manifest_and_artifact_order(tmp_path: Path) -
         ).read_bytes()
 
 
+def test_parallel_export_failure_cleans_all_staging_artifacts(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+
+    with pytest.raises(VideoExportError, match="injected failure"):
+        SixCameraVideoExportService(
+            _FakeExporter(fail_on=CameraId.CAM_04),
+            max_parallel_exports=6,
+        ).export_local(request)
+
+    assert not request.output_directory.exists()
+    assert list(tmp_path.glob(".export.partial-*")) == []
+
+
 def test_parallel_export_worker_count_is_bounded() -> None:
     with pytest.raises(ValueError, match="six camera"):
         SixCameraVideoExportService(_FakeExporter(), max_parallel_exports=7)

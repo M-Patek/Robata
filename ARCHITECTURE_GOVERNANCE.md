@@ -4,7 +4,7 @@
 **Version:** 1.0
 **Date:** 2026-07-19
 **Scope:** Non-normative throughput optimization tracks supporting the authoritative Architecture V1.1 phases
-**Authority:** Architecture V1.1, ADRs 0001-0007, Execution Spec V1
+**Authority:** Architecture V1.1, ADRs 0001-0008, Execution Spec V1
 **Phase note:** This document uses **T1 (parallel local)** and **T2 (distributed execution)**. It does not redefine normative Phase 0/1A/1B/2 numbering or close O-01/O-03/O-04/O-10 gates.
 
 ---
@@ -20,7 +20,7 @@ This document defines a staged governance framework for throughput experiments a
 | Recording hours/wall-clock hour | NOT_MEASURED | 20.83 candidate | pending O-01 |
 | Camera-video hours/wall-clock hour | NOT_MEASURED | 125.0 candidate | pending O-01 |
 | Architecture | Modular monolith (verified local) | Distributed pipeline (candidate) | pending ADR/PoC |
-| Concurrency | Serial default; T1 opt-in stage parallelism | Parallel per-camera/worker pools (candidate) | pending benchmark |
+| Concurrency | Serial default; T1 opt-in camera/stage parallelism; local worker contract | Distributed per-camera/worker pools (candidate) | pending governed benchmark |
 | Storage | Local SQLite + filesystem (verified local) | PostgreSQL/S3 candidates | no infrastructure decision yet |
 
 ### Governance Principles
@@ -30,6 +30,18 @@ This document defines a staged governance framework for throughput experiments a
 3. **Phase-gated evolution** — Each phase has measurable exit criteria
 4. **Backward compatibility** — Schema and contract evolution must not break existing pipelines
 5. **Fail-closed by default** — Safety and correctness take precedence over throughput
+
+
+### Checked-in implementation boundary (2026-07-19)
+
+The repository now contains the complete local preparation path: bounded opt-in camera export,
+frame materialization, and independent fake-inference parallelism; deterministic benchmark
+accounting with optional CPU/traced-allocation observations; a provider-neutral `TaskQueue` plus
+in-memory lease/retry/dead-letter scaffold; `PipelineWorker`; and dependency-free metrics and
+correlation-ID logging primitives. Serial execution remains the default. These components are
+contract-tested and offline only. Redis/PostgreSQL/S3 adapters, network telemetry, ProcessPool
+Windows validation, PNG encoder reuse, governed capacity evidence, and real-model/provider
+integration remain explicitly out of scope for this local slice.
 
 ---
 
@@ -619,6 +631,7 @@ Phase 1A (Current)
 - ADR 0006: Opt-In Deterministic Parallel Inference for Throughput Track T1
 - ADR 0007: Provider-Neutral Task Queue Contract and In-Memory T2 Scaffold
 - ADR 0008: Opt-In Local Camera Export/Materialization Parallelism and Benchmark Accounting
+- `docs/operations/worker-and-observability.md`: Local worker, metrics, logging, and resource observations
 
 ---
 

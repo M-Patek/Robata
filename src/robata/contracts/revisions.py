@@ -18,7 +18,7 @@ from robata.contracts.logical_nodes import (
     Rfc3339Timestamp,
 )
 
-type RevisionPublicationStatus = Annotated[
+RevisionPublicationStatus = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -27,7 +27,7 @@ type RevisionPublicationStatus = Annotated[
         pattern=r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$",
     ),
 ]
-type SelectionSequence = Annotated[int, Field(strict=True, ge=1, le=INT64_MAX)]
+SelectionSequence = Annotated[int, Field(strict=True, ge=1, le=INT64_MAX)]
 
 
 def _validate_rfc3339_calendar(value: str) -> str:
@@ -41,7 +41,7 @@ def _validate_rfc3339_calendar(value: str) -> str:
     return value
 
 
-type _ValidatedRfc3339Timestamp = Annotated[
+_ValidatedRfc3339Timestamp = Annotated[
     Rfc3339Timestamp,
     AfterValidator(_validate_rfc3339_calendar),
 ]

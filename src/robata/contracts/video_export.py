@@ -17,8 +17,8 @@ from robata.contracts.common import (
     StrictModel,
 )
 
-type NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
-type ArtifactUri = Annotated[
+NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
+ArtifactUri = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -26,14 +26,14 @@ type ArtifactUri = Annotated[
         pattern=r"^[A-Za-z][A-Za-z0-9+.-]*://\S+$",
     ),
 ]
-type MediaType = Annotated[
+MediaType = Annotated[
     str,
     StringConstraints(
         strict=True,
         pattern=r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
     ),
 ]
-type UuidString = Annotated[
+UuidString = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -43,9 +43,9 @@ type UuidString = Annotated[
         ),
     ),
 ]
-type NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
-type PositiveInt = Annotated[int, Field(strict=True, ge=1)]
-type Int64 = Annotated[int, Field(strict=True, ge=INT64_MIN, le=INT64_MAX)]
+NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+Int64 = Annotated[int, Field(strict=True, ge=INT64_MIN, le=INT64_MAX)]
 
 
 class VideoExportExecutionMode(StrEnum):

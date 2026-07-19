@@ -145,3 +145,8 @@ Architecture V1.1 Phase 1B source/time and Phase 2 temporal-data-plane gates. Se
 This runbook does **not** authorize a real provider, credentials, internet access, production
 capacity, quality claims, alignment approval, or event promotion. `production_eligible` remains
 `false` for every fake-model event and `provider_requests` must remain zero.
+
+The provider-neutral worker, local metrics/logging primitives, and resource benchmark observations
+are documented in [`worker-and-observability.md`](worker-and-observability.md). They are local
+contracts only: no Redis/PostgreSQL/S3 adapter, Prometheus endpoint, or model SDK is installed by
+this project.

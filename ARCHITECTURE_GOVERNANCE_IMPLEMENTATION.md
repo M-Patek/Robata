@@ -196,24 +196,24 @@ evidence are approved.
 
 ## 3. Track T2: Distributed Infrastructure (not normative Phase 2)
 
-All T2 components below are design/PoC backlog items. Do not add Redis, PostgreSQL, S3,
-Kafka, Celery, or other external dependencies until the corresponding port contract and
-infrastructure ADR are accepted. The current local path remains offline and dependency-free.
+Durable T2 components remain design/PoC backlog items. Do not add Redis, PostgreSQL, S3, Kafka,
+Celery, or other external dependencies until the corresponding port contract and infrastructure
+ADR are accepted. The current local path remains offline and dependency-free.
 
-The provider-neutral `TaskQueue` port and deterministic `InMemoryTaskQueue` scaffold are now
-implemented for local contract tests (`src/robata/ports/task_queue.py`,
-`src/robata/adapters/in_memory_task_queue.py`, ADR 0007). Durable queue/worker integration is
-still open.
+The provider-neutral `TaskQueue` port, deterministic `InMemoryTaskQueue` scaffold, and local
+`PipelineWorker` contract are implemented for contract tests (`src/robata/ports/task_queue.py`,
+`src/robata/adapters/in_memory_task_queue.py`, `src/robata/worker.py`, ADR 0007). Durable queue,
+registry, and distributed worker integration remain open.
 
 ### 3.1 Epic: Task Queue and Scheduler
 
 **Story:** As a pipeline operator, I want tasks to be queued and scheduled across multiple workers so that throughput scales horizontally.
 
 **Acceptance Criteria:**
-- [ ] Tasks are queued durably
-- [ ] Workers claim tasks via lease mechanism
-- [ ] Failed tasks are retried with exponential backoff
-- [ ] Dead letter queue captures permanently failed tasks
+- [ ] Tasks are queued durably (distributed adapter remains open)
+- [x] Local workers claim tasks via a queue-issued lease
+- [x] Local queue failures are retried with deterministic exponential backoff
+- [x] Local queue captures permanently failed tasks in a dead-letter view
 
 **Tasks:**
 
@@ -426,92 +426,37 @@ class S3BlobStorage(BlobStorage):
 
 ### 3.3 Epic: Worker Pool
 
-**Story:** As a pipeline operator, I want workers to process tasks from the queue so that throughput scales with worker count.
+**Story:** As a pipeline operator, I want a provider-neutral worker contract so that local task
+execution can be tested before a durable scheduler is selected.
 
-**Acceptance Criteria:**
-- [ ] Workers claim tasks, process them, and mark complete
-- [ ] Workers heartbeat to prevent lease expiration
-- [ ] Worker failures trigger task reassignment
-- [ ] Worker count can be scaled up/down dynamically
-
-**Tasks:**
+**Local acceptance (complete 2026-07-19):**
+- [x] Workers claim tasks, process opaque payloads, and mark completion through the queue port.
+- [x] Workers renew leases and surface rejected heartbeats as `LOST_LEASE`.
+- [x] Handler failures are delegated to queue retry/dead-letter policy.
+- [x] Bounded polling and graceful stop are deterministic and testable.
+- [ ] Durable reassignment, dynamic scale-up/down, and process supervision require a future
+  infrastructure ADR/PoC.
 
 #### Task 2.3.1: Implement Worker
 
-**File:** `src/robata/worker.py` (new)
+**File:** `src/robata/worker.py`
 
-```python
-"""Pipeline worker for distributed execution."""
+`PipelineWorker` is synchronous and provider-neutral. It receives a `TaskQueue`, an opaque
+`TaskHandler` returning `bytes`, and a validated `WorkerConfig`. `run_once()` claims one task,
+starts a daemon heartbeat loop, invokes the handler, and calls `complete()` only while the lease
+remains valid. Any heartbeat rejection returns `WorkerRunStatus.LOST_LEASE`; handler failures
+call `fail()` so queue-owned retry/DLQ semantics remain authoritative. `run()` adds bounded
+polling and a stop event. Optional `MetricsRegistry` and `StructuredLogger` hooks add local
+telemetry without network dependencies.
 
-from __future__ import annotations
+#### Task 2.3.2: Worker contract tests
 
-import asyncio
-import signal
-from dataclasses import dataclass
+**File:** `tests/unit/test_worker.py`
 
-from robata.ports.task_queue import TaskQueue, LeaseId
-
-
-@dataclass
-class WorkerConfig:
-    """Configuration for a pipeline worker."""
-    worker_id: str
-    lease_duration_seconds: int = 30
-    heartbeat_interval_seconds: int = 10
-    max_retries: int = 3
-
-
-class PipelineWorker:
-    """Worker that claims and processes pipeline tasks."""
-
-    def __init__(self, config: WorkerConfig, queue: TaskQueue) -> None:
-        self._config = config
-        self._queue = queue
-        self._shutdown = asyncio.Event()
-
-    async def run(self) -> None:
-        """Main worker loop: claim tasks, process, repeat."""
-        while not self._shutdown.is_set():
-            task = self._queue.claim(
-                self._config.worker_id,
-                self._config.lease_duration_seconds,
-            )
-            if task is None:
-                await asyncio.sleep(1)
-                continue
-
-            lease_id = LeaseId(f"{task.task_id.value}:{self._config.worker_id}")
-
-            # Start heartbeat task
-            heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(lease_id)
-            )
-
-            try:
-                result = await self._process_task(task)
-                self._queue.complete(lease_id, result)
-            except Exception as e:
-                self._queue.fail(lease_id, str(e))
-            finally:
-                heartbeat_task.cancel()
-
-    async def _heartbeat_loop(self, lease_id: LeaseId) -> None:
-        """Send periodic heartbeats to keep lease alive."""
-        while True:
-            await asyncio.sleep(self._config.heartbeat_interval_seconds)
-            if not self._queue.heartbeat(lease_id):
-                raise LeaseExpiredError(lease_id)
-
-    async def _process_task(self, task: PipelineTask) -> bytes:
-        """Process a single pipeline task."""
-        # Delegate to appropriate stage handler
-        handler = self._get_handler(task.stage)
-        return await handler(task.payload)
-
-    def shutdown(self) -> None:
-        """Signal worker to shut down gracefully."""
-        self._shutdown.set()
-```
+The unit suite covers completion/result bytes, retry and dead-letter routing, heartbeat rejection,
+queue failure acknowledgement, non-byte handler results, injected polling sleep, and graceful
+shutdown. These tests validate the local contract only; they do not claim durable failover or
+production worker-pool behavior.
 
 **Effort:** 2 days
 **Dependencies:** Task 2.1.1
@@ -522,21 +467,22 @@ class PipelineWorker:
 
 ### 4.1 Unit Tests
 
-| Component | Coverage Target | Key Tests |
-|-----------|----------------|-----------|
-| Parallel export | 90% | Determinism, ordering, error handling |
-| Parallel materialization | 90% | Bit-exact output, resource cleanup |
-| Task queue | 90% | Lease expiry, retry, dead letter |
-| Worker | 85% | Heartbeat, graceful shutdown, failure |
+| Component | Current evidence | Remaining gate |
+|-----------|------------------|----------------|
+| Parallel export | Serial/parallel manifest and six-artifact byte equality | Windows ProcessPool PoC and governed speedup |
+| Parallel materialization | Canonical merge and cleanup paths; all-parallel smoke | PNG reuse/ProcessPool compatibility PoC |
+| Task queue | Lease expiry, retry, dead letter, backpressure unit suite | Durable adapter contract tests |
+| Worker | Completion, heartbeat rejection, failure routing, stop behavior | Process supervision/reassignment PoC |
+| Metrics/logging | Deterministic snapshot/text/JSON unit suite | Transport/export wiring |
 
 ### 4.2 Integration Tests
 
 | Scenario | Setup | Expected |
 |----------|-------|----------|
-| End-to-end parallel pipeline | 6-camera MCAP | <15s total, bit-exact output |
-| Worker failure recovery | Kill worker mid-task | Task retried, no data loss |
-| Scale-up | Add workers mid-run | Throughput increases linearly |
-| Backpressure | Flood queue | Queue bounded, no OOM |
+| End-to-end parallel pipeline | 6-camera MCAP | Bit-exact semantic replay; wall time is observational |
+| Worker failure recovery | Inject heartbeat/fail rejection | `LOST_LEASE` is surfaced; queue owns retry/DLQ |
+| Scale-up | Future durable adapter PoC | Measure only after governed workload approval |
+| Backpressure | In-memory bounded queue | Deterministic `QUEUE_FULL`; no unbounded local growth |
 
 ### 4.3 Benchmark Tests
 
@@ -552,37 +498,51 @@ def test_capacity_scaling(benchmark, worker_count):
 
 ---
 
-## 5. Monitoring and Observability (future T2 work)
+## 5. Monitoring and Observability
+
+The local implementation provides dependency-free primitives; deployment transport remains future
+T2+ work. See `docs/operations/worker-and-observability.md`.
 
 ### 5.1 Metrics
 
-| Metric | Type | Alert Threshold |
-|--------|------|----------------|
-| `pipeline.throughput` | Gauge | report both units; candidate T1/T2 thresholds remain NOT_MEASURED |
-| `pipeline.latency` | Histogram | p99 > 60s |
-| `worker.tasks_completed` | Counter | - |
-| `worker.tasks_failed` | Counter | > 1% of completed |
-| `queue.depth` | Gauge | > 1000 |
-| `queue.oldest_task_age` | Gauge | > 5 minutes |
+`robata.runtime.observability.MetricsRegistry` supports thread-safe counters, gauges, and
+histogram observations with deterministic labels. `render_prometheus()` emits text exposition for
+local inspection but does not start an HTTP endpoint. Suggested names remain provider-neutral:
 
-### 5.2 Logging
+| Metric family | Type | Local contract |
+|---------------|------|----------------|
+| `pipeline_throughput` | Gauge/summary | Report both throughput units; certification remains `NOT_MEASURED` |
+| `pipeline_latency_ms` | Histogram | Stage/run observations |
+| `worker_tasks_completed` | Counter | Worker completion count |
+| `worker_tasks_failed` | Counter | Queue-routed failures |
+| `queue_depth` | Gauge | In-memory queue depth when available |
 
-```python
-# Structured logging with correlation IDs
-{
-    "timestamp": "2026-07-19T10:30:00Z",
-    "level": "INFO",
-    "correlation_id": "abc123",
-    "task_id": "task-456",
-    "stage": "video_export",
-    "camera_id": "cam_03",
-    "message": "Export completed",
-    "duration_ms": 1200,
-    "output_sha256": "aabbcc...",
-}
-```
+### 5.2 Structured logging
+
+`StructuredLogger` serializes JSON events through stdlib `logging`. `new_correlation_id(seed)`
+and `correlation_scope()` provide deterministic/context-local correlation IDs. The helper does
+not add timestamps, raw frames, credentials, or network exporters; deployment-specific enrichers
+remain an ADR/PoC decision.
 
 ---
+
+## 5.3 Local completion evidence (2026-07-19)
+
+The bounded local workstreams are executable without a model provider or cloud service:
+
+- `scripts/run_local_workstreams.py` runs sample-MCAP QA, the 21-issue matrix, frame-cache and
+  worker integration checks, serial/parallel synthetic benchmarking, the Windows-spawn probe,
+  PNG byte-stability comparison, and the 1/2/4 H100 x 7B/32B assumption matrix.
+- `robata.adapters.local_vision_model` exposes a lazy optional transformers boundary.  A caller
+  must provide a runner that returns a validated `VisionInferenceOutcome`; no checkpoint download
+  or provider request occurs automatically.
+- Synthetic/fake observations remain `measurement_status=NOT_MEASURED` (or `ASSUMPTION` for
+  capacity) and `production_eligible=false`.  `certify_summary` rejects local fake execution.
+- Durable Redis/PostgreSQL/S3 adapters, real model quality, and production throughput remain
+  explicit promotion gates rather than being inferred from local smoke tests.
+
+Evidence is emitted to `reports/local-workstreams-2026-07-19.json` and
+`reports/requirements-acceptance-2026-07-19.json`.
 
 ## 6. Risk Register
 

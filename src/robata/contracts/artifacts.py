@@ -11,8 +11,8 @@ from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
 
-type NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
-type ArtifactUri = Annotated[
+NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
+ArtifactUri = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -20,7 +20,7 @@ type ArtifactUri = Annotated[
         pattern=r"^[A-Za-z][A-Za-z0-9+.-]*://\S+$",
     ),
 ]
-type ArtifactId = Annotated[
+ArtifactId = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -30,15 +30,15 @@ type ArtifactId = Annotated[
         ),
     ),
 ]
-type MediaType = Annotated[
+MediaType = Annotated[
     str,
     StringConstraints(
         strict=True,
         pattern=r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
     ),
 ]
-type PositiveInt = Annotated[int, Field(strict=True, ge=1)]
-type Rfc3339Timestamp = Annotated[
+PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+Rfc3339Timestamp = Annotated[
     str,
     StringConstraints(
         strict=True,

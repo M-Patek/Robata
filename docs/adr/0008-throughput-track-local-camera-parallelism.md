@@ -1,4 +1,4 @@
-# ADR 0008: Opt-In Local Camera Export Parallelism and Benchmark Accounting
+# ADR 0008: Opt-In Local Camera Export/Materialization Parallelism and Benchmark Accounting
 
 - Status: Accepted for local fake-model experimentation only
 - Date: 2026-07-19
@@ -9,8 +9,9 @@
 
 The six camera exports are independent after mapping authorization and source inspection. The
 serial service already verifies every generated MP4 and timestamp sidecar before constructing one
-canonical manifest. Throughput work needs an opt-in path that preserves those checks and does not
-silently change the default execution mode.
+canonical manifest. Frame decode/render plans are likewise independent after sampling. Throughput
+work needs opt-in paths that preserve those checks and do not silently change the default execution
+mode.
 
 ## Decision
 
@@ -20,8 +21,12 @@ a private staging directory. The service waits for results in canonical `CAMERA_
 manifest and artifact ordering are independent of completion order.
 3. `RegisteredSixCameraVideoExportService` forwards the same bound. The CLI exposes
 `--parallel-video-export` and `--max-video-export-workers`; the flags are opt-in and local-only.
-4. No broker, durable queue, provider SDK, credential, or network dependency is introduced.
-5. `runtime.benchmark.run_repeated` and `scripts/benchmark_local_mainline.py` report both
+4. `PyAvFrameMaterializer` accepts `max_parallel_cameras`, defaulting to `1`; the opt-in
+`ParallelPyAvFrameMaterializer` uses isolated per-camera staging directories and canonical camera
+merge order before content hashing/publication. The CLI exposes
+`--parallel-frame-materialization` and `--max-frame-materialization-workers`.
+5. No broker, durable queue, provider SDK, credential, or network dependency is introduced.
+6. `runtime.benchmark.run_repeated` and `scripts/benchmark_local_mainline.py` report both
 recording-hours/wall-hour and camera-video-hours/wall-hour. Reports are explicitly
 `NOT_MEASURED`, set `provider_requests=0`, and set `production_eligible=false` until a governed
 corpus and normative benchmark evidence are approved.
@@ -29,15 +34,17 @@ corpus and normative benchmark evidence are approved.
 ## Consequences
 
 - Serial behavior and artifact identity remain the compatibility baseline.
-- Parallel export can overlap independent PyAV work on local hosts, but this ADR makes no speedup
-claim and does not authorize ProcessPool or distributed deployment.
+- Parallel export/materialization can overlap independent PyAV work on local hosts, but this ADR
+makes no speedup claim and does not authorize ProcessPool or distributed deployment. PNG encoder
+reuse remains deferred until a byte-stability PoC is governed.
 - A failed worker propagates through the atomic service; the private staging tree is removed and
 no incomplete manifest is published.
 - Benchmark output is engineering evidence only; cache mode and worker settings are recorded.
 
 ## Verification
 
-- Unit coverage compares serial and parallel manifest bytes and all six artifact bytes.
-- CLI validation rejects worker counts outside 1..6.
+- Unit coverage compares serial and parallel manifest bytes and all six artifact bytes; parallel
+export failure cleanup is covered.
+- CLI validation rejects worker counts outside 1..6 for both camera controls.
 - Full local verification must continue to pass with `provider_requests=0` and
 `production_eligible=false`.

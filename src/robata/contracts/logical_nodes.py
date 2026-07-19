@@ -10,7 +10,7 @@ from pydantic import StringConstraints, field_validator, model_validator
 
 from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
 
-type NodeType = Annotated[
+NodeType = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -19,7 +19,7 @@ type NodeType = Annotated[
         pattern=r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$",
     ),
 ]
-type RunNodeRole = Annotated[
+RunNodeRole = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -28,7 +28,7 @@ type RunNodeRole = Annotated[
         pattern=r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$",
     ),
 ]
-type KeyNamespace = Annotated[
+KeyNamespace = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -37,7 +37,7 @@ type KeyNamespace = Annotated[
         pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*$",
     ),
 ]
-type NodeLogicalKey = Annotated[
+NodeLogicalKey = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -49,7 +49,7 @@ type NodeLogicalKey = Annotated[
         ),
     ),
 ]
-type OpaqueUuid = Annotated[
+OpaqueUuid = Annotated[
     str,
     StringConstraints(
         strict=True,
@@ -59,7 +59,7 @@ type OpaqueUuid = Annotated[
         ),
     ),
 ]
-type Rfc3339Timestamp = Annotated[
+Rfc3339Timestamp = Annotated[
     str,
     StringConstraints(
         strict=True,

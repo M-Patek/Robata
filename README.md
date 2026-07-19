@@ -41,6 +41,8 @@ Project and architecture inputs are intentionally split by authority:
   the phase taxonomy, unit, interface, and gate review.
 - [Task queue scaffold runbook](docs/operations/task-queue-scaffold.md) documents the local T2
   contract and its no-network scope.
+- [Worker and observability runbook](docs/operations/worker-and-observability.md) documents the
+  provider-neutral worker, local metrics/logging, and resource-observation contracts.
 
 The current baseline is deliberately contract-first. It provides strict domain values,
 canonical six-camera collections, a 16-document exact schema catalog, authoritative JSON
@@ -148,7 +150,33 @@ request ordering, and does not constitute a throughput or production-readiness c
 A real model can replace the `VisionModelAdapter` at the application port; no real provider
 adapter or model-quality claim is included in this slice. The completed local sample evidence
 is recorded in [`reports/local-full-mainline-fake-model-2026-07-19.md`](reports/local-full-mainline-fake-model-2026-07-19.md),
-and the operating procedures are in [`docs/operations/local-mainline-runbook.md`](docs/operations/local-mainline-runbook.md).
+with the final non-provider verification pass summarized in [`reports/local-mainline-final-verification-2026-07-19.md`](reports/local-mainline-final-verification-2026-07-19.md). The operating procedures are in [`docs/operations/local-mainline-runbook.md`](docs/operations/local-mainline-runbook.md).
+
+## Requirements workstreams (provider-free completion)
+
+The production requirements in [`REQUIREMENTS.md`](REQUIREMENTS.md) are now represented by
+provider-neutral local components; real model/provider wiring remains intentionally out of scope:
+
+- `robata.qa`: canonical 21-issue taxonomy, immutable `ClipMark` intervals, and deterministic
+  `pass`/`warning`/`fail` policy. Only `fail` requests deletion; all warning clips are retained.
+- `robata.frame_cache`: filesystem content-addressed frame cache with per-video `feed_once`
+  coordination. Annotation consumes the manifest produced by QA instead of decoding again.
+- `robata.annotation`: annotation-principal port, deterministic fake principal, structured labels
+  (`verb`, `noun`, `attributes`, `location`, `hand`), and fail exclusion/warning propagation.
+- `robata.search`: zero-GPU structured-label clip index, 48+ verb-family normalization aliases,
+  natural-language/facet parsing, and direct `start`/`end` playback targets.
+- `robata.capacity`: T+1/T+3 SLA deadlines, 500 recording-hours/day target accounting, and
+  explicit 2?H100/7B assumption reporting. Local fake measurements never set
+  `production_eligible=true`.
+
+Run the offline acceptance check (no network, credentials, or provider SDKs):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_requirements.py --output reports\requirements-acceptance-2026-07-19.json
+```
+
+The JSON report deliberately includes `provider_requests=0`,
+`execution_mode=LOCAL_DEVELOPMENT_FAKE_MODEL`, and `production_eligible=false`.
 
 ## Full development
 
@@ -211,4 +239,31 @@ uv run --locked python scripts/benchmark_local_mainline.py `
   tmp/local-mainline-benchmark `
   --allow-unapproved `
   --iterations 1
+```
+
+### Local workstream validation commands
+
+The engineering table is executable offline with the following checks:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\validate_qa_sample.py
+.\.venv\Scripts\python.exe scripts\validate_search_mvp.py
+.\.venv\Scripts\python.exe scripts\stress_frame_cache.py
+.\.venv\Scripts\python.exe scripts\validate_worker_integration.py
+.\.venv\Scripts\python.exe scripts\benchmark_synthetic.py
+.\.venv\Scripts\python.exe scripts\calibrate_capacity.py
+.\.venv\Scripts\python.exe scripts\probe_process_pool.py
+```
+
+`robata.adapters.local_vision_model.TransformersVisionModelAdapter` is a lazy, local-only
+boundary.  It requires a caller-supplied runner that emits a validated
+`VisionInferenceOutcome`; `load_local(..., local_files_only=True)` never downloads a checkpoint.
+`robata.runtime.process_pool_poc` reports ProcessPool support and PNG byte stability as
+non-certifying evidence.  See [`docs/operations/local-validation-workstreams.md`](docs/operations/local-validation-workstreams.md)
+for the guardrails and expected flags.
+
+For one aggregate local evidence run (including the sample MCAP inspection), use:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_local_workstreams.py
 ```

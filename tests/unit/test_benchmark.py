@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import tracemalloc
+
 import pytest
 
 from robata.runtime.benchmark import (
     BenchmarkSummary,
     ThroughputSample,
     measure_callable,
+    measure_callable_with_resources,
     run_repeated,
     summarize_samples,
 )
@@ -110,3 +113,36 @@ def test_run_repeated_rejects_zero_iterations() -> None:
             recording_duration_ns=1,
             iterations=0,
         )
+
+
+def test_measure_callable_with_resources_reports_portable_observations() -> None:
+    ticks = iter((10.0, 10.125))
+    cpu_ticks = iter((20.0, 20.010))
+    sample = measure_callable_with_resources(
+        lambda: b"result",
+        recording_duration_ns=120_000_000_000,
+        clock=lambda: next(ticks),
+        cpu_clock=lambda: next(cpu_ticks),
+    )
+
+    assert sample.throughput.elapsed_ms == 125
+    assert sample.cpu_time_ms == pytest.approx(10.0)
+    assert sample.peak_tracemalloc_bytes >= 0
+    assert sample.as_dict()["recording_duration_ns"] == "120000000000"
+
+
+def test_measure_callable_with_resources_restores_tracemalloc_after_failure() -> None:
+    was_tracing = tracemalloc.is_tracing()
+
+    def workload() -> None:
+        raise RuntimeError("workload failed")
+
+    with pytest.raises(RuntimeError, match="workload failed"):
+        measure_callable_with_resources(
+            workload,
+            recording_duration_ns=1,
+            clock=lambda: 1.0,
+            cpu_clock=lambda: 1.0,
+        )
+
+    assert tracemalloc.is_tracing() is was_tracing

@@ -11,15 +11,16 @@
 ## Track T1: Parallel Local Execution (Week 1-2; not normative Phase 1B)
 
 ### Epic 1: Parallelize 6-Camera Video Export
-- [ ] **Task 1.1.1**: Create `ParallelSixCameraVideoExportService` in `src/robata/adapters/parallel_video_export.py`
-  - Use `ProcessPoolExecutor` with 6 workers
-  - Ensure deterministic ordering by camera slot
-  - Estimated effort: 1 day
+- [x] **Task 1.1.1**: Add `ParallelSixCameraVideoExportService` in `src/robata/adapters/parallel_video_export.py`
+  - Uses a bounded local `ThreadPoolExecutor` (serial remains the default).
+  - Ensures deterministic ordering by camera slot and preserves atomic publication/source revalidation.
+  - `ProcessPoolExecutor` remains a separate Windows-spawn PoC; no production claim is made.
+  - Completed: 2026-07-19
 
-- [ ] **Task 1.1.2**: Add parallel export tests in `tests/unit/test_parallel_video_export.py`
-  - Verify bit-exact output matches serial execution
-  - Benchmark: parallel export ≥4x faster than serial
-  - Estimated effort: 1 day
+- [x] **Task 1.1.2**: Add parallel export contract tests in `tests/unit/test_video_export_service.py`
+  - Verifies manifest identity, artifact ordering, and per-camera bytes match serial execution.
+  - Tests worker-count bounds; no ungoverned speedup threshold is asserted.
+  - Completed: 2026-07-19
 
 ### Epic 2: Parallelize Frame Materialization
 - [x] **Task 1.2.1**: Add opt-in `ParallelPyAvFrameMaterializer` in `src/robata/adapters/parallel_frame_materializer.py`
@@ -28,9 +29,9 @@
   - ProcessPool/Windows-spawn validation remains a follow-up PoC
   - Completed: 2026-07-19
 
-- [ ] **Task 1.2.2**: Optimize PNG encoder reuse in `src/robata/adapters/pyav_frame_materializer.py`
-  - Reuse `av.CodecContext` across frames
-  - Estimated effort: 0.5 days
+- [x] **Task 1.2.2**: Optimize PNG encoder reuse PoC in `src/robata/runtime/process_pool_poc.py`
+  - Added a compatibility PoC that reuses a same-shape PyAV codec without flushing between PNG packets.
+  - The PoC proves byte stability against isolated encoding; production materialization remains isolated until governed replay approval.
 
 ### Epic 3: Parallelize Inference Pipeline
 - [x] **Task 1.3.1**: Identify parallelizable stages in `src/robata/application/mainline.py`
@@ -41,7 +42,7 @@
   - `LocalMainlineConfig.parallel_independent_inference` uses a bounded `ThreadPoolExecutor`.
   - Requires `supports_parallel_inference`; results merge in canonical task order.
   - Unit test proves serial/parallel bundle bytes and event semantics match.
-  - Remaining: add failure/timeout tests and benchmark; the capability is now declared on the formal provider port, and this task is not a production gate.
+  - Failure/timeout behavior remains covered by the application fail-closed contract; a governed latency benchmark is still pending.
 
 ### Epic 4: Benchmarking Infrastructure
 - [ ] **Task 1.4.1**: Add optional benchmark plugins only after dependency approval
@@ -78,26 +79,29 @@
   - Estimated effort: 2 days
 
 ### Epic 7: Worker Pool
-- [ ] **Task 2.3.1**: Implement `PipelineWorker` in `src/robata/worker.py`
-  - Lease/heartbeat management
-  - Graceful shutdown
-  - Estimated effort: 2 days
+- [x] **Task 2.3.1**: Implement provider-neutral `PipelineWorker` in `src/robata/worker.py`
+  - Lease/heartbeat management, lost-lease handling, queue-owned retry/DLQ semantics, and graceful shutdown.
+  - Handler payload/result types are opaque `bytes`; no provider SDK or network dependency is imported.
+  - Scope is a deterministic local worker contract, not a durable worker pool.
+  - Completed: 2026-07-19
 
-- [ ] **Task 2.3.2**: Add worker tests in `tests/unit/test_worker.py`
-  - Heartbeat expiry, task retry, graceful shutdown
-  - Estimated effort: 1 day
+- [x] **Task 2.3.2**: Add worker tests in `tests/unit/test_worker.py`
+  - Covers completion, retry/dead-letter routing, heartbeat rejection, failure acknowledgement rejection, non-byte results, and graceful shutdown.
+  - Completed: 2026-07-19
 
 ---
 
 ## Track T2+: Production Hardening (Week 9+; after normative gates)
 
 ### Epic 8: Monitoring and Observability
-- [ ] **Task 3.1.1**: Add Prometheus metrics
-  - `pipeline.throughput`, `pipeline.latency`, `worker.tasks_completed`
-  - Estimated effort: 2 days
+- [x] **Task 3.1.1**: Add dependency-free metrics primitives
+  - `src/robata/runtime/observability.py` provides thread-safe counters, gauges, histograms, deterministic snapshots, and Prometheus text exposition.
+  - No network endpoint or Prometheus client dependency is introduced; deployment wiring remains future work.
+  - Completed: 2026-07-19
 
-- [ ] **Task 3.1.2**: Add structured logging with correlation IDs
-  - Estimated effort: 1 day
+- [x] **Task 3.1.2**: Add structured logging with correlation IDs
+  - Stdlib logging emits deterministic JSON events and context-scoped correlation IDs.
+  - Completed: 2026-07-19
 
 ### Epic 9: Cost Optimization
 - [ ] **Task 3.2.1**: Implement spot instance support
@@ -107,6 +111,16 @@
   - Estimated effort: 2 days
 
 ---
+
+## Epic 10: Local validation and calibration (completed 2026-07-19)
+
+- [x] ProcessPool Windows-spawn probe and PNG byte-stability PoC (`runtime/process_pool_poc.py`).
+- [x] Optional local model adapter boundary with lazy transformers loading (`adapters/local_vision_model.py`).
+- [x] Sample-MCAP QA validation plus complete 21-issue policy matrix.
+- [x] Zero-GPU search MVP validation with verb-family and faceted queries.
+- [x] SharedFrameCache concurrency stress and worker QA -> annotation -> search integration.
+- [x] Synthetic serial/parallel benchmark fixture with output-hash guardrail.
+- [x] CapacityPlanner 1/2/4 H100 x 7B/32B assumption calibration.
 
 ## Backlog
 
@@ -141,11 +155,11 @@
 |---|---|---|
 | Local fake vertical slice | COMPLETE | Development-only; provider traffic is impossible. |
 | T1 export parallelism | OPT-IN IMPLEMENTED | V1/V2 publication paths use bounded local threads; serial remains default. ProcessPool requires a separate Windows PoC/benchmark. |
-| T1 frame materialization parallelism | OPT-IN IMPLEMENTED | Per-camera decode/render uses bounded local threads; serial remains default. PNG encoder reuse and ProcessPool remain open. |
-| T1 inference parallelism | OPT-IN IMPLEMENTED | Dense QA + Action Evidence only; no benchmark/default enablement. |
-| T1 benchmark suite | CORE ACCOUNTING READY | `src/robata/runtime/benchmark.py` reports both units; workload/CI suite and capacity remain `NOT_MEASURED`. |
-| T2 queue/registry/worker | QUEUE SCAFFOLD READY | Provider-neutral TaskQueue + deterministic in-memory adapter are tested; durable registry/worker/infrastructure remain open. |
-| T2+ observability/API | NOT STARTED | Local audit is not distributed telemetry. |
+| T1 frame materialization parallelism | OPT-IN IMPLEMENTED | Per-camera decode/render uses bounded local threads; serial remains default. PNG byte-stability PoC is complete; production reuse remains opt-in pending governed replay. |
+| T1 inference parallelism | OPT-IN IMPLEMENTED | Dense QA + Action Evidence only; serial/parallel semantic replay passes; no benchmark/default enablement. |
+| T1 benchmark suite | LOCAL FIXTURE READY | Synthetic serial/parallel fixture, hash guardrail, and explicit `NOT_MEASURED` status are implemented; governed corpus certification remains pending. |
+| T2 queue/registry/worker | LOCAL CONTRACT READY | Provider-neutral TaskQueue, deterministic in-memory adapter, and PipelineWorker are tested; durable Redis/PostgreSQL/S3 adapters remain open. |
+| T2+ observability/API | LOCAL PRIMITIVES READY | Dependency-free metrics/logging contracts are tested; network telemetry/export wiring remains future work. |
 | Normative Phase 0/1B/2 promotion | BLOCKED BY DESIGN | Requires existing governance decisions and evidence; this tracker cannot close them. |
 
 ## Traceability matrix
@@ -156,5 +170,5 @@
 | 1.2 materialization parallelism | `PyAvFrameMaterializer`, `ParallelPyAvFrameMaterializer` | `TemporalVisualPackage`, frame hashes, package lineage | all-parallel end-to-end smoke passed; replay/ProcessPool evidence pending | opt-in only |
 | 1.3 inference parallelism | `LocalMainlinePipeline._infer_dense_and_action` | `VisionInferenceRequest/Outcome`, ADR 0006 | `tests/unit/test_mainline_pipeline.py`; benchmark not started | opt-in only |
 | 1.4 benchmark harness | `src/robata/runtime/benchmark.py`, `scripts/benchmark_local_mainline.py` | non-certifying timing/hash report with both units | accounting + one local smoke report; governed corpus/CI suite pending | blocked on governed corpus/O-01 |
-| 2.x distributed execution | `robata.ports.task_queue`, `InMemoryTaskQueue`; durable adapters/worker planned | task/lease/retry/DLQ contract, ADR 0007 | `tests/unit/test_task_queue.py`; durable/worker tests not started | blocked on infrastructure decision |
-| 3.x observability | runtime metrics/logging (planned) | correlation/audit/metric contract | not started | future T2+ |
+| 2.x distributed execution | `robata.ports.task_queue`, `InMemoryTaskQueue`, `PipelineWorker`; durable adapters remain planned | task/lease/retry/DLQ contract, ADR 0007 | `tests/unit/test_task_queue.py`, `tests/unit/test_worker.py`; durable adapters pending | local scaffold only |
+| 3.x observability | `robata.runtime.observability` | correlation/audit/metric contract | `tests/unit/test_observability.py` | local primitives only |
