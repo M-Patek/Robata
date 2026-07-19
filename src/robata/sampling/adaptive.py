@@ -128,7 +128,7 @@ class AdaptiveSampler:
     def sample(
         self,
         window: object,  # TemporalWindow not imported to avoid circular deps
-        frames: dict[CameraId, Sequence["FramePayload"]],
+        frames: dict[CameraId, Sequence[FramePayload]],
     ) -> AdaptiveSamplingResult:
         """Run all detectors and produce an adaptive sampling result.
 

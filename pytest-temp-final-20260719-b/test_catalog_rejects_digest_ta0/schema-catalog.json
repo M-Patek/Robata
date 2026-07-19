@@ -1,0 +1,27 @@
+{
+  "catalog_version": "1.0",
+  "schemas": [
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/synthetic",
+        "version": "1.0.0",
+        "artifact_id": "5ab566da-78dd-9e3c-d026-2ffe4d9ee6d7",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/synthetic.schema.json",
+      "artifact_path": "v1/synthetic.schema.json",
+      "owner": "test",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "synthetic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    }
+  ],
+  "upcasters": []
+}

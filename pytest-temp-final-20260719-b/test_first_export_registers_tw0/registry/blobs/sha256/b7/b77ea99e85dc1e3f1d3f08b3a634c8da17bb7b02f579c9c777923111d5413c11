@@ -1,0 +1,1 @@
+{"approval_status":"UNAPPROVED","approved":false,"mapping_policy":"EXACT_TOPIC","profile_id":"test-observed","profile_kind":"OBSERVED","required_schema":"foxglove.CompressedImage","schema_version":"2.0","topics":{"cam_01":"/camera/1","cam_02":"/camera/2","cam_03":"/camera/3","cam_04":"/camera/4","cam_05":"/camera/5","cam_06":"/camera/6"},"version":"test-observed-v1"}

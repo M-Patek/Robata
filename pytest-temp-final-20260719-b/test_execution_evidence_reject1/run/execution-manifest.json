@@ -1,0 +1,55 @@
+{
+  "accounting": {
+    "candidate_count": 1,
+    "completed_at": "2026-07-19T10:00:01Z",
+    "duration_ms": 10,
+    "event_count": 1,
+    "fake_inference_attempt_count": 2,
+    "inference_attempt_count": 2,
+    "inference_failure_count": 0,
+    "inference_invalid_output_count": 0,
+    "inference_success_count": 2,
+    "package_count": 1,
+    "provider_request_count": 0,
+    "started_at": "2026-07-19T10:00:00Z",
+    "status": "PRIMARY_COMPLETE",
+    "window_count": 1
+  },
+  "artifacts": [],
+  "execution_mode": "LOCAL_DEVELOPMENT_FAKE_MODEL",
+  "manifest_kind": "ROBATA_LOCAL_EXECUTION",
+  "model": {
+    "name": null,
+    "provider": "fake",
+    "version": null
+  },
+  "pipeline": {
+    "config_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "local-mainline-v0"
+  },
+  "run_id": "11111111-1111-1111-1111-111111111111",
+  "schema_version": "1.0",
+  "semantic_sha256": "02a943ee1bd064108414693ae74a45246b99d473b595682945882372c9215ae8",
+  "source": {
+    "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "mcap_id": "22222222-2222-2222-2222-222222222222",
+    "recording_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "stages": [
+    {
+      "duration_ms": 10,
+      "failed": 0,
+      "pending": 0,
+      "planned": 1,
+      "skipped": 0,
+      "stage": "WINDOWING",
+      "status": "SUCCEEDED",
+      "succeeded": 1
+    }
+  ],
+  "video": {
+    "manifest_artifact_id": "33333333-3333-3333-3333-333333333333",
+    "manifest_semantic_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}

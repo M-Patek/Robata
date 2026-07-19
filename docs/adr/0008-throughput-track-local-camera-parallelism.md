@@ -35,8 +35,9 @@ corpus and normative benchmark evidence are approved.
 
 - Serial behavior and artifact identity remain the compatibility baseline.
 - Parallel export/materialization can overlap independent PyAV work on local hosts, but this ADR
-makes no speedup claim and does not authorize ProcessPool or distributed deployment. PNG encoder
-reuse remains deferred until a byte-stability PoC is governed.
+makes no speedup claim and does not authorize ProcessPool or distributed deployment. A separate
+`runtime.process_pool_poc` records Windows-spawn support and compares reusable PNG bytes with
+isolated encoding; codec reuse remains opt-in until governed replay approval.
 - A failed worker propagates through the atomic service; the private staging tree is removed and
 no incomplete manifest is published.
 - Benchmark output is engineering evidence only; cache mode and worker settings are recorded.

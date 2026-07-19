@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v2/mapping-profile.schema.json",
+  "title": "Robata Mapping Profile Artifact Payload V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "version",
+    "profile_kind",
+    "approval_status",
+    "approved",
+    "mapping_policy",
+    "required_schema",
+    "topics"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "profile_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "profile_kind": {"type": "string", "minLength": 1},
+    "approval_status": {"enum": ["APPROVED", "UNAPPROVED"]},
+    "approved": {"type": "boolean"},
+    "mapping_policy": {"const": "EXACT_TOPIC"},
+    "required_schema": {"const": "foxglove.CompressedImage"},
+    "topics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cam_01", "cam_02", "cam_03", "cam_04", "cam_05", "cam_06"],
+      "properties": {
+        "cam_01": {"type": "string", "minLength": 1},
+        "cam_02": {"type": "string", "minLength": 1},
+        "cam_03": {"type": "string", "minLength": 1},
+        "cam_04": {"type": "string", "minLength": 1},
+        "cam_05": {"type": "string", "minLength": 1},
+        "cam_06": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"approval_status": {"const": "APPROVED"}},
+        "required": ["approval_status"]
+      },
+      "then": {"properties": {"approved": {"const": true}}},
+      "else": {"properties": {"approved": {"const": false}}}
+    }
+  ]
+}

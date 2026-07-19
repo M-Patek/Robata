@@ -1,6 +1,5 @@
 """Application ports for source inspection and decoder validation."""
 
-from robata.ports.annotation import AnnotationPrincipal, PrincipalContext
 from robata.ports.artifact_registry import (
     ArtifactBlobSource,
     ArtifactRegistry,
@@ -8,7 +7,6 @@ from robata.ports.artifact_registry import (
     ArtifactRegistryErrorCode,
     PublishedArtifactDerivation,
 )
-from robata.ports.frame_cache import FrameFeedCoordinator, SharedFrameCache
 from robata.ports.ingestion import (
     COMPRESSED_IMAGE_SCHEMA,
     CameraMappingPolicy,
@@ -44,7 +42,6 @@ from robata.ports.revision_registry import (
     RevisionSelectionRegistryErrorCode,
     VerifiedRevisionSubject,
 )
-from robata.ports.search import ClipSearchIndex, NaturalLanguageQueryParser
 from robata.ports.task_queue import (
     InspectableTaskQueue,
     LeaseId,
@@ -66,7 +63,6 @@ from robata.ports.video_export import (
 
 __all__ = [
     "COMPRESSED_IMAGE_SCHEMA",
-    "AnnotationPrincipal",
     "ArtifactBlobSource",
     "ArtifactRegistry",
     "ArtifactRegistryError",
@@ -80,7 +76,6 @@ __all__ = [
     "DecoderProbeResult",
     "ExistingNodeDisposition",
     "ExportedCameraVideoFacts",
-    "FrameFeedCoordinator",
     "FrameMaterializationError",
     "FrameMaterializationErrorCode",
     "FrameMaterializationRequest",
@@ -95,17 +90,13 @@ __all__ = [
     "LogicalNodeRegistryErrorCode",
     "McapInspection",
     "McapInspector",
-    "NaturalLanguageQueryParser",
     "PipelineTask",
-    "PrincipalContext",
     "PublishedArtifactDerivation",
     "PublishedRevision",
     "PublishedRunNodeMembership",
-    "PublishedSelection",
     "RevisionSelectionRegistry",
     "RevisionSelectionRegistryError",
     "RevisionSelectionRegistryErrorCode",
-    "SharedFrameCache",
     "TaskId",
     "TaskQueue",
     "TaskQueueError",

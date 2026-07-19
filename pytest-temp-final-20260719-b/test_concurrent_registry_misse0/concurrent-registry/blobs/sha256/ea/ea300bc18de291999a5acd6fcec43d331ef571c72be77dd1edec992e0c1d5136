@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/camera-video-timestamp-row.schema.json",
+  "title": "Robata V1 CameraVideoTimestampRow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "export_profile_id",
+    "export_profile_version",
+    "camera_id",
+    "packet_index",
+    "source_sequence",
+    "source_log_time_ns",
+    "source_publish_time_ns",
+    "embedded_header_time_ns",
+    "relative_pts_ns",
+    "relative_dts_ns",
+    "duration_ns",
+    "time_base_numerator",
+    "time_base_denominator",
+    "is_keyframe",
+    "duration_is_estimated"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.schema.json#/$defs/schemaVersion"
+    },
+    "export_profile_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "export_profile_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "camera_id": {
+      "$ref": "common.schema.json#/$defs/cameraId"
+    },
+    "packet_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_log_time_ns": {
+      "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+    },
+    "source_publish_time_ns": {
+      "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+    },
+    "embedded_header_time_ns": {
+      "$ref": "common.schema.json#/$defs/int64Nanoseconds"
+    },
+    "relative_pts_ns": {
+      "$ref": "common.schema.json#/$defs/nonnegativeInt64Nanoseconds"
+    },
+    "relative_dts_ns": {
+      "$ref": "common.schema.json#/$defs/nonnegativeInt64Nanoseconds"
+    },
+    "duration_ns": {
+      "$ref": "common.schema.json#/$defs/positiveInt64String"
+    },
+    "time_base_numerator": {
+      "const": 1
+    },
+    "time_base_denominator": {
+      "const": 1000000000
+    },
+    "is_keyframe": {
+      "type": "boolean"
+    },
+    "duration_is_estimated": {
+      "type": "boolean"
+    }
+  }
+}

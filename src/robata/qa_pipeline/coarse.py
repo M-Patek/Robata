@@ -22,7 +22,6 @@ from robata.contracts.mainline import (
     QAIssueSeverity,
     TemporalVisualPackage,
 )
-from robata.qa import QAClassifier
 from robata.qa_pipeline.stages import QAStage, QAStageIssue, QAStageResult
 
 __all__ = [
@@ -107,7 +106,7 @@ class CoarseQAPipeline:
 
     def __init__(
         self,
-        classifier: QAClassifier,
+        classifier: "QAClassifier",  # type: ignore[name-defined]
         sampler: "Sampler",  # type: ignore[name-defined]
     ) -> None:
         self.classifier = classifier

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v2/export-config.schema.json",
+  "title": "Robata Camera Video Export Config Artifact Payload V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "exporter"],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "exporter": {
+      "$ref": "../v1/camera-video-export-manifest.schema.json#/$defs/exporter"
+    }
+  }
+}

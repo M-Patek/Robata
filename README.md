@@ -166,7 +166,7 @@ provider-neutral local components; real model/provider wiring remains intentiona
 - `robata.search`: zero-GPU structured-label clip index, 48+ verb-family normalization aliases,
   natural-language/facet parsing, and direct `start`/`end` playback targets.
 - `robata.capacity`: T+1/T+3 SLA deadlines, 500 recording-hours/day target accounting, and
-  explicit 2?H100/7B assumption reporting. Local fake measurements never set
+  explicit 2×H100/7B assumption reporting. Local fake measurements never set
   `production_eligible=true`.
 
 Run the offline acceptance check (no network, credentials, or provider SDKs):

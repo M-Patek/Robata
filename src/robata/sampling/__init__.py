@@ -36,6 +36,7 @@ from robata.sampling.signals import (
 )
 
 __all__ = [
+    "NANOSECONDS_PER_SECOND",
     "AdaptiveSampler",
     "AdaptiveSamplingPolicy",
     "AdaptiveSamplingResult",
@@ -47,7 +48,6 @@ __all__ = [
     "FrameCandidate",
     "FrameSelection",
     "MotionEnergyDetector",
-    "NANOSECONDS_PER_SECOND",
     "PackageSetBuilder",
     "SamplingGrid",
     "SamplingRate",
