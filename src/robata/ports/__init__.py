@@ -7,6 +7,12 @@ from robata.ports.artifact_registry import (
     ArtifactRegistryErrorCode,
     PublishedArtifactDerivation,
 )
+from robata.ports.frame_materialization import (
+    FrameMaterializationError,
+    FrameMaterializationErrorCode,
+    FrameMaterializationRequest,
+    FrameMaterializer,
+)
 from robata.ports.ingestion import (
     COMPRESSED_IMAGE_SCHEMA,
     CameraMappingPolicy,
@@ -26,13 +32,6 @@ from robata.ports.logical_node_registry import (
     LogicalNodeRegistryErrorCode,
     PublishedRunNodeMembership,
     VerifiedLogicalNode,
-)
-from robata.ports.mainline import (
-    FrameMaterializationError,
-    FrameMaterializationErrorCode,
-    FrameMaterializationRequest,
-    FrameMaterializer,
-    VisionModelAdapter,
 )
 from robata.ports.revision_registry import (
     PublishedRevision,
@@ -107,5 +106,4 @@ __all__ = [
     "VerifiedRevisionSubject",
     "VideoExportError",
     "VideoExportErrorCode",
-    "VisionModelAdapter",
 ]

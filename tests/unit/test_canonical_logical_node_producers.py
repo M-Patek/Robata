@@ -9,32 +9,51 @@ from pydantic import ValidationError
 
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical_offline import (
+    CANONICAL_CALL_BARRIER_IDENTITY_POLICY_VERSION,
+    CANONICAL_CALL_PART_IDENTITY_POLICY_VERSION,
+    CANONICAL_EVENT_HYPOTHESIS_IDENTITY_POLICY_VERSION,
+    CANONICAL_INPUT_PLAN_IDENTITY_POLICY_VERSION,
+    CANONICAL_OUTPUT_DECISION_IDENTITY_POLICY_VERSION,
+    CANONICAL_OUTPUT_DECISION_LOGICAL_KEY_NAMESPACE,
+    CANONICAL_OUTPUT_DECISION_SEMANTIC_PROJECTION_VERSION,
+    CANONICAL_OUTPUT_DECISION_UUID_NAMESPACE,
     CanonicalOfflineConfigurationError,
     CanonicalOutputAdmissionDecision,
     CanonicalRootWindow,
     _canonical_output_decision_projection_values,
     _stable_uuid,
+    canonical_call_barrier_logical_node,
     canonical_call_part_logical_node,
+    canonical_event_hypothesis_logical_node,
     canonical_input_plan_logical_node,
     canonical_output_decision_logical_node,
+    canonical_output_decision_projection,
     canonical_package_set_logical_node,
     canonical_parsed_claim_logical_node,
     canonical_root_window_logical_node,
 )
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import semantic_sha256
-from robata.contracts.mainline import SamplingPurpose
+from robata.contracts.pipeline import SamplingPurpose
 from robata.event_pipeline.identity_registry import (
+    EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE,
+    AdmissionEvidenceClass,
+    OutputAdmissionProof,
     PlatformEnrichedOutputReference,
     ProductionOutputAdmissionPolicyRef,
-    ProductionOutputAdmissionProof,
 )
 from robata.inference.enrichment import OrchestratorEnrichedOutput
+from robata.inference.input_plan import (
+    CALL_BARRIER_LOGICAL_KEY_NAMESPACE,
+    CALL_PART_LOGICAL_KEY_NAMESPACE,
+    INPUT_PLAN_LOGICAL_KEY_NAMESPACE,
+)
 from robata.sampling.package_set import PackageSetBuilder
 from tests.unit.test_event_identity_registry import (
     OUTPUT_ADMISSION_POLICY,
     _context,
     _enriched_output,
+    _hypothesis,
     _hypothesis_fact,
     _output_proof,
 )
@@ -75,12 +94,14 @@ def _decision_values(
     decision: CanonicalOutputAdmissionDecision,
     *,
     fusion_reduction_logical_key: str | None = None,
-    production_output_admission: ProductionOutputAdmissionProof | None = None,
+    production_output_admission: OutputAdmissionProof | None = None,
 ) -> dict[str, object]:
     proof = production_output_admission or decision.production_output_admission
     key = fusion_reduction_logical_key or decision.fusion_reduction_logical_key
     projection = _canonical_output_decision_projection_values(
         decision=decision.decision,
+        evidence_class=decision.evidence_class,
+        production_eligible=decision.production_eligible,
         recording_identity=decision.recording_identity,
         source_enrichments=decision.source_enrichments,
         fusion_reduction_logical_key=key,
@@ -93,9 +114,11 @@ def _decision_values(
     )
     digest = semantic_sha256(projection)
     return {
-        "schema_version": "1.0",
-        "decision_id": _stable_uuid("canonical-output-admission", digest),
+        "schema_version": "2.0",
+        "decision_id": _stable_uuid(CANONICAL_OUTPUT_DECISION_UUID_NAMESPACE, digest),
         "decision": decision.decision,
+        "evidence_class": decision.evidence_class,
+        "production_eligible": decision.production_eligible,
         "semantic_sha256": digest,
         "recording_identity": decision.recording_identity,
         "source_enrichments": decision.source_enrichments,
@@ -109,7 +132,7 @@ def _decision_values(
     }
 
 
-def _production_decision() -> tuple[
+def _local_admitted_decision() -> tuple[
     CanonicalOutputAdmissionDecision,
     AdmittedRecordingContextV2,
     OrchestratorEnrichedOutput,
@@ -126,9 +149,11 @@ def _production_decision() -> tuple[
     proof = _output_proof(context, output, fact)
     fusion_digest = _digest("canonical-fusion-reduction")
     provisional = CanonicalOutputAdmissionDecision.model_construct(
-        schema_version="1.0",
+        schema_version="2.0",
         decision_id=_uuid(1),
-        decision="PRODUCTION_ADMITTED",
+        decision="ADMITTED",
+        evidence_class=AdmissionEvidenceClass.LOCAL_CONFORMANCE,
+        production_eligible=False,
         semantic_sha256="0" * 64,
         recording_identity=context.recording_identity,
         source_enrichments=source_refs,
@@ -262,6 +287,50 @@ def test_input_plan_node_converges_across_row_locator_and_clock_changes() -> Non
     assert canonical_input_plan_logical_node(relocated) == canonical_input_plan_logical_node(first)
 
 
+def test_input_plan_chain_nodes_publish_only_v2_identity_namespaces() -> None:
+    plan = _input_plan_fixture()[3]
+    input_node = canonical_input_plan_logical_node(plan)
+    part_node = canonical_call_part_logical_node(plan, plan.call_plan.parts[0])
+    barrier_node = canonical_call_barrier_logical_node(plan)
+
+    assert (
+        input_node.key_namespace,
+        input_node.identity_policy_version,
+    ) == (
+        INPUT_PLAN_LOGICAL_KEY_NAMESPACE,
+        CANONICAL_INPUT_PLAN_IDENTITY_POLICY_VERSION,
+    )
+    assert (
+        part_node.key_namespace,
+        part_node.identity_policy_version,
+    ) == (
+        CALL_PART_LOGICAL_KEY_NAMESPACE,
+        CANONICAL_CALL_PART_IDENTITY_POLICY_VERSION,
+    )
+    assert (
+        barrier_node.key_namespace,
+        barrier_node.identity_policy_version,
+    ) == (
+        CALL_BARRIER_LOGICAL_KEY_NAMESPACE,
+        CANONICAL_CALL_BARRIER_IDENTITY_POLICY_VERSION,
+    )
+    assert all(
+        node.node_logical_key.startswith(f"{node.key_namespace}:")
+        for node in (input_node, part_node, barrier_node)
+    )
+    assert {
+        input_node.key_namespace,
+        part_node.key_namespace,
+        barrier_node.key_namespace,
+    }.isdisjoint(
+        {
+            "inference-input-plan",
+            "inference-input-call-part",
+            "inference-input-barrier",
+        }
+    )
+
+
 def test_call_part_node_requires_complete_plan_admission() -> None:
     plan = _input_plan_fixture()[3]
     part = plan.call_plan.parts[0]
@@ -283,8 +352,64 @@ def test_call_part_node_rejects_part_detached_from_complete_plan() -> None:
         canonical_call_part_logical_node(plan, detached)
 
 
+def test_output_and_event_nodes_publish_only_v2_identity_domains() -> None:
+    decision, context, output = _local_admitted_decision()
+    hypothesis = _hypothesis(
+        context,
+        output,
+        start_ns=10,
+        end_ns=20,
+        fingerprint="canonical-node-producer",
+        ordinal=0,
+        output_proof=decision.production_output_admission,
+    )
+
+    output_node = canonical_output_decision_logical_node(decision)
+    event_node = canonical_event_hypothesis_logical_node(hypothesis)
+
+    assert (
+        output_node.key_namespace,
+        output_node.identity_policy_version,
+    ) == (
+        CANONICAL_OUTPUT_DECISION_LOGICAL_KEY_NAMESPACE,
+        CANONICAL_OUTPUT_DECISION_IDENTITY_POLICY_VERSION,
+    )
+    assert (
+        event_node.key_namespace,
+        event_node.identity_policy_version,
+    ) == (
+        EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE,
+        CANONICAL_EVENT_HYPOTHESIS_IDENTITY_POLICY_VERSION,
+    )
+    assert (
+        canonical_output_decision_projection(decision)["semantic_projection_version"]
+        == CANONICAL_OUTPUT_DECISION_SEMANTIC_PROJECTION_VERSION
+    )
+    assert output_node.node_logical_key.startswith(
+        f"{CANONICAL_OUTPUT_DECISION_LOGICAL_KEY_NAMESPACE}:"
+    )
+    assert event_node.node_logical_key.startswith(f"{EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE}:")
+
+
+def test_output_decision_rejects_v1_status_and_uuid_domain() -> None:
+    decision, _, _ = _local_admitted_decision()
+
+    old_status = _decision_values(decision)
+    old_status["decision"] = "PRODUCTION_ADMITTED"
+    with pytest.raises(ValidationError, match="ADMITTED"):
+        CanonicalOutputAdmissionDecision.model_validate(old_status, strict=True)
+
+    old_identity = _decision_values(decision)
+    old_identity["decision_id"] = _stable_uuid(
+        "canonical-output-admission",
+        decision.semantic_sha256,
+    )
+    with pytest.raises(ValidationError, match="decision ID"):
+        CanonicalOutputAdmissionDecision.model_validate(old_identity, strict=True)
+
+
 def test_output_decision_rejects_fusion_key_digest_mismatch() -> None:
-    decision, _, _ = _production_decision()
+    decision, _, _ = _local_admitted_decision()
     wrong_key = f"fusion-reduction:{_digest('different-fusion-reduction')}"
 
     with pytest.raises(
@@ -299,7 +424,7 @@ def test_output_decision_rejects_fusion_key_digest_mismatch() -> None:
 
 
 def test_output_decision_rejects_proof_policy_mismatch() -> None:
-    decision, context, output = _production_decision()
+    decision, context, output = _local_admitted_decision()
     other_policy = ProductionOutputAdmissionPolicyRef(
         version="other-output-admission-v1",
         semantic_sha256=_digest("other-output-admission-v1"),

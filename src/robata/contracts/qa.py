@@ -2,7 +2,7 @@
 
 Replaces the old MVP ``robata.qa`` module with canonical V1.1 contracts
 that align with the two-stage QA pipeline (Section 12) and the
-``contracts/mainline.py`` models.
+``contracts/pipeline.py`` models.
 """
 
 from __future__ import annotations

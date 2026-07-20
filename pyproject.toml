@@ -51,14 +51,11 @@ line-length = 100
 extend-exclude = [
   ".agents",
   ".codex",
+  "archive/old_mvp",
   "data",
   "tmp",
   "pytest-cache-files-*",
   ".claude",
-  "src/robata/event_pipeline",
-  "src/robata/qa_pipeline",
-  "src/robata/queue",
-  "src/robata/storage",
 ]
 
 [tool.ruff.lint]
@@ -68,8 +65,16 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src/robata"]
-exclude = "(^|/)(event_pipeline|qa_pipeline|queue|storage)(/|$)"
 
+# Owner: sampling adapter.
+# Reason: NumPy is optional and absent from the core environment.
+# Remove when it is a declared extra with typing or this module enters a runnable path.
 [[tool.mypy.overrides]]
 module = ["robata.sampling.signals", "numpy", "numpy.*"]
+ignore_missing_imports = true
+
+# Owner: storage adapter. SQLAlchemy is optional and absent from the core environment.
+# Remove this exception when storage becomes a runnable, declared project extra.
+[[tool.mypy.overrides]]
+module = ["sqlalchemy", "sqlalchemy.*"]
 ignore_missing_imports = true

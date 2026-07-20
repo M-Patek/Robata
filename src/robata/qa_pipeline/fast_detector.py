@@ -8,10 +8,12 @@ on container structure, timestamp monotonicity, and decode continuity
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Sequence
+from typing import Annotated
 
 from pydantic import Field
 
@@ -157,9 +159,9 @@ class FastDetector:
         Returns a :class:`StreamIntegrityResult` whose ``status`` is one of
         ``PASS``, ``DEGRADED``, or ``FAIL``.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        checked_at = datetime.now(timezone.utc).isoformat()
+        checked_at = datetime.now(UTC).isoformat()
         issues: list[StreamIntegrityIssue] = []
 
         # 1. Metadata sanity
@@ -218,9 +220,9 @@ class FastDetector:
         Does **not** parse the full MCAP index; that is the ingestion service's
         responsibility.  This is a fast pre-flight check.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        checked_at = datetime.now(timezone.utc).isoformat()
+        checked_at = datetime.now(UTC).isoformat()
         issues: list[StreamIntegrityIssue] = []
 
         if not mcap_path.exists():
@@ -259,9 +261,9 @@ class FastDetector:
 
         Returns the number of non-monotonic gaps detected and the overall status.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        checked_at = datetime.now(timezone.utc).isoformat()
+        checked_at = datetime.now(UTC).isoformat()
         issues: list[StreamIntegrityIssue] = []
 
         if not timestamps:
@@ -299,7 +301,7 @@ class FastDetector:
                             end_ns=end_ns,
                         ),
                         message=f"Non-monotonic timestamp at index {i}: "
-                                f"{timestamps[i]} <= {timestamps[i - 1]}",
+                        f"{timestamps[i]} <= {timestamps[i - 1]}",
                     )
                 )
 
@@ -320,9 +322,9 @@ class FastDetector:
         FPS) against the number of successfully decoded :class:`FramePayload`
         instances.  A large discrepancy flags a decode gap.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        checked_at = datetime.now(timezone.utc).isoformat()
+        checked_at = datetime.now(UTC).isoformat()
         issues: list[StreamIntegrityIssue] = []
 
         decoded_frames = len(frames)
@@ -354,7 +356,7 @@ class FastDetector:
                     StreamIntegrityIssue(
                         code="LARGE_DECODE_INTERVAL",
                         message=f"Average decode interval is {avg_interval:.2f}s, "
-                                f"suggesting dropped frames",
+                        f"suggesting dropped frames",
                     )
                 )
 

@@ -5,7 +5,7 @@ Implements the core tables from ARCHITECTURE_DESIGN_V1.md Section 16.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 try:
@@ -32,17 +32,21 @@ except ImportError:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             del args, kwargs
 
-    DeclarativeBase = object  # type: ignore[assignment, misc]
-    Mapped = Any  # type: ignore[assignment, misc]
-    mapped_column = lambda *args, **kwargs: None  # type: ignore[assignment]
-    BigInteger = Boolean = DateTime = Float = Integer = String = Text = _SqlType
-    UUID = _SqlType
+    DeclarativeBase = object
+    Mapped = Any
 
-    def ForeignKey(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+    def mapped_column(*args: Any, **kwargs: Any) -> Any:
         del args, kwargs
         return None
 
-    def UniqueConstraint(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+    BigInteger = Boolean = DateTime = Float = Integer = String = Text = _SqlType
+    UUID = _SqlType
+
+    def ForeignKey(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        return None
+
+    def UniqueConstraint(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
         return None
 
@@ -56,7 +60,7 @@ else:
     _HAS_SQLALCHEMY = True
 
 
-class Base(DeclarativeBase):
+class Base(DeclarativeBase):  # type: ignore[misc]
     """SQLAlchemy declarative base."""
 
 
@@ -74,7 +78,7 @@ class Artifact(Base):
     producer: Mapped[str] = mapped_column(Text, nullable=False)
     producer_version: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -96,7 +100,7 @@ class MCAPRecording(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -132,7 +136,7 @@ class CameraMappingRun(Base):
     mapping_policy_version: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -175,7 +179,7 @@ class AlignmentRun(Base):
     algorithm_version: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -201,7 +205,7 @@ class TemporalWindow(Base):
     )
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -226,7 +230,7 @@ class TemporalPackage(Base):
     frame_count: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -234,9 +238,7 @@ class TemporalPackageCamera(Base):
     """Per-camera entry within a temporal package."""
 
     __tablename__ = "temporal_package_camera"
-    __table_args__ = (
-        UniqueConstraint("package_id", "camera_id", name="uq_package_camera"),
-    )
+    __table_args__ = (UniqueConstraint("package_id", "camera_id", name="uq_package_camera"),)
 
     package_camera_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     package_id: Mapped[str] = mapped_column(
@@ -272,7 +274,7 @@ class ModelInference(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -304,7 +306,7 @@ class WorkItem(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -319,7 +321,7 @@ class WorkBarrier(Base):
     expected_member_count: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="PENDING")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -327,9 +329,7 @@ class WorkBarrierMember(Base):
     """One member of a work barrier."""
 
     __tablename__ = "work_barrier_member"
-    __table_args__ = (
-        UniqueConstraint("barrier_id", "work_item_id", name="uq_barrier_work_item"),
-    )
+    __table_args__ = (UniqueConstraint("barrier_id", "work_item_id", name="uq_barrier_work_item"),)
 
     member_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     barrier_id: Mapped[str] = mapped_column(
@@ -356,7 +356,7 @@ class OutboxEvent(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="PENDING")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 

@@ -105,9 +105,7 @@ class ReducedInterval(StrictModel):
         self._validate_interval(self.start_ns, self.end_ns)
         if self.merged_from_count != len(self.source_intervals):
             raise ValueError("merged_from_count must match source_intervals")
-        canonical_cameras = tuple(
-            sorted(set(self.cameras), key=lambda item: item.value)
-        )
+        canonical_cameras = tuple(sorted(set(self.cameras), key=lambda item: item.value))
         if not self.cameras or canonical_cameras != self.cameras:
             raise ValueError("cameras must be unique and in canonical order")
         return self

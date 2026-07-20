@@ -1,6 +1,7 @@
 # ADR 0003: Artifact Registry and Schema Evolution
 
-- Status: Accepted and implemented for the local V2 schema/registry/export slice
+- Status: Accepted and implemented for the local V2 schema/registry/export slice and
+  synthetic upcaster conformance fixture
 - Date: 2026-07-18
 - Governing authority: Architecture V1.1 Sections 5.3, 8.2, 16.2, 20.2,
   25.4, 25.7, and 25.10; ADR 0002
@@ -33,9 +34,17 @@ cannot contain its own exact-byte digest without creating a circular preimage.
 4. Compatibility is declared and tested, never inferred from a version number. V1 to V2
    camera-video export has no automatic upcaster because artifact identity and lineage
    cannot be fabricated. Stored V1 bytes remain readable through their frozen schema.
-5. Upcasters, when later registered, are pure functions with exact source/target schema
-   refs, code/runtime digests, golden vectors, one unambiguous path, and immutable
-   provenance.
+5. Domain upcasters, when registered, have exact source/target schema refs, catalog paths
+   and byte pins for code/runtime/golden artifacts, paired golden vectors, one unambiguous
+   path, and immutable provenance. Execution checks input mutation, compares the repeated
+   executions within one call, instantiates pinned code in a fresh namespace for every
+   transform invocation, and retains a graph-local digest seal so the same canonical input
+   cannot produce a different output on a later call. Ordered provenance uses the versioned
+   `upcaster-chain-digest-policy-v1` digest over the exact source/target refs, upcaster ID,
+   code digest, and runtime digest.
+   The live project catalog currently registers no domain upcaster. A separate checked-in
+   synthetic catalog and fixture exercise the mechanism without claiming a migration for
+   production schemas.
 
 ### Artifact records and identity
 
@@ -107,6 +116,13 @@ failure. Cleanup errors do not replace the primary failure.
   governed READY, approved media policy, or production durability.
 - SQLite and the local blob layout are adapter choices, not domain contracts or the
   production database/object-store decision.
+- The registry-backed synthetic upcaster fixture proves exact code/runtime/golden artifact
+  paths and byte pins, exact schema pins, golden-vector execution, preserved-field behavior,
+  endpoint validation, within-call and cross-call repeated-output determinism,
+  module-namespace isolation, input-mutation checks, versioned code-and-runtime-bound chain
+  provenance, and fail-closed graph conflicts. It is mechanism evidence only: the live
+  catalog remains closed with no registered domain upcaster, and no stored production
+  artifact is migrated by this fixture.
 - At this work item's completion, Phase 1A still required the separate
   logical-node/run-membership and immutable revision/current-selection primitives. ADR
   0004 subsequently implements the former, and ADR 0005 subsequently implements the
@@ -115,8 +131,14 @@ failure. Cleanup errors do not replace the primary failure.
 
 ## Implementation evidence
 
+- `src/robata/contracts/schema_registry.py`
+- `src/robata/contracts/schema_upcasting.py`
+- `tests/fixtures/schema_upcasting/`
+- `tests/contract/test_schema_upcasting.py`
+
 The exact schema-catalog closure, 20-entry derivation snapshot, registry database
 accounting, two registry-backed 13-file views, real-media replay timings, and automated
 verification are recorded in
 `reports/local-artifact-registry-v2-2026-07-18.md`. This evidence is local and
-non-promotional; it does not change the remaining Phase 0, Phase 1A, or Phase 1B gates.
+non-promotional. The synthetic upcaster evidence likewise does not change the remaining
+Phase 0, Phase 1A, or Phase 1B gates.

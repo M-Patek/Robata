@@ -5,7 +5,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from robata.contracts import CameraId, NanosecondInterval, SixCameraMap
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     BoundaryCameraClaim,
     BoundaryRefinement,
     BoundaryStatus,

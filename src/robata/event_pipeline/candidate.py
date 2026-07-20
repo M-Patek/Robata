@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from robata.contracts.common import StrictModel
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CandidateEvent,
     NonEmptyString,
 )
@@ -51,9 +51,10 @@ class CandidateEventManager:
         Returns:
             Merged candidate events.
         """
-        # Skeleton: merge logic to be implemented per Section 13.1.
-        _ = candidates
-        return []
+        raise NotImplementedError(
+            "CandidateEventManager.merge_candidates is a non-runnable architecture skeleton; "
+            "candidate merge policy is not implemented."
+        )
 
     def split_candidate(
         self,
@@ -73,10 +74,10 @@ class CandidateEventManager:
         Returns:
             New candidate segments.
         """
-        # Skeleton: split logic to be implemented per Section 13.1.
-        _ = candidate
-        _ = split_points
-        return []
+        raise NotImplementedError(
+            "CandidateEventManager.split_candidate is a non-runnable architecture skeleton; "
+            "candidate split policy is not implemented."
+        )
 
     def validate_candidate(self, candidate: CandidateEvent) -> ValidationResult:
         """Validate a single candidate against architecture rules.
@@ -92,24 +93,9 @@ class CandidateEventManager:
         Returns:
             Validation result with is_valid, errors, and warnings.
         """
-        errors: list[ValidationIssue] = []
-        warnings: list[ValidationIssue] = []
-
-        # Interval must be non-empty (NanosecondInterval already enforces this)
-        # and within MCAP duration is checked by the caller context.
-
-        # camera_coverage must contain all six cameras
-        # (enforced by the contract model, but we validate explicitly here)
-        # Note: CandidateEvent uses proposal.cameras which is a SixCameraMap
-        # and already validates exactly six canonical keys.
-
-        # Skeleton: additional validation rules to be implemented.
-        _ = candidate
-
-        return ValidationResult(
-            is_valid=not errors,
-            errors=tuple(errors),
-            warnings=tuple(warnings),
+        raise NotImplementedError(
+            "CandidateEventManager.validate_candidate is a non-runnable architecture skeleton; "
+            "candidate validation policy is not implemented."
         )
 
 

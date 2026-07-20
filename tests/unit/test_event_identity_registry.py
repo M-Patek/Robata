@@ -7,6 +7,7 @@ from threading import Barrier, Lock
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from robata.admission import (
     AdmissionContextResolver,
@@ -18,6 +19,12 @@ from robata.admission import (
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.event_pipeline.identity_registry import (
+    ADMISSION_PROOF_SEMANTIC_PROJECTION_VERSION,
+    EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE,
+    EVENT_HYPOTHESIS_SEMANTIC_PROJECTION_VERSION,
+    OUTPUT_ADMISSION_SEMANTIC_PROJECTION_VERSION,
+    AdmissionEvidenceClass,
+    AdmissionProof,
     CrossRecordingEventIdentityError,
     EventIdentityAssignmentDisposition,
     EventIdentityInputError,
@@ -25,12 +32,15 @@ from robata.event_pipeline.identity_registry import (
     EventIdentityRegistryService,
     ExactFingerprintEventIdentityResolver,
     InMemoryEventIdentityRegistryRepository,
+    OutputAdmissionProof,
     PlatformEnrichedEventHypothesis,
     PlatformEnrichedOutputReference,
-    ProductionAdmissionProof,
     ProductionAdmittedHypothesisFact,
     ProductionOutputAdmissionPolicyRef,
-    ProductionOutputAdmissionProof,
+    ProductionQualificationUnavailableError,
+    admission_proof_projection,
+    event_hypothesis_semantic_projection,
+    output_admission_projection,
     platform_enriched_output_logical_projection,
 )
 from robata.inference.enrichment import SelectedAttemptOutput
@@ -158,8 +168,8 @@ def _output_proof(
     output,
     *facts: ProductionAdmittedHypothesisFact,
     policy: ProductionOutputAdmissionPolicyRef = OUTPUT_ADMISSION_POLICY,
-) -> ProductionOutputAdmissionProof:
-    return ProductionOutputAdmissionProof.create(
+) -> OutputAdmissionProof:
+    return OutputAdmissionProof.create(
         recording_identity=context.recording_identity,
         source_enrichments=(PlatformEnrichedOutputReference.from_output(output),),
         admitted_hypothesis_facts=facts,
@@ -175,7 +185,7 @@ def _hypothesis(
     end_ns: int,
     fingerprint: str,
     ordinal: int,
-    output_proof: ProductionOutputAdmissionProof | None = None,
+    output_proof: OutputAdmissionProof | None = None,
 ) -> PlatformEnrichedEventHypothesis:
     references = (PlatformEnrichedOutputReference.from_output(output),)
     fact = _hypothesis_fact(
@@ -191,9 +201,45 @@ def _hypothesis(
         fusion_logical_key=fact.fusion_logical_key,
         fusion_output_ordinal=ordinal,
         source_enrichments=references,
-        production_admission=ProductionAdmissionProof.from_context(context),
+        production_admission=AdmissionProof.from_context(context),
         production_output_admission=output_proof or _output_proof(context, output, fact),
     )
+
+
+def _evidence_lineage(
+    context,
+    output,
+    evidence_class: AdmissionEvidenceClass,
+) -> tuple[AdmissionProof, OutputAdmissionProof, PlatformEnrichedEventHypothesis]:
+    fact = _hypothesis_fact(
+        start_ns=10,
+        end_ns=20,
+        fingerprint="evidence-tier-event",
+        ordinal=0,
+    )
+    references = (PlatformEnrichedOutputReference.from_output(output),)
+    admission = AdmissionProof.from_context(
+        context,
+        evidence_class=evidence_class,
+    )
+    output_proof = OutputAdmissionProof.create(
+        recording_identity=context.recording_identity,
+        source_enrichments=references,
+        admitted_hypothesis_facts=(fact,),
+        policy=OUTPUT_ADMISSION_POLICY,
+        evidence_class=evidence_class,
+    )
+    hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=context.recording_identity,
+        effective_interval=fact.effective_interval,
+        semantic_fingerprint_sha256=fact.semantic_fingerprint_sha256,
+        fusion_logical_key=fact.fusion_logical_key,
+        fusion_output_ordinal=fact.fusion_output_ordinal,
+        source_enrichments=references,
+        production_admission=admission,
+        production_output_admission=output_proof,
+    )
+    return admission, output_proof, hypothesis
 
 
 class _SequenceAllocator:
@@ -237,6 +283,164 @@ def _service(repository, allocator) -> EventIdentityRegistryService:
         output_admission_policy=OUTPUT_ADMISSION_POLICY,
         max_cas_retries=4,
     )
+
+
+def test_nonproduction_evidence_class_is_hash_bearing() -> None:
+    context = _context()
+    output = _enriched_output(context)
+    lineages = {
+        evidence_class: _evidence_lineage(context, output, evidence_class)
+        for evidence_class in (
+            AdmissionEvidenceClass.LOCAL_CONFORMANCE,
+            AdmissionEvidenceClass.GOVERNED_BENCHMARK,
+        )
+    }
+
+    for evidence_class, (admission, output_proof, hypothesis) in lineages.items():
+        assert admission.decision == output_proof.decision == "ADMITTED"
+        assert admission.evidence_class is output_proof.evidence_class is evidence_class
+        assert admission.production_eligible is False
+        assert output_proof.production_eligible is False
+        assert (
+            admission_proof_projection(admission)["semantic_projection_version"]
+            == ADMISSION_PROOF_SEMANTIC_PROJECTION_VERSION
+        )
+        assert (
+            output_admission_projection(output_proof)["semantic_projection_version"]
+            == OUTPUT_ADMISSION_SEMANTIC_PROJECTION_VERSION
+        )
+        assert (
+            event_hypothesis_semantic_projection(hypothesis)["semantic_projection_version"]
+            == EVENT_HYPOTHESIS_SEMANTIC_PROJECTION_VERSION
+        )
+        assert hypothesis.event_hypothesis_logical_key.startswith(
+            f"{EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE}:"
+        )
+
+    assert len({item[1].semantic_sha256 for item in lineages.values()}) == 2
+    assert len({item[2].semantic_sha256 for item in lineages.values()}) == 2
+    assert len({item[2].event_hypothesis_logical_key for item in lineages.values()}) == 2
+
+
+def test_evidence_metadata_rejects_inconsistent_production_eligibility() -> None:
+    context = _context()
+    output = _enriched_output(context)
+    admission, output_proof, _ = _evidence_lineage(
+        context,
+        output,
+        AdmissionEvidenceClass.LOCAL_CONFORMANCE,
+    )
+
+    admission_values = admission.model_dump(mode="python")
+    admission_values["production_eligible"] = True
+    with pytest.raises(ValidationError, match="production_eligible"):
+        AdmissionProof.model_validate(admission_values, strict=True)
+
+    output_values = output_proof.model_dump(mode="python")
+    output_values["production_eligible"] = True
+    with pytest.raises(ValidationError, match="production_eligible"):
+        OutputAdmissionProof.model_validate(output_values, strict=True)
+
+
+def test_v1_admission_status_and_event_namespace_fail_closed() -> None:
+    context = _context()
+    output = _enriched_output(context)
+    admission, output_proof, hypothesis = _evidence_lineage(
+        context,
+        output,
+        AdmissionEvidenceClass.LOCAL_CONFORMANCE,
+    )
+
+    for model, proof in (
+        (AdmissionProof, admission),
+        (OutputAdmissionProof, output_proof),
+    ):
+        values = proof.model_dump(mode="python")
+        values["decision"] = "PRODUCTION_ADMITTED"
+        with pytest.raises(ValidationError, match="ADMITTED"):
+            model.model_validate(values, strict=True)
+
+    hypothesis_values = hypothesis.model_dump(mode="python")
+    hypothesis_values["event_hypothesis_logical_key"] = (
+        f"event-hypothesis:{hypothesis.semantic_sha256}"
+    )
+    with pytest.raises(ValidationError, match="unexpected namespace"):
+        PlatformEnrichedEventHypothesis.model_validate(hypothesis_values, strict=True)
+
+    output_values = output_proof.model_dump(mode="python")
+    output_values["schema_version"] = "1.0"
+    with pytest.raises(ValidationError, match=r"2\.0"):
+        OutputAdmissionProof.model_validate(output_values, strict=True)
+
+    hypothesis_values = hypothesis.model_dump(mode="python")
+    hypothesis_values["schema_version"] = "1.0"
+    with pytest.raises(ValidationError, match=r"2\.0"):
+        PlatformEnrichedEventHypothesis.model_validate(hypothesis_values, strict=True)
+
+
+def test_production_qualification_cannot_be_self_minted() -> None:
+    context = _context()
+    output = _enriched_output(context)
+    fact = _hypothesis_fact(
+        start_ns=10,
+        end_ns=20,
+        fingerprint="production-qualified",
+        ordinal=0,
+    )
+
+    with pytest.raises(
+        ProductionQualificationUnavailableError,
+        match="governed qualification gateway",
+    ):
+        AdmissionProof.from_context(
+            context,
+            evidence_class=AdmissionEvidenceClass.PRODUCTION_QUALIFIED,
+        )
+    with pytest.raises(
+        ProductionQualificationUnavailableError,
+        match="governed qualification gateway",
+    ):
+        OutputAdmissionProof.create(
+            recording_identity=context.recording_identity,
+            source_enrichments=(PlatformEnrichedOutputReference.from_output(output),),
+            admitted_hypothesis_facts=(fact,),
+            policy=OUTPUT_ADMISSION_POLICY,
+            evidence_class=AdmissionEvidenceClass.PRODUCTION_QUALIFIED,
+        )
+
+    admission = AdmissionProof.from_context(context)
+    admission_values = admission.model_dump(mode="python")
+    admission_values.update(
+        evidence_class=AdmissionEvidenceClass.PRODUCTION_QUALIFIED,
+        production_eligible=True,
+    )
+    with pytest.raises(ValidationError, match="governed qualification gateway"):
+        AdmissionProof.model_validate(admission_values, strict=True)
+
+    output_proof = _output_proof(context, output, fact)
+    output_values = output_proof.model_dump(mode="python")
+    output_values.update(
+        evidence_class=AdmissionEvidenceClass.PRODUCTION_QUALIFIED,
+        production_eligible=True,
+    )
+    with pytest.raises(ValidationError, match="governed qualification gateway"):
+        OutputAdmissionProof.model_validate(output_values, strict=True)
+
+    policy = EventIdentityPolicyRef(
+        version="exact-fingerprint-v1",
+        semantic_sha256=_digest("exact-fingerprint-v1"),
+    )
+    with pytest.raises(
+        ProductionQualificationUnavailableError,
+        match="governed qualification gateway",
+    ):
+        EventIdentityRegistryService(
+            repository=InMemoryEventIdentityRegistryRepository(),
+            resolver=ExactFingerprintEventIdentityResolver(policy),
+            allocator=_SequenceAllocator(),
+            output_admission_policy=OUTPUT_ADMISSION_POLICY,
+            admission_evidence_class=AdmissionEvidenceClass.PRODUCTION_QUALIFIED,
+        )
 
 
 def test_canonical_batch_reuses_exact_fingerprint_and_replay_is_idempotent() -> None:
@@ -332,13 +536,13 @@ def test_logical_identity_converges_across_exact_attempt_and_artifact_locators()
         platform_enriched_output_logical_projection(second_reference)
     )
 
-    first_proof = ProductionOutputAdmissionProof.create(
+    first_proof = OutputAdmissionProof.create(
         recording_identity=context.recording_identity,
         source_enrichments=(first_reference,),
         admitted_hypothesis_facts=(fact,),
         policy=OUTPUT_ADMISSION_POLICY,
     )
-    second_proof = ProductionOutputAdmissionProof.create(
+    second_proof = OutputAdmissionProof.create(
         recording_identity=context.recording_identity,
         source_enrichments=(second_reference,),
         admitted_hypothesis_facts=(fact,),
@@ -351,7 +555,7 @@ def test_logical_identity_converges_across_exact_attempt_and_artifact_locators()
         fusion_logical_key=fact.fusion_logical_key,
         fusion_output_ordinal=fact.fusion_output_ordinal,
         source_enrichments=(first_reference,),
-        production_admission=ProductionAdmissionProof.from_context(context),
+        production_admission=AdmissionProof.from_context(context),
         production_output_admission=first_proof,
     )
     second_hypothesis = PlatformEnrichedEventHypothesis.create(
@@ -361,7 +565,7 @@ def test_logical_identity_converges_across_exact_attempt_and_artifact_locators()
         fusion_logical_key=fact.fusion_logical_key,
         fusion_output_ordinal=fact.fusion_output_ordinal,
         source_enrichments=(second_reference,),
-        production_admission=ProductionAdmissionProof.from_context(context),
+        production_admission=AdmissionProof.from_context(context),
         production_output_admission=second_proof,
     )
 
@@ -411,13 +615,13 @@ def test_logical_identity_separates_distinct_enrichment_logical_keys() -> None:
         fingerprint="same-event-facts",
         ordinal=0,
     )
-    first_proof = ProductionOutputAdmissionProof.create(
+    first_proof = OutputAdmissionProof.create(
         recording_identity=context.recording_identity,
         source_enrichments=(first_reference,),
         admitted_hypothesis_facts=(fact,),
         policy=OUTPUT_ADMISSION_POLICY,
     )
-    second_proof = ProductionOutputAdmissionProof.create(
+    second_proof = OutputAdmissionProof.create(
         recording_identity=context.recording_identity,
         source_enrichments=(second_reference,),
         admitted_hypothesis_facts=(fact,),
@@ -430,7 +634,7 @@ def test_logical_identity_separates_distinct_enrichment_logical_keys() -> None:
         fusion_logical_key=fact.fusion_logical_key,
         fusion_output_ordinal=fact.fusion_output_ordinal,
         source_enrichments=(first_reference,),
-        production_admission=ProductionAdmissionProof.from_context(context),
+        production_admission=AdmissionProof.from_context(context),
         production_output_admission=first_proof,
     )
     second_hypothesis = PlatformEnrichedEventHypothesis.create(
@@ -440,7 +644,7 @@ def test_logical_identity_separates_distinct_enrichment_logical_keys() -> None:
         fusion_logical_key=fact.fusion_logical_key,
         fusion_output_ordinal=fact.fusion_output_ordinal,
         source_enrichments=(second_reference,),
-        production_admission=ProductionAdmissionProof.from_context(context),
+        production_admission=AdmissionProof.from_context(context),
         production_output_admission=second_proof,
     )
 
@@ -464,8 +668,8 @@ def test_registry_rejects_forged_enrichment_lineage() -> None:
         fusion_logical_key=f"fusion:{_digest('fusion')}",
         fusion_output_ordinal=0,
         source_enrichments=(reference,),
-        production_admission=ProductionAdmissionProof.from_context(context),
-        production_output_admission=ProductionOutputAdmissionProof.create(
+        production_admission=AdmissionProof.from_context(context),
+        production_output_admission=OutputAdmissionProof.create(
             recording_identity=context.recording_identity,
             source_enrichments=(reference,),
             admitted_hypothesis_facts=(
@@ -507,8 +711,8 @@ def test_registry_rejects_an_unconfigured_output_admission_policy() -> None:
         fusion_logical_key=f"fusion:{_digest('fusion-other-policy')}",
         fusion_output_ordinal=0,
         source_enrichments=references,
-        production_admission=ProductionAdmissionProof.from_context(context),
-        production_output_admission=ProductionOutputAdmissionProof.create(
+        production_admission=AdmissionProof.from_context(context),
+        production_output_admission=OutputAdmissionProof.create(
             recording_identity=context.recording_identity,
             source_enrichments=references,
             admitted_hypothesis_facts=(

@@ -163,6 +163,7 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "model-inference",
         "orchestrator-enriched-output",
         "parsed-provider-claim-artifact",
+        "primary-completion-record",
         "processing-run-node-membership",
         "provider-claim-payload",
         "raw-provider-response-artifact",

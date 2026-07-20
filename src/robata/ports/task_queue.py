@@ -37,6 +37,7 @@ class LeaseStatus(StrEnum):
 class TaskQueueErrorCode(StrEnum):
     """Stable machine-readable failures at the task queue boundary."""
 
+    ADAPTER_UNAVAILABLE = "ADAPTER_UNAVAILABLE"
     INVALID_REQUEST = "INVALID_REQUEST"
     DUPLICATE_TASK = "DUPLICATE_TASK"
     TASK_NOT_FOUND = "TASK_NOT_FOUND"
@@ -184,7 +185,7 @@ class TaskQueue(Protocol):
     Implementations must make claim/heartbeat/complete/fail atomic with respect
     to competing workers.  The in-memory fake provides this contract for local
     tests; Redis/PostgreSQL adapters remain intentionally out of scope for the
-    local mainline and must not be imported by this module.
+    local analysis runner and must not be imported by this module.
     """
 
     def enqueue(self, task: PipelineTask) -> TaskId:

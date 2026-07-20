@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import robata.inference.input_plan as input_plan_module
 from robata.contracts.cameras import CAMERA_IDS
 from robata.contracts.hashing import semantic_sha256
 from robata.inference.adapter import (
@@ -29,6 +30,16 @@ from robata.inference.call_barrier import (
     InMemoryInferenceCallBarrierStorage,
 )
 from robata.inference.input_plan import (
+    CALL_BARRIER_LOGICAL_KEY_NAMESPACE,
+    CALL_BARRIER_SEMANTIC_PROJECTION_VERSION,
+    CALL_IDEMPOTENCY_KEY_NAMESPACE,
+    CALL_IDEMPOTENCY_KEY_POLICY_VERSION,
+    CALL_PART_LOGICAL_KEY_NAMESPACE,
+    CALL_PART_SEMANTIC_PROJECTION_VERSION,
+    CALL_PLAN_SEMANTIC_PROJECTION_VERSION,
+    INFERENCE_INPUT_PLANNER_VERSION,
+    INPUT_PLAN_SEMANTIC_PROJECTION_VERSION,
+    REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION,
     ApplicableProviderLimits,
     CallPartSpec,
     CatalogCamera,
@@ -45,6 +56,8 @@ from robata.inference.input_plan import (
     RenderedArtifact,
     RenderedProviderItem,
     TransformOperation,
+    input_plan_semantic_projection,
+    request_catalog_semantic_projection,
 )
 from robata.inference.models import (
     ConcurrencyClass,
@@ -122,7 +135,7 @@ def _target(*, row_offset: int = 0) -> InputPlanTarget:
         model_name="vision-model",
         model_version="1.0",
         adapter_version="adapter-1",
-        planner_version="planner-1",
+        planner_version=INFERENCE_INPUT_PLANNER_VERSION,
         capability_snapshot_id=_uuid(700 + row_offset),
         capability_snapshot_sha256=_digest(701),
     )
@@ -157,7 +170,7 @@ def _fixture(
     max_images: int | None = 4,
     prompt_output: PromptOutputContract | None = None,
 ):
-    planner = InferenceInputPlanner("planner-1")
+    planner = InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION)
     package = _package(
         row_offset=row_offset,
         semantic_content_sha256=semantic_content_sha256,
@@ -227,6 +240,27 @@ def _fixture(
     return planner, catalog, items, plan
 
 
+def _identity_values(plan: InferenceInputPlan) -> dict[str, str]:
+    return {
+        "request_catalog": plan.request_catalog.semantic_sha256,
+        "input_plan": plan.semantic_sha256,
+        "call_plan": plan.call_plan.call_plan_sha256,
+        "call_part": plan.call_plan.parts[0].part_semantic_sha256,
+        "barrier": plan.call_plan.barrier_semantic_sha256,
+        "idempotency": plan.call_plan.parts[0].idempotency_key,
+    }
+
+
+def test_legacy_planner_version_is_rejected() -> None:
+    with pytest.raises(ValueError, match=INFERENCE_INPUT_PLANNER_VERSION):
+        InferenceInputPlanner("planner-1")
+
+    payload = _fixture()[3].model_dump(mode="json")
+    payload["target"]["planner_version"] = "planner-1"
+    with pytest.raises(ValidationError, match=INFERENCE_INPUT_PLANNER_VERSION):
+        InferenceInputPlan.model_validate_json(json.dumps(payload))
+
+
 def test_builds_lossless_ordered_plan_with_limits_and_barrier() -> None:
     _, catalog, items, plan = _fixture()
 
@@ -236,9 +270,66 @@ def test_builds_lossless_ordered_plan_with_limits_and_barrier() -> None:
     assert [part.overlap_after_items for part in plan.call_plan.parts] == [1, 0]
     assert plan.measured_limits.max_images_per_request == 4
     assert all(decision.status is LimitDecisionStatus.PASS for decision in plan.limit_decisions)
-    assert plan.call_plan.barrier_logical_key.startswith("inference-input-barrier:")
+    assert plan.call_plan.barrier_logical_key.startswith(f"{CALL_BARRIER_LOGICAL_KEY_NAMESPACE}:")
+    assert all(
+        part.part_logical_key.startswith(f"{CALL_PART_LOGICAL_KEY_NAMESPACE}:")
+        for part in plan.call_plan.parts
+    )
+    assert all(
+        part.idempotency_key.startswith(f"{CALL_IDEMPOTENCY_KEY_NAMESPACE}:")
+        for part in plan.call_plan.parts
+    )
     assert len({part.idempotency_key for part in plan.call_plan.parts}) == 2
     assert tuple(item.provider_item_ordinal for item in items) == tuple(range(6))
+
+
+@pytest.mark.parametrize(
+    ("constant_name", "identity_name"),
+    (
+        ("REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION", "request_catalog"),
+        ("INPUT_PLAN_SEMANTIC_PROJECTION_VERSION", "input_plan"),
+        ("CALL_PLAN_SEMANTIC_PROJECTION_VERSION", "call_plan"),
+        ("CALL_PART_SEMANTIC_PROJECTION_VERSION", "call_part"),
+        ("CALL_BARRIER_SEMANTIC_PROJECTION_VERSION", "barrier"),
+        ("CALL_IDEMPOTENCY_KEY_POLICY_VERSION", "idempotency"),
+    ),
+)
+def test_v2_identity_policy_markers_are_hash_bearing(
+    monkeypatch: pytest.MonkeyPatch,
+    constant_name: str,
+    identity_name: str,
+) -> None:
+    baseline = _identity_values(_fixture()[3])
+    marker = getattr(input_plan_module, constant_name)
+    assert isinstance(marker, str) and marker.endswith("-v2")
+
+    monkeypatch.setattr(input_plan_module, constant_name, f"{marker}-migration-test")
+    migrated = _identity_values(_fixture()[3])
+
+    assert migrated[identity_name] != baseline[identity_name]
+
+
+def test_v2_projection_markers_are_explicit() -> None:
+    plan = _fixture()[3]
+
+    assert (
+        request_catalog_semantic_projection(plan.request_catalog)["semantic_projection_version"]
+        == REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION
+    )
+    assert input_plan_semantic_projection(plan)["semantic_projection_version"] == (
+        INPUT_PLAN_SEMANTIC_PROJECTION_VERSION
+    )
+    assert {
+        CALL_PLAN_SEMANTIC_PROJECTION_VERSION,
+        CALL_PART_SEMANTIC_PROJECTION_VERSION,
+        CALL_BARRIER_SEMANTIC_PROJECTION_VERSION,
+        CALL_IDEMPOTENCY_KEY_POLICY_VERSION,
+    } == {
+        "inference-call-plan-semantic-v2",
+        "inference-call-part-semantic-v2",
+        "inference-call-barrier-semantic-v2",
+        "inference-call-idempotency-key-v2",
+    }
 
 
 def test_semantic_identity_excludes_row_ids_locators_and_clock_fields() -> None:
@@ -329,6 +420,29 @@ def test_plan_digest_tampering_and_catalog_digest_tampering_fail_closed() -> Non
     payload = plan.model_dump(mode="json")
     payload["request_catalog"]["semantic_sha256"] = _digest(9998)
     with pytest.raises(ValidationError, match="semantic_sha256"):
+        InferenceInputPlan.model_validate_json(json.dumps(payload))
+
+
+def test_v1_identity_key_namespaces_are_rejected() -> None:
+    plan = _fixture()[3]
+
+    payload = plan.model_dump(mode="json")
+    part = payload["call_plan"]["parts"][0]
+    part_digest = part["part_semantic_sha256"]
+    part["part_logical_key"] = f"inference-input-call-part:{part_digest}"
+    with pytest.raises(ValidationError, match="call part semantic identity"):
+        InferenceInputPlan.model_validate_json(json.dumps(payload))
+
+    payload = plan.model_dump(mode="json")
+    call_plan = payload["call_plan"]
+    barrier_digest = call_plan["barrier_semantic_sha256"]
+    call_plan["barrier_logical_key"] = f"inference-input-barrier:{barrier_digest}"
+    with pytest.raises(ValidationError, match="barrier identity"):
+        InferenceInputPlan.model_validate_json(json.dumps(payload))
+
+    payload = plan.model_dump(mode="json")
+    payload["call_plan"]["parts"][0]["idempotency_key"] = "inference-input-call:" + ("0" * 64)
+    with pytest.raises(ValidationError, match="idempotency_key"):
         InferenceInputPlan.model_validate_json(json.dumps(payload))
 
 

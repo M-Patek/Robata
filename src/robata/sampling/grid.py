@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from math import gcd
@@ -115,12 +115,13 @@ class SamplingGrid:
             return quotient
         return quotient + 1
 
-    def enumerate_targets(self, start_ns: int, end_ns: int) -> tuple[SamplingTarget, ...]:
-        """Enumerate unique rounded targets in the half-open effective interval.
+    def iter_unique_targets(self, start_ns: int, end_ns: int) -> Iterator[SamplingTarget]:
+        """Yield unique rounded targets in the half-open effective interval.
 
         The persisted origin is never changed, so clipping an interval cannot reset grid
-        phase.  Iteration starts at the exact first covering index and therefore naturally
-        supports negative ``k`` values.
+        phase. Iteration retains the lowest ``k`` for each rounded timestamp. The inverse
+        boundary jump also avoids scanning every duplicate ``k`` when a rate exceeds
+        nanosecond timestamp resolution.
         """
 
         _require_int64("start_ns", start_ns)
@@ -130,15 +131,17 @@ class SamplingGrid:
 
         first_k = self._first_k_at_or_after(start_ns)
         stop_k = self._first_k_at_or_after(end_ns)
-        targets: list[SamplingTarget] = []
-        previous_target_ns: int | None = None
-        for k in range(first_k, stop_k):
+        k = first_k
+        while k < stop_k:
             target_ns = self.target_ns(k)
-            if target_ns == previous_target_ns:
-                continue
-            targets.append(SamplingTarget(k=k, target_ns=target_ns))
-            previous_target_ns = target_ns
-        return tuple(targets)
+            yield SamplingTarget(k=k, target_ns=target_ns)
+            # ``target_ns < end_ns <= INT64_MAX``, so the increment cannot overflow.
+            k = self._first_k_at_or_after(target_ns + 1)
+
+    def enumerate_targets(self, start_ns: int, end_ns: int) -> tuple[SamplingTarget, ...]:
+        """Enumerate unique rounded targets in the half-open effective interval."""
+
+        return tuple(self.iter_unique_targets(start_ns, end_ns))
 
     def targets(self, start_ns: int, end_ns: int) -> tuple[SamplingTarget, ...]:
         """Alias for :meth:`enumerate_targets`."""

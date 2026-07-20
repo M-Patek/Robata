@@ -1,12 +1,5 @@
 """Concrete local adapters for optional ingestion dependencies."""
 
-from robata.adapters.fake_vision_model import (
-    FAKE_MODEL_NAME,
-    FAKE_MODEL_VERSION,
-    FAKE_PROVIDER,
-    DeterministicFakeVisionModelAdapter,
-    FakeVisionModelAdapter,
-)
 from robata.adapters.in_memory_task_queue import InMemoryTaskQueue
 from robata.adapters.local_artifact_registry import (
     LocalArtifactRegistry,
@@ -65,11 +58,6 @@ __all__ = [
     "EXPORT_CONFIG",
     "EXPORT_PROFILE_ID",
     "EXPORT_PROFILE_VERSION",
-    "FAKE_MODEL_NAME",
-    "FAKE_MODEL_VERSION",
-    "FAKE_PROVIDER",
-    "DeterministicFakeVisionModelAdapter",
-    "FakeVisionModelAdapter",
     "InMemoryTaskQueue",
     "LocalArtifactRegistry",
     "LocalLogicalNodeRegistry",

@@ -6,14 +6,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
-from collections.abc import Callable
+import stat
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar, cast
+from typing import Annotated, Any, BinaryIO, Literal, TypeVar, cast
 
 from jsonschema import Draft202012Validator, FormatChecker, validators
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -27,6 +30,9 @@ from robata.contracts.common import StrictModel
 DEFAULT_SCHEMA_CATALOG = Path(__file__).resolve().parents[3] / "schemas" / "schema-catalog.json"
 CATALOG_SCHEMA_FILENAME = "schema-catalog.schema.json"
 DEFAULT_SOFTWARE_VERSION = "0.1.0"
+SCHEMA_PUBLICATION_LOCK_FILENAME = ".schema-registration.lock"
+SCHEMA_PUBLICATION_MARKER_FILENAME = ".schema-publication-transaction.json"
+SCHEMA_PUBLICATION_MARKER_FORMAT = "robata-schema-publication-transaction-v1"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 _WIRE_VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 _SCHEMA_ID_PATTERN = r"^https://schemas\.robata\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
@@ -213,22 +219,40 @@ class SchemaCatalogEntry(StrictModel):
     supported_predecessors: tuple[SchemaRef, ...] = ()
 
 
+class GoldenVectorCatalogEntry(StrictModel):
+    input_artifact_path: _NonEmpty
+    input_sha256: _Digest
+    output_artifact_path: _NonEmpty
+    output_sha256: _Digest
+
+
 class UpcasterCatalogEntry(StrictModel):
     upcaster_id: _UpcasterId
     source: SchemaRef
     target: SchemaRef
     code_artifact_id: _ArtifactId
+    code_artifact_path: _NonEmpty
     code_sha256: _Digest
     runtime_artifact_id: _ArtifactId
+    runtime_artifact_path: _NonEmpty
     runtime_sha256: _Digest
-    golden_vector_sha256: tuple[_Digest, ...]
+    golden_vectors: tuple[GoldenVectorCatalogEntry, ...]
 
     @model_validator(mode="after")
     def require_golden_vectors(self) -> UpcasterCatalogEntry:
-        if not self.golden_vector_sha256:
-            raise ValueError("at least one golden vector digest is required")
-        if len(set(self.golden_vector_sha256)) != len(self.golden_vector_sha256):
-            raise ValueError("golden vector digests must be unique")
+        if not self.golden_vectors:
+            raise ValueError("at least one golden vector pair is required")
+        pairs = {
+            (
+                vector.input_artifact_path,
+                vector.input_sha256,
+                vector.output_artifact_path,
+                vector.output_sha256,
+            )
+            for vector in self.golden_vectors
+        }
+        if len(pairs) != len(self.golden_vectors):
+            raise ValueError("golden vector pairs must be unique")
         return self
 
 
@@ -236,6 +260,14 @@ class SchemaCatalog(StrictModel):
     catalog_version: Literal["1.0"]
     schemas: tuple[SchemaCatalogEntry, ...]
     upcasters: tuple[UpcasterCatalogEntry, ...] = ()
+
+
+class _SchemaPublicationMarker(StrictModel):
+    format_version: Literal["robata-schema-publication-transaction-v1"]
+    artifact_path: _NonEmpty
+    artifact_sha256: _Digest
+    original_catalog_sha256: _Digest
+    new_catalog_sha256: _Digest
 
 
 @dataclass(frozen=True)
@@ -247,6 +279,25 @@ class RegisteredSchema:
     @property
     def ref(self) -> SchemaRef:
         return self.entry.ref
+
+
+@dataclass(frozen=True)
+class RegisteredGoldenVector:
+    entry: GoldenVectorCatalogEntry
+    input_path: Path
+    input_bytes: bytes
+    output_path: Path
+    output_bytes: bytes
+
+
+@dataclass(frozen=True)
+class RegisteredUpcaster:
+    entry: UpcasterCatalogEntry
+    code_path: Path
+    code_bytes: bytes
+    runtime_path: Path
+    runtime_bytes: bytes
+    golden_vectors: tuple[RegisteredGoldenVector, ...]
 
 
 class SchemaPinMismatchError(SchemaRegistryError):
@@ -498,14 +549,22 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _decode_json_object(source: str, raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SchemaDefinitionError(source, str(exc)) from exc
+    if not isinstance(value, dict):
+        raise SchemaDefinitionError(source, "document root must be an object")
+    return value
+
+
 def _load_json_object(path: Path) -> tuple[bytes, dict[str, Any]]:
     try:
         raw = path.read_bytes()
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except OSError as exc:
         raise SchemaDefinitionError(path.name, str(exc)) from exc
-    if not isinstance(value, dict):
-        raise SchemaDefinitionError(path.name, "document root must be an object")
+    value = _decode_json_object(path.name, raw)
     return raw, value
 
 
@@ -522,16 +581,173 @@ def _locate_catalog(source: str | Path | None) -> Path:
     raise SchemaRegistryError(f"schema catalog does not exist for: {resolved}")
 
 
+def _is_symlink_or_reparse(metadata: os.stat_result) -> bool:
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        reparse_attribute and file_attributes & reparse_attribute
+    )
+
+
+def _scan_schema_tree(root: Path) -> tuple[Path, ...]:
+    pending = [root]
+    paths: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                inspected = sorted(
+                    (
+                        Path(entry.path),
+                        entry.stat(follow_symlinks=False),
+                    )
+                    for entry in entries
+                )
+        except OSError as exc:
+            raise SchemaDefinitionError(directory.as_posix(), str(exc)) from exc
+        child_directories: list[Path] = []
+        for path, metadata in inspected:
+            if _is_symlink_or_reparse(metadata):
+                raise SchemaDefinitionError(
+                    path.relative_to(root).as_posix(),
+                    "schema tree must not contain a symlink or reparse point",
+                )
+            paths.append(path)
+            if stat.S_ISDIR(metadata.st_mode):
+                child_directories.append(path)
+        pending.extend(reversed(child_directories))
+    return tuple(paths)
+
+
 def _resolve_artifact_path(root: Path, relative: str) -> Path:
     if "\\" in relative or Path(relative).is_absolute():
         raise SchemaDefinitionError(relative, "artifact_path must be a relative POSIX path")
     parts = relative.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise SchemaDefinitionError(relative, "artifact_path contains an unsafe path segment")
-    resolved = (root / Path(*parts)).resolve()
+    lexical = root / Path(*parts)
+    cursor = root
+    for part in parts:
+        cursor /= part
+        if not cursor.exists() and not cursor.is_symlink():
+            break
+        try:
+            metadata = cursor.lstat()
+        except OSError as exc:
+            raise SchemaDefinitionError(relative, f"cannot inspect artifact_path: {exc}") from exc
+        if _is_symlink_or_reparse(metadata):
+            raise SchemaDefinitionError(
+                relative,
+                "artifact_path traverses a symlink or reparse point",
+            )
+    try:
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise SchemaDefinitionError(relative, f"cannot resolve artifact_path: {exc}") from exc
     if not resolved.is_relative_to(root):
         raise SchemaDefinitionError(relative, "artifact_path escapes the catalog directory")
     return resolved
+
+
+def _lock_schema_reader(stream: BinaryIO) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(stream.fileno(), fcntl.LOCK_SH)  # type: ignore[attr-defined]
+
+
+def _unlock_schema_reader(stream: BinaryIO) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+
+
+def _validate_existing_schema_lock(lock_path: Path) -> None:
+    try:
+        metadata = lock_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SchemaRegistryError(f"cannot inspect schema publication lock: {exc}") from exc
+    if _is_symlink_or_reparse(metadata):
+        raise SchemaRegistryError("schema publication lock must not be a symlink or reparse point")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SchemaRegistryError("schema publication lock must be a regular file")
+
+
+def _open_schema_lock(lock_path: Path, *, writable: bool) -> BinaryIO:
+    flags = (os.O_RDWR | os.O_CREAT) if writable else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    if os.name != "nt":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SchemaRegistryError("schema publication lock must be a regular file")
+        return os.fdopen(descriptor, "r+b" if writable else "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _schema_publication_read_lock(schema_root: Path, *, enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+
+    lock_path = schema_root / SCHEMA_PUBLICATION_LOCK_FILENAME
+    _validate_existing_schema_lock(lock_path)
+    stream: BinaryIO
+    try:
+        stream = _open_schema_lock(lock_path, writable=True)
+    except OSError as writable_error:
+        _validate_existing_schema_lock(lock_path)
+        try:
+            stream = _open_schema_lock(lock_path, writable=False)
+        except FileNotFoundError:
+            # A read-only registry cannot have a concurrent local publisher.
+            yield
+            return
+        except OSError as exc:
+            raise SchemaRegistryError(f"cannot open schema publication lock: {exc}") from exc
+        if stream.seek(0, os.SEEK_END) == 0:
+            stream.close()
+            raise SchemaRegistryError(
+                f"schema publication lock is empty and not writable: {writable_error}"
+            ) from writable_error
+    else:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+
+    locked = False
+    try:
+        _lock_schema_reader(stream)
+        locked = True
+    except OSError as exc:
+        stream.close()
+        raise SchemaRegistryError(f"cannot acquire schema publication read lock: {exc}") from exc
+    try:
+        yield
+    finally:
+        if locked:
+            _unlock_schema_reader(stream)
+        stream.close()
 
 
 class _CatalogSchemaRegistry:
@@ -542,29 +758,37 @@ class _CatalogSchemaRegistry:
         catalog: str | Path | None = None,
         *,
         software_version: str = DEFAULT_SOFTWARE_VERSION,
+        _skip_publication_lock: bool = False,
     ) -> None:
         _version_key(software_version)
         self.software_version = software_version
         self.catalog_path = _locate_catalog(catalog)
         self.schema_root = self.catalog_path.parent.resolve()
-        catalog_raw, catalog_data = _load_json_object(self.catalog_path)
-        self._validate_catalog_document(catalog_data)
-        try:
-            self.catalog = SchemaCatalog.model_validate_json(catalog_raw, strict=True)
-        except PydanticValidationError as exc:
-            raise SchemaDefinitionError(self.catalog_path.name, str(exc)) from exc
+        with _schema_publication_read_lock(
+            self.schema_root,
+            enabled=not _skip_publication_lock,
+        ):
+            catalog_raw, catalog_data = _load_json_object(self.catalog_path)
+            self._catalog_sha256 = hashlib.sha256(catalog_raw).hexdigest()
+            self._validate_catalog_document(catalog_data)
+            try:
+                self.catalog = SchemaCatalog.model_validate_json(catalog_raw, strict=True)
+            except PydanticValidationError as exc:
+                raise SchemaDefinitionError(self.catalog_path.name, str(exc)) from exc
 
-        self._registered_by_key: dict[tuple[str, str], RegisteredSchema] = {}
-        self._registered_by_artifact_id: dict[str, RegisteredSchema] = {}
-        self._registered_by_digest: dict[str, RegisteredSchema] = {}
-        self._registered_by_document_id: dict[str, RegisteredSchema] = {}
-        self._registered_by_path: dict[Path, RegisteredSchema] = {}
-        self._documents_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        self._aliases: dict[str, list[SchemaRef]] = {}
-        self._load_catalog_entries()
-        self._build_reference_registry()
-        self._validate_catalog_metadata()
-        self.validate_schema_documents()
+            self._registered_by_key: dict[tuple[str, str], RegisteredSchema] = {}
+            self._registered_by_artifact_id: dict[str, RegisteredSchema] = {}
+            self._registered_by_digest: dict[str, RegisteredSchema] = {}
+            self._registered_by_document_id: dict[str, RegisteredSchema] = {}
+            self._registered_by_path: dict[Path, RegisteredSchema] = {}
+            self._documents_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+            self._aliases: dict[str, list[SchemaRef]] = {}
+            self._registered_upcasters_by_id: dict[str, RegisteredUpcaster] = {}
+            self._load_catalog_entries()
+            self._build_reference_registry()
+            self._validate_catalog_metadata()
+            self._load_upcaster_artifacts()
+            self.validate_schema_documents()
 
     def _validate_catalog_metadata(self) -> None:
         for registered in self.entries:
@@ -619,7 +843,7 @@ class _CatalogSchemaRegistry:
             outgoing.setdefault(upcaster.source, []).append(upcaster.target)
             upcaster_nodes.update(edge)
             self.resolve_exact(upcaster.source, require_software_support=False)
-            self.resolve_exact(upcaster.target, require_software_support=False)
+            target_registered = self.resolve_exact(upcaster.target, require_software_support=False)
             if upcaster.source.schema_id != upcaster.target.schema_id:
                 raise SchemaDefinitionError(
                     self.catalog_path.name,
@@ -629,6 +853,13 @@ class _CatalogSchemaRegistry:
                 raise SchemaDefinitionError(
                     self.catalog_path.name,
                     "upcaster source version must be lower than target version",
+                )
+
+            if upcaster.source not in target_registered.entry.supported_predecessors:
+                raise SchemaDefinitionError(
+                    self.catalog_path.name,
+                    "upcaster source must be a declared target predecessor: "
+                    f"{upcaster.upcaster_id}",
                 )
 
         ordered_nodes = sorted(
@@ -651,6 +882,123 @@ class _CatalogSchemaRegistry:
                             f"{target.schema_id}@{target.version}",
                         )
 
+    def _load_upcaster_artifacts(self) -> None:
+        for entry in self.catalog.upcasters:
+            code_path, code_bytes = self._load_pinned_artifact(
+                entry.code_artifact_path,
+                entry.code_sha256,
+                kind="upcaster code",
+            )
+            runtime_path, runtime_bytes = self._load_pinned_artifact(
+                entry.runtime_artifact_path,
+                entry.runtime_sha256,
+                kind="upcaster runtime",
+            )
+            _decode_json_object(entry.runtime_artifact_path, runtime_bytes)
+
+            golden_vectors: list[RegisteredGoldenVector] = []
+            for vector in entry.golden_vectors:
+                input_path, input_bytes = self._load_pinned_artifact(
+                    vector.input_artifact_path,
+                    vector.input_sha256,
+                    kind="upcaster golden input",
+                )
+                output_path, output_bytes = self._load_pinned_artifact(
+                    vector.output_artifact_path,
+                    vector.output_sha256,
+                    kind="upcaster golden output",
+                )
+                input_payload = _decode_json_object(vector.input_artifact_path, input_bytes)
+                output_payload = _decode_json_object(vector.output_artifact_path, output_bytes)
+                source = self.resolve_exact(entry.source, require_software_support=False)
+                target = self.resolve_exact(entry.target, require_software_support=False)
+                self._validate_registered(source, input_payload)
+                self._validate_registered(target, output_payload)
+                golden_vectors.append(
+                    RegisteredGoldenVector(
+                        entry=vector,
+                        input_path=input_path,
+                        input_bytes=input_bytes,
+                        output_path=output_path,
+                        output_bytes=output_bytes,
+                    )
+                )
+
+            self._registered_upcasters_by_id[entry.upcaster_id] = RegisteredUpcaster(
+                entry=entry,
+                code_path=code_path,
+                code_bytes=code_bytes,
+                runtime_path=runtime_path,
+                runtime_bytes=runtime_bytes,
+                golden_vectors=tuple(golden_vectors),
+            )
+
+    def _load_pinned_artifact(
+        self,
+        relative_path: str,
+        expected_sha256: str,
+        *,
+        kind: str,
+    ) -> tuple[Path, bytes]:
+        path = _resolve_artifact_path(self.schema_root, relative_path)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise SchemaDefinitionError(relative_path, f"cannot read {kind}: {exc}") from exc
+        actual_sha256 = hashlib.sha256(raw).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise SchemaDefinitionError(
+                relative_path,
+                f"exact SHA-256 mismatch: catalog={expected_sha256}, actual={actual_sha256}",
+            )
+        return path, raw
+
+    def _pending_publication_artifact(self) -> Path | None:
+        marker_path = self.schema_root / SCHEMA_PUBLICATION_MARKER_FILENAME
+        try:
+            marker_raw = marker_path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SchemaDefinitionError(marker_path.name, str(exc)) from exc
+        marker_data = _decode_json_object(marker_path.name, marker_raw)
+        try:
+            marker = _SchemaPublicationMarker.model_validate(marker_data, strict=True)
+        except PydanticValidationError as exc:
+            raise SchemaDefinitionError(marker_path.name, str(exc)) from exc
+        if self._catalog_sha256 not in {
+            marker.original_catalog_sha256,
+            marker.new_catalog_sha256,
+        }:
+            raise SchemaDefinitionError(
+                marker_path.name,
+                "publication marker does not match the current catalog digest",
+            )
+
+        target = _resolve_artifact_path(self.schema_root, marker.artifact_path)
+        target_present = target.exists() or target.is_symlink()
+        if not target_present:
+            if self._catalog_sha256 == marker.new_catalog_sha256:
+                raise SchemaDefinitionError(
+                    marker.artifact_path,
+                    "published marker artifact is missing",
+                )
+            return None
+        if not target.is_file():
+            raise SchemaDefinitionError(marker.artifact_path, "marker artifact is not a file")
+        try:
+            actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise SchemaDefinitionError(marker.artifact_path, str(exc)) from exc
+        if actual_sha256 != marker.artifact_sha256:
+            raise SchemaDefinitionError(
+                marker.artifact_path,
+                "publication marker artifact SHA-256 mismatch",
+            )
+        if self._catalog_sha256 == marker.original_catalog_sha256:
+            return target
+        return None
+
     @property
     def entries(self) -> tuple[RegisteredSchema, ...]:
         return tuple(self._registered_by_key[key] for key in sorted(self._registered_by_key))
@@ -666,6 +1014,13 @@ class _CatalogSchemaRegistry:
     @property
     def upcasters(self) -> tuple[UpcasterCatalogEntry, ...]:
         return self.catalog.upcasters
+
+    @property
+    def registered_upcasters(self) -> tuple[RegisteredUpcaster, ...]:
+        return tuple(
+            self._registered_upcasters_by_id[key]
+            for key in sorted(self._registered_upcasters_by_id)
+        )
 
     def _ensure_supported(self, registered: RegisteredSchema) -> None:
         entry = registered.entry
@@ -796,15 +1151,46 @@ class _CatalogSchemaRegistry:
                 self._add_alias(alias, entry.ref)
 
         cataloged = set(self._registered_by_path)
-        discovered = {
-            path.resolve()
-            for version_dir in self.schema_root.glob("v*")
-            if version_dir.is_dir()
-            for path in version_dir.rglob(f"*{SCHEMA_FILE_SUFFIX}")
-        }
-        missing = sorted(
-            path.relative_to(self.schema_root).as_posix() for path in discovered - cataloged
-        )
+        discovered: set[Path] = set()
+        tree_paths = _scan_schema_tree(self.schema_root)
+        for path in (item for item in tree_paths if item.name.endswith(SCHEMA_FILE_SUFFIX)):
+            relative = path.relative_to(self.schema_root)
+            cursor = self.schema_root
+            for part in relative.parts:
+                cursor /= part
+                try:
+                    path_metadata = cursor.lstat()
+                except OSError as exc:
+                    raise SchemaDefinitionError(path.as_posix(), str(exc)) from exc
+                if _is_symlink_or_reparse(path_metadata):
+                    raise SchemaDefinitionError(
+                        path.as_posix(),
+                        "schema path must not traverse a symlink or reparse point",
+                    )
+            if relative.parts == (CATALOG_SCHEMA_FILENAME,):
+                continue
+            if len(relative.parts) < 2 or re.fullmatch(r"v[0-9]+", relative.parts[0]) is None:
+                raise SchemaDefinitionError(
+                    relative.as_posix(),
+                    "schema document must live below a v[0-9]+ directory",
+                )
+            if not path.is_file():
+                raise SchemaDefinitionError(relative.as_posix(), "schema document is not a file")
+            try:
+                resolved = path.resolve()
+            except (OSError, RuntimeError) as exc:
+                raise SchemaDefinitionError(path.as_posix(), str(exc)) from exc
+            if not resolved.is_relative_to(self.schema_root):
+                raise SchemaDefinitionError(
+                    path.as_posix(),
+                    "discovered schema path escapes the catalog directory",
+                )
+            discovered.add(resolved)
+        uncataloged = discovered - cataloged
+        pending = self._pending_publication_artifact()
+        if pending is not None:
+            uncataloged.discard(pending)
+        missing = sorted(path.relative_to(self.schema_root).as_posix() for path in uncataloged)
         nonexistent = sorted(
             path.relative_to(self.schema_root).as_posix() for path in cataloged - discovered
         )
@@ -919,8 +1305,9 @@ class SchemaRegistry(_CatalogSchemaRegistry):
         catalog: str | Path | None = None,
         *,
         software_version: str = DEFAULT_SOFTWARE_VERSION,
+        _skip_publication_lock: bool = False,
     ) -> Any:
-        del software_version
+        del software_version, _skip_publication_lock
         if catalog is not None:
             source = Path(catalog).resolve()
             if source.is_dir() and not (source / DEFAULT_SCHEMA_CATALOG.name).is_file():
@@ -951,9 +1338,15 @@ __all__ = [
     "DEFAULT_SCHEMA_CATALOG",
     "DEFAULT_SCHEMA_DIRECTORY",
     "JSON_SCHEMA_DIALECT",
+    "SCHEMA_PUBLICATION_LOCK_FILENAME",
+    "SCHEMA_PUBLICATION_MARKER_FILENAME",
+    "SCHEMA_PUBLICATION_MARKER_FORMAT",
     "CompatibilityMode",
+    "GoldenVectorCatalogEntry",
     "PayloadValidationError",
+    "RegisteredGoldenVector",
     "RegisteredSchema",
+    "RegisteredUpcaster",
     "SchemaAmbiguityError",
     "SchemaCatalog",
     "SchemaCatalogEntry",

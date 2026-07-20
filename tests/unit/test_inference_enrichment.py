@@ -31,6 +31,7 @@ from robata.inference.enrichment import (
     orchestrator_enriched_output_projection,
 )
 from robata.inference.input_plan import (
+    INFERENCE_INPUT_PLANNER_VERSION,
     ApplicableProviderLimits,
     CallPartSpec,
     CatalogCamera,
@@ -78,7 +79,7 @@ def _input_plan(
     provider_schema: JsonSchemaRef,
     enriched_schema: JsonSchemaRef,
 ) -> InferenceInputPlan:
-    planner = InferenceInputPlanner("planner-1")
+    planner = InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION)
     cameras = tuple(
         CatalogCamera(
             camera_id=camera_id,
@@ -154,7 +155,7 @@ def _input_plan(
             model_name="vision-model",
             model_version="1.0",
             adapter_version="adapter-1",
-            planner_version="planner-1",
+            planner_version=INFERENCE_INPUT_PLANNER_VERSION,
             capability_snapshot_id=_uuid(501),
             capability_snapshot_sha256=_digest(502),
         ),

@@ -95,10 +95,12 @@
         "source",
         "target",
         "code_artifact_id",
+        "code_artifact_path",
         "code_sha256",
         "runtime_artifact_id",
+        "runtime_artifact_path",
         "runtime_sha256",
-        "golden_vector_sha256"
+        "golden_vectors"
       ],
       "properties": {
         "upcaster_id": {
@@ -108,15 +110,49 @@
         "source": {"$ref": "#/$defs/schemaRef"},
         "target": {"$ref": "#/$defs/schemaRef"},
         "code_artifact_id": {"$ref": "#/$defs/artifactId"},
+        "code_artifact_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        },
         "code_sha256": {"$ref": "#/$defs/digest"},
         "runtime_artifact_id": {"$ref": "#/$defs/artifactId"},
+        "runtime_artifact_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        },
         "runtime_sha256": {"$ref": "#/$defs/digest"},
-        "golden_vector_sha256": {
+        "golden_vectors": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": {"$ref": "#/$defs/digest"}
+          "items": {"$ref": "#/$defs/goldenVector"}
         }
+      }
+    },
+    "goldenVector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_artifact_path",
+        "input_sha256",
+        "output_artifact_path",
+        "output_sha256"
+      ],
+      "properties": {
+        "input_artifact_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        },
+        "input_sha256": {"$ref": "#/$defs/digest"},
+        "output_artifact_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        },
+        "output_sha256": {"$ref": "#/$defs/digest"}
       }
     }
   }

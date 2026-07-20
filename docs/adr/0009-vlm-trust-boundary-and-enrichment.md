@@ -63,8 +63,8 @@ claims, and orchestrator-enriched output to remain separate immutable artifacts.
   changes still produce distinct identities.
 - This SQLite graph is restartable local conformance evidence. It does not choose the O-14
   production database, object store, isolation model, recovery topology, or retention policy.
-- The old normalized adapter envelope remains for compatibility; it is not
-  evidence that the legacy application mainline has been rewired to this
+- The old normalized adapter envelope remains for compatibility. The legacy application runner
+  has been removed from the live package; archived results do not prove conformance to this
   boundary.
 - Durable output-decision/run/work/barrier records, production artifact storage, and a real
   provider adapter remain open governance/integration work.
@@ -75,7 +75,10 @@ claims, and orchestrator-enriched output to remain separate immutable artifacts.
 - `src/robata/inference/offline_fixture.py`
 - `src/robata/inference/evidence.py`
 - `src/robata/adapters/sqlite_inference_evidence.py`
-- `src/robata/application/canonical_offline.py`
+- `src/robata/application/canonical/runner.py`
+- `src/robata/application/canonical/result_validation.py`
+- `src/robata/application/canonical/output_admission.py`
+- `src/robata/application/canonical_offline.py` (public re-export facade only)
 - `src/robata/event_pipeline/identity_registry.py`
 - `schemas/v1/provider-claim-payload.schema.json`
 - `schemas/v1/inference-intent.schema.json`

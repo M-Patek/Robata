@@ -256,7 +256,7 @@ def test_production_catalog_pins_exact_inference_evidence_contracts() -> None:
 def test_every_catalog_entry_has_exact_digest_and_deterministic_id() -> None:
     registry = SchemaRegistry()
 
-    assert len(registry.entries) == 28
+    assert len(registry.entries) == 30
     assert registry.upcasters == ()
     for registered in registry.entries:
         digest = hashlib.sha256(registered.document_bytes).hexdigest()

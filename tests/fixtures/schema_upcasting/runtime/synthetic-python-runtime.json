@@ -1,0 +1,8 @@
+{
+  "runtime": "python",
+  "contract": "robata-schema-upcaster-fixture-v1",
+  "clock": false,
+  "database": false,
+  "network": false,
+  "randomness": false
+}

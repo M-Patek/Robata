@@ -10,7 +10,7 @@ from robata.contracts.common import (
     StrictModel,
 )
 from robata.contracts.logical_nodes import OpaqueUuid
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CandidateEvent,
     NonEmptyString,
     TemporalVisualPackage,
@@ -81,11 +81,10 @@ class EventProposer:
             proposed action intervals.  May be empty when no likely
             physical change is detected.
         """
-        # Skeleton: concrete algorithm to be implemented per Section 13.
-        _ = qa_complete_recording
-        _ = coarse_packages
-        _ = temporal_signals
-        return []
+        raise NotImplementedError(
+            "EventProposer.propose is a non-runnable architecture skeleton; "
+            "event proposal policy and inference wiring are not implemented."
+        )
 
 
 __all__ = [

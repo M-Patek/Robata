@@ -147,16 +147,12 @@ def _aggregate(
     member_list = tuple(members)
     failed = sum(_terminal_failure(member.outcome) for member in member_list)
     degraded = sum(
-        _terminal_failure(member.outcome)
-        and member.criticality is DependencyCriticality.DEGRADABLE
+        _terminal_failure(member.outcome) and member.criticality is DependencyCriticality.DEGRADABLE
         for member in member_list
     )
 
     if barrier.expected_member_count == 0:
-        try:
-            empty_status = StageStatus(barrier.empty_semantics)
-        except ValueError:
-            empty_status = StageStatus.SKIPPED_NOT_NEEDED
+        empty_status = StageStatus(barrier.empty_semantics)
         return AggregateStatus(
             overall_status=empty_status,
             degraded_cameras=0,
@@ -322,11 +318,21 @@ class BarrierCoordinator:
             raise ValueError("required_count cannot exceed expected_members")
         if reduction_policy.degradable_count > expected_members:
             raise ValueError("degradable_count cannot exceed expected_members")
-        if not isinstance(empty_semantics, str) or not empty_semantics.strip():
-            raise ValueError("empty_semantics must be a non-empty string")
+        try:
+            empty_outcome = StageStatus(empty_semantics)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("empty_semantics must identify a terminal StageStatus") from exc
+        if empty_outcome not in _SUCCESS_OUTCOMES and empty_outcome not in _FAILURE_OUTCOMES:
+            raise ValueError("empty_semantics must identify a terminal StageStatus")
 
         barrier_id = str(uuid5(NAMESPACE_URL, f"robata:barrier:{logical_key}"))
-        status = "CLOSED" if expected_members == 0 else "OPEN"
+        status = (
+            "FAILED"
+            if expected_members == 0 and empty_outcome in _FAILURE_OUTCOMES
+            else "CLOSED"
+            if expected_members == 0
+            else "OPEN"
+        )
         barrier = Barrier(
             barrier_id=barrier_id,
             logical_key=logical_key,

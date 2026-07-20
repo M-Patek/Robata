@@ -20,7 +20,7 @@ from pydantic import ValidationError
 
 from robata.contracts.cameras import CAMERA_IDS, CameraId, SixCameraMap
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CameraPackage,
     CameraPackageStatus,
     MaterializedFrame,
@@ -34,7 +34,7 @@ from robata.contracts.video_export_v2 import (
     CameraVideoExportManifestV2,
     CameraVideoExportRecordV2,
 )
-from robata.ports.mainline import (
+from robata.ports.frame_materialization import (
     FrameMaterializationError,
     FrameMaterializationErrorCode,
     FrameMaterializationRequest,

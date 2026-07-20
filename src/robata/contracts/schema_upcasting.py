@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from threading import RLock
+from types import MappingProxyType
+from typing import Any, Literal, Protocol, Self, cast
 
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
-from robata.contracts.schema_registry import SchemaRef, SchemaRegistry, UpcasterCatalogEntry
+from robata.contracts.schema_registry import (
+    RegisteredUpcaster,
+    SchemaRef,
+    SchemaRegistry,
+    UpcasterCatalogEntry,
+)
 
 type JsonObject = dict[str, Any]
 type UpcasterTransform = Callable[[JsonObject], JsonObject]
+
+UPCASTER_CHAIN_DIGEST_POLICY_VERSION: Literal["upcaster-chain-digest-policy-v1"] = (
+    "upcaster-chain-digest-policy-v1"
+)
 
 
 class SchemaUpcastingError(RuntimeError):
@@ -51,6 +63,7 @@ class UpcastProvenance:
     source: SchemaRef
     target: SchemaRef
     upcaster_ids: tuple[str, ...]
+    upcaster_chain_digest_policy_version: Literal["upcaster-chain-digest-policy-v1"]
     upcaster_chain_digests: tuple[str, ...]
 
 
@@ -60,28 +73,156 @@ class UpcastProjection:
     provenance: UpcastProvenance
 
 
+class _RegistryPort(Protocol):
+    def resolve_exact(
+        self,
+        ref: SchemaRef,
+        *,
+        require_software_support: bool = True,
+    ) -> object: ...
+
+    def validate_pinned(self, ref: SchemaRef, payload: Any) -> Any: ...
+
+
+def _decode_golden_object(raw: bytes, source: str) -> JsonObject:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UpcasterRegistrationError(f"invalid golden JSON {source}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise UpcasterRegistrationError(f"golden JSON root must be an object: {source}")
+    return value
+
+
+def _load_registered_implementation(registered: RegisteredUpcaster) -> UpcasterImplementation:
+    entry = registered.entry
+    try:
+        source = registered.code_bytes.decode("utf-8")
+        code = compile(source, entry.code_artifact_path, "exec")
+    except (UnicodeError, SyntaxError) as exc:
+        raise UpcasterRegistrationError(
+            f"cannot compile pinned upcaster code {entry.upcaster_id}: {exc}"
+        ) from exc
+
+    def instantiate_transform() -> UpcasterTransform:
+        namespace: dict[str, Any] = {
+            "__file__": str(registered.code_path),
+            "__name__": f"_robata_upcaster_{entry.upcaster_id.replace('-', '_')}",
+        }
+        try:
+            exec(code, namespace)
+        except Exception as exc:
+            raise UpcasterRegistrationError(
+                f"cannot load pinned upcaster code {entry.upcaster_id}: {exc}"
+            ) from exc
+        transform = namespace.get("upcast")
+        if not callable(transform):
+            raise UpcasterRegistrationError(
+                f"pinned upcaster code has no callable 'upcast': {entry.upcaster_id}"
+            )
+        return cast(UpcasterTransform, transform)
+
+    instantiate_transform()
+
+    def isolated_transform(payload: JsonObject) -> JsonObject:
+        return instantiate_transform()(payload)
+
+    return UpcasterImplementation(
+        upcaster_id=entry.upcaster_id,
+        code_sha256=entry.code_sha256,
+        runtime_sha256=entry.runtime_sha256,
+        transform=isolated_transform,
+    )
+
+
+def upcaster_chain_digest(registration: UpcasterCatalogEntry) -> str:
+    """Bind one chain element to its versioned schemas, code, and runtime."""
+
+    return semantic_sha256(
+        {
+            "digest_policy_version": UPCASTER_CHAIN_DIGEST_POLICY_VERSION,
+            "upcaster_id": registration.upcaster_id,
+            "source": registration.source.model_dump(mode="json"),
+            "target": registration.target.model_dump(mode="json"),
+            "code_sha256": registration.code_sha256,
+            "runtime_sha256": registration.runtime_sha256,
+        }
+    )
+
+
 class SchemaUpcasterGraph:
     """Validate and execute the catalog's single-path deterministic upcaster graph."""
 
     def __init__(
         self,
         registry: SchemaRegistry,
+    ) -> None:
+        if not isinstance(registry, SchemaRegistry):
+            raise UpcasterRegistrationError(
+                "SchemaUpcasterGraph requires a catalog-backed SchemaRegistry"
+            )
+        implementations = {
+            registered.entry.upcaster_id: _load_registered_implementation(registered)
+            for registered in registry.registered_upcasters
+        }
+        self._initialize(registry, registry.upcasters, implementations)
+        self._verify_registered_goldens(registry.registered_upcasters)
+
+    @classmethod
+    def _from_test_components(
+        cls,
+        registry: _RegistryPort,
         *,
-        registrations: Iterable[UpcasterCatalogEntry] | None = None,
+        registrations: tuple[UpcasterCatalogEntry, ...],
         implementations: Mapping[str, UpcasterImplementation] | None = None,
+    ) -> Self:
+        """Build arbitrary graph mechanics only for tests using a fake registry."""
+
+        if getattr(registry, "_schema_upcaster_test_double", False) is not True:
+            raise UpcasterRegistrationError(
+                "test-only graph construction requires an explicit fake registry"
+            )
+        graph = cls.__new__(cls)
+        graph._initialize(registry, registrations, implementations or {})
+        return graph
+
+    def _initialize(
+        self,
+        registry: _RegistryPort,
+        registrations: tuple[UpcasterCatalogEntry, ...],
+        implementations: Mapping[str, UpcasterImplementation],
     ) -> None:
         self.registry = registry
-        self.registrations = tuple(registry.upcasters if registrations is None else registrations)
-        self.implementations = dict(implementations or {})
+        self._registrations = registrations
+        self._implementations: Mapping[str, UpcasterImplementation] = MappingProxyType(
+            dict(implementations)
+        )
         self._by_edge: dict[tuple[SchemaRef, SchemaRef], UpcasterCatalogEntry] = {}
         self._outgoing: dict[SchemaRef, tuple[UpcasterCatalogEntry, ...]] = {}
+        self._determinism_seals: dict[tuple[str, str], str] = {}
+        self._execution_lock = RLock()
         self._validate_and_index()
+
+    def _check_determinism_seal(
+        self,
+        registration: UpcasterCatalogEntry,
+        payload: JsonObject,
+        output: JsonObject,
+    ) -> None:
+        key = (registration.upcaster_id, semantic_sha256(payload))
+        output_digest = semantic_sha256(output)
+        expected_digest = self._determinism_seals.setdefault(key, output_digest)
+        if output_digest != expected_digest:
+            raise UpcastPurityError(
+                f"upcaster {registration.upcaster_id} changed output across calls "
+                "for the same canonical input"
+            )
 
     def _validate_and_index(self) -> None:
         ids: set[str] = set()
         outgoing: dict[SchemaRef, list[UpcasterCatalogEntry]] = defaultdict(list)
         nodes: set[SchemaRef] = set()
-        for registration in self.registrations:
+        for registration in self._registrations:
             self.registry.resolve_exact(registration.source, require_software_support=False)
             self.registry.resolve_exact(registration.target, require_software_support=False)
             if registration.source.schema_id != registration.target.schema_id:
@@ -108,13 +249,13 @@ class SchemaUpcasterGraph:
         self._reject_cycles(nodes)
         self._reject_ambiguous_paths(nodes)
 
-        unknown = sorted(set(self.implementations) - ids)
+        unknown = sorted(set(self._implementations) - ids)
         if unknown:
             raise UpcasterRegistrationError(
                 f"implementations have no catalog registration: {unknown!r}"
             )
-        by_id = {item.upcaster_id: item for item in self.registrations}
-        for upcaster_id, implementation in self.implementations.items():
+        by_id = {item.upcaster_id: item for item in self._registrations}
+        for upcaster_id, implementation in self._implementations.items():
             if implementation.upcaster_id != upcaster_id:
                 raise UpcasterRegistrationError(
                     f"implementation key does not match upcaster_id: {upcaster_id}"
@@ -126,6 +267,62 @@ class SchemaUpcasterGraph:
                 raise UpcasterRegistrationError(
                     f"runtime digest mismatch for upcaster {upcaster_id}"
                 )
+
+    def _verify_registered_goldens(
+        self,
+        registered_upcasters: tuple[RegisteredUpcaster, ...],
+    ) -> None:
+        for registered in registered_upcasters:
+            registration = registered.entry
+            for vector in registered.golden_vectors:
+                golden_input = _decode_golden_object(
+                    vector.input_bytes,
+                    vector.entry.input_artifact_path,
+                )
+                golden_output = _decode_golden_object(
+                    vector.output_bytes,
+                    vector.entry.output_artifact_path,
+                )
+                self.registry.validate_pinned(registration.source, golden_input)
+                self.registry.validate_pinned(registration.target, golden_output)
+                actual = self._execute_registration(registration, golden_input)
+                if canonical_json_bytes(actual) != canonical_json_bytes(golden_output):
+                    raise UpcasterRegistrationError(
+                        "golden output mismatch for upcaster "
+                        f"{registration.upcaster_id}: {vector.entry.output_artifact_path}"
+                    )
+
+    def _execute_registration(
+        self,
+        registration: UpcasterCatalogEntry,
+        payload: JsonObject,
+    ) -> JsonObject:
+        try:
+            implementation = self._implementations[registration.upcaster_id]
+        except KeyError as exc:
+            raise UpcasterRegistrationError(
+                f"no implementation for upcaster {registration.upcaster_id}"
+            ) from exc
+        with self._execution_lock:
+            first_input = copy.deepcopy(payload)
+            second_input = copy.deepcopy(payload)
+            first_before = canonical_json_bytes(first_input)
+            second_before = canonical_json_bytes(second_input)
+            first = implementation.transform(first_input)
+            second = implementation.transform(second_input)
+            if canonical_json_bytes(first_input) != first_before:
+                raise UpcastPurityError(f"upcaster {registration.upcaster_id} mutated its input")
+            if canonical_json_bytes(second_input) != second_before:
+                raise UpcastPurityError(f"upcaster {registration.upcaster_id} mutated its input")
+            if not isinstance(first, dict) or not isinstance(second, dict):
+                raise UpcastPurityError(
+                    f"upcaster {registration.upcaster_id} must return a JSON object"
+                )
+            if canonical_json_bytes(first) != canonical_json_bytes(second):
+                raise UpcastPurityError(f"upcaster {registration.upcaster_id} is nondeterministic")
+            self.registry.validate_pinned(registration.target, first)
+            self._check_determinism_seal(registration, payload, first)
+            return copy.deepcopy(first)
 
     def _reject_cycles(self, nodes: set[SchemaRef]) -> None:
         state: dict[SchemaRef, int] = {}
@@ -210,32 +407,9 @@ class SchemaUpcasterGraph:
         chain_digests: list[str] = []
 
         for registration in path:
-            try:
-                implementation = self.implementations[registration.upcaster_id]
-            except KeyError as exc:
-                raise UpcasterRegistrationError(
-                    f"no implementation for upcaster {registration.upcaster_id}"
-                ) from exc
-            first_input = copy.deepcopy(current)
-            second_input = copy.deepcopy(current)
-            first_before = canonical_json_bytes(first_input)
-            second_before = canonical_json_bytes(second_input)
-            first = implementation.transform(first_input)
-            second = implementation.transform(second_input)
-            if canonical_json_bytes(first_input) != first_before:
-                raise UpcastPurityError(f"upcaster {registration.upcaster_id} mutated its input")
-            if canonical_json_bytes(second_input) != second_before:
-                raise UpcastPurityError(f"upcaster {registration.upcaster_id} mutated its input")
-            if not isinstance(first, dict) or not isinstance(second, dict):
-                raise UpcastPurityError(
-                    f"upcaster {registration.upcaster_id} must return a JSON object"
-                )
-            if canonical_json_bytes(first) != canonical_json_bytes(second):
-                raise UpcastPurityError(f"upcaster {registration.upcaster_id} is nondeterministic")
-            self.registry.validate_pinned(registration.target, first)
-            current = copy.deepcopy(first)
+            current = self._execute_registration(registration, current)
             chain_ids.append(registration.upcaster_id)
-            chain_digests.append(registration.code_sha256)
+            chain_digests.append(upcaster_chain_digest(registration))
 
         return UpcastProjection(
             payload=current,
@@ -244,12 +418,14 @@ class SchemaUpcasterGraph:
                 source=source,
                 target=target,
                 upcaster_ids=tuple(chain_ids),
+                upcaster_chain_digest_policy_version=(UPCASTER_CHAIN_DIGEST_POLICY_VERSION),
                 upcaster_chain_digests=tuple(chain_digests),
             ),
         )
 
 
 __all__ = [
+    "UPCASTER_CHAIN_DIGEST_POLICY_VERSION",
     "JsonObject",
     "SchemaUpcasterGraph",
     "SchemaUpcastingError",
@@ -261,4 +437,5 @@ __all__ = [
     "UpcasterImplementation",
     "UpcasterRegistrationError",
     "UpcasterTransform",
+    "upcaster_chain_digest",
 ]

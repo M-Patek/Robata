@@ -1,28 +1,23 @@
-"""Coarse QA: full-recording, all-six-camera screening.
+"""Future contract for coarse all-six-camera QA screening.
 
-This module implements the coarse stage of the two-stage QA pipeline
-(Architecture V1 Section 12.1).  It covers the complete recording for all
-six cameras using benchmark-selected sampling rates, producing per-camera
-results and a set of suspicious intervals for the dense stage.
+This non-runnable skeleton defines the planned coarse stage of the two-stage
+QA pipeline (Architecture V1 Section 12.1). It will cover the complete
+recording for all six cameras after sampling and inference wiring exists.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Annotated
 
 from pydantic import Field
 
 from robata.contracts.cameras import CameraId, SixCameraMap
-from robata.contracts.common import NanosecondInterval, StrictModel
+from robata.contracts.common import StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid
-from robata.contracts.mainline import (
-    CameraQAStatus,
-    CameraQAResult,
-    QAIssueSeverity,
-    TemporalVisualPackage,
-)
-from robata.qa_pipeline.stages import QAStage, QAStageIssue, QAStageResult
+from robata.contracts.mcap import MCAPRecording
+from robata.contracts.pipeline import CameraQAResult
+from robata.contracts.qa import QAClassifier
+from robata.sampling.adaptive import AdaptiveSampler
 
 __all__ = [
     "CameraCoarseResult",
@@ -96,25 +91,25 @@ class CoarseQAResult(StrictModel):
 
 
 class CoarseQAPipeline:
-    """Coarse QA: full-recording, all-six-camera screening.
+    """Future coarse-QA execution contract; currently non-runnable.
 
-    The pipeline runs the classifier over the complete recording, producing
+    The pipeline will run the classifier over the complete recording, producing
     per-camera QA results and a set of suspicious intervals for the dense
-    stage.  It uses the benchmark-selected sampling rate and does not
+    stage. It will use the benchmark-selected sampling rate and will not
     attempt to vary density per camera at this stage.
     """
 
     def __init__(
         self,
-        classifier: "QAClassifier",  # type: ignore[name-defined]
-        sampler: "Sampler",  # type: ignore[name-defined]
+        classifier: QAClassifier,
+        sampler: AdaptiveSampler,
     ) -> None:
         self.classifier = classifier
         self.sampler = sampler
 
     def run_coarse(
         self,
-        recording: "MCAPRecording",  # type: ignore[name-defined]
+        recording: MCAPRecording,
         sampling_plan: SamplingPlan,
     ) -> CoarseQAResult:
         """Run coarse QA over the complete recording.
@@ -133,5 +128,5 @@ class CoarseQAPipeline:
         """
         raise NotImplementedError(
             "CoarseQAPipeline.run_coarse is a skeleton; "
-            "implementation requires MCAPRecording, Sampler, and inference wiring."
+            "implementation requires MCAP frame sampling and inference wiring."
         )

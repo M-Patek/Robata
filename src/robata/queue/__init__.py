@@ -44,40 +44,33 @@ from robata.queue.redis_adapter import RedisTaskQueue
 from robata.queue.stage import Stage, StageStatus
 
 __all__ = [
-    # stage
-    "Stage",
-    "StageStatus",
-    # models
-    "WorkItem",
-    "WorkItemSubjectType",
-    "WorkDependency",
-    "DependencyCriticality",
-    "WorkBarrier",
-    "WorkBarrierMember",
-    "OutboxEvent",
-    "OutboxEventStatus",
-    # dispatcher
-    "DispatcherConfig",
-    "DispatchResult",
-    "CapacityReservation",
-    "StageDispatcher",
-    # barrier
+    "AdmissionDecision",
+    "AggregateStatus",
+    "BackpressureConfig",
+    "BackpressureController",
     "Barrier",
-    "BarrierState",
-    "BarrierStorage",
     "BarrierCoordinator",
     "BarrierMember",
-    "AggregateStatus",
-    "ReductionPolicy",
+    "BarrierState",
+    "BarrierStorage",
+    "CapacityReservation",
+    "DependencyCriticality",
+    "DispatchResult",
+    "DispatcherConfig",
     "InMemoryBarrierStorage",
-    # backpressure
-    "BackpressureConfig",
-    "QueueMetrics",
-    "AdmissionDecision",
-    "SheddingAction",
-    "BackpressureController",
-    # outbox
+    "OutboxEvent",
+    "OutboxEventStatus",
     "OutboxPublisher",
-    # redis adapter
+    "QueueMetrics",
     "RedisTaskQueue",
+    "ReductionPolicy",
+    "SheddingAction",
+    "Stage",
+    "StageDispatcher",
+    "StageStatus",
+    "WorkBarrier",
+    "WorkBarrierMember",
+    "WorkDependency",
+    "WorkItem",
+    "WorkItemSubjectType",
 ]

@@ -1,8 +1,8 @@
-"""Dense QA: targeted high-rate analysis on suspicious intervals.
+"""Future contract for dense QA over suspicious intervals.
 
-This module implements the dense stage of the two-stage QA pipeline
-(Architecture V1 Section 12.1).  It increases sampling rate for suspicious
-cameras while retaining low-rate synchronized context from other views.
+This non-runnable skeleton defines the planned dense stage of the two-stage QA
+pipeline (Architecture V1 Section 12.1). It will increase sampling for target
+cameras while retaining synchronized context from other views.
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ from pydantic import Field
 from robata.contracts.cameras import CameraId, SixCameraMap
 from robata.contracts.common import StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid
-from robata.contracts.mainline import CameraQAResult
+from robata.contracts.mcap import MCAPRecording
+from robata.contracts.pipeline import CameraQAResult
+from robata.contracts.qa import QAClassifier
 from robata.qa_pipeline.suspicion_reducer import ReducedInterval
 
 __all__ = [
@@ -76,23 +78,23 @@ class DenseQAResult(StrictModel):
 
 
 class DenseQAPipeline:
-    """Dense QA: targeted high-rate analysis on suspicious intervals.
+    """Future dense-QA execution contract; currently non-runnable.
 
-    For each reduced interval, the pipeline:
+    For each reduced interval, the pipeline will:
     1. Identifies target cameras (those with suspicious intervals).
     2. Increases sampling rate for target cameras.
     3. Retains low-rate synchronized context from other views.
-    4. Runs VLM inference on the dense package.
-    5. Produces per-camera dense QA results.
+    4. Run VLM inference on the dense package.
+    5. Produce per-camera dense QA results.
     """
 
-    def __init__(self, classifier: "QAClassifier") -> None:  # type: ignore[name-defined]
+    def __init__(self, classifier: QAClassifier) -> None:
         self.classifier = classifier
 
     def run_dense(
         self,
         reduced_intervals: Sequence[ReducedInterval],
-        recording: "MCAPRecording",  # type: ignore[name-defined]
+        recording: MCAPRecording,
     ) -> DenseQAResult:
         """Run dense QA over the reduced suspicious intervals.
 

@@ -1,0 +1,85 @@
+{
+  "catalog_version": "1.0",
+  "schemas": [
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/synthetic-upcast",
+        "version": "1.0.0",
+        "artifact_id": "345f2fc3-003d-f0ab-7f39-87134a1aa5cc",
+        "sha256": "09f0412717dc250c3c4efa436e52db909bb1eddf077ba9f669104bf86ce35ff6"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/fixtures/v1/synthetic-upcast.schema.json",
+      "artifact_path": "v1/synthetic-upcast.schema.json",
+      "owner": "contract-fixture",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "synthetic-upcast-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/synthetic-upcast",
+        "version": "2.0.0",
+        "artifact_id": "9cba556f-ea64-4da0-9cd3-194eaa14763f",
+        "sha256": "e26a9401bceae283ca1b5f989b8f0a7ca6b06dc57daf06504d6b760dfe05434b"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/fixtures/v2/synthetic-upcast.schema.json",
+      "artifact_path": "v2/synthetic-upcast.schema.json",
+      "owner": "contract-fixture",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "synthetic-upcast-v2",
+      "compatibility_mode": "BACKWARD",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": [
+        {
+          "schema_id": "https://schemas.robata.dev/synthetic-upcast",
+          "version": "1.0.0",
+          "artifact_id": "345f2fc3-003d-f0ab-7f39-87134a1aa5cc",
+          "sha256": "09f0412717dc250c3c4efa436e52db909bb1eddf077ba9f669104bf86ce35ff6"
+        }
+      ]
+    }
+  ],
+  "upcasters": [
+    {
+      "upcaster_id": "synthetic-v1-to-v2",
+      "source": {
+        "schema_id": "https://schemas.robata.dev/synthetic-upcast",
+        "version": "1.0.0",
+        "artifact_id": "345f2fc3-003d-f0ab-7f39-87134a1aa5cc",
+        "sha256": "09f0412717dc250c3c4efa436e52db909bb1eddf077ba9f669104bf86ce35ff6"
+      },
+      "target": {
+        "schema_id": "https://schemas.robata.dev/synthetic-upcast",
+        "version": "2.0.0",
+        "artifact_id": "9cba556f-ea64-4da0-9cd3-194eaa14763f",
+        "sha256": "e26a9401bceae283ca1b5f989b8f0a7ca6b06dc57daf06504d6b760dfe05434b"
+      },
+      "code_artifact_id": "39a04de4-2ed3-e916-ffb6-ebf2dbba70bb",
+      "code_artifact_path": "upcasters/synthetic-v1-to-v2.py",
+      "code_sha256": "2343e206268e466d92a8fee8dff8c361bcaf9173df7a37b774ebe96ecc0e787f",
+      "runtime_artifact_id": "bd8b7459-add4-9113-ce1a-9f95db15b8c5",
+      "runtime_artifact_path": "runtime/synthetic-python-runtime.json",
+      "runtime_sha256": "7fdba17b3c5fc13e1745e0def677a79d9616d6f583b6cbb3edb8fdf10f77639d",
+      "golden_vectors": [
+        {
+          "input_artifact_path": "golden/synthetic-v1-to-v2.input.json",
+          "input_sha256": "c94058477df63eab3d79050d4a9e37d8b87d6ae1de475ef79e86fcec75034284",
+          "output_artifact_path": "golden/synthetic-v1-to-v2.output.json",
+          "output_sha256": "7a68e2f584c4d0ba905d2a2bfd710234a29d307c6c7514afafeb564e0b651c78"
+        }
+      ]
+    }
+  ]
+}

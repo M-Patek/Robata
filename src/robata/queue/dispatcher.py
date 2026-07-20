@@ -271,9 +271,7 @@ class StageDispatcher:
             )
 
         eligible_weights = {
-            candidate: weight
-            for candidate, weight in self._stage_weights.items()
-            if weight > 0
+            candidate: weight for candidate, weight in self._stage_weights.items() if weight > 0
         }
         if not eligible_weights:
             return DispatchResult(accepted=False, reason="no positively weighted stages")

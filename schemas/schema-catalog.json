@@ -16,7 +16,10 @@
       "projection_version": "alignment-manifest-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -34,7 +37,10 @@
       "projection_version": "camera-video-export-manifest-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -52,7 +58,10 @@
       "projection_version": "camera-video-timestamp-row-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -70,7 +79,10 @@
       "projection_version": "common-wire-definitions-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -88,7 +100,10 @@
       "projection_version": "mcap-ready-manifest-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -106,7 +121,10 @@
       "projection_version": "mcap-validation-report-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -124,7 +142,10 @@
       "projection_version": "logical-node-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -142,7 +163,10 @@
       "projection_version": "processing-run-node-membership-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -160,7 +184,10 @@
       "projection_version": "immutable-node-revision-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -178,7 +205,10 @@
       "projection_version": "selection-decision-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -196,7 +226,10 @@
       "projection_version": "current-selection-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -214,7 +247,10 @@
       "projection_version": "artifact-registry-entry-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -232,7 +268,10 @@
       "projection_version": "artifact-registry-snapshot-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -250,7 +289,10 @@
       "projection_version": "camera-video-export-manifest-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -268,7 +310,10 @@
       "projection_version": "export-config-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -286,7 +331,10 @@
       "projection_version": "mapping-profile-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -304,7 +352,10 @@
       "projection_version": "provider-claim-payload-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -322,7 +373,10 @@
       "projection_version": "inference-intent-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -340,7 +394,10 @@
       "projection_version": "model-inference-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -358,7 +415,10 @@
       "projection_version": "inference-attempt-selection-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -376,7 +436,10 @@
       "projection_version": "raw-provider-response-artifact-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -394,7 +457,10 @@
       "projection_version": "parsed-provider-claim-artifact-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -412,7 +478,10 @@
       "projection_version": "selected-attempt-output-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -430,7 +499,10 @@
       "projection_version": "orchestrator-enriched-output-v1",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -448,7 +520,10 @@
       "projection_version": "orchestrator-enriched-output-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -466,7 +541,10 @@
       "projection_version": "mcap-validation-report-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -484,7 +562,10 @@
       "projection_version": "mcap-ready-manifest-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     },
     {
@@ -502,7 +583,52 @@
       "projection_version": "alignment-manifest-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
-      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/primary-completion-record",
+        "version": "1.0.0",
+        "artifact_id": "7effd375-1030-5576-b377-04d91434a9a7",
+        "sha256": "1902cac298e40f01848dfa596785b7f60c576ced82396cf202d565f021f539b5"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/primary-completion-record.schema.json",
+      "artifact_path": "v1/primary-completion-record.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "primary-completion-record-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/primary-completion-record",
+        "version": "2.0.0",
+        "artifact_id": "ecfd2bde-0d5c-8caf-47be-86babc3144a7",
+        "sha256": "165dd2134989f6582b8c68f65186547b034e99229d7bd8195a86012ca5202b15"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/primary-completion-record.schema.json",
+      "artifact_path": "v2/primary-completion-record.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "primary-completion-record-semantic-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
       "supported_predecessors": []
     }
   ],

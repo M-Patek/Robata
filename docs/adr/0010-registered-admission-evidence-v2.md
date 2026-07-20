@@ -114,7 +114,10 @@ a mutable READY status.
 - `src/robata/contracts/admission_v2.py`
 - `src/robata/admission/context.py`
 - `src/robata/sampling/materializer.py`
-- `src/robata/application/canonical_offline.py`
+- `src/robata/application/canonical/models.py`
+- `src/robata/application/canonical/runner_support.py`
+- `src/robata/application/canonical/runner.py`
+- `src/robata/application/canonical_offline.py` (public re-export facade only)
 - `tests/contract/test_admission_evidence_v2_contract.py`
 - `tests/unit/test_admission_context.py`
 - `tests/integration/test_canonical_offline.py`

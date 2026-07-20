@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import Field
 
 from robata.contracts.common import SchemaVersion, StrictModel
-from robata.contracts.mainline import NonEmptyString
+from robata.contracts.pipeline import NonEmptyString
 from robata.event_pipeline.fusion import FusionDecision
 
 

@@ -64,7 +64,7 @@ class TemporalWindow(StrictModel):
     overlap_before_ns: Nanoseconds = 0
     overlap_after_ns: Nanoseconds = 0
     # Optional lineage fields let callers attach a fully identified source
-    # window without making the planner depend on the mainline contract.
+    # window without making the planner depend on the shared pipeline contract.
     mcap_id: NonEmptyString | None = None
     camera_mapping_run_id: NonEmptyString | None = None
     alignment_id: NonEmptyString | None = None

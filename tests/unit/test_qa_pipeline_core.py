@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from robata.contracts import CameraId, NanosecondInterval
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CameraQAClaim,
     CameraQAResult,
     CameraQAStatus,

@@ -39,6 +39,7 @@ from robata.inference import (
     TransformOperation,
     VisionTask,
 )
+from robata.inference.input_plan import INFERENCE_INPUT_PLANNER_VERSION
 from robata.sampling import (
     CameraSourceFrameIndex,
     CanonicalSixCameraFrameIndex,
@@ -500,7 +501,7 @@ def _input_target() -> InputPlanTarget:
         model_name="fixture-vision",
         model_version="1.0",
         adapter_version="1.0",
-        planner_version="planner-v1",
+        planner_version=INFERENCE_INPUT_PLANNER_VERSION,
         capability_snapshot_id=_uuid(9_000),
         capability_snapshot_sha256=_digest("capability"),
     )
@@ -520,7 +521,7 @@ def _prompt_output() -> PromptOutputContract:
 
 def _preparer() -> InputPlanPreparer:
     return InputPlanPreparer(
-        InferenceInputPlanner("planner-v1"),
+        InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION),
         ProviderRenderingPolicy(
             version="render-v1",
             transform_policy_version="identity-v1",

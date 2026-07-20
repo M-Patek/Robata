@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -27,6 +27,21 @@ NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 TransformValue = str | int | bool
 type FrozenTuple[T] = Annotated[tuple[T, ...], Field(strict=False)]
+
+INFERENCE_INPUT_PLANNER_VERSION: Final = "inference-input-planner-v2"
+REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION: Final = "request-catalog-semantic-v2"
+INPUT_PLAN_SEMANTIC_PROJECTION_VERSION: Final = "inference-input-plan-semantic-v2"
+CALL_PLAN_SEMANTIC_PROJECTION_VERSION: Final = "inference-call-plan-semantic-v2"
+CALL_PART_SEMANTIC_PROJECTION_VERSION: Final = "inference-call-part-semantic-v2"
+CALL_BARRIER_SEMANTIC_PROJECTION_VERSION: Final = "inference-call-barrier-semantic-v2"
+CALL_IDEMPOTENCY_KEY_POLICY_VERSION: Final = "inference-call-idempotency-key-v2"
+
+REQUEST_CATALOG_UUID_NAMESPACE: Final = "provider-request-catalog-v2"
+INPUT_PLAN_UUID_NAMESPACE: Final = "inference-input-plan-v2"
+INPUT_PLAN_LOGICAL_KEY_NAMESPACE: Final = "inference-input-plan-v2"
+CALL_PART_LOGICAL_KEY_NAMESPACE: Final = "inference-input-call-part-v2"
+CALL_BARRIER_LOGICAL_KEY_NAMESPACE: Final = "inference-input-barrier-v2"
+CALL_IDEMPOTENCY_KEY_NAMESPACE: Final = "inference-input-call-v2"
 
 
 class TransformOperation(StrEnum):
@@ -435,8 +450,8 @@ class InferenceInputPlanner:
     """Build strict input plans from explicit provider rendering and call choices."""
 
     def __init__(self, planner_version: SchemaVersion) -> None:
-        if not isinstance(planner_version, str) or not planner_version:
-            raise ValueError("planner_version must be a nonempty string")
+        if planner_version != INFERENCE_INPUT_PLANNER_VERSION:
+            raise ValueError(f"planner_version must be {INFERENCE_INPUT_PLANNER_VERSION!r}")
         self._planner_version = planner_version
 
     @property
@@ -454,10 +469,7 @@ class InferenceInputPlanner:
         """Create a catalog digest without row IDs, exact manifests, locators, or time."""
 
         package_tuple = tuple(packages)
-        projection = {
-            "task": task.value,
-            "packages": [_catalog_package_projection(package) for package in package_tuple],
-        }
+        projection = _request_catalog_projection(task=task, packages=package_tuple)
         return RequestCatalog(
             schema_version="1.0",
             request_catalog_id=request_catalog_id,
@@ -510,8 +522,9 @@ class InferenceInputPlanner:
             part.model_copy(
                 update={
                     "part_semantic_sha256": _part_semantic_sha256(call_plan_sha256, part),
-                    "part_logical_key": (
-                        f"inference-input-call-part:{_part_semantic_sha256(call_plan_sha256, part)}"
+                    "part_logical_key": _logical_key(
+                        CALL_PART_LOGICAL_KEY_NAMESPACE,
+                        _part_semantic_sha256(call_plan_sha256, part),
                     ),
                     "idempotency_key": _idempotency_key(
                         call_plan_sha256, part, idempotency_policy_version
@@ -520,20 +533,21 @@ class InferenceInputPlanner:
             )
             for part in parts
         )
-        barrier_digest = semantic_sha256(
-            {
-                "call_plan_sha256": call_plan_sha256,
-                "part_count": len(parts),
-                "reduction_policy": reduction_policy,
-                "reduction_policy_version": reduction_policy_version,
-            }
+        barrier_digest = _barrier_semantic_sha256(
+            call_plan_sha256=call_plan_sha256,
+            part_count=len(parts),
+            reduction_policy=reduction_policy,
+            reduction_policy_version=reduction_policy_version,
         )
         call_plan = InferenceCallPlan(
             call_plan_sha256=call_plan_sha256,
             parts=parts,
             idempotency_policy_version=idempotency_policy_version,
             barrier_semantic_sha256=barrier_digest,
-            barrier_logical_key=f"inference-input-barrier:{barrier_digest}",
+            barrier_logical_key=_logical_key(
+                CALL_BARRIER_LOGICAL_KEY_NAMESPACE,
+                barrier_digest,
+            ),
             reduction_policy=reduction_policy,
             reduction_policy_version=reduction_policy_version,
         )
@@ -579,16 +593,14 @@ class InferenceInputPlanner:
 def request_catalog_semantic_projection(catalog: RequestCatalog) -> dict[str, object]:
     """Return catalog identity without row IDs, exact manifests, locators, or time."""
 
-    return {
-        "task": catalog.task.value,
-        "packages": [_catalog_package_projection(package) for package in catalog.packages],
-    }
+    return _request_catalog_projection(task=catalog.task, packages=catalog.packages)
 
 
 def input_plan_semantic_projection(plan: InferenceInputPlan) -> dict[str, object]:
     """Return the complete stable input-plan identity projection."""
 
     return {
+        "semantic_projection_version": INPUT_PLAN_SEMANTIC_PROJECTION_VERSION,
         "schema_version": plan.schema_version,
         "subject": _subject_projection(plan.subject),
         "target": _target_projection(plan.target),
@@ -599,6 +611,18 @@ def input_plan_semantic_projection(plan: InferenceInputPlan) -> dict[str, object
         "measured_limits": plan.measured_limits.model_dump(mode="json"),
         "limit_decisions": [decision.model_dump(mode="json") for decision in plan.limit_decisions],
         "call_plan": plan.call_plan.model_dump(mode="json"),
+    }
+
+
+def _request_catalog_projection(
+    *,
+    task: VisionTask,
+    packages: Sequence[CatalogPackage],
+) -> dict[str, object]:
+    return {
+        "semantic_projection_version": REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION,
+        "task": task.value,
+        "packages": [_catalog_package_projection(package) for package in packages],
     }
 
 
@@ -862,6 +886,7 @@ def _call_plan_digest(
 ) -> Sha256Digest:
     return semantic_sha256(
         {
+            "semantic_projection_version": CALL_PLAN_SEMANTIC_PROJECTION_VERSION,
             "subject": _subject_projection(subject),
             "target": _target_projection(target),
             "rendering_sha256": rendering_sha256,
@@ -882,11 +907,12 @@ def _idempotency_key(
     part_digest = _part_semantic_sha256(call_plan_sha256, part)
     digest = semantic_sha256(
         {
+            "key_policy_version": CALL_IDEMPOTENCY_KEY_POLICY_VERSION,
             "part_semantic_sha256": part_digest,
-            "policy_version": policy_version,
+            "provider_policy_version": policy_version,
         }
     )
-    return f"inference-input-call:{digest}"
+    return _logical_key(CALL_IDEMPOTENCY_KEY_NAMESPACE, digest)
 
 
 def _part_semantic_sha256(
@@ -895,10 +921,33 @@ def _part_semantic_sha256(
 ) -> Sha256Digest:
     return semantic_sha256(
         {
+            "semantic_projection_version": CALL_PART_SEMANTIC_PROJECTION_VERSION,
             "call_plan_sha256": call_plan_sha256,
             "part": _raw_part_projection(part),
         }
     )
+
+
+def _barrier_semantic_sha256(
+    *,
+    call_plan_sha256: str,
+    part_count: int,
+    reduction_policy: str,
+    reduction_policy_version: str,
+) -> Sha256Digest:
+    return semantic_sha256(
+        {
+            "semantic_projection_version": CALL_BARRIER_SEMANTIC_PROJECTION_VERSION,
+            "call_plan_sha256": call_plan_sha256,
+            "part_count": part_count,
+            "reduction_policy": reduction_policy,
+            "reduction_policy_version": reduction_policy_version,
+        }
+    )
+
+
+def _logical_key(namespace: str, digest: str) -> str:
+    return f"{namespace}:{digest}"
 
 
 def _measure_provider_limits(
@@ -974,6 +1023,10 @@ def _limit_decisions(
 
 
 def _validate_complete_plan(plan: InferenceInputPlan) -> None:
+    if plan.target.planner_version != INFERENCE_INPUT_PLANNER_VERSION:
+        raise ValueError(
+            f"input plan target planner_version must be {INFERENCE_INPUT_PLANNER_VERSION!r}"
+        )
     expected_subject = _subject_from_catalog(plan.request_catalog)
     if plan.subject != expected_subject:
         raise ValueError("input plan subject does not match its request catalog")
@@ -1008,7 +1061,8 @@ def _validate_complete_plan(plan: InferenceInputPlan) -> None:
         expected_part_digest = _part_semantic_sha256(expected_call_digest, part)
         if (
             part.part_semantic_sha256 != expected_part_digest
-            or part.part_logical_key != f"inference-input-call-part:{expected_part_digest}"
+            or part.part_logical_key
+            != _logical_key(CALL_PART_LOGICAL_KEY_NAMESPACE, expected_part_digest)
         ):
             raise ValueError("call part semantic identity is inconsistent")
         expected_key = _idempotency_key(
@@ -1019,17 +1073,16 @@ def _validate_complete_plan(plan: InferenceInputPlan) -> None:
         if part.idempotency_key != expected_key:
             raise ValueError("call part idempotency_key is inconsistent")
 
-    expected_barrier = semantic_sha256(
-        {
-            "call_plan_sha256": expected_call_digest,
-            "part_count": len(plan.call_plan.parts),
-            "reduction_policy": plan.call_plan.reduction_policy,
-            "reduction_policy_version": plan.call_plan.reduction_policy_version,
-        }
+    expected_barrier = _barrier_semantic_sha256(
+        call_plan_sha256=expected_call_digest,
+        part_count=len(plan.call_plan.parts),
+        reduction_policy=plan.call_plan.reduction_policy,
+        reduction_policy_version=plan.call_plan.reduction_policy_version,
     )
     if (
         plan.call_plan.barrier_semantic_sha256 != expected_barrier
-        or plan.call_plan.barrier_logical_key != f"inference-input-barrier:{expected_barrier}"
+        or plan.call_plan.barrier_logical_key
+        != _logical_key(CALL_BARRIER_LOGICAL_KEY_NAMESPACE, expected_barrier)
     ):
         raise ValueError("call plan barrier identity is inconsistent")
 
@@ -1047,6 +1100,19 @@ def _validate_complete_plan(plan: InferenceInputPlan) -> None:
 
 
 __all__ = [
+    "CALL_BARRIER_LOGICAL_KEY_NAMESPACE",
+    "CALL_BARRIER_SEMANTIC_PROJECTION_VERSION",
+    "CALL_IDEMPOTENCY_KEY_NAMESPACE",
+    "CALL_IDEMPOTENCY_KEY_POLICY_VERSION",
+    "CALL_PART_LOGICAL_KEY_NAMESPACE",
+    "CALL_PART_SEMANTIC_PROJECTION_VERSION",
+    "CALL_PLAN_SEMANTIC_PROJECTION_VERSION",
+    "INFERENCE_INPUT_PLANNER_VERSION",
+    "INPUT_PLAN_LOGICAL_KEY_NAMESPACE",
+    "INPUT_PLAN_SEMANTIC_PROJECTION_VERSION",
+    "INPUT_PLAN_UUID_NAMESPACE",
+    "REQUEST_CATALOG_SEMANTIC_PROJECTION_VERSION",
+    "REQUEST_CATALOG_UUID_NAMESPACE",
     "ApplicableProviderLimits",
     "CallPartSpec",
     "CatalogCamera",

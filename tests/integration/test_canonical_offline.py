@@ -18,24 +18,33 @@ from robata.adapters.sqlite_inference_evidence import SQLiteInferenceEvidenceLed
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical_offline import (
     CANONICAL_OFFLINE_PIPELINE_VERSION,
+    CANONICAL_OUTPUT_DECISION_UUID_NAMESPACE,
     CanonicalOfflineConfigurationError,
     CanonicalOfflineExecutionPolicy,
     CanonicalOfflinePartStatus,
     CanonicalOfflinePipeline,
     CanonicalOfflineRunResult,
     CanonicalOfflineRunStatus,
+    CanonicalOutputAdmissionDecision,
+    _stable_uuid,
+    canonical_output_decision_projection,
 )
 from robata.application.canonical_run_membership import CanonicalProcessingRunContext
 from robata.contracts.common import NanosecondInterval
-from robata.contracts.hashing import canonical_json_bytes
+from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 from robata.contracts.logical_nodes import RunNodeDisposition
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.temporal import PackageLineage
 from robata.event_pipeline.identity_registry import (
+    AdmissionEvidenceClass,
+    AdmissionProof,
     EventIdentityPolicyRef,
     EventIdentityRegistryService,
     ExactFingerprintEventIdentityResolver,
     InMemoryEventIdentityRegistryRepository,
+    OutputAdmissionProof,
+    PlatformEnrichedEventHypothesis,
+    ProductionAdmittedHypothesisFact,
     ProductionOutputAdmissionPolicyRef,
 )
 from robata.inference.adapter import (
@@ -51,7 +60,12 @@ from robata.inference.enrichment import (
     PROVIDER_CLAIM_SCHEMA_ID,
     ProviderReferenceCatalog,
 )
-from robata.inference.input_plan import InferenceInputPlanner
+from robata.inference.input_plan import (
+    INFERENCE_INPUT_PLANNER_VERSION,
+    INPUT_PLAN_UUID_NAMESPACE,
+    REQUEST_CATALOG_UUID_NAMESPACE,
+    InferenceInputPlanner,
+)
 from robata.inference.models import (
     ConcurrencyClass,
     InferenceFailure,
@@ -315,18 +329,8 @@ def _harness(
         response_factory=response_factory,
     )
     repository = repository or InMemoryEventIdentityRegistryRepository()
-    identity_policy = EventIdentityPolicyRef(
-        version="exact-fingerprint-v1",
-        semantic_sha256=_digest("exact-fingerprint-v1"),
-    )
-    identity_registry = EventIdentityRegistryService(
-        repository=repository,
-        resolver=ExactFingerprintEventIdentityResolver(identity_policy),
-        allocator=_SequenceEventIdAllocator(),
-        output_admission_policy=output_policy,
-    )
     input_preparer = InputPlanPreparer(
-        InferenceInputPlanner("planner-v1"),
+        InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION),
         ProviderRenderingPolicy(
             version="render-v1",
             transform_policy_version="identity-v1",
@@ -346,7 +350,6 @@ def _harness(
         adapter=adapter,
         inference_policy=inference_policy,
         schema_registry=registry,
-        identity_registry=identity_registry,
         logical_node_registry=logical_node_registry,
         execution_policy=execution_policy,
         inference_ledger=inference_evidence,
@@ -455,7 +458,7 @@ def _inference_evidence_counts(database_path: Path) -> dict[str, int]:
         }
 
 
-def test_success_connects_raw_claim_enrichment_and_recording_scoped_identity(
+def test_success_connects_raw_claim_enrichment_and_local_hypothesis(
     tmp_path: Path,
 ) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
@@ -463,6 +466,37 @@ def test_success_connects_raw_claim_enrichment_and_recording_scoped_identity(
     result = _run(harness)
 
     assert result.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert result.package_set is not None
+    assert result.input_plan is not None
+    target = result.input_plan.target
+    request_catalog = result.input_plan.request_catalog
+    request_uuid_parts = (
+        result.package_set.lineage,
+        harness.execution_policy.semantic_sha256,
+        target.capability_snapshot_sha256,
+    )
+    input_plan_uuid_parts = (
+        request_catalog.semantic_sha256,
+        target.capability_snapshot_sha256,
+        result.input_plan.prompt_output.rendered_message_sha256,
+        harness.execution_policy.semantic_sha256,
+    )
+    assert request_catalog.request_catalog_id == _stable_uuid(
+        REQUEST_CATALOG_UUID_NAMESPACE,
+        *request_uuid_parts,
+    )
+    assert request_catalog.request_catalog_id != _stable_uuid(
+        "provider-request-catalog",
+        *request_uuid_parts,
+    )
+    assert result.input_plan.input_plan_id == _stable_uuid(
+        INPUT_PLAN_UUID_NAMESPACE,
+        *input_plan_uuid_parts,
+    )
+    assert result.input_plan.input_plan_id != _stable_uuid(
+        "inference-input-plan",
+        *input_plan_uuid_parts,
+    )
     assert result.attempt_count == result.adapter_infer_calls == 1
     assert result.terminal is not None
     assert result.selection is not None
@@ -472,20 +506,20 @@ def test_success_connects_raw_claim_enrichment_and_recording_scoped_identity(
     assert result.selected_output is not None
     assert result.enriched_output is not None
     assert result.output_decision is not None
-    assert result.output_decision.decision == "PRODUCTION_ADMITTED"
+    assert result.output_decision.decision == "ADMITTED"
+    assert result.output_decision.evidence_class is AdmissionEvidenceClass.LOCAL_CONFORMANCE
+    assert result.output_decision.production_eligible is False
+    assert b"PRODUCTION_ADMITTED" not in canonical_json_bytes(result.model_dump(mode="json"))
     assert len(result.hypotheses) == 1
-    assert result.identity_result is not None
-    assignment = result.identity_result.assignments[0]
-    assert assignment.event_id == _uuid(10_000)
-    assert assignment.recording_identity == harness.context.recording_identity
+    assert result.identity_result is None
     assert result.hypotheses[0].production_output_admission == (
         result.output_decision.production_output_admission
     )
     snapshot = harness.repository.snapshot(harness.context.recording_identity)
-    assert snapshot.generation == 1
-    assert tuple(item.event_id for item in snapshot.identities) == (_uuid(10_000),)
-    assert len(snapshot.assignments) == 1
-    assert len(harness.repository.list_outbox(harness.context.recording_identity)) == 1
+    assert snapshot.generation == 0
+    assert snapshot.identities == ()
+    assert snapshot.assignments == ()
+    assert harness.repository.list_outbox(harness.context.recording_identity) == ()
     assert len(harness.raw_store.list_records()) == 1
     assert harness.pipeline.evidence_store.get_parsed_claim(result.parsed_claims.artifact_id) == (
         result.parsed_claims
@@ -572,7 +606,7 @@ def test_exact_replay_reuses_selected_success_without_new_side_effects(
     first = _run(harness, processing_run=processing_run)
     assert first.status is CanonicalOfflineRunStatus.SUCCEEDED
     assert first.input_plan is not None
-    assert first.identity_result is not None
+    assert first.identity_result is None
     part_count = len(first.input_plan.call_plan.parts)
     assert part_count > 1
     assert len(first.part_results) == part_count
@@ -600,12 +634,10 @@ def test_exact_replay_reuses_selected_success_without_new_side_effects(
     assert len(first_raw) == part_count
     replay_snapshot = harness.repository.snapshot(harness.context.recording_identity)
     assert replay_snapshot == first_snapshot
-    assert replay_snapshot.generation == 1
+    assert replay_snapshot.generation == 0
     assert harness.repository.list_outbox(harness.context.recording_identity) == first_outbox
-    assert replay.identity_result is not None
-    assert replay.identity_result.new_identities == ()
-    assert replay.identity_result.outbox == ()
-    assert len(replay.identity_result.replayed_assignment_logical_keys) == part_count
+    assert first_outbox == ()
+    assert replay.identity_result is None
     _assert_offline(replay, harness)
 
 
@@ -687,6 +719,8 @@ def test_fresh_runs_reuse_the_full_logical_chain_across_clock_facts(tmp_path: Pa
     assert first.package_set.package_set_id == second.package_set.package_set_id
     assert first.input_plan is not None and second.input_plan is not None
     assert first.input_plan.semantic_sha256 == second.input_plan.semantic_sha256
+    assert first.output_decision == second.output_decision
+    assert first.hypotheses == second.hypotheses
     assert tuple(
         (item.node_type, item.node_logical_key, item.role) for item in first.run_memberships
     ) == tuple(
@@ -696,9 +730,8 @@ def test_fresh_runs_reuse_the_full_logical_chain_across_clock_facts(tmp_path: Pa
     assert all(item.disposition is RunNodeDisposition.REUSED for item in second.run_memberships)
     assert second.adapter_infer_calls == 0
     assert harness.pipeline.adapter.infer_calls == len(first.input_plan.call_plan.parts)
-    assert second.identity_result is not None
-    assert second.identity_result.new_identities == ()
-    assert second.identity_result.outbox == ()
+    assert first.identity_result is second.identity_result is None
+    assert harness.repository.snapshot(harness.context.recording_identity).generation == 0
 
 
 def test_sqlite_inference_evidence_recovers_across_fresh_pipeline_instances(
@@ -782,12 +815,13 @@ def test_sqlite_inference_evidence_recovers_across_fresh_pipeline_instances(
     assert _inference_evidence_counts(evidence_path) == first_counts
     assert second_harness.raw_store.list_records() == first_harness.raw_store.list_records()
     assert all(item.disposition is RunNodeDisposition.REUSED for item in second.run_memberships)
-    assert second.identity_result is not None
-    assert second.identity_result.new_identities == ()
-    assert second.identity_result.outbox == ()
+    assert first.identity_result is second.identity_result is None
+    assert repository.snapshot(first_harness.context.recording_identity).generation == 0
 
 
-def test_fresh_retry_attempt_reuses_run_independent_fusion_and_identity(tmp_path: Path) -> None:
+def test_fresh_retry_attempt_reuses_run_independent_fusion_and_hypotheses(
+    tmp_path: Path,
+) -> None:
     repository = InMemoryEventIdentityRegistryRepository()
     first_harness = _harness(
         _claim_bytes,
@@ -862,12 +896,9 @@ def test_fresh_retry_attempt_reuses_run_independent_fusion_and_identity(tmp_path
         item.semantic_sha256 for item in second.hypotheses
     )
 
-    assert first.identity_result is not None and second.identity_result is not None
-    assert second.identity_result.new_identities == ()
-    assert second.identity_result.outbox == ()
-    assert len(second.identity_result.replayed_assignment_logical_keys) == len(first.hypotheses)
+    assert first.identity_result is second.identity_result is None
     snapshot = repository.snapshot(first_harness.context.recording_identity)
-    assert snapshot.generation == 1
+    assert snapshot.generation == 0
 
 
 def test_nonoverlapping_root_window_fails_before_capability_or_dispatch(
@@ -912,10 +943,37 @@ def test_processing_run_must_bind_recording_and_execution_policy(tmp_path: Path)
     assert harness.logical_node_registry.list_run_memberships(processing_run.run_id) == ()
 
 
+def test_v1_running_processing_run_cannot_resume_under_v2(tmp_path: Path) -> None:
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
+    legacy = CanonicalProcessingRunContext.fresh(
+        run_id=_uuid(22_101),
+        recording_identity=harness.context.recording_identity,
+        mcap_id=harness.context.ready_manifest.mcap_id,
+        pipeline_version="canonical-offline-v1",
+        config_sha256=harness.execution_policy.semantic_sha256,
+        started_at=NOW_TEXT,
+    )
+    resumed = CanonicalProcessingRunContext.resume(legacy.to_record())
+
+    assert CANONICAL_OFFLINE_PIPELINE_VERSION == "canonical-offline-v2"
+    with pytest.raises(CanonicalOfflineConfigurationError, match="processing run"):
+        _run(harness, processing_run=resumed)
+
+    assert harness.pipeline.adapter.capability_calls == 0
+    assert harness.pipeline.adapter.infer_calls == 0
+    assert harness.logical_node_registry.list_run_memberships(resumed.run_id) == ()
+
+
 def test_run_result_rejects_tampered_binding_and_membership_proof(tmp_path: Path) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
     result = _run(harness)
     assert result.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert result.output_decision is not None
+
+    v1_decision = result.output_decision.model_dump(mode="python")
+    v1_decision["schema_version"] = "1.0"
+    with pytest.raises(ValidationError, match=r"2\.0"):
+        _revalidate_result(result, output_decision=v1_decision)
 
     with pytest.raises(ValidationError, match="terminal processing-run record"):
         _revalidate_result(result, mcap_id=_uuid(22_201))
@@ -964,41 +1022,150 @@ def test_run_result_rejects_tampered_binding_and_membership_proof(tmp_path: Path
         _revalidate_result(result, run_memberships=wrong_work_item)
 
 
-def test_membership_failed_result_rejects_published_identity_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    success_harness = _harness(
+def test_run_result_requires_exact_local_evidence_proof(tmp_path: Path) -> None:
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
+    result = _run(harness)
+    assert result.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert result.output_decision is not None
+    assert len(result.hypotheses) == 1
+    decision = result.output_decision
+    output_proof = decision.production_output_admission
+    assert output_proof is not None
+    hypothesis = result.hypotheses[0]
+
+    def rebound_decision(
+        *,
+        evidence_class: AdmissionEvidenceClass,
+        output_proof: OutputAdmissionProof,
+        admitted_claim_ordinals: tuple[int, ...],
+    ) -> CanonicalOutputAdmissionDecision:
+        draft = decision.model_copy(
+            update={
+                "evidence_class": evidence_class,
+                "production_eligible": False,
+                "production_output_admission": output_proof,
+                "admitted_claim_ordinals": admitted_claim_ordinals,
+            }
+        )
+        digest = semantic_sha256(canonical_output_decision_projection(draft))
+        return draft.model_copy(
+            update={
+                "semantic_sha256": digest,
+                "decision_id": _stable_uuid(
+                    CANONICAL_OUTPUT_DECISION_UUID_NAMESPACE,
+                    digest,
+                ),
+            }
+        )
+
+    benchmark_admission = AdmissionProof.from_context(
+        harness.context,
+        evidence_class=AdmissionEvidenceClass.GOVERNED_BENCHMARK,
+    )
+    benchmark_output = OutputAdmissionProof.create(
+        recording_identity=harness.context.recording_identity,
+        source_enrichments=decision.source_enrichments,
+        admitted_hypothesis_facts=output_proof.admitted_hypothesis_facts,
+        policy=harness.execution_policy.output_admission_policy,
+        evidence_class=AdmissionEvidenceClass.GOVERNED_BENCHMARK,
+    )
+    benchmark_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=hypothesis.recording_identity,
+        effective_interval=hypothesis.effective_interval,
+        semantic_fingerprint_sha256=hypothesis.semantic_fingerprint_sha256,
+        fusion_logical_key=hypothesis.fusion_logical_key,
+        fusion_output_ordinal=hypothesis.fusion_output_ordinal,
+        source_enrichments=hypothesis.source_enrichments,
+        production_admission=benchmark_admission,
+        production_output_admission=benchmark_output,
+    )
+    benchmark_decision = rebound_decision(
+        evidence_class=AdmissionEvidenceClass.GOVERNED_BENCHMARK,
+        output_proof=benchmark_output,
+        admitted_claim_ordinals=decision.admitted_claim_ordinals,
+    )
+
+    with pytest.raises(ValidationError, match="decisions require LOCAL_CONFORMANCE"):
+        _revalidate_result(
+            result,
+            output_decision=benchmark_decision,
+            hypotheses=(benchmark_hypothesis,),
+        )
+    with pytest.raises(ValidationError, match="one exact local proof lineage"):
+        _revalidate_result(result, hypotheses=(benchmark_hypothesis,))
+
+    extra_fact = ProductionAdmittedHypothesisFact(
+        fusion_output_ordinal=99,
+        effective_interval=NanosecondInterval(start_ns=900_000_000, end_ns=900_000_001),
+        semantic_fingerprint_sha256=_digest("extra-hypothesis"),
+        fusion_logical_key=f"fusion:{_digest('extra-hypothesis')}",
+    )
+    expanded_output = OutputAdmissionProof.create(
+        recording_identity=harness.context.recording_identity,
+        source_enrichments=decision.source_enrichments,
+        admitted_hypothesis_facts=(
+            *output_proof.admitted_hypothesis_facts,
+            extra_fact,
+        ),
+        policy=harness.execution_policy.output_admission_policy,
+    )
+    expanded_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=hypothesis.recording_identity,
+        effective_interval=hypothesis.effective_interval,
+        semantic_fingerprint_sha256=hypothesis.semantic_fingerprint_sha256,
+        fusion_logical_key=hypothesis.fusion_logical_key,
+        fusion_output_ordinal=hypothesis.fusion_output_ordinal,
+        source_enrichments=hypothesis.source_enrichments,
+        production_admission=hypothesis.production_admission,
+        production_output_admission=expanded_output,
+    )
+    expanded_decision = rebound_decision(
+        evidence_class=AdmissionEvidenceClass.LOCAL_CONFORMANCE,
+        output_proof=expanded_output,
+        admitted_claim_ordinals=tuple(
+            sorted((*decision.admitted_claim_ordinals, extra_fact.fusion_output_ordinal))
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="exactly cover the run hypotheses"):
+        _revalidate_result(
+            result,
+            output_decision=expanded_decision,
+            hypotheses=(expanded_hypothesis,),
+        )
+
+
+def test_local_result_rejects_authoritative_identity_result(tmp_path: Path) -> None:
+    harness = _harness(
         _claim_bytes,
-        logical_registry_root=tmp_path / "success",
+        logical_registry_root=tmp_path,
     )
-    successful = _run(success_harness)
-    assert successful.identity_result is not None
+    successful = _run(harness)
+    assert successful.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert successful.identity_result is None
 
-    failure_harness = _harness(
-        _claim_bytes,
-        logical_registry_root=tmp_path / "failure",
+    identity_policy = EventIdentityPolicyRef(
+        version="exact-fingerprint-v1",
+        semantic_sha256=_digest("exact-fingerprint-v1"),
     )
-    attach = failure_harness.logical_node_registry.attach_run_node
-
-    def reject_event_hypothesis(**kwargs: object):  # type: ignore[no-untyped-def]
-        if getattr(kwargs["node"], "node_type", None) == "EVENT_HYPOTHESIS":
-            raise LogicalNodeRegistryError(
-                LogicalNodeRegistryErrorCode.TRANSACTION_FAILED,
-                "injected event-hypothesis membership failure",
-            )
-        return attach(**kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        failure_harness.logical_node_registry,
-        "attach_run_node",
-        reject_event_hypothesis,
+    identity_registry = EventIdentityRegistryService(
+        repository=harness.repository,
+        resolver=ExactFingerprintEventIdentityResolver(identity_policy),
+        allocator=_SequenceEventIdAllocator(),
+        output_admission_policy=harness.execution_policy.output_admission_policy,
     )
-    failed = _run(failure_harness)
-    assert failed.status is CanonicalOfflineRunStatus.RUN_MEMBERSHIP_FAILED
+    enriched_outputs = tuple(
+        item.enriched_output for item in successful.part_results if item.enriched_output is not None
+    )
+    identity_result = identity_registry.assign_batch(
+        admitted_context=harness.context,
+        hypotheses=successful.hypotheses,
+        enriched_outputs=enriched_outputs,
+        decided_at=NOW_TEXT,
+    )
 
-    with pytest.raises(ValidationError, match="cannot carry a published identity result"):
-        _revalidate_result(failed, identity_result=successful.identity_result)
+    with pytest.raises(ValidationError, match="authoritative identity assignments"):
+        _revalidate_result(successful, identity_result=identity_result)
 
 
 def test_all_required_parts_abstain_without_mutating_identity_registry(tmp_path: Path) -> None:
@@ -1240,12 +1407,11 @@ def test_provider_limit_multi_part_reduces_complete_ordered_call_set(tmp_path: P
         range(part_count)
     )
     assert len(result.hypotheses) == part_count
-    assert result.identity_result is not None
-    assert len(result.identity_result.assignments) == part_count
+    assert result.identity_result is None
     completions = harness.pipeline.call_barrier_storage.list_completions(_barrier_id(result))
     assert tuple(item.part_ordinal for item in completions) == tuple(range(part_count))
     assert len(harness.raw_store.list_records()) == part_count
-    assert harness.repository.snapshot(harness.context.recording_identity).generation == 1
+    assert harness.repository.snapshot(harness.context.recording_identity).generation == 0
     _assert_offline(result, harness)
 
 

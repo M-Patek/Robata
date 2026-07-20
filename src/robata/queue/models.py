@@ -10,7 +10,6 @@ from pydantic import Field, StringConstraints
 from robata.contracts.common import StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
 
-
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]

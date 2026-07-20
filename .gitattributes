@@ -1,0 +1,12 @@
+*.json text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+
+# These published v1 artifacts predate the LF-only release rule. Their exact
+# checkout bytes are pinned by schema-catalog.json and must not be normalized.
+schemas/v1/inference-attempt-selection.schema.json -text -eol whitespace=cr-at-eol
+schemas/v1/inference-intent.schema.json -text -eol whitespace=cr-at-eol
+schemas/v1/model-inference.schema.json -text -eol whitespace=cr-at-eol
+schemas/v1/parsed-provider-claim-artifact.schema.json -text -eol whitespace=cr-at-eol
+schemas/v1/raw-provider-response-artifact.schema.json -text -eol whitespace=cr-at-eol
+schemas/v1/selected-attempt-output.schema.json -text -eol whitespace=cr-at-eol

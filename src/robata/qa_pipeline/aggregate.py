@@ -17,7 +17,7 @@ from pydantic import Field, model_validator
 from robata.contracts.cameras import CameraId
 from robata.contracts.common import NanosecondInterval, StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CameraQAResult,
     CameraQAStatus,
     RecordingQAStatus,
@@ -157,9 +157,7 @@ class QAAggregator:
             Recording-level QA decision with full provenance.
         """
         if len(coarse_results) != 6:
-            raise ValueError(
-                f"Expected exactly 6 coarse camera results, got {len(coarse_results)}"
-            )
+            raise ValueError(f"Expected exactly 6 coarse camera results, got {len(coarse_results)}")
 
         scope = coarse_results[0].claim.observed_interval
         mcap_id = coarse_results[0].mcap_id
@@ -216,9 +214,7 @@ class QAAggregator:
         # Check for INCOMPLETE: any camera with INCOMPLETE status makes the
         # recording INCOMPLETE unless all others are GOOD/DEGRADED.
         incomplete_count = sum(
-            1
-            for result in camera_map.values()
-            if result.claim.status is CameraQAStatus.INCOMPLETE
+            1 for result in camera_map.values() if result.claim.status is CameraQAStatus.INCOMPLETE
         )
         if incomplete_count > 0 and self._policy.incomplete_is_blocking:
             overall_status = RecordingQAStatus.INCOMPLETE
@@ -226,20 +222,15 @@ class QAAggregator:
         # Compute overall quality as mean of per-camera quality scores.
         # Missing evidence (UNKNOWN/INCOMPLETE) contributes 0.0 to the mean.
         policy_scores = [
-            self._policy.status_quality[result.claim.status]
-            for result in camera_map.values()
+            self._policy.status_quality[result.claim.status] for result in camera_map.values()
         ]
         overall_quality = sum(policy_scores) / len(policy_scores)
 
         # Collect result IDs.
-        camera_result_ids = tuple(
-            camera_map[camera_id].qa_result_id for camera_id in CameraId
-        )
+        camera_result_ids = tuple(camera_map[camera_id].qa_result_id for camera_id in CameraId)
         coarse_by_camera = {result.camera_id: result for result in coarse_results}
         coarse_ids = tuple(coarse_by_camera[camera_id].qa_result_id for camera_id in CameraId)
-        dense_by_camera = {
-            result.camera_id: result for result in dense_results or ()
-        }
+        dense_by_camera = {result.camera_id: result for result in dense_results or ()}
         dense_ids = tuple(
             dense_by_camera[camera_id].qa_result_id
             for camera_id in CameraId
@@ -255,9 +246,7 @@ class QAAggregator:
             if result.claim.reported_score is not None
         ]
         model_score = (
-            round(sum(reported_scores) / len(reported_scores), 4)
-            if reported_scores
-            else None
+            round(sum(reported_scores) / len(reported_scores), 4) if reported_scores else None
         )
         return RecordingQAResult(
             mcap_id=mcap_id,

@@ -62,6 +62,13 @@ the current worktree unless their claims are independently reproduced by current
 - Unit, schema-conformance, property, golden-vector, mutation-rejection, and replay tests.
 - Tooling for formatting, linting, type checking, and tests through documented `uv` commands.
 
+Current local upcasting evidence uses a registry-backed synthetic catalog and fixture. It pins
+exact source/target schemas plus catalog paths and exact bytes for code/runtime/golden artifacts,
+executes paired golden vectors, preserves declared fields, validates both endpoints, and rejects
+missing, cyclic, or ambiguous paths, input mutation, repeat-execution nondeterminism, and pin
+conflicts. The live schema catalog still registers no domain upcaster. This proves a local Section
+25.7/25.11 mechanism subset; it does not by itself satisfy the complete Phase 1A exit gate.
+
 ### Acceptance
 
 - A clean environment installs from the lock file and runs all checks through documented `uv` commands.
@@ -256,14 +263,21 @@ media exercise is retained in
 
 ## Historical Isolated Fake-Model Mainline: Development Evidence
 
-**Status: retained as a legacy smoke path; not the current unified execution chain and not a
-phase-gate result.**
+**Status: removed from the live package and CLI surface; retained only as archived development
+history and not a phase-gate result.**
 
-The `application/mainline.py` path composes the registered V2 video export with legacy
-provider-neutral package/request contracts and a deterministic fake adapter. It does not yet
-consume the canonical materialized `TemporalPackageSet`, `InferenceInputPlan`, ingestion/READY
-publication ledger, or current benchmark evidence context. No network client, credential, Qwen/GPT
-call, or model-quality evaluation is part of this isolated path.
+The former `application/mainline.py` path composed the registered V2 video export with legacy
+provider-neutral package/request contracts and a deterministic fake adapter. It did not consume
+the canonical materialized `TemporalPackageSet`, `InferenceInputPlan`, ingestion/READY publication
+ledger, or current benchmark evidence context. Its source, commands, and results are historical;
+the implementation remains available only through repository history and older supporting
+material under `archive/old_mvp`, not through the live namespace.
+
+The deletion also covers the old `robata.contracts.mainline` and `robata.ports.mainline`
+namespaces, smoke-only run bundle/report/stage types, fake-attempt accounting, and the duplicate
+legacy model-adapter port. No compatibility shim remains. Shared domain contracts and the live
+frame-materialization port were moved to the semantically neutral `robata.contracts.pipeline` and
+`robata.ports.frame_materialization` modules.
 
 ### Historical delivered path
 
@@ -291,9 +305,9 @@ call, or model-quality evaluation is part of this isolated path.
   exact byte length and SHA-256; `execution-audit.ndjson` records canonical stage accounting
   without source paths, credentials, or raw frames. Both are written inside the atomic staging
   tree and are absent from failed runs.
-- `scripts/preflight_local_mainline.py` performs an offline Python/dependency/mapping/source/
-  output/registry/spec-hash readiness check and always reports `provider_requests = 0`.
-  Historical operating context is retained in
+- The archived preflight performed an offline Python/dependency/mapping/source/output/registry/
+  spec-hash readiness check and always reported `provider_requests = 0`. Historical operating
+  context is retained in
   `archive/old_mvp/docs/operations/local-mainline-runbook.md` and
   `archive/old_mvp/docs/operations/provider-adapter-readiness.md`.
 
@@ -319,29 +333,52 @@ The live tree now has a canonical post-admission offline conformance spine from 
 materialized provider-neutral package set,
 strict provider-specific input plan/catalog, independently retried call parts, an all-terminal
 barrier, selected raw/parsed/enriched lineage, deterministic ordered fusion reduction, local output
-admission, and recording-scoped fenced identity/outbox assignment. Exact replay, all-abstain,
-mixed-abstain, permanent-failure, and fail-closed lineage paths are covered locally with zero
-network calls. Locator-only package/prompt/schema and retry-attempt changes preserve reusable
-logical identities while exact audit lineage remains distinct. Each admitted stage is attached to
-its processing run in the local SQLite logical-node registry; separate fresh runs retain separate
-membership histories and reuse the same semantic nodes. One append-only local SQLite inference
-ledger preserves intent, pre-parse raw bytes, terminal attempts, typed raw artifacts, selections,
-parsed claims, selected outputs, and enrichments; a fresh ledger/adapter/pipeline instance reopens
-selected evidence without provider redispatch. Local SQLite repositories also add restart-safe
-logical memberships, recording fences, assignments, relations, and outbox rows without claiming
-production infrastructure.
+admission, and immutable local event hypotheses. It stops before stable identity assignment and
+outbox publication. Exact replay, all-abstain, mixed-abstain, permanent-failure, and fail-closed
+lineage paths are covered locally with zero network calls. Locator-only package/prompt/schema and
+retry-attempt changes preserve reusable logical identities while exact audit lineage remains
+distinct. Each admitted stage is attached to its processing run in the local SQLite logical-node
+registry; separate fresh runs retain separate membership histories and reuse the same semantic
+nodes. One append-only local SQLite inference ledger preserves intent, pre-parse raw bytes,
+terminal attempts, typed raw artifacts, selections, parsed claims, selected outputs, and
+enrichments; a fresh ledger/adapter/pipeline instance reopens selected evidence without provider
+redispatch. Separate SQLite identity repositories provide restart-safe component conformance for
+recording fences, assignments, relations, and outbox rows, but are not injected into this
+canonical composition and do not claim production infrastructure.
 
-This spine does not replace the legacy CLI, produce V2 admission evidence from raw MCAP, dispatch
+This spine does not expose an operator CLI, produce V2 admission evidence from raw MCAP, dispatch
 real providers, or provide end-to-end production persistence. Its adapter is fixture-only, and its
 barriers, processing-run/work lifecycle, output decisions, and run results remain in-process even
-though selected inference evidence, logical memberships, and event identity/outbox have local
-SQLite adapters. The remaining convergence work is to add those durable lifecycle and recovery
-boundaries, then compose raw admission, ActionEvent revision/current selection, outbox publication,
-and downstream task paths when their governance and policy inputs are resolved. Derived
-package-set/input-plan/inference hashes created by the former exact-manifest-polluted identity
-formula must be rebuilt; registered wire shapes and versions are unchanged.
-Until then, a legacy fake run remains a smoke test and a canonical fixture run remains local
-conformance evidence only.
+though selected inference evidence and logical memberships have local SQLite adapters.
+Identity/outbox is tested only as an independent component, not as a canonical completion side
+effect. The remaining convergence work is to add those durable lifecycle and recovery boundaries,
+then compose raw admission, governed qualification, prepared identity, ActionEvent
+revision/current selection, outbox publication, and downstream task paths when their governance
+and policy inputs are resolved. Derived package-set/input-plan/inference hashes created by the
+former exact-manifest-polluted identity formula must be rebuilt. Registered wire shapes and
+versions are unchanged; the unregistered local output-proof, output-decision, and
+event-hypothesis contracts advance to V2 and reject V1 payloads. canonical-offline-v1 processing
+runs, including old RUNNING records, cannot resume under canonical-offline-v2. Archived fake-run
+results remain historical comparison material only; canonical fixture runs remain local
+conformance evidence.
+
+### Canonical module ownership
+
+The canonical spine remains one behavioral path without returning to one implementation owner:
+
+- `canonical/models.py` owns status, error, root-window, part-result, and execution-policy models.
+- `canonical/projections.py` owns semantic projections and identity-policy namespaces.
+- `canonical/reduction.py` owns deterministic fusion reduction.
+- `canonical/output_admission.py` owns local output decisions and hypothesis projection.
+- `canonical/logical_nodes.py` owns typed logical-node producers.
+- `canonical/runner_support.py` owns validation and conversion helpers used by composition.
+- `canonical/result_validation.py` owns terminal run-result and retained-lineage validation.
+- `canonical/runner.py` owns state progression and port calls.
+- `canonical_offline.py` is a stable re-export facade, not an implementation owner.
+
+New durable work, provider, QA, revision, or completion behavior must enter its owning module or
+an explicit port rather than accumulating in the facade or turning `runner.py` into a second
+all-domain owner.
 
 ## Phase 1B: Real MCAP and Source-Time Admission
 
@@ -427,8 +464,9 @@ Tests may report deterministic case counts and local durations, but those values
 - **O-14:** Database, broker, object store, and deployment selection is not required for the local contract/admission foundation, but is required before production durability and concurrency claims.
 - **Section 25.7 durable surfaces:** Work messages, output decisions, durable multi-part barrier
   recovery, run-result persistence, a production recording-scoped identity store, and an outbox
-  publisher remain required for a production path. The local SQLite inference and identity/outbox
-  adapters are conformance evidence, not an O-14 infrastructure decision.
+  publisher remain required for a production path. The local SQLite inference adapter and the
+  separately tested identity/outbox adapter are conformance evidence, not an O-14 infrastructure
+  decision or one composed completion transaction.
 - **O-15:** Retention, access, encryption, data handling, residency, and audit rules are part of the Phase 0 hard gate.
 
 ## Promotion Rule

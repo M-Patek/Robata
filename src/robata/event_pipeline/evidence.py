@@ -1,13 +1,12 @@
-"""ActionEvidence extraction (Section 13.2).
+"""Future contract for ActionEvidence extraction (Section 13.2).
 
-Builds dense six-camera evidence packages, runs per-camera and optional
-cross-view hypothesis generation, normalizes evidence, and performs
-provisional fusion to separate simultaneous physical actions.
+This non-runnable skeleton will build dense six-camera evidence packages and
+normalize per-camera and cross-view evidence. Extraction remains unimplemented.
 """
 
 from __future__ import annotations
 
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     ActionEvidence,
     CandidateEvent,
     TemporalVisualPackage,
@@ -15,7 +14,7 @@ from robata.contracts.mainline import (
 
 
 class ActionEvidenceExtractor:
-    """Extract action evidence from a dense package for a candidate event.
+    """Future action-evidence extractor; currently non-runnable.
 
     Steps:
     1. Add context padding and clip to recording bounds.
@@ -40,11 +39,8 @@ class ActionEvidenceExtractor:
         Returns:
             Normalized six-camera action evidence.
         """
-        # Skeleton: evidence extraction to be implemented per Section 13.2.
         _ = candidate
         _ = dense_package
-        # Return a placeholder; real implementation will construct from
-        # inference results.
         raise NotImplementedError("extract_evidence is a skeleton")
 
 

@@ -17,10 +17,10 @@ from robata.contracts.common import (
 )
 
 # ---------------------------------------------------------------------------
-# Re-export canonical status enums from the mainline contract so pipeline
+# Re-export canonical status enums from the shared pipeline contract so pipeline
 # modules can import them from a single location.
 # ---------------------------------------------------------------------------
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     CameraQAStatus,
     QAIssueSeverity,
     RecordingQAStatus,
@@ -28,11 +28,11 @@ from robata.contracts.mainline import (
 
 __all__ = [
     "CameraQAStatus",
-    "QAStage",
-    "QAStageResult",
     "QAIssueSeverity",
-    "RecordingQAStatus",
+    "QAStage",
     "QAStageIssue",
+    "QAStageResult",
+    "RecordingQAStatus",
 ]
 
 

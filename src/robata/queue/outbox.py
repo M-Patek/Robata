@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
-from robata.queue.models import NonEmptyString, OpaqueUuid, OutboxEvent, OutboxEventStatus
+from robata.queue.models import OutboxEvent, OutboxEventStatus
 
 
 class OutboxPublisher:
@@ -34,9 +34,7 @@ class OutboxPublisher:
         """
         if event_id in self._events:
             existing = self._events[event_id]
-            self._events[event_id] = existing.model_copy(
-                update={"status": OutboxEventStatus.SENT}
-            )
+            self._events[event_id] = existing.model_copy(update={"status": OutboxEventStatus.SENT})
 
     def get_pending(self, limit: int = 100) -> Sequence[OutboxEvent]:
         """Return up to ``limit`` events that have not yet been delivered.
@@ -45,8 +43,7 @@ class OutboxPublisher:
         delivery of stale items.
         """
         pending = [
-            event for event in self._events.values()
-            if event.status is OutboxEventStatus.PENDING
+            event for event in self._events.values() if event.status is OutboxEventStatus.PENDING
         ]
         return tuple(pending[:limit])
 

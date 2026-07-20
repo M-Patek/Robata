@@ -106,6 +106,35 @@ def test_zero_child_barrier_closes_with_explicit_empty_semantics() -> None:
     assert aggregate.is_complete is True
 
 
+def test_zero_child_barrier_can_fail_with_explicit_terminal_semantics() -> None:
+    coordinator, _ = _coordinator()
+    barrier = coordinator.create_barrier(
+        "event:mcap-empty-failure",
+        0,
+        ReductionPolicy(version="event-empty-v1", required_count=0),
+        empty_semantics=StageStatus.FAILED.value,
+    )
+
+    assert barrier.status == "FAILED"
+    assert coordinator.is_complete(barrier.barrier_id) is True
+    assert coordinator.get_aggregate_status(barrier.barrier_id).overall_status is StageStatus.FAILED
+
+
+@pytest.mark.parametrize("empty_semantics", ["UNKNOWN", StageStatus.PENDING, StageStatus.RUNNING])
+def test_zero_child_barrier_rejects_unknown_or_nonterminal_empty_semantics(
+    empty_semantics: str,
+) -> None:
+    coordinator, _ = _coordinator()
+
+    with pytest.raises(ValueError, match="terminal StageStatus"):
+        coordinator.create_barrier(
+            "event:mcap-invalid-empty-semantics",
+            0,
+            ReductionPolicy(version="event-empty-v1", required_count=0),
+            empty_semantics=empty_semantics,
+        )
+
+
 def test_conflicting_or_excess_member_replay_fails_closed() -> None:
     coordinator, _ = _coordinator()
     barrier = coordinator.create_barrier(

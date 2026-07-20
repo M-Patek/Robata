@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Sequence
+from collections.abc import Sequence
+from typing import Annotated
 
 from pydantic import Field
 
 from robata.contracts.common import StrictModel
 from robata.queue.models import NonEmptyString, NonNegativeInt
 from robata.queue.stage import Stage
-
 
 NonNegativeFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
 

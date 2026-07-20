@@ -1,0 +1,94 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  live-tree:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          version: '0.11.29'
+          enable-cache: true
+
+      - name: Sync locked development environment
+        run: uv sync --locked --dev
+
+      - name: Test live tree
+        shell: pwsh
+        run: >-
+          uv run pytest -q -p no:cacheprovider
+          --basetemp "$env:RUNNER_TEMP\robata-tests"
+
+      - name: Lint and format check
+        run: |
+          uv run ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run ruff format --check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Verify schemas and documentation
+        run: |
+          uv run python scripts/verify_schema_registry.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run python scripts/check_doc_links.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Enforce published Schema immutability
+        shell: pwsh
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          SCHEMA_BASELINE_REF: ${{ vars.SCHEMA_BASELINE_REF }}
+        run: |
+          $eventBaseline = if ($env:PR_BASE_SHA) { $env:PR_BASE_SHA } else { $env:PUSH_BEFORE_SHA }
+          if (-not $eventBaseline -or $eventBaseline -match '^0+$') {
+            throw 'The pull-request or push event did not provide a usable immutable baseline SHA.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SCHEMA_BASELINE_REF)) {
+            throw 'Repository variable SCHEMA_BASELINE_REF must name a protected release commit or tag.'
+          }
+          uv run python scripts/check_schema_immutability.py --baseline-ref $eventBaseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run python scripts/check_schema_immutability.py --baseline-ref $env:SCHEMA_BASELINE_REF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build clean tracked-source evidence
+        shell: pwsh
+        run: |
+          $manifest = "$env:RUNNER_TEMP\robata-source-release-manifest.json"
+          $archive = "$env:RUNNER_TEMP\robata-source-${{ github.sha }}.tar"
+          uv run python scripts/check_release_hygiene.py --archive-output $archive --expected-commit "${{ github.sha }}" > $manifest
+
+      - name: Publish source archive and manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: robata-source-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/robata-source-${{ github.sha }}.tar
+            ${{ runner.temp }}/robata-source-release-manifest.json
+          if-no-files-found: error
+          retention-days: 14

@@ -27,7 +27,7 @@ from robata.contracts.common import (
 )
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import OpaqueUuid
-from robata.contracts.mainline import (
+from robata.contracts.pipeline import (
     BoundaryRefinement,
     CameraActionClaim,
     CameraEvidenceStatus,

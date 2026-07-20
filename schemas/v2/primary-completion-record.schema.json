@@ -1,0 +1,442 @@
+{
+  "$defs": {
+    "DetailedResultArtifactReference": {
+      "additionalProperties": false,
+      "description": "Exact immutable reference to the schema-governed detailed run result.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_bytes_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Bytes Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "const": "application/json",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_bytes_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "DetailedResultArtifactReference",
+      "type": "object"
+    },
+    "PrimaryCompletionOutcome": {
+      "description": "Terminal outcomes that constitute authoritative primary completion.",
+      "enum": [
+        "PRIMARY_COMPLETE",
+        "PRIMARY_COMPLETE_NO_EVENTS",
+        "PRIMARY_COMPLETE_WITH_SKIPS"
+      ],
+      "title": "PrimaryCompletionOutcome",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v2/primary-completion-record.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "PRIMARY_COMPLETE_NO_EVENTS"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "current_selection_count": {
+            "const": 0
+          },
+          "hypothesis_count": {
+            "const": 0
+          },
+          "identity_assignment_count": {
+            "const": 0
+          },
+          "identity_relation_count": {
+            "const": 0
+          },
+          "new_identity_count": {
+            "const": 0
+          },
+          "revision_count": {
+            "const": 0
+          },
+          "selection_decision_count": {
+            "const": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "PRIMARY_COMPLETE_WITH_SKIPS"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "skipped_work_item_count": {
+            "minimum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "PRIMARY_COMPLETE",
+              "PRIMARY_COMPLETE_NO_EVENTS"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "skipped_work_item_count": {
+            "const": 0
+          }
+        }
+      }
+    }
+  ],
+  "description": "Compact registered record committed with all primary publication facts.",
+  "properties": {
+    "barrier_definition_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Barrier Definition Semantic Sha256",
+      "type": "string"
+    },
+    "barrier_member_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Barrier Member Count",
+      "type": "integer"
+    },
+    "barrier_member_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Barrier Member Digest Root",
+      "type": "string"
+    },
+    "barrier_reduction_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Barrier Reduction Semantic Sha256",
+      "type": "string"
+    },
+    "completed_at": {
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "config_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Sha256",
+      "type": "string"
+    },
+    "current_selection_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Current Selection Count",
+      "type": "integer"
+    },
+    "current_selection_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Current Selection Digest Root",
+      "type": "string"
+    },
+    "detailed_result": {
+      "$ref": "#/$defs/DetailedResultArtifactReference"
+    },
+    "hypothesis_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Hypothesis Count",
+      "type": "integer"
+    },
+    "hypothesis_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Hypothesis Digest Root",
+      "type": "string"
+    },
+    "identity_assignment_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Identity Assignment Count",
+      "type": "integer"
+    },
+    "identity_assignment_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Identity Assignment Digest Root",
+      "type": "string"
+    },
+    "identity_relation_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Identity Relation Count",
+      "type": "integer"
+    },
+    "identity_relation_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Identity Relation Digest Root",
+      "type": "string"
+    },
+    "mcap_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Mcap Id",
+      "type": "string"
+    },
+    "new_identity_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "New Identity Count",
+      "type": "integer"
+    },
+    "new_identity_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "New Identity Digest Root",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/PrimaryCompletionOutcome"
+    },
+    "output_admission_policy_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Output Admission Policy Sha256",
+      "type": "string"
+    },
+    "output_admission_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Output Admission Policy Version",
+      "type": "string"
+    },
+    "output_decision_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Output Decision Semantic Sha256",
+      "type": "string"
+    },
+    "pipeline_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Pipeline Version",
+      "type": "string"
+    },
+    "recording_identity": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Identity",
+      "type": "string"
+    },
+    "revision_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Revision Count",
+      "type": "integer"
+    },
+    "revision_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Revision Digest Root",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "run_membership_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Run Membership Count",
+      "type": "integer"
+    },
+    "run_membership_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Run Membership Digest Root",
+      "type": "string"
+    },
+    "schema_ref": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        {
+          "properties": {
+            "schema_id": {
+              "const": "https://schemas.robata.dev/primary-completion-record"
+            },
+            "version": {
+              "const": "2.0.0"
+            }
+          }
+        }
+      ]
+    },
+    "schema_version": {
+      "const": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "selection_decision_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Selection Decision Count",
+      "type": "integer"
+    },
+    "selection_decision_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Selection Decision Digest Root",
+      "type": "string"
+    },
+    "semantic_projection_version": {
+      "const": "primary-completion-record-semantic-v2",
+      "title": "Semantic Projection Version",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Semantic Sha256",
+      "type": "string"
+    },
+    "skipped_work_item_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Skipped Work Item Count",
+      "type": "integer"
+    },
+    "skipped_work_item_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Skipped Work Item Digest Root",
+      "type": "string"
+    },
+    "started_at": {
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Started At",
+      "type": "string"
+    },
+    "successor_outbox_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Successor Outbox Count",
+      "type": "integer"
+    },
+    "successor_outbox_digest_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Successor Outbox Digest Root",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "semantic_projection_version",
+    "semantic_sha256",
+    "run_id",
+    "recording_identity",
+    "mcap_id",
+    "pipeline_version",
+    "config_sha256",
+    "started_at",
+    "outcome",
+    "barrier_definition_semantic_sha256",
+    "barrier_reduction_semantic_sha256",
+    "output_decision_semantic_sha256",
+    "output_admission_policy_version",
+    "output_admission_policy_sha256",
+    "run_membership_count",
+    "run_membership_digest_root",
+    "barrier_member_count",
+    "barrier_member_digest_root",
+    "hypothesis_count",
+    "hypothesis_digest_root",
+    "identity_assignment_count",
+    "identity_assignment_digest_root",
+    "new_identity_count",
+    "new_identity_digest_root",
+    "identity_relation_count",
+    "identity_relation_digest_root",
+    "revision_count",
+    "revision_digest_root",
+    "selection_decision_count",
+    "selection_decision_digest_root",
+    "current_selection_count",
+    "current_selection_digest_root",
+    "successor_outbox_count",
+    "successor_outbox_digest_root",
+    "skipped_work_item_count",
+    "skipped_work_item_digest_root",
+    "detailed_result",
+    "completed_at"
+  ],
+  "title": "Primary Completion Record",
+  "type": "object"
+}

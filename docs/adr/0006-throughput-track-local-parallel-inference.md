@@ -1,9 +1,12 @@
 # ADR 0006: Opt-In Deterministic Parallel Inference for Throughput Track T1
 
-- Status: Accepted for local fake-model experimentation only
+- Status: Retired on 2026-07-20 with removal of the legacy fake-model runner
 - Date: 2026-07-19
 - Governing authority: Architecture V1.1, ADR 0001, and the local mainline contracts
 - Scope: non-normative throughput track T1; does not redefine Architecture V1.1 Phase 1B/2
+
+The decision record is retained for history. Its `LocalMainlineConfig` implementation and fake
+adapter are no longer installed or runnable from the live package.
 
 ## Context
 

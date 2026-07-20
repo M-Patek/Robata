@@ -1,12 +1,21 @@
 """Deterministic timestamp-grid sampling primitives."""
 
 from robata.sampling.adaptive import (
+    ADAPTIVE_TARGET_PLAN_SEMANTIC_PROJECTION_VERSION,
+    AdaptiveResolutionMode,
     AdaptiveSampler,
     AdaptiveSamplingPolicy,
     AdaptiveSamplingResult,
     AdaptiveSignal,
+    CanonicalAdaptiveGridSegment,
+    FrozenAdaptiveResolutionRequest,
+    FrozenAdaptiveTriggerArtifactRef,
+    ResolvedAdaptivePlan,
+    ResolvedAdaptiveTarget,
     SignalDetector,
     SignalTrigger,
+    adaptive_target_plan_semantic_projection,
+    resolve_frozen_adaptive_targets,
 )
 from robata.sampling.dense import (
     DenseSamplingPlanner,
@@ -66,7 +75,9 @@ from robata.sampling.signals import (
 )
 
 __all__ = [
+    "ADAPTIVE_TARGET_PLAN_SEMANTIC_PROJECTION_VERSION",
     "NANOSECONDS_PER_SECOND",
+    "AdaptiveResolutionMode",
     "AdaptiveSampler",
     "AdaptiveSamplingPolicy",
     "AdaptiveSamplingResult",
@@ -74,6 +85,7 @@ __all__ = [
     "BlurDetector",
     "CameraSourceFrameIndex",
     "CandidateFrame",
+    "CanonicalAdaptiveGridSegment",
     "CanonicalSixCameraFrameIndex",
     "DenseSamplingPlanner",
     "DenseSplitPolicy",
@@ -81,6 +93,8 @@ __all__ = [
     "FrameArtifactResolver",
     "FrameCandidate",
     "FrameSelection",
+    "FrozenAdaptiveResolutionRequest",
+    "FrozenAdaptiveTriggerArtifactRef",
     "GridTargetMaterialization",
     "IndexedSourceFrame",
     "IntervalPart",
@@ -98,6 +112,8 @@ __all__ = [
     "PackageMaterializationErrorCode",
     "PackageSetBuilder",
     "ProviderNeutralTemporalPackage",
+    "ResolvedAdaptivePlan",
+    "ResolvedAdaptiveTarget",
     "SamplingGrid",
     "SamplingRate",
     "SamplingTarget",
@@ -111,10 +127,12 @@ __all__ = [
     "TemporalPackageSet",
     "TemporalPackageSetMember",
     "TemporalWindow",
+    "adaptive_target_plan_semantic_projection",
     "derive_temporal_package_id",
     "frame_counts_for_interval",
     "package_semantic_projection",
     "plan_interval_parts",
+    "resolve_frozen_adaptive_targets",
     "sampling_plan_digest",
     "sampling_plan_projection",
     "select_nearest_frames",
