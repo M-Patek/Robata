@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v2/mcap-manifest.schema.json",
+  "title": "Robata MCAPReadyManifest V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "ready_manifest_id",
+    "ready_manifest_semantic_sha256",
+    "mcap_id",
+    "recording_identity",
+    "source_content_sha256",
+    "source",
+    "source_durability",
+    "validation_report_id",
+    "validation_report_semantic_sha256",
+    "validation_report_schema_ref",
+    "camera_mapping_run_id",
+    "camera_mapping_semantic_sha256",
+    "mapping_policy",
+    "admission_policy",
+    "recording",
+    "camera_count",
+    "cameras",
+    "published_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "schema_ref": {
+      "allOf": [
+        {"$ref": "artifact-registry-entry.schema.json#/$defs/schemaArtifactReference"},
+        {
+          "properties": {
+            "schema_id": {"const": "https://schemas.robata.dev/mcap-manifest"},
+            "version": {"const": "2.0.0"}
+          }
+        }
+      ]
+    },
+    "ready_manifest_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "ready_manifest_semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "mcap_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "recording_identity": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "source_content_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "source": {"$ref": "#/$defs/source"},
+    "source_durability": {"$ref": "#/$defs/durabilityEvidence"},
+    "validation_report_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "validation_report_semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "validation_report_schema_ref": {
+      "allOf": [
+        {"$ref": "artifact-registry-entry.schema.json#/$defs/schemaArtifactReference"},
+        {
+          "properties": {
+            "schema_id": {"const": "https://schemas.robata.dev/mcap-validation-report"},
+            "version": {"const": "2.0.0"}
+          }
+        }
+      ]
+    },
+    "camera_mapping_run_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "camera_mapping_semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "mapping_policy": {"$ref": "#/$defs/semanticPolicyReference"},
+    "admission_policy": {"$ref": "#/$defs/semanticPolicyReference"},
+    "recording": {"$ref": "#/$defs/recording"},
+    "camera_count": {"const": 6},
+    "cameras": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_01"}}}]},
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_02"}}}]},
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_03"}}}]},
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_04"}}}]},
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_05"}}}]},
+        {"allOf": [{"$ref": "#/$defs/camera"}, {"properties": {"camera_id": {"const": "cam_06"}}}]}
+      ],
+      "items": false
+    },
+    "published_at": {"$ref": "../v1/common.schema.json#/$defs/rfc3339"}
+  },
+  "$defs": {
+    "evidenceComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "code_sha256", "configuration_sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "code_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "configuration_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"}
+      }
+    },
+    "semanticPolicyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "semantic_sha256"],
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "uri", "object_version", "sha256", "bytes"],
+      "properties": {
+        "artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "uri": {"type": "string", "minLength": 1},
+        "object_version": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "durabilityEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifier", "outcome", "verified_sha256", "verified_bytes"],
+      "properties": {
+        "verifier": {"$ref": "#/$defs/evidenceComponent"},
+        "outcome": {"const": "PASS"},
+        "verified_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "verified_bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "recording": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_utc", "end_utc", "duration_ns", "timebase"],
+      "properties": {
+        "start_utc": {
+          "oneOf": [
+            {"$ref": "../v1/common.schema.json#/$defs/rfc3339"},
+            {"type": "null"}
+          ]
+        },
+        "end_utc": {
+          "oneOf": [
+            {"$ref": "../v1/common.schema.json#/$defs/rfc3339"},
+            {"type": "null"}
+          ]
+        },
+        "duration_ns": {"$ref": "../v1/common.schema.json#/$defs/positiveInt64String"},
+        "timebase": {"type": "string", "minLength": 1}
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "camera_id",
+        "role",
+        "stream_id",
+        "stream_semantic_sha256",
+        "topic",
+        "channel_id",
+        "codec",
+        "width",
+        "height",
+        "nominal_fps",
+        "source_start_ns",
+        "source_end_ns",
+        "frame_count"
+      ],
+      "properties": {
+        "camera_id": {"$ref": "../v1/common.schema.json#/$defs/cameraId"},
+        "role": {"type": "string", "minLength": 1},
+        "stream_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "stream_semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "topic": {"type": "string", "minLength": 1},
+        "channel_id": {"type": "integer", "minimum": 0},
+        "codec": {"type": "string", "minLength": 1},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "nominal_fps": {"type": "number", "exclusiveMinimum": 0},
+        "source_start_ns": {"$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"},
+        "source_end_ns": {"$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"},
+        "frame_count": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

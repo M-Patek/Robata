@@ -1,6 +1,11 @@
 """Source inspection policies."""
 
-from robata.ingestion.indexer import StreamIndexer
+from robata.contracts.mcap import (
+    MCAPReadyManifest,
+    MCAPValidationReport,
+    MCAPValidationVerdict,
+)
+from robata.ingestion.indexer import IndexingCapabilityError, StreamIndexer
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
 from robata.ingestion.models import (
     CameraMapping,
@@ -9,7 +14,11 @@ from robata.ingestion.models import (
     SourceFrameIndex,
     StreamIndex,
 )
-from robata.ingestion.service import MCAPIngestionService
+from robata.ingestion.service import (
+    IngestionCapabilityError,
+    IngestionStateError,
+    MCAPIngestionService,
+)
 from robata.ingestion.validator import (
     MCAPValidator,
     ValidationResult,
@@ -20,8 +29,14 @@ __all__ = [
     "CameraMapping",
     "CameraMappingRun",
     "ExactTopicMappingPolicy",
+    "IndexingCapabilityError",
+    "IngestionCapabilityError",
     "IngestionResult",
+    "IngestionStateError",
     "MCAPIngestionService",
+    "MCAPReadyManifest",
+    "MCAPValidationReport",
+    "MCAPValidationVerdict",
     "MCAPValidator",
     "SourceFrameIndex",
     "StreamIndex",

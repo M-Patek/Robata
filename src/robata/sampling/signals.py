@@ -8,12 +8,15 @@ package dependency footprint minimal.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-try:
+if TYPE_CHECKING:
     import numpy as np
-except ModuleNotFoundError:  # optional signal-detector dependency
-    np = None
+else:
+    try:
+        import numpy as np
+    except ModuleNotFoundError:  # optional signal-detector dependency
+        np = None
 
 from robata.contracts.common import INT64_MAX, INT64_MIN
 from robata.sampling.adaptive import AdaptiveSignal, SignalDetector, SignalTrigger
@@ -30,7 +33,7 @@ def _require_numpy() -> object:
     return np
 
 
-def _to_gray_ndarray(data: bytes) -> np.ndarray:
+def _to_gray_ndarray(data: bytes) -> np.ndarray[Any, np.dtype[np.uint8]]:
     """Best-effort decode of raw frame bytes into a grayscale NumPy array.
 
     The implementation assumes the payload is a raw 8-bit grayscale image
@@ -68,7 +71,7 @@ class MotionEnergyDetector(SignalDetector):
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         triggers: list[SignalTrigger] = []
-        prev_gray: np.ndarray | None = None
+        prev_gray: np.ndarray[Any, np.dtype[np.uint8]] | None = None
         for payload in frames:
             gray = _to_gray_ndarray(payload.data)
             if gray.size == 0:
@@ -77,8 +80,7 @@ class MotionEnergyDetector(SignalDetector):
                 # Resize to the smaller common shape if dimensions differ.
                 if prev_gray.shape != gray.shape:
                     min_shape = tuple(
-                        min(a, b)
-                        for a, b in zip(prev_gray.shape, gray.shape, strict=True)
+                        min(a, b) for a, b in zip(prev_gray.shape, gray.shape, strict=True)
                     )
                     prev_gray = prev_gray[: min_shape[0], : min_shape[1]]
                     gray = gray[: min_shape[0], : min_shape[1]]
@@ -116,7 +118,7 @@ class SceneChangeDetector(SignalDetector):
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         triggers: list[SignalTrigger] = []
-        prev_hist: np.ndarray | None = None
+        prev_hist: np.ndarray[Any, np.dtype[np.float32]] | None = None
         for payload in frames:
             gray = _to_gray_ndarray(payload.data)
             if gray.size == 0:

@@ -13,7 +13,6 @@ from typing import Annotated
 from pydantic import Field, StringConstraints
 
 from robata.contracts.common import NanosecondInterval, StrictModel
-from robata.contracts.logical_nodes import OpaqueUuid
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 UnitInterval = Annotated[float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)]

@@ -1127,25 +1127,29 @@ class MainlineBundle(StrictModel):
                 raise ValueError("complete fused events require boundary inference lineage")
             boundary_request = request_by_inference.get(boundary_id)
             boundary_outcome = outcome_by_inference.get(boundary_id)
+            boundary_output = (
+                boundary_outcome.output
+                if isinstance(boundary_outcome, VisionInferenceSuccess)
+                else None
+            )
             if (
                 boundary_request is None
                 or boundary_request.task is not VisionTask.BOUNDARY_REFINEMENT
                 or boundary_request.package_id != evidence_package_id
                 or boundary_request.subject_candidate_id not in event.candidate_event_ids
-                or not isinstance(boundary_outcome, VisionInferenceSuccess)
-                or not isinstance(boundary_outcome.output, BoundaryRefinement)
+                or not isinstance(boundary_output, BoundaryRefinement)
             ):
                 raise ValueError("event must reference its successful boundary refinement")
-            for camera_id, claim in boundary_outcome.output.cameras.items():
+            for camera_id, boundary_claim in boundary_output.cameras.items():
                 for interval in (
-                    claim.observed_interval,
-                    claim.onset_interval,
-                    claim.offset_interval,
+                    boundary_claim.observed_interval,
+                    boundary_claim.onset_interval,
+                    boundary_claim.offset_interval,
                 ):
                     if interval is not None and not _contains(evidence_package.interval, interval):
                         raise ValueError("boundary evidence must lie in the evidence package")
                 frame_count = len(evidence_package.cameras[camera_id].frames)
-                if any(ordinal >= frame_count for ordinal in claim.frame_ordinals):
+                if any(ordinal >= frame_count for ordinal in boundary_claim.frame_ordinals):
                     raise ValueError("boundary claim references an absent package frame ordinal")
 
         aggregate_inference_ids: set[str] = set()

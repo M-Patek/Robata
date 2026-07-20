@@ -10,19 +10,17 @@ interface.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, model_validator
 
-from robata.contracts.common import Nanoseconds, SchemaVersion, Sha256Digest, StrictModel
+from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid
-
+from robata.inference.input_plan import InferenceInputPlan
 from robata.inference.models import (
     InferenceFailure,
     InferenceStatus,
     ModelCapabilities,
-    ModelInferenceUsage,
-    Retryability,
     VisionTask,
 )
 
@@ -83,6 +81,12 @@ class VisionInferenceRequest(StrictModel):
     prompt_artifact_id: NonEmptyString
     prompt_sha256: Sha256Digest
     rendered_input_digest: Sha256Digest
+    input_plan_id: OpaqueUuid | None = None
+    input_plan_semantic_sha256: Sha256Digest | None = None
+    input_plan_part_ordinal: NonNegativeInt | None = None
+    input_plan_part_count: PositiveInt | None = None
+    input_plan_part_semantic_sha256: Sha256Digest | None = None
+    input_plan: InferenceInputPlan | None = None
     output_schema: JsonSchemaRef
     capability_snapshot_id: OpaqueUuid
     capability_snapshot_digest: Sha256Digest
@@ -91,6 +95,85 @@ class VisionInferenceRequest(StrictModel):
     provider_idempotency_key: NonEmptyString
     timeout_ms: PositiveInt
     metadata: dict[NonEmptyString, NonEmptyString]
+
+    @model_validator(mode="after")
+    def validate_input_plan_binding(self) -> Self:
+        plan = self.input_plan
+        if plan is None:
+            if any(
+                value is not None
+                for value in (
+                    self.input_plan_id,
+                    self.input_plan_semantic_sha256,
+                    self.input_plan_part_ordinal,
+                    self.input_plan_part_count,
+                    self.input_plan_part_semantic_sha256,
+                )
+            ):
+                raise ValueError("input plan references require the immutable input plan")
+            return self
+        if (
+            self.input_plan_id != plan.input_plan_id
+            or self.input_plan_semantic_sha256 != plan.semantic_sha256
+        ):
+            raise ValueError("input plan identity binding is inconsistent")
+        part_fields = (
+            self.input_plan_part_ordinal,
+            self.input_plan_part_count,
+            self.input_plan_part_semantic_sha256,
+        )
+        if all(value is None for value in part_fields):
+            if self.rendered_input_digest != plan.rendering_sha256:
+                raise ValueError("input plan rendering binding is inconsistent")
+        else:
+            if any(value is None for value in part_fields):
+                raise ValueError("input plan call part references must be all present")
+            assert self.input_plan_part_ordinal is not None
+            if self.input_plan_part_ordinal >= len(plan.call_plan.parts):
+                raise ValueError("input plan call part ordinal is out of range")
+            part = plan.call_plan.parts[self.input_plan_part_ordinal]
+            if (
+                self.input_plan_part_count != part.part_count
+                or self.input_plan_part_semantic_sha256 != part.part_semantic_sha256
+                or self.rendered_input_digest != part.item_manifest_sha256
+            ):
+                raise ValueError("input plan call part binding is inconsistent")
+        if (
+            self.task is not plan.subject.task
+            or self.provider != plan.target.provider
+            or self.model_name != plan.target.model_name
+            or self.model_version != plan.target.model_version
+            or self.capability_snapshot_id != plan.target.capability_snapshot_id
+            or self.capability_snapshot_digest != plan.target.capability_snapshot_sha256
+        ):
+            raise ValueError("input plan target does not match the inference request")
+        if (
+            self.prompt_version != plan.prompt_output.prompt_version
+            or self.prompt_sha256 != plan.prompt_output.prompt_sha256
+            or self.output_schema.sha256 != plan.prompt_output.provider_response_schema_sha256
+        ):
+            raise ValueError("input plan prompt/output contract does not match the request")
+        request_packages = tuple(
+            (
+                item.package_id,
+                item.ordinal,
+                item.package_semantic_content_sha256,
+                item.package_manifest_sha256,
+            )
+            for item in self.package_inputs
+        )
+        plan_packages = tuple(
+            (
+                item.package_id,
+                item.ordinal,
+                item.semantic_content_sha256,
+                item.manifest_bytes_sha256,
+            )
+            for item in plan.subject.packages
+        )
+        if request_packages != plan_packages:
+            raise ValueError("input plan packages do not match the inference request")
+        return self
 
 
 class VisionUsage(StrictModel):
@@ -120,6 +203,9 @@ class NormalizedOutputEnvelope(StrictModel):
     task: VisionTask
     output_schema: JsonSchemaRef
     package_input_set_sha256: Sha256Digest
+    input_plan_semantic_sha256: Sha256Digest | None = None
+    input_plan_part_ordinal: NonNegativeInt | None = None
+    input_plan_part_semantic_sha256: Sha256Digest | None = None
     payload: dict[str, object]
 
 
@@ -206,6 +292,7 @@ class VisionModelAdapter(Protocol):
         The adapter is responsible for:
         - Resolving package frame references into provider-accepted media.
         - Enforcing provider limits before sending.
+        - Executing exactly the explicit input-plan call part bound to the request.
         - Translating provider responses into the normalized envelope.
         - Preserving the raw response as an immutable artifact.
         - Returning provider identity and request ID.

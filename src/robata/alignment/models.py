@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, model_validator
 
 from robata.contracts.alignment import (
     AlignmentMethod,
@@ -17,8 +17,9 @@ from robata.contracts.alignment import (
     AlignmentSegment,
     AlignmentStatus,
     CameraAlignment,
+    CanonicalOrigin,
 )
-from robata.contracts.cameras import CameraId
+from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import Nanoseconds, StrictModel
 from robata.contracts.logical_nodes import OpaqueUuid
 
@@ -66,6 +67,13 @@ class AlignmentValidationResult(StrictModel):
     overall_status: AlignmentStatus
     issues: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def require_six_camera_metrics(self) -> AlignmentValidationResult:
+        actual = tuple(metric.camera_id for metric in self.per_camera)
+        if actual != CAMERA_IDS:
+            raise ValueError("alignment validation metrics must be ordered cam_01 through cam_06")
+        return self
+
 
 __all__ = [
     "AlignmentMethod",
@@ -75,5 +83,6 @@ __all__ = [
     "AlignmentValidationMetrics",
     "AlignmentValidationResult",
     "CameraAlignment",
+    "CanonicalOrigin",
     "FrameAlignmentProjection",
 ]

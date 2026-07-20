@@ -5,7 +5,6 @@ Implements the core tables from ARCHITECTURE_DESIGN_V1.md Section 16.
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,7 +12,6 @@ try:
     from sqlalchemy import (
         BigInteger,
         Boolean,
-        Column,
         DateTime,
         Float,
         ForeignKey,
@@ -24,14 +22,38 @@ try:
         create_engine,
     )
     from sqlalchemy.dialects.postgresql import UUID
-    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 except ImportError:
-    # SQLAlchemy is optional; provide stubs for type checking
+    # Keep model types importable without the optional database backend.
+    # Concrete operations fail explicitly through _require_sqlalchemy below.
+    _HAS_SQLALCHEMY = False
+
+    class _SqlType:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
     DeclarativeBase = object  # type: ignore[assignment, misc]
     Mapped = Any  # type: ignore[assignment, misc]
-    mapped_column = lambda *a, **k: None  # type: ignore[assignment]
-    UUID = lambda native=True: String  # type: ignore[assignment]
-    BigInteger = Integer  # type: ignore[assignment]
+    mapped_column = lambda *args, **kwargs: None  # type: ignore[assignment]
+    BigInteger = Boolean = DateTime = Float = Integer = String = Text = _SqlType
+    UUID = _SqlType
+
+    def ForeignKey(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        del args, kwargs
+        return None
+
+    def UniqueConstraint(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        del args, kwargs
+        return None
+
+    def create_engine(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise ImportError(
+            "SQLAlchemy is required for storage operations. Install the optional dependency "
+            "before creating an engine."
+        )
+else:
+    _HAS_SQLALCHEMY = True
 
 
 class Base(DeclarativeBase):
@@ -347,6 +369,7 @@ def get_engine(database_url: str | None = None) -> Any:
     Returns:
         SQLAlchemy engine instance.
     """
+    _require_sqlalchemy()
     url = database_url or "sqlite:///:memory:"
     return create_engine(url, echo=False)
 
@@ -357,6 +380,7 @@ def create_tables(engine: Any) -> None:
     Args:
         engine: SQLAlchemy engine.
     """
+    _require_sqlalchemy()
     Base.metadata.create_all(engine)
 
 
@@ -366,7 +390,16 @@ def drop_tables(engine: Any) -> None:
     Args:
         engine: SQLAlchemy engine.
     """
+    _require_sqlalchemy()
     Base.metadata.drop_all(engine)
+
+
+def _require_sqlalchemy() -> None:
+    if not _HAS_SQLALCHEMY:
+        raise ImportError(
+            "SQLAlchemy is required for storage operations. Install the optional dependency "
+            "before using the storage models."
+        )
 
 
 __all__ = [

@@ -162,9 +162,10 @@ class AdaptiveSampler:
         if duration_frames > 0 and trigger_count > 0:
             # Simple heuristic: more triggers -> higher FPS, bounded by policy
             density_factor = min(trigger_count / max(duration_frames, 1), 1.0)
-            actual_fps = self._policy.min_fps + (
-                self._policy.max_fps - self._policy.min_fps
-            ) * density_factor
+            actual_fps = (
+                self._policy.min_fps
+                + (self._policy.max_fps - self._policy.min_fps) * density_factor
+            )
         else:
             actual_fps = self._policy.min_fps
 

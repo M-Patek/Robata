@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/provider-claim-payload.schema.json",
+  "title": "Untrusted provider task claims",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["claims", "abstained"],
+  "properties": {
+    "claims": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/claim"}
+    },
+    "abstained": {"type": "boolean"}
+  },
+  "$defs": {
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_ordinal",
+        "kind",
+        "package_ordinal",
+        "camera_ordinal",
+        "interval",
+        "label",
+        "observation",
+        "evidence_tokens",
+        "model_reported_score",
+        "conflict_codes"
+      ],
+      "properties": {
+        "claim_ordinal": {"type": "integer", "minimum": 0},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ACTION_OBSERVATION",
+            "BOUNDARY_OBSERVATION",
+            "CROSS_VIEW_HYPOTHESIS",
+            "EVENT_PROPOSAL",
+            "FUSION_HYPOTHESIS",
+            "QA_OBSERVATION"
+          ]
+        },
+        "package_ordinal": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "camera_ordinal": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 5
+        },
+        "interval": {
+          "oneOf": [
+            {"$ref": "#/$defs/interval"},
+            {"type": "null"}
+          ]
+        },
+        "label": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "observation": {
+          "type": "string",
+          "enum": [
+            "CONFLICT",
+            "DEGRADED",
+            "GOOD",
+            "MISSING",
+            "NO_BOUNDARY",
+            "NO_EVENT",
+            "OBSERVED",
+            "OCCLUDED",
+            "PARTIAL",
+            "PROPOSED",
+            "SUPPORTING",
+            "UNKNOWN",
+            "UNUSABLE"
+          ]
+        },
+        "evidence_tokens": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ref:[0-9a-f]{64}$"
+          }
+        },
+        "model_reported_score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "conflict_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_ns", "end_ns"],
+      "properties": {
+        "start_ns": {"$ref": "common.schema.json#/$defs/int64Nanoseconds"},
+        "end_ns": {"$ref": "common.schema.json#/$defs/int64Nanoseconds"}
+      }
+    }
+  }
+}

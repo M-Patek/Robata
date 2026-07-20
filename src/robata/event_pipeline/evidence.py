@@ -7,10 +7,8 @@ provisional fusion to separate simultaneous physical actions.
 
 from __future__ import annotations
 
-from robata.contracts.cameras import SixCameraMap
 from robata.contracts.mainline import (
     ActionEvidence,
-    BoundaryRefinement,
     CandidateEvent,
     TemporalVisualPackage,
 )

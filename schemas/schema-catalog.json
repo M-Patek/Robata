@@ -288,6 +288,96 @@
       "lifecycle": "ACTIVE",
       "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
       "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/provider-claim-payload",
+        "version": "1.0.0",
+        "artifact_id": "463c9875-6ef8-d723-2851-5baef6922e10",
+        "sha256": "3c791356e25aff5a9e575a5ae406404fb0057fb4b5dd065071d9b8a48afe591d"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/provider-claim-payload.schema.json",
+      "artifact_path": "v1/provider-claim-payload.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "provider-claim-payload-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/orchestrator-enriched-output",
+        "version": "1.0.0",
+        "artifact_id": "60ec381f-057a-935e-5bad-9b1655e4b2c1",
+        "sha256": "076687fa1f93ae14736c5fb66531a6345ebbbc134c81a47685a22d92f6dc9e9c"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/orchestrator-enriched-output.schema.json",
+      "artifact_path": "v1/orchestrator-enriched-output.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "orchestrator-enriched-output-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mcap-validation-report",
+        "version": "2.0.0",
+        "artifact_id": "8d5525ee-4a06-2096-6e6b-9d610b106e69",
+        "sha256": "882a4a6544a6c242c6faf2203a7b0c645873ff536356fc8c1f50c15a1acf3b48"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/mcap-validation-report.schema.json",
+      "artifact_path": "v2/mcap-validation-report.schema.json",
+      "owner": "robata-admission",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mcap-validation-report-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mcap-manifest",
+        "version": "2.0.0",
+        "artifact_id": "9b3329aa-53fe-df00-f02d-15e49d911f38",
+        "sha256": "533e365e99fb9c4c8d919944936ce34e79b8fe761440d8b5be81765cffc84ed4"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/mcap-manifest.schema.json",
+      "artifact_path": "v2/mcap-manifest.schema.json",
+      "owner": "robata-admission",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mcap-ready-manifest-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/alignment-manifest",
+        "version": "2.0.0",
+        "artifact_id": "f581927c-b4bf-fb8f-66aa-35cbdd9cc7c1",
+        "sha256": "a953d17bb5846d4d40f0af963a8b4b88504c90fa27a7ecaaf689c3f19a5d8469"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/alignment-manifest.schema.json",
+      "artifact_path": "v2/alignment-manifest.schema.json",
+      "owner": "robata-admission",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "alignment-manifest-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
     }
   ],
   "upcasters": []

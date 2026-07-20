@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Self
+from typing import Annotated, Any, Self
 
-from pydantic import ConfigDict, RootModel, field_serializer, model_validator
+from pydantic import BeforeValidator, ConfigDict, RootModel, field_serializer, model_validator
 
 
 class CameraId(StrEnum):
@@ -24,7 +24,21 @@ CAMERA_ID_VALUES: tuple[str, ...] = tuple(camera_id.value for camera_id in CAMER
 _CAMERA_ID_SET = frozenset(CAMERA_IDS)
 
 
-class SixCameraMap[T](RootModel[Mapping[CameraId, T]]):
+def _normalize_camera_id(value: Any) -> CameraId:
+    if isinstance(value, CameraId):
+        return value
+    if type(value) is str:
+        try:
+            return CameraId(value)
+        except ValueError as exc:
+            raise ValueError(f"unknown camera ID: {value!r}") from exc
+    raise ValueError("camera IDs must be canonical strings")
+
+
+_CanonicalCameraId = Annotated[CameraId, BeforeValidator(_normalize_camera_id)]
+
+
+class SixCameraMap[T](RootModel[Mapping[_CanonicalCameraId, T]]):
     """A mapping containing every canonical camera exactly once.
 
     Input order is intentionally ignored. The stored and serialized order is always
@@ -33,30 +47,9 @@ class SixCameraMap[T](RootModel[Mapping[CameraId, T]]):
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    @model_validator(mode="before")
-    @classmethod
-    def validate_and_order_keys(cls, value: Any) -> dict[CameraId, Any]:
-        if isinstance(value, SixCameraMap):
-            value = value.root
-        if not isinstance(value, Mapping):
-            raise ValueError("SixCameraMap must be an object mapping camera IDs to values")
-
-        normalized: dict[CameraId, Any] = {}
-        for key, item in value.items():
-            if isinstance(key, CameraId):
-                camera_id = key
-            elif type(key) is str:
-                try:
-                    camera_id = CameraId(key)
-                except ValueError as exc:
-                    raise ValueError(f"unknown camera ID: {key!r}") from exc
-            else:
-                raise ValueError("camera IDs must be canonical strings")
-            if camera_id in normalized:
-                raise ValueError(f"duplicate camera ID: {camera_id.value}")
-            normalized[camera_id] = item
-
-        actual = frozenset(normalized)
+    @model_validator(mode="after")
+    def validate_and_freeze_mapping(self) -> Self:
+        actual = frozenset(self.root)
         if actual != _CAMERA_ID_SET:
             missing = [camera_id.value for camera_id in CAMERA_IDS if camera_id not in actual]
             extra = sorted(camera_id.value for camera_id in actual - _CAMERA_ID_SET)
@@ -68,11 +61,8 @@ class SixCameraMap[T](RootModel[Mapping[CameraId, T]]):
             detail = ", ".join(details)
             raise ValueError(f"SixCameraMap requires exactly the canonical camera IDs: {detail}")
 
-        return {camera_id: normalized[camera_id] for camera_id in CAMERA_IDS}
-
-    @model_validator(mode="after")
-    def freeze_mapping(self) -> Self:
-        object.__setattr__(self, "root", MappingProxyType(dict(self.root)))
+        ordered = {camera_id: self.root[camera_id] for camera_id in CAMERA_IDS}
+        object.__setattr__(self, "root", MappingProxyType(ordered))
         return self
 
     @field_serializer("root")

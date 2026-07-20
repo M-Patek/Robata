@@ -677,8 +677,12 @@ class LocalMainlinePipeline:
         candidate_id: str | None,
     ) -> tuple[VisionInferenceRequest, VisionInferenceSuccess]:
         identity = {
-            "run_id": run_id,
+            # Execution membership is not semantic input. Keep run_id on the
+            # report path, but never let a replay mint a new inference identity.
             "package_id": package.package_id,
+            "package_content_sha256": package.content_sha256,
+            "mcap_id": package.mcap_id,
+            "interval": package.interval,
             "task": task.value,
             "candidate_id": candidate_id,
             "model": [

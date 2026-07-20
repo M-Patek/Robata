@@ -1,5 +1,17 @@
 """Application services that coordinate domain ports without provider coupling."""
 
+from robata.application.canonical_offline import (
+    CanonicalOfflineConfigurationError,
+    CanonicalOfflineError,
+    CanonicalOfflineExecutionPolicy,
+    CanonicalOfflinePipeline,
+    CanonicalOfflineRunResult,
+    CanonicalOfflineRunStatus,
+    CanonicalOfflineStage,
+    CanonicalOutputAdmissionDecision,
+    CanonicalRootWindow,
+    FusionEventHypothesisProjector,
+)
 from robata.application.mainline import (
     LocalMainlineConfig,
     LocalMainlinePipeline,
@@ -11,12 +23,6 @@ from robata.application.registered_video_export import (
     PublishedRegisteredVideoExport,
     RegisteredSixCameraVideoExportService,
 )
-from robata.application.requirements_pipeline import (
-    FullRequirementsPipeline,
-    LocalRequirementsPipeline,
-    RequirementsPipeline,
-    RequirementsRunResult,
-)
 from robata.application.video_export import (
     LocalVideoExportRequest,
     PublishedVideoExport,
@@ -27,10 +33,18 @@ from robata.application.video_export import (
 )
 
 __all__ = [
-    "FullRequirementsPipeline",
+    "CanonicalOfflineConfigurationError",
+    "CanonicalOfflineError",
+    "CanonicalOfflineExecutionPolicy",
+    "CanonicalOfflinePipeline",
+    "CanonicalOfflineRunResult",
+    "CanonicalOfflineRunStatus",
+    "CanonicalOfflineStage",
+    "CanonicalOutputAdmissionDecision",
+    "CanonicalRootWindow",
+    "FusionEventHypothesisProjector",
     "LocalMainlineConfig",
     "LocalMainlinePipeline",
-    "LocalRequirementsPipeline",
     "LocalVideoExportRequest",
     "MainlineRunError",
     "MainlineRunErrorCode",
@@ -38,8 +52,6 @@ __all__ = [
     "PublishedRegisteredVideoExport",
     "PublishedVideoExport",
     "RegisteredSixCameraVideoExportService",
-    "RequirementsPipeline",
-    "RequirementsRunResult",
     "SixCameraVideoExportService",
     "VideoExportRunError",
     "VideoExportRunErrorCode",

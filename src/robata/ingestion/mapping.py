@@ -118,6 +118,22 @@ class ExactTopicMappingPolicy:
                 f"mapping profile assigns topics more than once: {duplicate_topics!r}",
             )
 
+    def semantic_projection(self) -> dict[str, Any]:
+        """Return the complete runtime mapping semantics used for admission."""
+
+        return {
+            "mapping_policy": "EXACT_TOPIC",
+            "required_schema": COMPRESSED_IMAGE_SCHEMA,
+            "version": self.version,
+            "topics": self._topics.model_dump(mode="json"),
+        }
+
+    @property
+    def semantic_digest(self) -> Sha256Digest:
+        """Digest the actual policy semantics rather than an opaque class name."""
+
+        return semantic_sha256(self.semantic_projection())
+
     @classmethod
     def from_profile(
         cls,

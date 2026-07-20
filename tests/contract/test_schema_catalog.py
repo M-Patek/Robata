@@ -22,6 +22,9 @@ RUN_NODE_MEMBERSHIP_SCHEMA_ID = "https://schemas.robata.dev/processing-run-node-
 IMMUTABLE_REVISION_SCHEMA_ID = "https://schemas.robata.dev/immutable-node-revision"
 SELECTION_DECISION_SCHEMA_ID = "https://schemas.robata.dev/selection-decision"
 CURRENT_SELECTION_SCHEMA_ID = "https://schemas.robata.dev/current-selection"
+MCAP_VALIDATION_REPORT_SCHEMA_ID = "https://schemas.robata.dev/mcap-validation-report"
+MCAP_READY_MANIFEST_SCHEMA_ID = "https://schemas.robata.dev/mcap-manifest"
+ALIGNMENT_MANIFEST_SCHEMA_ID = "https://schemas.robata.dev/alignment-manifest"
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> bytes:
@@ -122,10 +125,33 @@ def test_production_catalog_pins_exact_revision_selection_contracts() -> None:
     )
 
 
+def test_production_catalog_pins_exact_v2_admission_evidence() -> None:
+    registry = SchemaRegistry()
+
+    assert registry.resolve_version(MCAP_VALIDATION_REPORT_SCHEMA_ID, "2.0.0").ref == SchemaRef(
+        schema_id=MCAP_VALIDATION_REPORT_SCHEMA_ID,
+        version="2.0.0",
+        artifact_id="8d5525ee-4a06-2096-6e6b-9d610b106e69",
+        sha256="882a4a6544a6c242c6faf2203a7b0c645873ff536356fc8c1f50c15a1acf3b48",
+    )
+    assert registry.resolve_version(MCAP_READY_MANIFEST_SCHEMA_ID, "2.0.0").ref == SchemaRef(
+        schema_id=MCAP_READY_MANIFEST_SCHEMA_ID,
+        version="2.0.0",
+        artifact_id="9b3329aa-53fe-df00-f02d-15e49d911f38",
+        sha256="533e365e99fb9c4c8d919944936ce34e79b8fe761440d8b5be81765cffc84ed4",
+    )
+    assert registry.resolve_version(ALIGNMENT_MANIFEST_SCHEMA_ID, "2.0.0").ref == SchemaRef(
+        schema_id=ALIGNMENT_MANIFEST_SCHEMA_ID,
+        version="2.0.0",
+        artifact_id="f581927c-b4bf-fb8f-66aa-35cbdd9cc7c1",
+        sha256="a953d17bb5846d4d40f0af963a8b4b88504c90fa27a7ecaaf689c3f19a5d8469",
+    )
+
+
 def test_every_catalog_entry_has_exact_digest_and_deterministic_id() -> None:
     registry = SchemaRegistry()
 
-    assert len(registry.entries) == 16
+    assert len(registry.entries) == 21
     assert registry.upcasters == ()
     for registered in registry.entries:
         digest = hashlib.sha256(registered.document_bytes).hexdigest()

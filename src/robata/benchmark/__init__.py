@@ -5,6 +5,11 @@ manifest, ground-truth annotations, data splits, experiment matrices,
 metrics calculation, statistical analysis, and promotion gates.
 """
 
+from robata.benchmark.evidence import (
+    BenchmarkEvidenceContext,
+    EvidenceContextIdentity,
+    benchmark_evidence_context_projection,
+)
 from robata.benchmark.experiments import (
     CameraAblationExperiment,
     DenseSamplingExperiment,
@@ -27,6 +32,8 @@ from robata.benchmark.metrics import (
     BoundaryMetrics,
     CalibrationMetrics,
     EventMetrics,
+    EvidenceBoundMetrics,
+    MeasurementStatus,
     MetricsCalculator,
     QAMetrics,
 )
@@ -48,6 +55,8 @@ from robata.benchmark.splits import (
     DataSplitResult,
     DataSplitter,
     SplitConfig,
+    SplitMetadataError,
+    SplitRecord,
 )
 from robata.benchmark.statistics import (
     BootstrapResult,
@@ -57,28 +66,24 @@ from robata.benchmark.statistics import (
 )
 
 __all__ = [
-    # models
+    "BenchmarkEvidenceContext",
     "BenchmarkManifest",
-    # promotion
     "BenchmarkResults",
-    # statistics
     "BootstrapResult",
-    # ground_truth
     "BoundaryExample",
-    # metrics
     "BoundaryMetrics",
     "CalibrationMetrics",
-    # experiments
     "CameraAblationExperiment",
     "CameraEvidenceAnnotation",
     "ConfidenceInterval",
     "DataSplit",
-    # splits
     "DataSplitResult",
     "DataSplitter",
     "DenseSamplingExperiment",
     "EventMetrics",
     "EventProposalExperiment",
+    "EvidenceBoundMetrics",
+    "EvidenceContextIdentity",
     "ExperimentMatrix",
     "GateCategory",
     "GateResult",
@@ -86,6 +91,7 @@ __all__ = [
     "InterAnnotatorAgreement",
     "Interval",
     "McNemarResult",
+    "MeasurementStatus",
     "MetricsCalculator",
     "PhysicalActionAnnotation",
     "PromotionDecision",
@@ -98,6 +104,9 @@ __all__ = [
     "RecordingUsability",
     "ShadowComparisonExperiment",
     "SplitConfig",
+    "SplitMetadataError",
+    "SplitRecord",
     "StatisticalAnalyzer",
     "StratificationDimension",
+    "benchmark_evidence_context_projection",
 ]

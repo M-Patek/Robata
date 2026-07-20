@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -41,7 +42,6 @@ _RFC3339_PATTERN = re.compile(
 _ROBATA_FORMAT_CHECKER = FormatChecker()
 
 
-@_ROBATA_FORMAT_CHECKER.checks("date-time")
 def _is_rfc3339_datetime(instance: object) -> bool:
     if not isinstance(instance, str):
         return True
@@ -55,6 +55,12 @@ def _is_rfc3339_datetime(instance: object) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
+cast(
+    Callable[[str], Callable[[Callable[[object], bool]], Callable[[object], bool]]],
+    _ROBATA_FORMAT_CHECKER.checks,
+)("date-time")(_is_rfc3339_datetime)
+
+
 def _is_strict_json_integer(_checker: object, instance: object) -> bool:
     return isinstance(instance, int) and not isinstance(instance, bool)
 
@@ -64,11 +70,11 @@ _STRICT_TYPE_CHECKER = Draft202012Validator.TYPE_CHECKER.redefine(
     _is_strict_json_integer,
 )
 _StrictDraft202012Validator = cast(
-    type[Draft202012Validator],
-    validators.extend(  # type: ignore[no-untyped-call]
-        Draft202012Validator,
-        type_checker=_STRICT_TYPE_CHECKER,
-    ),
+    Callable[..., type[Draft202012Validator]],
+    validators.extend,
+)(
+    Draft202012Validator,
+    type_checker=_STRICT_TYPE_CHECKER,
 )
 
 
@@ -314,7 +320,7 @@ class _DirectorySchemaRegistry:
             (schema_id, Resource.from_contents(schemas_by_name[name]))
             for schema_id, name in sorted(names_by_id.items())
         ]
-        self._registry: Registry[Any] = Registry().with_resources(resources)
+        self._registry: Registry[Any] = Registry[dict[str, Any]]().with_resources(resources)
         self._schemas_by_name = schemas_by_name
         self._names_by_id = names_by_id
         self._sources_by_name = sources_by_name
@@ -820,7 +826,7 @@ class _CatalogSchemaRegistry:
             (registered.entry.document_id, Resource.from_contents(self._documents_by_key[key]))
             for key, registered in sorted(self._registered_by_key.items())
         ]
-        self._registry: Registry[Any] = Registry().with_resources(resources)
+        self._registry: Registry[Any] = Registry[dict[str, Any]]().with_resources(resources)
 
     def get_schema(self, schema: str | SchemaRef) -> dict[str, Any]:
         registered = (

@@ -202,6 +202,11 @@ class ModelInference(StrictModel):
     prompt_artifact_id: NonEmptyString
     prompt_sha256: Sha256Digest
     rendered_input_digest: Sha256Digest
+    input_plan_id: OpaqueUuid | None = None
+    input_plan_semantic_sha256: Sha256Digest | None = None
+    input_plan_part_ordinal: NonNegativeInt | None = None
+    input_plan_part_count: Annotated[int, Field(strict=True, ge=1)] | None = None
+    input_plan_part_semantic_sha256: Sha256Digest | None = None
     output_schema_id: NonEmptyString
     output_schema_version: SchemaVersion
     output_schema_artifact_id: NonEmptyString
@@ -212,6 +217,7 @@ class ModelInference(StrictModel):
     input_config: dict[str, object]
     sampling_config: dict[str, object]
     generation_config: dict[str, object]
+    provider_idempotency_key: NonEmptyString | None = None
     provider_request_id: NonEmptyString | None = None
     experiment_id: NonEmptyString | None = None
     shadow_route_id: NonEmptyString | None = None

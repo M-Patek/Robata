@@ -94,7 +94,8 @@ class WorkBarrier(StrictModel):
     barrier_id: OpaqueUuid
     logical_key: NonEmptyString
     subject: NonEmptyString
-    expected_member_count: PositiveInt
+    # Zero-child fan-outs are explicit empty barriers, not dangling work.
+    expected_member_count: NonNegativeInt
     empty_semantics: NonEmptyString
     reduction_policy: NonEmptyString
     status: NonEmptyString

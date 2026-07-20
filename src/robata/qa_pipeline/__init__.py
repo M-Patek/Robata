@@ -5,6 +5,7 @@ This package contains the two-stage QA pipeline implementation
 """
 
 from robata.qa_pipeline.aggregate import (
+    QAAggregationPolicy,
     QAAggregator,
     RecordingQAResult,
 )
@@ -13,7 +14,9 @@ from robata.qa_pipeline.coarse import (
     CoarseQAPipeline,
     CoarseQAResult,
     SamplingPlan,
-    SuspiciousInterval,
+)
+from robata.qa_pipeline.coarse import (
+    SuspiciousInterval as CoarseSuspiciousInterval,
 )
 from robata.qa_pipeline.dense import (
     CameraDenseResult,
@@ -32,10 +35,10 @@ from robata.qa_pipeline.fast_detector import (
 )
 from robata.qa_pipeline.stages import (
     CameraQAStatus,
+    QAIssueSeverity,
     QAStage,
     QAStageIssue,
     QAStageResult,
-    QAIssueSeverity,
     RecordingQAStatus,
 )
 from robata.qa_pipeline.suspicion_reducer import (
@@ -47,38 +50,34 @@ from robata.qa_pipeline.suspicion_reducer import (
 )
 
 __all__ = [
-    # stages
+    "CameraCoarseResult",
+    "CameraDenseResult",
     "CameraQAStatus",
+    "CoarseQAPipeline",
+    "CoarseQAResult",
+    "CoarseSuspiciousInterval",
+    "ContainerCheckResult",
+    "DecodeGapResult",
+    "DenseQAPipeline",
+    "DenseQAResult",
+    "FastDetector",
+    "FastDetectorConfig",
+    "IntervalDenseResult",
+    "QAAggregationPolicy",
+    "QAAggregator",
+    "QAIssueSeverity",
     "QAStage",
     "QAStageIssue",
     "QAStageResult",
-    "QAIssueSeverity",
+    "RecordingQAResult",
     "RecordingQAStatus",
-    # fast_detector
-    "ContainerCheckResult",
-    "DecodeGapResult",
-    "FastDetector",
-    "FastDetectorConfig",
-    "StreamIntegrityResult",
-    "TimestampCheckResult",
-    "VideoStream",
-    # coarse
-    "CameraCoarseResult",
-    "CoarseQAPipeline",
-    "CoarseQAResult",
-    "SamplingPlan",
-    "SuspiciousInterval",
-    # suspicion_reducer
     "ReducedInterval",
     "ReductionPolicyVersion",
+    "SamplingPlan",
     "SourceIntervalRef",
+    "StreamIntegrityResult",
+    "SuspiciousInterval",
     "SuspiciousIntervalReducer",
-    # dense
-    "CameraDenseResult",
-    "DenseQAPipeline",
-    "DenseQAResult",
-    "IntervalDenseResult",
-    # aggregate
-    "QAAggregator",
-    "RecordingQAResult",
+    "TimestampCheckResult",
+    "VideoStream",
 ]

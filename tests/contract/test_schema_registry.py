@@ -158,7 +158,9 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "logical-node",
         "mcap-manifest",
         "mcap-validation-report",
+        "orchestrator-enriched-output",
         "processing-run-node-membership",
+        "provider-claim-payload",
         "selection-decision",
     )
     assert len(registry.schema_ids) == len(set(registry.schema_ids))

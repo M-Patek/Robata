@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from robata.contracts.common import (
-    NanosecondInterval,
     Nanoseconds,
     SchemaVersion,
     StrictModel,

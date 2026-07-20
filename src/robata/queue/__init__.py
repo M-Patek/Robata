@@ -6,20 +6,22 @@ outbox publication.  Production adapters (e.g. Redis) live in sibling modules;
 the contracts here are intentionally infrastructure-agnostic.
 """
 
-from robata.queue.barrier import (
-    AggregateStatus,
-    Barrier,
-    BarrierCoordinator,
-    BarrierState,
-    BarrierStorage,
-    ReductionPolicy,
-)
 from robata.queue.backpressure import (
     AdmissionDecision,
     BackpressureConfig,
     BackpressureController,
     QueueMetrics,
     SheddingAction,
+)
+from robata.queue.barrier import (
+    AggregateStatus,
+    Barrier,
+    BarrierCoordinator,
+    BarrierMember,
+    BarrierState,
+    BarrierStorage,
+    InMemoryBarrierStorage,
+    ReductionPolicy,
 )
 from robata.queue.dispatcher import (
     CapacityReservation,
@@ -64,8 +66,10 @@ __all__ = [
     "BarrierState",
     "BarrierStorage",
     "BarrierCoordinator",
+    "BarrierMember",
     "AggregateStatus",
     "ReductionPolicy",
+    "InMemoryBarrierStorage",
     # backpressure
     "BackpressureConfig",
     "QueueMetrics",

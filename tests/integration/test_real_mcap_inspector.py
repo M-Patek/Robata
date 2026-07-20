@@ -38,6 +38,7 @@ def test_cli_rejects_unapproved_profile_before_source_access() -> None:
 
     payload = json.loads(completed.stdout)
     assert completed.returncode == 2
+    assert payload["provider_requests"] == 0
     assert payload["error"]["code"] == "INVALID_CAMERA_MAPPING"
     assert "not approved" in payload["error"]["message"]
 

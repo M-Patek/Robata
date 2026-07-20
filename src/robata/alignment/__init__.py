@@ -8,6 +8,7 @@ from robata.alignment.models import (
     AlignmentValidationMetrics,
     AlignmentValidationResult,
     CameraAlignment,
+    CanonicalOrigin,
     FrameAlignmentProjection,
 )
 from robata.alignment.rational_time import (
@@ -15,9 +16,15 @@ from robata.alignment.rational_time import (
     RationalTransformSegment,
     round_half_even,
 )
-from robata.alignment.service import AlignmentService
+from robata.alignment.service import (
+    AlignmentCapabilityError,
+    AlignmentError,
+    AlignmentService,
+)
 
 __all__ = [
+    "AlignmentCapabilityError",
+    "AlignmentError",
     "AlignmentMethod",
     "AlignmentRun",
     "AlignmentSegment",
@@ -26,6 +33,7 @@ __all__ = [
     "AlignmentValidationMetrics",
     "AlignmentValidationResult",
     "CameraAlignment",
+    "CanonicalOrigin",
     "FrameAlignmentProjection",
     "PiecewiseAlignment",
     "RationalTransformSegment",

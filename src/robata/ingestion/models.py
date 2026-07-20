@@ -6,11 +6,10 @@ from typing import Annotated, Literal
 
 from pydantic import Field, StringConstraints
 
-from robata.contracts.common import Nanoseconds, SchemaVersion, StrictModel
+from robata.contracts.common import Nanoseconds, StrictModel
 from robata.contracts.logical_nodes import Rfc3339Timestamp
 from robata.contracts.mcap import CameraMapping as McapCameraMapping
 from robata.contracts.mcap import CameraMappingRun as McapCameraMappingRun
-from robata.contracts.mcap import CameraStream as McapCameraStream
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]

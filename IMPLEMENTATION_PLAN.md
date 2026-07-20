@@ -19,6 +19,10 @@ status ledgers, exact time, and dependency order. A conflict requires an explici
 architecture revision plus applicable schema, semantic-validator, migration/replay, and
 conformance-test changes; implementation code cannot silently choose an interpretation.
 
+The live-tree implementation map is `docs/current-implementation-status.md`. Files under
+`archive/old_mvp` are historical, non-normative evidence and do not establish the status of
+the current worktree unless their claims are independently reproduced by current checks.
+
 ## Phase 0: Security, Privacy, and Data Governance
 
 ### Deliverables
@@ -110,8 +114,8 @@ unique key is exactly `(run_id, node_type, node_logical_key, role)`.
 - `INVALIDATED` and `OBSERVED` require an existing verified node and never mutate global
   node content or prior memberships.
 
-Evidence and explicit limitations are recorded in
-`reports/local-logical-node-membership-2026-07-18.md`. ADR 0005 and its separate evidence
+Historical evidence and explicit limitations are retained in
+`archive/old_mvp/reports/local-logical-node-membership-2026-07-18.md`. ADR 0005 and its separate evidence
 report cover the subsequent generic revision/current-selection primitive. The combined
 local primitives do not implement concrete-producer identity/revision admission, business
 selection policy, work scheduling, global validity, cross-registry atomicity, or a
@@ -166,7 +170,7 @@ selection is a replaceable projection of verified append-only authority.
 
 Implementation scope, exact contract pins, threat limits, final local automated
 verification, and remaining gates are recorded in
-`reports/local-immutable-revision-selection-2026-07-18.md`. This slice does not admit a
+`archive/old_mvp/reports/local-immutable-revision-selection-2026-07-18.md`. This slice does not admit a
 concrete producer, define business truth or authorization, implement invalidation/work
 propagation, provide cross-registry atomicity, qualify production storage, or declare
 Phase 0, Phase 1A, or Phase 1B complete.
@@ -182,9 +186,10 @@ identity or admission artifact. Its registered contracts and deterministic fixtu
 Phase 1A work. Exercising an unapproved local MCAP is an isolated, non-promotional
 development probe at the Phase 1B boundary.
 
-The exact V2 registry/lineage/replay evidence is recorded in
-`reports/local-artifact-registry-v2-2026-07-18.md`. The earlier frozen-V1 media exercise
-is recorded in `reports/local-six-camera-video-export-2026-07-18.md`.
+Historical V2 registry/lineage/replay evidence is retained in
+`archive/old_mvp/reports/local-artifact-registry-v2-2026-07-18.md`. The earlier frozen-V1
+media exercise is retained in
+`archive/old_mvp/reports/local-six-camera-video-export-2026-07-18.md`.
 
 ### Deliverables
 
@@ -249,17 +254,18 @@ is recorded in `reports/local-six-camera-video-export-2026-07-18.md`.
   representative data, O-03, O-04, and Phase 1B replay remain separate prerequisites;
   this plan does not claim any of them complete.
 
-## Current Local End-to-End Fake-Model Mainline Slice: Development Evidence
+## Historical Isolated Fake-Model Mainline: Development Evidence
 
-**Status: complete local vertical slice implemented and exercised against a real local
-sample with zero provider traffic; this is not a production-model or phase-gate result.**
+**Status: retained as a legacy smoke path; not the current unified execution chain and not a
+phase-gate result.**
 
-The mainline composes the registered V2 video export with a provider-neutral frame package
-and a deterministic fake adapter. The application boundary is intentionally ready for a
-real `VisionModelAdapter`, but no network client, credential, Qwen/GPT call, or model-quality
-evaluation is part of this slice.
+The `application/mainline.py` path composes the registered V2 video export with legacy
+provider-neutral package/request contracts and a deterministic fake adapter. It does not yet
+consume the canonical materialized `TemporalPackageSet`, `InferenceInputPlan`, ingestion/READY
+publication ledger, or current benchmark evidence context. No network client, credential, Qwen/GPT
+call, or model-quality evaluation is part of this isolated path.
 
-### Delivered path
+### Historical delivered path
 
 - One command composes mapping authorization, official MCAP inspection, registered six-
   camera H.264 remux, exact 13-file view publication, strict sidecar/manifest/PTS checks,
@@ -287,22 +293,41 @@ evaluation is part of this slice.
   tree and are absent from failed runs.
 - `scripts/preflight_local_mainline.py` performs an offline Python/dependency/mapping/source/
   output/registry/spec-hash readiness check and always reports `provider_requests = 0`.
-  The operating procedure and provider handoff boundary are documented in
-  `docs/operations/local-mainline-runbook.md` and
-  `docs/operations/provider-adapter-readiness.md`.
+  Historical operating context is retained in
+  `archive/old_mvp/docs/operations/local-mainline-runbook.md` and
+  `archive/old_mvp/docs/operations/provider-adapter-readiness.md`.
 
-### Local acceptance evidence
+### Historical local acceptance evidence
 
 The real local `sample-medium.mcap` run on 2026-07-19 produced `PRIMARY_COMPLETE`, one
 `FINAL` `object_interaction` event, five successful fake inferences, two packages, two QA
 aggregates, 13 video/sidecar/manifest files, 510 PNG frames, 10 inference records, and
 zero provider requests. The exact source/manifest/bundle IDs, hashes, output counts, and
-limitations are recorded in
-`reports/local-full-mainline-fake-model-2026-07-19.md`.
+limitations are retained in
+`archive/old_mvp/reports/local-full-mainline-fake-model-2026-07-19.md`. Current-tree status
+and verification do not inherit that historical report's result, and the legacy path must not
+be used as evidence that the current canonical slices are wired together.
 
 This evidence does **not** close Phase 0, producer identity/admission, O-03, O-04, O-10,
 real-model quality, provider policy, capacity, or Phase 1B promotion. The sample is local
 development data and the mapping remains explicitly unapproved/unverified.
+
+### Current convergence boundary
+
+The live tree now has a canonical post-admission offline conformance spine from a resolved
+`AdmittedRecordingContextV2` through root window, materialized provider-neutral package set,
+strict provider-specific input plan/catalog, single-part barrier and selected attempt, raw-byte
+persistence before parsing, provider claims, orchestrator enrichment, local output admission, and
+recording-scoped fenced identity/outbox assignment. Exact replay and fail-closed negative paths are
+covered locally with zero network calls.
+
+This spine does not replace the legacy CLI, produce V2 admission evidence from raw MCAP, dispatch
+multi-part plans, or provide production persistence. Its adapter is fixture-only and its ledgers,
+barriers, raw store, registry, and outbox are in-memory. The remaining convergence work is to add
+the missing durable Section 25.7 boundaries and multi-part reducer/recovery behavior, then compose
+the raw-admission and downstream task paths when their governance and policy inputs are resolved.
+Until then, a legacy fake run remains a smoke test and a canonical fixture run remains local
+conformance evidence only.
 
 ## Phase 1B: Real MCAP and Source-Time Admission
 
@@ -366,9 +391,9 @@ The following remain `NOT_MEASURED` until an applicable phase has a governed, re
 |---|---|---|
 | Recording and camera-video hours | `NOT_MEASURED` | The 37-member local inventory is not admitted or characterized. |
 | Throughput and wall time | `NOT_MEASURED` | No governed production-shaped replay exists. |
-| Queue, service, and API latency percentiles | `NOT_MEASURED` | Phase 1A has no broker or provider API; Phase 1B is local admission. |
+| Queue, service, and API latency percentiles | `NOT_MEASURED` | Only in-memory barriers and an offline fixture are exercised; there is no production broker or provider API. |
 | CPU, memory, disk, network, and storage rates | `NOT_MEASURED` | Workload shape and actual source codecs remain unresolved until O-03. |
-| Qwen/GPT requests, tokens, latency, and cost | `NOT_MEASURED` | Model inference is outside Phase 0/1A/1B. |
+| Qwen/GPT requests, tokens, latency, and cost | `NOT_MEASURED` | The canonical fixture makes zero real-model requests and provides no provider latency, token, or cost evidence. |
 | Quality metrics and confidence intervals | `NOT_MEASURED` | No registered ground truth or promoted O-10 policy exists. |
 | Capacity against either 500-hours/day interpretation | `NOT_MEASURED` | O-01 and production-shaped measurements are unresolved. |
 
@@ -380,12 +405,21 @@ Tests may report deterministic case counts and local durations, but those values
 - **Representative real MCAP corpus:** Required for Phase 1B; the local 37-member zip inventory alone is insufficient.
 - **O-03:** Required source topics, schemas, camera roles, auxiliary channels, codecs, resolutions, rates, keyframe behavior, and decoder probes.
 - **O-04:** Required clock relationships, sync evidence, reset behavior, alignment tolerance, drift model, and missing-frame policy.
+- **O-06/O-08:** Required before real primary-model integration and promoted provider encoding,
+  limits, split policy, latency, quota, cost, and data-handling claims.
 - **O-10:** Required before six-camera QA aggregation or acceptance promotion; the source summary does not settle it.
+- **O-12:** Required before promoting fusion, candidate identity, merge/split, boundary tolerance,
+  confidence calibration, and review behavior beyond the exact-fingerprint local resolver.
 - **O-14:** Database, broker, object store, and deployment selection is not required for the local contract/admission foundation, but is required before production durability and concurrency claims.
+- **Section 25.7 durable surfaces:** Raw/parsed/enriched/output-decision schemas and ledgers,
+  multi-part barrier/reducer recovery, transactional recording-scoped identity, and an outbox
+  publisher remain required for a production path.
 - **O-15:** Retention, access, encryption, data handling, residency, and audit rules are part of the Phase 0 hard gate.
 
 ## Promotion Rule
 
 Phase 0 is complete only when its security/privacy/governance controls and non-bypass tests pass. Phase 1A is complete only when its executable contract foundation and conformance evidence pass. Phase 1B is complete only after Phase 0 and 1A, governed representative real data, O-03, O-04, separate validation/READY publication, independent source/alignment reconciliation, and real replay evidence all pass.
 
-The presence of 37 local MCAPs, synthetic fixtures, a readable container, or a successful local command does not waive a predecessor gate or promote any phase.
+The presence of 37 local MCAPs, synthetic fixtures, a readable container, a successful legacy
+command, or a successful canonical fixture/integration run does not waive a predecessor gate or
+promote any phase.
