@@ -24,11 +24,14 @@ from robata.inference.models import (
     InferenceStatus,
     InputMode,
     ModelCapabilities,
+    ModelInference,
     Retryability,
     VisionTask,
+    inference_attempt_selection_logical_key,
 )
 from robata.inference.orchestrator import (
     CapabilityValidationError,
+    InferenceLedgerError,
     InferenceOrchestrator,
     InferencePolicy,
     InMemoryInferenceLedger,
@@ -239,6 +242,7 @@ def _orchestrator(
     capabilities: ModelCapabilities | None = None,
     raised: BaseException | None = None,
     ledger: InMemoryInferenceLedger | None = None,
+    policy: InferencePolicy | None = None,
 ) -> tuple[InferenceOrchestrator, FakeAdapter, InMemoryInferenceLedger]:
     store = ledger or InMemoryInferenceLedger()
     adapter = FakeAdapter(
@@ -247,10 +251,11 @@ def _orchestrator(
         capabilities=capabilities,
         raised=raised,
     )
+    selected_policy = policy or _policy()
     orchestrator = InferenceOrchestrator(
         adapters={"fake": adapter},
-        task_policies={VisionTask.ACTION_EVIDENCE: _policy()},
-        schema_documents={SCHEMA_REF.artifact_id: SCHEMA},
+        task_policies={VisionTask.ACTION_EVIDENCE: selected_policy},
+        schema_documents={selected_policy.output_schema.artifact_id: SCHEMA},
         ledger=store,
         clock=lambda: NOW,
     )
@@ -390,7 +395,15 @@ def test_intent_is_persisted_before_dispatch_and_success_is_idempotent() -> None
     assert len(store.list_intents()) == 1
     assert len(store.list_terminals()) == 1
     assert len(store.list_selections()) == 1
-    assert store.list_selections()[0].inference_id == first.inference_id
+    selection = store.list_selections()[0]
+    assert selection.inference_id == first.inference_id
+    assert selection.selection_reason == "FIRST_SCHEMA_VALID_SUCCESS"
+    assert selection.selection_decision_logical_key == (
+        inference_attempt_selection_logical_key(
+            logical_invocation_id=first.logical_invocation_id,
+            policy_version="selection-1",
+        )
+    )
 
     second = _run(orchestrator.orchestrate(**_request_kwargs()))
     assert second == first
@@ -415,6 +428,115 @@ def test_logical_identity_uses_capability_digest_not_snapshot_row_id() -> None:
 
     assert first.logical_invocation_id == second.logical_invocation_id
     assert first.inference_id == second.inference_id
+
+
+def test_logical_identity_excludes_package_prompt_and_schema_artifact_locators() -> None:
+    relocated_schema = SCHEMA_REF.model_copy(update={"artifact_id": "schema-relocated"})
+    relocated_policy = _policy().model_copy(
+        update={
+            "prompt_artifact_id": "prompt-relocated",
+            "output_schema": relocated_schema,
+        }
+    )
+    first_orchestrator, _, first_store = _orchestrator(_success)
+    second_orchestrator, _, second_store = _orchestrator(
+        _success,
+        policy=relocated_policy,
+    )
+    second_kwargs = _request_kwargs()
+    second_package = _package_input().model_copy(
+        update={
+            "package_id": _uuid(999),
+            "package_manifest_sha256": _digest(998),
+        }
+    )
+    second_kwargs["package_inputs"] = (second_package,)
+
+    first = _run(first_orchestrator.orchestrate(**_request_kwargs()))
+    second = _run(second_orchestrator.orchestrate(**second_kwargs))
+    first_request = first_store.list_intents()[0].request
+    second_request = second_store.list_intents()[0].request
+
+    assert first.package_ids != second.package_ids
+    assert first.prompt_artifact_id != second.prompt_artifact_id
+    assert first_request.output_schema.artifact_id != second_request.output_schema.artifact_id
+    assert first_request.package_inputs[0].package_manifest_sha256 != (
+        second_request.package_inputs[0].package_manifest_sha256
+    )
+    assert first_request.package_input_set_sha256 == second_request.package_input_set_sha256
+    assert first.logical_invocation_id == second.logical_invocation_id
+    assert first.inference_id == second.inference_id
+    assert first_store.list_selections()[0].selection_decision_logical_key == (
+        second_store.list_selections()[0].selection_decision_logical_key
+    )
+
+
+def test_logical_identity_separates_changed_package_content() -> None:
+    first_orchestrator, _, first_store = _orchestrator(_success)
+    second_orchestrator, _, second_store = _orchestrator(_success)
+    changed_kwargs = _request_kwargs()
+    changed_package = _package_input().model_copy(
+        update={"package_semantic_content_sha256": _digest(999)}
+    )
+    changed_kwargs["package_inputs"] = (changed_package,)
+
+    first = _run(first_orchestrator.orchestrate(**_request_kwargs()))
+    changed = _run(second_orchestrator.orchestrate(**changed_kwargs))
+
+    assert first_store.list_intents()[0].request.package_input_set_sha256 != (
+        second_store.list_intents()[0].request.package_input_set_sha256
+    )
+    assert first.logical_invocation_id != changed.logical_invocation_id
+    assert first.inference_id != changed.inference_id
+
+
+def test_logical_identity_separates_changed_package_role() -> None:
+    first_orchestrator, _, first_store = _orchestrator(_success)
+    changed_orchestrator, _, changed_store = _orchestrator(_success)
+    changed_kwargs = _request_kwargs()
+    changed_kwargs["package_inputs"] = (_package_input().model_copy(update={"role": "context"}),)
+
+    first = _run(first_orchestrator.orchestrate(**_request_kwargs()))
+    changed = _run(changed_orchestrator.orchestrate(**changed_kwargs))
+
+    assert first_store.list_intents()[0].request.package_input_set_sha256 != (
+        changed_store.list_intents()[0].request.package_input_set_sha256
+    )
+    assert first.logical_invocation_id != changed.logical_invocation_id
+
+
+class _TamperingReadLedger(InMemoryInferenceLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tamper_terminal = False
+
+    def get_terminal(self, inference_id: str) -> ModelInference | None:
+        terminal = super().get_terminal(inference_id)
+        if terminal is None or not self.tamper_terminal:
+            return terminal
+        return terminal.model_copy(update={"input_manifest_set_sha256": _digest(997)})
+
+
+def test_selected_terminal_reuse_rejects_tampered_ledger_semantics() -> None:
+    ledger = _TamperingReadLedger()
+    orchestrator, adapter, _ = _orchestrator(_success, ledger=ledger)
+    first = _run(orchestrator.orchestrate(**_request_kwargs()))
+    ledger.tamper_terminal = True
+    relocated_kwargs = _request_kwargs()
+    relocated_kwargs["package_inputs"] = (
+        _package_input().model_copy(
+            update={
+                "package_id": _uuid(996),
+                "package_manifest_sha256": _digest(995),
+            }
+        ),
+    )
+
+    with pytest.raises(InferenceLedgerError, match="semantically inconsistent"):
+        _run(orchestrator.orchestrate(**relocated_kwargs))
+
+    assert first.status is InferenceStatus.SUCCEEDED
+    assert adapter.infer_calls == 1
 
 
 def test_package_count_does_not_stand_in_for_image_count() -> None:

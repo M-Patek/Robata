@@ -12,6 +12,7 @@ from robata.contracts.schema_registry import SchemaRegistry, SchemaValidationErr
 from robata.inference.adapter import JsonSchemaRef
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
+    ENRICHED_OUTPUT_SCHEMA_VERSION,
     PROVIDER_CLAIM_SCHEMA_ID,
     EnrichmentAuthorityContext,
     OrchestratorEnrichedOutput,
@@ -44,7 +45,11 @@ from robata.inference.input_plan import (
     RenderedProviderItem,
     TransformOperation,
 )
-from robata.inference.models import VisionTask
+from robata.inference.models import (
+    InferenceAttemptSelection,
+    VisionTask,
+    inference_attempt_selection_logical_key,
+)
 
 NOW = "2026-07-19T12:00:00Z"
 TASK = VisionTask.ACTION_EVIDENCE
@@ -59,7 +64,8 @@ def _digest(value: int) -> str:
 
 
 def _schema_ref(registry: SchemaRegistry, schema_id: str) -> JsonSchemaRef:
-    registered = registry.resolve_version(schema_id, "1.0.0").ref
+    version = ENRICHED_OUTPUT_SCHEMA_VERSION if schema_id == ENRICHED_OUTPUT_SCHEMA_ID else "1.0.0"
+    registered = registry.resolve_version(schema_id, version).ref
     return JsonSchemaRef(
         schema_id=registered.schema_id,
         version=registered.version,
@@ -207,13 +213,14 @@ def _parsed(
     payload: ProviderClaimPayload,
     provider_schema: JsonSchemaRef,
     row_offset: int = 0,
+    inference_id: str | None = None,
 ) -> ParsedProviderClaimArtifact:
     raw = RawProviderResponseArtifact.from_bytes(
         data=canonical_json_bytes(payload.model_dump(mode="json")),
         artifact_id=_uuid(600 + row_offset),
         media_type="application/json",
         provider_request_id=f"provider-request-{row_offset}",
-        inference_id=_uuid(601),
+        inference_id=inference_id or _uuid(601),
         provider="local-fake",
         model_name="vision-model",
         model_version="1.0",
@@ -230,6 +237,28 @@ def _parsed(
     )
 
 
+def _selection(
+    *,
+    inference_id: str,
+    logical_invocation_id: str = _uuid(805),
+    policy_version: str = "selection-1",
+    row_offset: int = 0,
+) -> InferenceAttemptSelection:
+    return InferenceAttemptSelection(
+        schema_version="1.0",
+        selection_id=_uuid(750 + row_offset),
+        inference_id=inference_id,
+        logical_invocation_id=logical_invocation_id,
+        policy_version=policy_version,
+        selection_reason="FIRST_SCHEMA_VALID_SUCCESS",
+        selection_decision_logical_key=inference_attempt_selection_logical_key(
+            logical_invocation_id=logical_invocation_id,
+            policy_version=policy_version,
+        ),
+        selected_at=NOW,
+    )
+
+
 @dataclass(frozen=True)
 class _Fixture:
     registry: SchemaRegistry
@@ -239,6 +268,7 @@ class _Fixture:
     reference_catalog: ProviderReferenceCatalog
     payload: ProviderClaimPayload
     parsed: ParsedProviderClaimArtifact
+    selection: InferenceAttemptSelection
     selected: SelectedAttemptOutput
     authority: EnrichmentAuthorityContext
 
@@ -256,14 +286,15 @@ def _fixture() -> _Fixture:
     )
     payload = _payload(reference_catalog)
     parsed = _parsed(payload=payload, provider_schema=provider_schema)
-    selected = SelectedAttemptOutput.create(parsed)
+    selection = _selection(inference_id=parsed.raw_response.inference_id)
+    selected = SelectedAttemptOutput.create(parsed, selection)
     authority = EnrichmentAuthorityContext(
         recording_identity=_digest(801),
         mcap_id=_uuid(802),
         camera_mapping_run_id=_uuid(803),
         alignment_id=_uuid(804),
         inference_id=selected.inference_id,
-        logical_invocation_id=_uuid(805),
+        logical_invocation_id=selection.logical_invocation_id,
         prompt_version="prompt-1",
         prompt_artifact_id=_uuid(806),
         prompt_sha256=_digest(503),
@@ -278,6 +309,7 @@ def _fixture() -> _Fixture:
         reference_catalog=reference_catalog,
         payload=payload,
         parsed=parsed,
+        selection=selection,
         selected=selected,
         authority=authority,
     )
@@ -288,6 +320,7 @@ def _enrich(
     *,
     parsed: ParsedProviderClaimArtifact | None = None,
     selected: SelectedAttemptOutput | None = None,
+    authority: EnrichmentAuthorityContext | None = None,
     enriched_schema: JsonSchemaRef | None = None,
 ) -> OrchestratorEnrichedOutput:
     return ProviderClaimEnricher(fixture.registry).enrich(
@@ -295,7 +328,7 @@ def _enrich(
         reference_catalog=fixture.reference_catalog,
         parsed_claims=parsed or fixture.parsed,
         selected_attempt=selected or fixture.selected,
-        authority=fixture.authority,
+        authority=authority or fixture.authority,
         enriched_output_schema=enriched_schema or fixture.enriched_schema,
         enrichment_policy_version="enrichment-1",
         artifact_id=_uuid(900),
@@ -332,7 +365,9 @@ def test_enriches_untrusted_claims_with_authoritative_lineage() -> None:
     assert output.semantic_sha256 == semantic_sha256(
         orchestrator_enriched_output_projection(output)
     )
-    registered = fixture.registry.resolve_version(ENRICHED_OUTPUT_SCHEMA_ID, "1.0.0")
+    registered = fixture.registry.resolve_version(
+        ENRICHED_OUTPUT_SCHEMA_ID, ENRICHED_OUTPUT_SCHEMA_VERSION
+    )
     assert fixture.registry.validate_pinned(
         registered.ref, output.model_dump(mode="json")
     ) == output.model_dump(mode="json")
@@ -387,7 +422,11 @@ def test_provider_tokens_fail_closed_when_missing_duplicate_or_out_of_catalog() 
         row_offset=10,
     )
     with pytest.raises(ProviderClaimEnrichmentError, match="outside the request catalog"):
-        _enrich(fixture, parsed=parsed, selected=SelectedAttemptOutput.create(parsed))
+        _enrich(
+            fixture,
+            parsed=parsed,
+            selected=SelectedAttemptOutput.create(parsed, fixture.selection),
+        )
 
 
 def test_camera_coverage_and_task_schema_bindings_are_fail_closed() -> None:
@@ -402,7 +441,11 @@ def test_camera_coverage_and_task_schema_bindings_are_fail_closed() -> None:
         row_offset=20,
     )
     with pytest.raises(ProviderClaimEnrichmentError, match="cover each"):
-        _enrich(fixture, parsed=parsed, selected=SelectedAttemptOutput.create(parsed))
+        _enrich(
+            fixture,
+            parsed=parsed,
+            selected=SelectedAttemptOutput.create(parsed, fixture.selection),
+        )
 
     forged_schema = fixture.enriched_schema.model_copy(update={"sha256": _digest(9999)})
     with pytest.raises(ProviderClaimEnrichmentError, match="not bound by input plan"):
@@ -422,22 +465,136 @@ def test_enriched_identity_tampering_is_rejected() -> None:
         OrchestratorEnrichedOutput.model_validate(payload)
 
 
-def test_artifact_locator_changes_do_not_change_selected_output_or_enrichment_key() -> None:
+def test_attempt_and_artifact_locators_do_not_change_semantic_identity() -> None:
     fixture = _fixture()
     second_parsed = _parsed(
         payload=fixture.payload,
         provider_schema=fixture.provider_schema,
         row_offset=50,
+        inference_id=_uuid(602),
     )
-    second_selected = SelectedAttemptOutput.create(second_parsed)
+    second_selection = _selection(
+        inference_id=second_parsed.raw_response.inference_id,
+        logical_invocation_id=fixture.selection.logical_invocation_id,
+        policy_version=fixture.selection.policy_version,
+        row_offset=50,
+    )
+    second_selected = SelectedAttemptOutput.create(second_parsed, second_selection)
+    second_authority = fixture.authority.model_copy(
+        update={"inference_id": second_selected.inference_id}
+    )
 
     assert second_parsed.semantic_sha256 == fixture.parsed.semantic_sha256
+    assert second_selected.inference_id != fixture.selected.inference_id
+    assert second_selected.selection_id != fixture.selected.selection_id
     assert second_selected.output_sha256 == fixture.selected.output_sha256
     assert (
         _enrich(
             fixture,
             parsed=second_parsed,
             selected=second_selected,
+            authority=second_authority,
         ).enrichment_logical_key
         == _enrich(fixture).enrichment_logical_key
     )
+
+
+def test_provider_schema_artifact_locator_does_not_change_selected_logical_content() -> None:
+    fixture = _fixture()
+    relocated_schema = fixture.provider_schema.model_copy(update={"artifact_id": _uuid(999)})
+    relocated_parsed = _parsed(
+        payload=fixture.payload,
+        provider_schema=relocated_schema,
+        row_offset=54,
+        inference_id=fixture.parsed.raw_response.inference_id,
+    )
+    relocated_selected = SelectedAttemptOutput.create(relocated_parsed, fixture.selection)
+
+    assert relocated_parsed.provider_claim_schema.artifact_id != (
+        fixture.parsed.provider_claim_schema.artifact_id
+    )
+    assert relocated_parsed.semantic_sha256 == fixture.parsed.semantic_sha256
+    assert relocated_selected.output_sha256 == fixture.selected.output_sha256
+    assert enrichment_logical_digest(
+        selected_attempt_output_sha256=relocated_selected.output_sha256,
+        request_catalog_sha256=fixture.reference_catalog.request_catalog_sha256,
+        target_schema_sha256=fixture.enriched_schema.sha256,
+        enrichment_policy_version="enrichment-1",
+    ) == enrichment_logical_digest(
+        selected_attempt_output_sha256=fixture.selected.output_sha256,
+        request_catalog_sha256=fixture.reference_catalog.request_catalog_sha256,
+        target_schema_sha256=fixture.enriched_schema.sha256,
+        enrichment_policy_version="enrichment-1",
+    )
+
+
+def test_parsed_and_selected_identity_include_provider_schema_content_digest() -> None:
+    fixture = _fixture()
+    changed_schema = fixture.provider_schema.model_copy(update={"sha256": _digest(999)})
+    changed_parsed = _parsed(
+        payload=fixture.payload,
+        provider_schema=changed_schema,
+        row_offset=55,
+        inference_id=fixture.parsed.raw_response.inference_id,
+    )
+    changed_selected = SelectedAttemptOutput.create(changed_parsed, fixture.selection)
+
+    assert changed_parsed.semantic_sha256 != fixture.parsed.semantic_sha256
+    assert changed_selected.output_sha256 != fixture.selected.output_sha256
+
+
+def test_selection_decision_distinguishes_identical_attempt_content() -> None:
+    fixture = _fixture()
+    second_selection = _selection(
+        inference_id=fixture.parsed.raw_response.inference_id,
+        logical_invocation_id=_uuid(806),
+        row_offset=51,
+    )
+    second_selected = SelectedAttemptOutput.create(fixture.parsed, second_selection)
+    second_authority = fixture.authority.model_copy(
+        update={"logical_invocation_id": second_selection.logical_invocation_id}
+    )
+
+    assert second_selected.selection_decision_logical_key != (
+        fixture.selected.selection_decision_logical_key
+    )
+    assert second_selected.output_sha256 != fixture.selected.output_sha256
+    assert (
+        _enrich(
+            fixture,
+            selected=second_selected,
+            authority=second_authority,
+        ).enrichment_logical_key
+        != _enrich(fixture).enrichment_logical_key
+    )
+
+
+def test_selection_policy_change_changes_selected_output_digest() -> None:
+    fixture = _fixture()
+    second_selection = _selection(
+        inference_id=fixture.parsed.raw_response.inference_id,
+        logical_invocation_id=fixture.selection.logical_invocation_id,
+        policy_version="selection-2",
+        row_offset=52,
+    )
+    second_selected = SelectedAttemptOutput.create(fixture.parsed, second_selection)
+
+    assert second_selected.output_sha256 != fixture.selected.output_sha256
+
+
+def test_selection_lineage_mismatch_and_forgery_fail_closed() -> None:
+    fixture = _fixture()
+    mismatched_selection = _selection(inference_id=_uuid(999), row_offset=53)
+    with pytest.raises(ValueError, match="does not reference"):
+        SelectedAttemptOutput.create(fixture.parsed, mismatched_selection)
+
+    payload = fixture.selected.model_dump(mode="python")
+    payload["selection_decision_logical_key"] = f"inference-attempt-selection:{_digest(999)}"
+    with pytest.raises(ValidationError, match="selection logical key is inconsistent"):
+        SelectedAttemptOutput.model_validate(payload)
+
+    mismatched_authority = fixture.authority.model_copy(
+        update={"logical_invocation_id": _uuid(999)}
+    )
+    with pytest.raises(ProviderClaimEnrichmentError, match="lineage is inconsistent"):
+        _enrich(fixture, authority=mismatched_authority)

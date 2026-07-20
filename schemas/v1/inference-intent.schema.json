@@ -1,0 +1,1321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/inference-intent.schema.json",
+  "title": "Durable inference dispatch intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "inference_id",
+    "logical_invocation_id",
+    "request_id",
+    "idempotency_key",
+    "task",
+    "provider",
+    "model_name",
+    "model_version",
+    "adapter_version",
+    "mcap_id",
+    "camera_mapping_run_id",
+    "alignment_id",
+    "start_ns",
+    "end_ns",
+    "input_config",
+    "sampling_config",
+    "input_plan_id",
+    "input_plan_semantic_sha256",
+    "input_plan_part_ordinal",
+    "input_plan_part_count",
+    "input_plan_part_semantic_sha256",
+    "experiment_id",
+    "shadow_route_id",
+    "primary_inference_id",
+    "attempt",
+    "retry_count",
+    "shadow",
+    "request",
+    "queued_at",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "inference_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "logical_invocation_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "request_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "task": {
+      "$ref": "#/$defs/VisionTask"
+    },
+    "provider": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "model_name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "model_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "adapter_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "mcap_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "camera_mapping_run_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "alignment_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "start_ns": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+    },
+    "end_ns": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+    },
+    "input_config": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "sampling_config": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "input_plan_id": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_plan_semantic_sha256": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_plan_part_ordinal": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_plan_part_count": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_plan_part_semantic_sha256": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "experiment_id": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "shadow_route_id": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "primary_inference_id": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attempt": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "retry_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "shadow": {
+      "type": "boolean"
+    },
+    "request": {
+      "$ref": "#/$defs/VisionInferenceRequest"
+    },
+    "queued_at": {
+      "allOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+        },
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        }
+      ]
+    },
+    "created_at": {
+      "allOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+        },
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "ApplicableProviderLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_images_per_request": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_pixels_per_image": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_payload_bytes_per_request": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_input_tokens_per_request": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "max_images_per_request",
+        "max_pixels_per_image",
+        "max_payload_bytes_per_request",
+        "max_input_tokens_per_request"
+      ],
+      "type": "object"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "type": "string"
+    },
+    "CatalogCamera": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "frames": {
+          "$ref": "#/$defs/FrozenTuple_CatalogFrame_"
+        }
+      },
+      "required": [
+        "camera_id",
+        "ordinal",
+        "frames"
+      ],
+      "type": "object"
+    },
+    "CatalogFrame": {
+      "additionalProperties": false,
+      "properties": {
+        "frame_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "aligned_timestamp_ns": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_timestamp_ns": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_artifact_uri": {
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$",
+          "type": "string"
+        },
+        "source_artifact_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "source_artifact_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "type": "string"
+        },
+        "encoding": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "width": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "height": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "frame_id",
+        "ordinal",
+        "aligned_timestamp_ns",
+        "source_timestamp_ns",
+        "source_artifact_uri",
+        "source_artifact_sha256",
+        "source_artifact_bytes",
+        "media_type",
+        "encoding",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "CatalogPackage": {
+      "additionalProperties": false,
+      "properties": {
+        "package_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "semantic_content_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "manifest_bytes_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "cameras": {
+          "$ref": "#/$defs/FrozenTuple_CatalogCamera_"
+        }
+      },
+      "required": [
+        "package_id",
+        "ordinal",
+        "semantic_content_sha256",
+        "manifest_bytes_sha256",
+        "cameras"
+      ],
+      "type": "object"
+    },
+    "FrameTransform": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/TransformOperation"
+        },
+        "policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "parameters": {
+          "$ref": "#/$defs/FrozenTuple_TransformParameter_"
+        },
+        "semantic_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "operation",
+        "policy_version",
+        "parameters",
+        "semantic_sha256"
+      ],
+      "type": "object"
+    },
+    "FrozenTuple_CatalogCamera_": {
+      "items": {
+        "$ref": "#/$defs/CatalogCamera"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_CatalogFrame_": {
+      "items": {
+        "$ref": "#/$defs/CatalogFrame"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_CatalogPackage_": {
+      "items": {
+        "$ref": "#/$defs/CatalogPackage"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_InferenceCallPart_": {
+      "items": {
+        "$ref": "#/$defs/InferenceCallPart"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_ProviderLimitDecision_": {
+      "items": {
+        "$ref": "#/$defs/ProviderLimitDecision"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_RenderedProviderItem_": {
+      "items": {
+        "$ref": "#/$defs/RenderedProviderItem"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_SubjectPackageDigest_": {
+      "items": {
+        "$ref": "#/$defs/SubjectPackageDigest"
+      },
+      "type": "array"
+    },
+    "FrozenTuple_TransformParameter_": {
+      "items": {
+        "$ref": "#/$defs/TransformParameter"
+      },
+      "type": "array"
+    },
+    "InferenceCallPart": {
+      "additionalProperties": false,
+      "properties": {
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "part_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "start_item_ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end_item_ordinal_exclusive": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "overlap_before_items": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "overlap_after_items": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "measured_input_tokens": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "item_manifest_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "part_semantic_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "part_logical_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordinal",
+        "part_count",
+        "start_item_ordinal",
+        "end_item_ordinal_exclusive",
+        "overlap_before_items",
+        "overlap_after_items",
+        "measured_input_tokens",
+        "item_manifest_sha256",
+        "part_semantic_sha256",
+        "part_logical_key",
+        "idempotency_key"
+      ],
+      "type": "object"
+    },
+    "InferenceCallPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "call_plan_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "parts": {
+          "$ref": "#/$defs/FrozenTuple_InferenceCallPart_"
+        },
+        "idempotency_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "barrier_semantic_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "barrier_logical_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reduction_policy": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reduction_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_plan_sha256",
+        "parts",
+        "idempotency_policy_version",
+        "barrier_semantic_sha256",
+        "barrier_logical_key",
+        "reduction_policy",
+        "reduction_policy_version"
+      ],
+      "type": "object"
+    },
+    "InferenceInputPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "input_plan_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "request_catalog": {
+          "$ref": "#/$defs/RequestCatalog"
+        },
+        "subject": {
+          "$ref": "#/$defs/InputPlanSubject"
+        },
+        "target": {
+          "$ref": "#/$defs/InputPlanTarget"
+        },
+        "rendered_items": {
+          "$ref": "#/$defs/FrozenTuple_RenderedProviderItem_"
+        },
+        "rendering_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "prompt_output": {
+          "$ref": "#/$defs/PromptOutputContract"
+        },
+        "applicable_limits": {
+          "$ref": "#/$defs/ApplicableProviderLimits"
+        },
+        "measured_limits": {
+          "$ref": "#/$defs/MeasuredProviderLimits"
+        },
+        "limit_decisions": {
+          "$ref": "#/$defs/FrozenTuple_ProviderLimitDecision_"
+        },
+        "call_plan": {
+          "$ref": "#/$defs/InferenceCallPlan"
+        },
+        "semantic_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "created_at": {
+          "allOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+            },
+            {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "input_plan_id",
+        "request_catalog",
+        "subject",
+        "target",
+        "rendered_items",
+        "rendering_sha256",
+        "prompt_output",
+        "applicable_limits",
+        "measured_limits",
+        "limit_decisions",
+        "call_plan",
+        "semantic_sha256",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "InputPlanSubject": {
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "$ref": "#/$defs/VisionTask"
+        },
+        "packages": {
+          "$ref": "#/$defs/FrozenTuple_SubjectPackageDigest_"
+        },
+        "request_catalog_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "task",
+        "packages",
+        "request_catalog_sha256"
+      ],
+      "type": "object"
+    },
+    "InputPlanTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "adapter_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "planner_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "capability_snapshot_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "capability_snapshot_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "provider",
+        "model_name",
+        "model_version",
+        "adapter_version",
+        "planner_version",
+        "capability_snapshot_id",
+        "capability_snapshot_sha256"
+      ],
+      "type": "object"
+    },
+    "JsonSchemaRef": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "LimitDecisionStatus": {
+      "enum": [
+        "FAIL",
+        "PASS"
+      ],
+      "type": "string"
+    },
+    "LimitMetric": {
+      "enum": [
+        "IMAGES_PER_REQUEST",
+        "INPUT_TOKENS_PER_REQUEST",
+        "PAYLOAD_BYTES_PER_REQUEST",
+        "PIXELS_PER_IMAGE"
+      ],
+      "type": "string"
+    },
+    "MeasuredProviderLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "total_provider_items": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_images_per_request": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_pixels_per_image": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_payload_bytes_per_request": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_input_tokens_per_request": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total_provider_items",
+        "max_images_per_request",
+        "max_pixels_per_image",
+        "max_payload_bytes_per_request",
+        "max_input_tokens_per_request"
+      ],
+      "type": "object"
+    },
+    "PackageInput": {
+      "additionalProperties": false,
+      "properties": {
+        "package_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "package_semantic_content_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "package_manifest_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "role": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "package_id",
+        "package_semantic_content_sha256",
+        "package_manifest_sha256",
+        "role",
+        "ordinal"
+      ],
+      "type": "object"
+    },
+    "PromptOutputContract": {
+      "additionalProperties": false,
+      "properties": {
+        "prompt_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "prompt_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "rendered_message_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "provider_response_schema_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "enriched_domain_schema_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "protocol_mode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tool_mode": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt_version",
+        "prompt_sha256",
+        "rendered_message_sha256",
+        "provider_response_schema_sha256",
+        "enriched_domain_schema_sha256",
+        "protocol_mode",
+        "tool_mode"
+      ],
+      "type": "object"
+    },
+    "ProviderLimitDecision": {
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "$ref": "#/$defs/LimitMetric"
+        },
+        "measured_value": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "applicable_limit": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LimitDecisionStatus"
+        }
+      },
+      "required": [
+        "metric",
+        "measured_value",
+        "applicable_limit",
+        "status"
+      ],
+      "type": "object"
+    },
+    "RenderedArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "uri": {
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "type": "string"
+        },
+        "encoding": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "width": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "height": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "uri",
+        "sha256",
+        "byte_count",
+        "media_type",
+        "encoding",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "RenderedProviderItem": {
+      "additionalProperties": false,
+      "properties": {
+        "provider_item_ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "package_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "package_ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "camera_ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "frame_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "frame_ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "aligned_timestamp_ns": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_timestamp_ns": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_artifact_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "artifact": {
+          "$ref": "#/$defs/RenderedArtifact"
+        },
+        "transform": {
+          "$ref": "#/$defs/FrameTransform"
+        }
+      },
+      "required": [
+        "provider_item_ordinal",
+        "package_id",
+        "package_ordinal",
+        "camera_id",
+        "camera_ordinal",
+        "frame_id",
+        "frame_ordinal",
+        "aligned_timestamp_ns",
+        "source_timestamp_ns",
+        "source_artifact_sha256",
+        "artifact",
+        "transform"
+      ],
+      "type": "object"
+    },
+    "RequestCatalog": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "request_catalog_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "task": {
+          "$ref": "#/$defs/VisionTask"
+        },
+        "packages": {
+          "$ref": "#/$defs/FrozenTuple_CatalogPackage_"
+        },
+        "semantic_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "created_at": {
+          "allOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+            },
+            {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_catalog_id",
+        "task",
+        "packages",
+        "semantic_sha256",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "SubjectPackageDigest": {
+      "additionalProperties": false,
+      "properties": {
+        "package_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "semantic_content_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "manifest_bytes_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "package_id",
+        "ordinal",
+        "semantic_content_sha256",
+        "manifest_bytes_sha256"
+      ],
+      "type": "object"
+    },
+    "TransformOperation": {
+      "enum": [
+        "NONE",
+        "RESIZE",
+        "RESIZE_TRANSCODE",
+        "TRANSCODE"
+      ],
+      "type": "string"
+    },
+    "TransformParameter": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "VisionInferenceRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "logical_invocation_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "request_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "package_set_id": {
+          "anyOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "package_inputs": {
+          "items": {
+            "$ref": "#/$defs/PackageInput"
+          },
+          "type": "array"
+        },
+        "package_input_set_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "task": {
+          "$ref": "#/$defs/VisionTask"
+        },
+        "prompt_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "prompt_artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "prompt_sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "rendered_input_digest": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "input_plan_id": {
+          "anyOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_plan_semantic_sha256": {
+          "anyOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_plan_part_ordinal": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_plan_part_count": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_plan_part_semantic_sha256": {
+          "anyOf": [
+            {
+              "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_plan": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InferenceInputPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_schema": {
+          "$ref": "#/$defs/JsonSchemaRef"
+        },
+        "capability_snapshot_id": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+        },
+        "capability_snapshot_digest": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        },
+        "model_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "generation_config": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "provider_idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "timeout_ms": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema_version",
+        "logical_invocation_id",
+        "request_id",
+        "idempotency_key",
+        "provider",
+        "model_name",
+        "model_version",
+        "package_set_id",
+        "package_inputs",
+        "package_input_set_sha256",
+        "task",
+        "prompt_version",
+        "prompt_artifact_id",
+        "prompt_sha256",
+        "rendered_input_digest",
+        "input_plan_id",
+        "input_plan_semantic_sha256",
+        "input_plan_part_ordinal",
+        "input_plan_part_count",
+        "input_plan_part_semantic_sha256",
+        "input_plan",
+        "output_schema",
+        "capability_snapshot_id",
+        "capability_snapshot_digest",
+        "model_policy_version",
+        "generation_config",
+        "provider_idempotency_key",
+        "timeout_ms",
+        "metadata"
+      ],
+      "type": "object"
+    },
+    "VisionTask": {
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_EVIDENCE",
+        "BOUNDARY_REFINEMENT",
+        "FUSION_ADJUDICATION"
+      ],
+      "type": "string"
+    }
+  }
+}

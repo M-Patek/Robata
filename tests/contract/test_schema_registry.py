@@ -155,12 +155,18 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "common",
         "current-selection",
         "immutable-node-revision",
+        "inference-attempt-selection",
+        "inference-intent",
         "logical-node",
         "mcap-manifest",
         "mcap-validation-report",
+        "model-inference",
         "orchestrator-enriched-output",
+        "parsed-provider-claim-artifact",
         "processing-run-node-membership",
         "provider-claim-payload",
+        "raw-provider-response-artifact",
+        "selected-attempt-output",
         "selection-decision",
     )
     assert len(registry.schema_ids) == len(set(registry.schema_ids))

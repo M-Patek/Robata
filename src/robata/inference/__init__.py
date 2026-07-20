@@ -30,6 +30,7 @@ from robata.inference.call_barrier import (
 )
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
+    ENRICHED_OUTPUT_SCHEMA_VERSION,
     PROVIDER_CLAIM_SCHEMA_ID,
     EnrichedEvidenceReference,
     EnrichedProviderClaim,
@@ -58,6 +59,11 @@ from robata.inference.evaluation import (
     FieldDelta,
     InferenceEvaluationMetrics,
     PairedEvaluationMetrics,
+)
+from robata.inference.evidence import (
+    InferenceEvidenceStore,
+    InferenceEvidenceStoreError,
+    InMemoryInferenceEvidenceStore,
 )
 from robata.inference.input_plan import (
     ApplicableProviderLimits,
@@ -103,6 +109,8 @@ from robata.inference.models import (
     ShadowRouteStatus,
     ShadowSelectionReason,
     VisionTask,
+    inference_attempt_selection_digest,
+    inference_attempt_selection_logical_key,
 )
 from robata.inference.offline_fixture import (
     InMemoryRawProviderBytesStore,
@@ -111,6 +119,7 @@ from robata.inference.offline_fixture import (
     OfflineFixtureVisionAdapter,
     ProviderResponseParseCode,
     RawProviderBytesNotFoundError,
+    RawProviderBytesStore,
     RawProviderBytesStoreError,
     StoredRawProviderBytes,
     StrictProviderClaimParseError,
@@ -140,6 +149,7 @@ from robata.inference.shadow import ShadowRouter, ShadowRoutingError
 
 __all__ = [
     "ENRICHED_OUTPUT_SCHEMA_ID",
+    "ENRICHED_OUTPUT_SCHEMA_VERSION",
     "PROVIDER_CLAIM_SCHEMA_ID",
     "ApplicableProviderLimits",
     "CallPartSpec",
@@ -159,6 +169,7 @@ __all__ = [
     "FieldDelta",
     "FrameTransform",
     "InMemoryInferenceCallBarrierStorage",
+    "InMemoryInferenceEvidenceStore",
     "InMemoryInferenceLedger",
     "InMemoryRawProviderBytesStore",
     "InferenceAttemptSelection",
@@ -176,6 +187,8 @@ __all__ = [
     "InferenceCallReduction",
     "InferenceCallReductionConfigurationError",
     "InferenceEvaluationMetrics",
+    "InferenceEvidenceStore",
+    "InferenceEvidenceStoreError",
     "InferenceExecutionGate",
     "InferenceFailure",
     "InferenceInputPlan",
@@ -228,6 +241,7 @@ __all__ = [
     "ProviderResponseParseCode",
     "ProviderTaskClaim",
     "RawProviderBytesNotFoundError",
+    "RawProviderBytesStore",
     "RawProviderBytesStoreError",
     "RawProviderResponseArtifact",
     "RenderedArtifact",
@@ -255,4 +269,6 @@ __all__ = [
     "VisionUsage",
     "applicable_limits_from_capabilities",
     "enrichment_logical_digest",
+    "inference_attempt_selection_digest",
+    "inference_attempt_selection_logical_key",
 ]

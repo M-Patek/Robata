@@ -110,7 +110,7 @@ class CatalogCamera(StrictModel):
 
 
 class CatalogPackage(StrictModel):
-    """One ordered provider-neutral package bound into a request catalog."""
+    """One ordered package with semantic identity and exact audit evidence."""
 
     package_id: OpaqueUuid
     ordinal: NonNegativeInt
@@ -161,7 +161,7 @@ class RequestCatalog(StrictModel):
 
 
 class SubjectPackageDigest(StrictModel):
-    """Ordered semantic and exact-byte identity of one source package."""
+    """Ordered semantic identity plus exact-byte audit evidence for one package."""
 
     package_id: OpaqueUuid
     ordinal: NonNegativeInt
@@ -451,7 +451,7 @@ class InferenceInputPlanner:
         packages: Sequence[CatalogPackage],
         created_at: str,
     ) -> RequestCatalog:
-        """Create a catalog whose digest excludes row IDs, locators, and clock time."""
+        """Create a catalog digest without row IDs, exact manifests, locators, or time."""
 
         package_tuple = tuple(packages)
         projection = {
@@ -577,7 +577,7 @@ class InferenceInputPlanner:
 
 
 def request_catalog_semantic_projection(catalog: RequestCatalog) -> dict[str, object]:
-    """Return catalog identity without row IDs, locators, or clock fields."""
+    """Return catalog identity without row IDs, exact manifests, locators, or time."""
 
     return {
         "task": catalog.task.value,
@@ -606,7 +606,6 @@ def _catalog_package_projection(package: CatalogPackage) -> dict[str, object]:
     return {
         "ordinal": package.ordinal,
         "semantic_content_sha256": package.semantic_content_sha256,
-        "manifest_bytes_sha256": package.manifest_bytes_sha256,
         "cameras": [
             {
                 "camera_id": camera.camera_id.value,
@@ -654,7 +653,6 @@ def _subject_projection(subject: InputPlanSubject) -> dict[str, object]:
             {
                 "ordinal": package.ordinal,
                 "semantic_content_sha256": package.semantic_content_sha256,
-                "manifest_bytes_sha256": package.manifest_bytes_sha256,
             }
             for package in subject.packages
         ],

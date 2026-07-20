@@ -18,13 +18,14 @@ from pydantic import Field, StringConstraints, model_validator
 
 from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.hashing import CanonicalizationError, semantic_sha256
-from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
+from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid, Rfc3339Timestamp
 from robata.inference.input_plan import InferenceCallPart, InferenceInputPlan
 from robata.inference.models import (
     InferenceAttemptSelection,
     InferenceFailure,
     InferenceStatus,
     ModelInference,
+    inference_attempt_selection_logical_key,
 )
 from robata.queue.barrier import AggregateStatus, BarrierCoordinator, ReductionPolicy
 from robata.queue.stage import StageStatus
@@ -107,6 +108,7 @@ class InferenceCallPartCompletion(StrictModel):
     logical_invocation_id: OpaqueUuid
     selection_id: OpaqueUuid | None
     selection_policy_version: SchemaVersion | None
+    selection_decision_logical_key: NodeLogicalKey | None
     attempt: PositiveInt
     status: InferenceStatus
     normalized_output: dict[str, object] | None
@@ -125,6 +127,7 @@ class InferenceCallPartCompletion(StrictModel):
                 or self.raw_output_artifact_id is None
                 or self.selection_id is None
                 or self.selection_policy_version is None
+                or self.selection_decision_logical_key is None
                 or self.failure is not None
             ):
                 raise ValueError(
@@ -136,11 +139,18 @@ class InferenceCallPartCompletion(StrictModel):
                 raise ValueError("part normalized output is not canonical JSON") from exc
             if self.normalized_output_sha256 != expected_output:
                 raise ValueError("part normalized output digest is inconsistent")
+            expected_selection_key = inference_attempt_selection_logical_key(
+                logical_invocation_id=self.logical_invocation_id,
+                policy_version=self.selection_policy_version,
+            )
+            if self.selection_decision_logical_key != expected_selection_key:
+                raise ValueError("part selection decision logical key is inconsistent")
         elif (
             self.normalized_output is not None
             or self.normalized_output_sha256 is not None
             or self.selection_id is not None
             or self.selection_policy_version is not None
+            or self.selection_decision_logical_key is not None
             or self.failure is None
         ):
             raise ValueError("failed part completion requires only failure details")
@@ -155,6 +165,7 @@ class InferenceCallPartCompletion(StrictModel):
             logical_invocation_id=self.logical_invocation_id,
             selection_id=self.selection_id,
             selection_policy_version=self.selection_policy_version,
+            selection_decision_logical_key=self.selection_decision_logical_key,
             attempt=self.attempt,
             status=self.status,
             normalized_output_sha256=self.normalized_output_sha256,
@@ -184,6 +195,7 @@ class InferenceCallReduction(StrictModel):
     ordered_completion_ids: tuple[OpaqueUuid, ...]
     ordered_part_semantic_sha256s: tuple[Sha256Digest, ...]
     ordered_normalized_output_sha256s: tuple[Sha256Digest, ...]
+    ordered_selection_decision_logical_keys: tuple[NodeLogicalKey, ...]
     normalized_output: dict[str, object]
     normalized_output_sha256: Sha256Digest
     reduced_at: Rfc3339Timestamp
@@ -195,6 +207,7 @@ class InferenceCallReduction(StrictModel):
             count == 0
             or len(self.ordered_part_semantic_sha256s) != count
             or len(self.ordered_normalized_output_sha256s) != count
+            or len(self.ordered_selection_decision_logical_keys) != count
         ):
             raise ValueError("reduction must bind equal nonempty ordered member tuples")
         try:
@@ -210,9 +223,9 @@ class InferenceCallReduction(StrictModel):
             reduction_policy=self.reduction_policy,
             reduction_policy_version=self.reduction_policy_version,
             output_schema_sha256=self.output_schema_sha256,
-            ordered_completion_ids=self.ordered_completion_ids,
             ordered_part_semantic_sha256s=self.ordered_part_semantic_sha256s,
             ordered_normalized_output_sha256s=self.ordered_normalized_output_sha256s,
+            ordered_selection_decision_logical_keys=(self.ordered_selection_decision_logical_keys),
             normalized_output_sha256=self.normalized_output_sha256,
         )
         if self.reduction_semantic_sha256 != expected:
@@ -340,6 +353,12 @@ class InMemoryInferenceCallBarrierStorage:
                 or reduction.reduction_policy != definition.reduction_policy
                 or reduction.reduction_policy_version != definition.reduction_policy_version
                 or reduction.ordered_completion_ids != tuple(item.completion_id for item in ordered)
+                or reduction.ordered_part_semantic_sha256s
+                != tuple(item.part_semantic_sha256 for item in ordered)
+                or reduction.ordered_normalized_output_sha256s
+                != tuple(_required_output_digest(item) for item in ordered)
+                or reduction.ordered_selection_decision_logical_keys
+                != tuple(_required_selection_key(item) for item in ordered)
             ):
                 raise InferenceCallBarrierConflictError(
                     "reduction does not match the completed declared member set"
@@ -447,6 +466,11 @@ class InferenceCallBarrierCoordinator:
                 selection is None
                 or selection.inference_id != inference.inference_id
                 or selection.logical_invocation_id != inference.logical_invocation_id
+                or selection.selection_decision_logical_key
+                != inference_attempt_selection_logical_key(
+                    logical_invocation_id=inference.logical_invocation_id,
+                    policy_version=selection.policy_version,
+                )
             ):
                 raise InferenceCallBarrierError(
                     "successful call part requires its exact persisted attempt selection"
@@ -481,6 +505,9 @@ class InferenceCallBarrierCoordinator:
             logical_invocation_id=inference.logical_invocation_id,
             selection_id=selection.selection_id if selection is not None else None,
             selection_policy_version=(selection.policy_version if selection is not None else None),
+            selection_decision_logical_key=(
+                selection.selection_decision_logical_key if selection is not None else None
+            ),
             attempt=inference.attempt,
             status=inference.status,
             normalized_output_sha256=normalized_output_sha256,
@@ -503,6 +530,9 @@ class InferenceCallBarrierCoordinator:
             logical_invocation_id=inference.logical_invocation_id,
             selection_id=selection.selection_id if selection is not None else None,
             selection_policy_version=(selection.policy_version if selection is not None else None),
+            selection_decision_logical_key=(
+                selection.selection_decision_logical_key if selection is not None else None
+            ),
             attempt=inference.attempt,
             status=inference.status,
             normalized_output=normalized_output,
@@ -586,6 +616,7 @@ class InferenceCallBarrierCoordinator:
         completion_ids = tuple(item.completion_id for item in completions)
         part_digests = tuple(item.part_semantic_sha256 for item in completions)
         output_digests = tuple(_required_output_digest(item) for item in completions)
+        selection_keys = tuple(_required_selection_key(item) for item in completions)
         reduction_digest = _reduction_semantic_sha256(
             barrier_semantic_sha256=definition.barrier_semantic_sha256,
             input_plan_semantic_sha256=plan.semantic_sha256,
@@ -593,9 +624,9 @@ class InferenceCallBarrierCoordinator:
             reduction_policy=definition.reduction_policy,
             reduction_policy_version=definition.reduction_policy_version,
             output_schema_sha256=plan.prompt_output.provider_response_schema_sha256,
-            ordered_completion_ids=completion_ids,
             ordered_part_semantic_sha256s=part_digests,
             ordered_normalized_output_sha256s=output_digests,
+            ordered_selection_decision_logical_keys=selection_keys,
             normalized_output_sha256=output_sha256,
         )
         reduction = InferenceCallReduction(
@@ -611,6 +642,7 @@ class InferenceCallBarrierCoordinator:
             ordered_completion_ids=completion_ids,
             ordered_part_semantic_sha256s=part_digests,
             ordered_normalized_output_sha256s=output_digests,
+            ordered_selection_decision_logical_keys=selection_keys,
             normalized_output=normalized_output,
             normalized_output_sha256=output_sha256,
             reduced_at=reduced_at,
@@ -721,6 +753,14 @@ def _required_output_digest(completion: InferenceCallPartCompletion) -> Sha256Di
     return completion.normalized_output_sha256
 
 
+def _required_selection_key(completion: InferenceCallPartCompletion) -> NodeLogicalKey:
+    if completion.selection_decision_logical_key is None:
+        raise InferenceCallBarrierFailedError(
+            "successful call part is missing its selection decision logical key"
+        )
+    return completion.selection_decision_logical_key
+
+
 def _raw_output_artifact_id(inference: ModelInference) -> str | None:
     raw_output = inference.raw_output
     if raw_output is None:
@@ -758,6 +798,7 @@ def _completion_semantic_sha256(
     logical_invocation_id: str,
     selection_id: str | None,
     selection_policy_version: str | None,
+    selection_decision_logical_key: str | None,
     attempt: int,
     status: InferenceStatus,
     normalized_output_sha256: str | None,
@@ -775,6 +816,7 @@ def _completion_semantic_sha256(
             "logical_invocation_id": logical_invocation_id,
             "selection_id": selection_id,
             "selection_policy_version": selection_policy_version,
+            "selection_decision_logical_key": selection_decision_logical_key,
             "attempt": attempt,
             "status": status,
             "normalized_output_sha256": normalized_output_sha256,
@@ -792,9 +834,9 @@ def _reduction_semantic_sha256(
     reduction_policy: str,
     reduction_policy_version: str,
     output_schema_sha256: str,
-    ordered_completion_ids: tuple[str, ...],
     ordered_part_semantic_sha256s: tuple[str, ...],
     ordered_normalized_output_sha256s: tuple[str, ...],
+    ordered_selection_decision_logical_keys: tuple[str, ...],
     normalized_output_sha256: str,
 ) -> Sha256Digest:
     return semantic_sha256(
@@ -805,9 +847,9 @@ def _reduction_semantic_sha256(
             "reduction_policy": reduction_policy,
             "reduction_policy_version": reduction_policy_version,
             "output_schema_sha256": output_schema_sha256,
-            "ordered_completion_ids": ordered_completion_ids,
             "ordered_part_semantic_sha256s": ordered_part_semantic_sha256s,
             "ordered_normalized_output_sha256s": ordered_normalized_output_sha256s,
+            "ordered_selection_decision_logical_keys": (ordered_selection_decision_logical_keys),
             "normalized_output_sha256": normalized_output_sha256,
         }
     )

@@ -168,6 +168,19 @@ class PlatformEnrichedOutputReference(StrictModel):
         )
 
 
+def platform_enriched_output_logical_projection(
+    reference: PlatformEnrichedOutputReference,
+) -> dict[str, object]:
+    """Project reusable enrichment identity without exact artifact evidence."""
+
+    return {
+        "authority": reference.authority,
+        "recording_identity": reference.recording_identity,
+        "enrichment_logical_key": reference.enrichment_logical_key,
+        "enrichment_policy_version": reference.enrichment_policy_version,
+    }
+
+
 class ProductionAdmittedHypothesisFact(StrictModel):
     """Non-circular semantic facts admitted from one enriched fusion claim."""
 
@@ -1479,9 +1492,13 @@ def event_hypothesis_projection_values(
         "semantic_fingerprint_sha256": values["semantic_fingerprint_sha256"],
         "fusion_logical_key": values["fusion_logical_key"],
         "fusion_output_ordinal": values["fusion_output_ordinal"],
-        "source_enrichments": [item.model_dump(mode="json") for item in source_enrichments],
+        "source_enrichments": [
+            platform_enriched_output_logical_projection(item) for item in source_enrichments
+        ],
         "production_admission": production_admission.model_dump(mode="json"),
-        "production_output_admission": production_output_admission.model_dump(mode="json"),
+        "production_output_admission": production_output_admission_projection(
+            production_output_admission
+        ),
     }
 
 
@@ -1547,7 +1564,9 @@ def production_output_admission_projection_values(
     return {
         "decision": values["decision"],
         "recording_identity": values["recording_identity"],
-        "source_enrichments": [item.model_dump(mode="json") for item in source_enrichments],
+        "source_enrichments": [
+            platform_enriched_output_logical_projection(item) for item in source_enrichments
+        ],
         "admitted_hypothesis_facts": [item.model_dump(mode="json") for item in admitted_facts],
         "output_admission_policy_version": values["output_admission_policy_version"],
         "output_admission_policy_sha256": values["output_admission_policy_sha256"],
@@ -1680,5 +1699,6 @@ __all__ = [
     "event_hypothesis_semantic_projection",
     "event_identity_assignment_semantic_projection",
     "event_identity_relation_semantic_projection",
+    "platform_enriched_output_logical_projection",
     "production_output_admission_projection",
 ]

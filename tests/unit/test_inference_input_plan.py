@@ -25,6 +25,7 @@ from robata.inference.call_barrier import (
     InferenceCallBarrierFailedError,
     InferenceCallBarrierOpenError,
     InferenceCallPartCompletion,
+    InferenceCallReduction,
     InMemoryInferenceCallBarrierStorage,
 )
 from robata.inference.input_plan import (
@@ -47,6 +48,7 @@ from robata.inference.input_plan import (
 )
 from robata.inference.models import (
     ConcurrencyClass,
+    InferenceAttemptSelection,
     InferenceFailure,
     InferenceStatus,
     InputMode,
@@ -54,11 +56,13 @@ from robata.inference.models import (
     ModelInference,
     Retryability,
     VisionTask,
+    inference_attempt_selection_logical_key,
 )
 from robata.inference.orchestrator import (
     InferenceOrchestrator,
     InferencePolicy,
     InMemoryInferenceLedger,
+    OrchestrationConfigurationError,
 )
 from robata.queue.barrier import BarrierCoordinator, InMemoryBarrierStorage
 from robata.queue.stage import StageStatus
@@ -75,7 +79,12 @@ def _digest(value: int) -> str:
     return f"{value:064x}"
 
 
-def _package(*, row_offset: int = 0) -> CatalogPackage:
+def _package(
+    *,
+    row_offset: int = 0,
+    semantic_content_sha256: str | None = None,
+    manifest_bytes_sha256: str | None = None,
+) -> CatalogPackage:
     cameras = tuple(
         CatalogCamera(
             camera_id=camera_id,
@@ -101,8 +110,8 @@ def _package(*, row_offset: int = 0) -> CatalogPackage:
     return CatalogPackage(
         package_id=_uuid(500 + row_offset),
         ordinal=0,
-        semantic_content_sha256=_digest(300),
-        manifest_bytes_sha256=_digest(301),
+        semantic_content_sha256=semantic_content_sha256 or _digest(300),
+        manifest_bytes_sha256=manifest_bytes_sha256 or _digest(301),
         cameras=cameras,
     )
 
@@ -143,11 +152,17 @@ def _limits(*, max_images: int | None = 4) -> ApplicableProviderLimits:
 def _fixture(
     *,
     row_offset: int = 0,
+    semantic_content_sha256: str | None = None,
+    manifest_bytes_sha256: str | None = None,
     max_images: int | None = 4,
     prompt_output: PromptOutputContract | None = None,
 ):
     planner = InferenceInputPlanner("planner-1")
-    package = _package(row_offset=row_offset)
+    package = _package(
+        row_offset=row_offset,
+        semantic_content_sha256=semantic_content_sha256,
+        manifest_bytes_sha256=manifest_bytes_sha256,
+    )
     catalog = planner.build_request_catalog(
         request_catalog_id=_uuid(900 + row_offset),
         task=TASK,
@@ -228,12 +243,16 @@ def test_builds_lossless_ordered_plan_with_limits_and_barrier() -> None:
 
 def test_semantic_identity_excludes_row_ids_locators_and_clock_fields() -> None:
     first = _fixture(row_offset=0)[3]
-    second = _fixture(row_offset=50)[3]
+    second = _fixture(row_offset=50, manifest_bytes_sha256=_digest(999))[3]
 
     assert first.input_plan_id != second.input_plan_id
     assert first.request_catalog.request_catalog_id != second.request_catalog.request_catalog_id
     assert first.created_at != second.created_at
     assert first.target.capability_snapshot_id != second.target.capability_snapshot_id
+    assert first.subject.packages[0].manifest_bytes_sha256 != (
+        second.subject.packages[0].manifest_bytes_sha256
+    )
+    assert first.request_catalog.semantic_sha256 == second.request_catalog.semantic_sha256
     assert first.semantic_sha256 == second.semantic_sha256
     assert first.rendering_sha256 == second.rendering_sha256
     assert first.call_plan.call_plan_sha256 == second.call_plan.call_plan_sha256
@@ -241,6 +260,16 @@ def test_semantic_identity_excludes_row_ids_locators_and_clock_fields() -> None:
     assert [part.idempotency_key for part in first.call_plan.parts] == [
         part.idempotency_key for part in second.call_plan.parts
     ]
+
+
+def test_package_semantic_content_change_changes_catalog_and_plan_identity() -> None:
+    first = _fixture()[3]
+    changed = _fixture(semantic_content_sha256=_digest(999))[3]
+
+    assert first.request_catalog.semantic_sha256 != changed.request_catalog.semantic_sha256
+    assert first.semantic_sha256 != changed.semantic_sha256
+    assert first.call_plan.call_plan_sha256 != changed.call_plan.call_plan_sha256
+    assert first.call_plan.barrier_semantic_sha256 != (changed.call_plan.barrier_semantic_sha256)
 
 
 def test_dropped_or_reordered_frame_is_rejected() -> None:
@@ -290,6 +319,11 @@ def test_plan_digest_tampering_and_catalog_digest_tampering_fail_closed() -> Non
     payload = plan.model_dump(mode="json")
     payload["semantic_sha256"] = _digest(9999)
     with pytest.raises(ValidationError, match="semantic_sha256"):
+        InferenceInputPlan.model_validate_json(json.dumps(payload))
+
+    payload = plan.model_dump(mode="json")
+    payload["subject"]["packages"][0]["manifest_bytes_sha256"] = _digest(9997)
+    with pytest.raises(ValidationError, match="subject does not match"):
         InferenceInputPlan.model_validate_json(json.dumps(payload))
 
     payload = plan.model_dump(mode="json")
@@ -622,6 +656,105 @@ def test_input_plan_is_bound_into_orchestrator_identity_and_request() -> None:
     _execution_fixture()
 
 
+def _relocated_input_plan(plan: InferenceInputPlan) -> InferenceInputPlan:
+    payload = plan.model_dump(mode="python")
+    payload["input_plan_id"] = _uuid(9_300)
+    payload["created_at"] = "2026-07-20T12:00:00Z"
+    payload["request_catalog"]["request_catalog_id"] = _uuid(9_301)
+    payload["request_catalog"]["created_at"] = "2026-07-20T11:59:00Z"
+
+    catalog_package = payload["request_catalog"]["packages"][0]
+    subject_package = payload["subject"]["packages"][0]
+    relocated_package_id = _uuid(9_302)
+    relocated_manifest_digest = _digest(9_303)
+    catalog_package["package_id"] = relocated_package_id
+    catalog_package["manifest_bytes_sha256"] = relocated_manifest_digest
+    subject_package["package_id"] = relocated_package_id
+    subject_package["manifest_bytes_sha256"] = relocated_manifest_digest
+
+    for ordinal, (camera, item) in enumerate(
+        zip(
+            catalog_package["cameras"],
+            payload["rendered_items"],
+            strict=True,
+        )
+    ):
+        frame = camera["frames"][0]
+        relocated_frame_id = _uuid(9_400 + ordinal)
+        frame["frame_id"] = relocated_frame_id
+        frame["source_artifact_uri"] = f"object://relocated-source/{ordinal}"
+        item["package_id"] = relocated_package_id
+        item["frame_id"] = relocated_frame_id
+        item["artifact"]["artifact_id"] = _uuid(9_500 + ordinal)
+        item["artifact"]["uri"] = f"object://relocated-rendering/{ordinal}"
+
+    return InferenceInputPlan.model_validate(payload)
+
+
+def _package_input_from_plan(plan: InferenceInputPlan) -> PackageInput:
+    package = plan.subject.packages[0]
+    return PackageInput(
+        package_id=package.package_id,
+        package_semantic_content_sha256=package.semantic_content_sha256,
+        package_manifest_sha256=package.manifest_bytes_sha256,
+        role="primary",
+        ordinal=package.ordinal,
+    )
+
+
+def test_initial_delivery_reuses_selected_terminal_across_exact_plan_relocation() -> None:
+    plan, adapter, orchestrator, request_args, selected, _ = _execution_fixture()
+    relocated = _relocated_input_plan(plan)
+    relocated_args = {
+        **request_args,
+        "package_set_id": _uuid(9_600),
+        "mcap_id": _uuid(9_601),
+        "camera_mapping_run_id": _uuid(9_602),
+        "alignment_id": _uuid(9_603),
+        "package_inputs": (_package_input_from_plan(relocated),),
+    }
+    request_count = len(adapter.requests)
+    intent_count = len(orchestrator.intents)
+
+    reused = asyncio.run(
+        orchestrator.orchestrate(
+            **relocated_args,
+            input_plan=relocated,
+            input_plan_part_ordinal=0,
+        )
+    )
+
+    assert relocated.input_plan_id != plan.input_plan_id
+    assert relocated.subject.packages[0].package_id != plan.subject.packages[0].package_id
+    assert relocated.subject.packages[0].manifest_bytes_sha256 != (
+        plan.subject.packages[0].manifest_bytes_sha256
+    )
+    assert relocated.semantic_sha256 == plan.semantic_sha256
+    assert reused == selected
+    assert len(adapter.requests) == request_count
+    assert len(orchestrator.intents) == intent_count
+
+
+def test_exact_plan_package_mismatch_is_rejected_before_selected_terminal_reuse() -> None:
+    plan, adapter, orchestrator, request_args, _, _ = _execution_fixture()
+    relocated = _relocated_input_plan(plan)
+    forged_package_input = _package_input_from_plan(relocated).model_copy(
+        update={"package_manifest_sha256": plan.subject.packages[0].manifest_bytes_sha256}
+    )
+    request_count = len(adapter.requests)
+
+    with pytest.raises(OrchestrationConfigurationError, match="subject packages"):
+        asyncio.run(
+            orchestrator.orchestrate(
+                **{**request_args, "package_inputs": (forged_package_input,)},
+                input_plan=relocated,
+                input_plan_part_ordinal=0,
+            )
+        )
+
+    assert len(adapter.requests) == request_count
+
+
 class _OrderedLabelReducer:
     def __init__(self) -> None:
         self.calls = 0
@@ -682,6 +815,10 @@ def test_call_parts_join_exact_barrier_and_reduce_once_in_plan_order() -> None:
         selection=selection_one,
     )
     assert completion_one.part_ordinal == 1
+    assert (
+        completion_one.selection_decision_logical_key
+        == selection_one.selection_decision_logical_key
+    )
     assert not coordinator.get_aggregate_status(plan).is_complete
     with pytest.raises(InferenceCallBarrierOpenError, match="every declared"):
         coordinator.reduce(plan, reduced_at=NOW)
@@ -756,6 +893,7 @@ def test_call_barrier_rejects_unconfirmed_or_conflicting_failure_and_reduction()
         failed,
         failure_is_final=True,
     )
+    assert failed_completion.selection_decision_logical_key is None
     assert (
         coordinator.submit_part_terminal(
             plan,
@@ -785,3 +923,139 @@ def test_call_barrier_rejects_terminal_with_wrong_part_idempotency_binding() -> 
 
     with pytest.raises(InferenceCallBarrierError, match="declared call part"):
         coordinator.submit_part_terminal(plan, wrong)
+
+
+def _selection_for_terminal(
+    terminal: ModelInference,
+    *,
+    selection_id: str,
+    policy_version: str,
+) -> InferenceAttemptSelection:
+    return InferenceAttemptSelection(
+        schema_version="1.0",
+        selection_id=selection_id,
+        inference_id=terminal.inference_id,
+        logical_invocation_id=terminal.logical_invocation_id,
+        policy_version=policy_version,
+        selection_reason="FIRST_SCHEMA_VALID_SUCCESS",
+        selection_decision_logical_key=inference_attempt_selection_logical_key(
+            logical_invocation_id=terminal.logical_invocation_id,
+            policy_version=policy_version,
+        ),
+        selected_at=NOW,
+    )
+
+
+def _relocated_terminal(terminal: ModelInference, *, ordinal: int) -> ModelInference:
+    raw_output = dict(terminal.raw_output or {})
+    raw_output["artifact_id"] = f"relocated-raw-output-{ordinal}"
+    return ModelInference.model_validate(
+        terminal.model_copy(
+            update={
+                "inference_id": _uuid(8000 + ordinal),
+                "attempt": terminal.attempt + 10,
+                "retry_count": terminal.retry_count + 10,
+                "raw_output": raw_output,
+            }
+        ).model_dump(mode="python")
+    )
+
+
+def _reduce_selected_terminals(
+    plan: InferenceInputPlan,
+    terminals_and_selections: tuple[tuple[ModelInference, InferenceAttemptSelection], ...],
+) -> tuple[tuple[InferenceCallPartCompletion, ...], InferenceCallReduction]:
+    coordinator = _call_barrier(_OrderedLabelReducer())
+    coordinator.declare(plan, created_at=NOW)
+    completions = tuple(
+        coordinator.submit_part_terminal(plan, terminal, selection=selection)
+        for terminal, selection in terminals_and_selections
+    )
+    return completions, coordinator.reduce(plan, reduced_at=NOW)
+
+
+def test_call_reduction_identity_uses_selection_semantics_not_execution_locators() -> None:
+    plan, _, orchestrator, _, part_zero, part_one = _execution_fixture()
+    original_selections = tuple(
+        orchestrator.selected_attempt(
+            logical_invocation_id=terminal.logical_invocation_id,
+            policy_version="selection-1",
+        )
+        for terminal in (part_zero, part_one)
+    )
+    assert all(selection is not None for selection in original_selections)
+    selected = tuple(selection for selection in original_selections if selection is not None)
+    original_completions, original_reduction = _reduce_selected_terminals(
+        plan,
+        tuple(zip((part_zero, part_one), selected, strict=True)),
+    )
+
+    relocated = tuple(
+        _relocated_terminal(terminal, ordinal=ordinal)
+        for ordinal, terminal in enumerate((part_zero, part_one))
+    )
+    relocated_selections = tuple(
+        _selection_for_terminal(
+            terminal,
+            selection_id=_uuid(8100 + ordinal),
+            policy_version="selection-1",
+        )
+        for ordinal, terminal in enumerate(relocated)
+    )
+    relocated_completions, relocated_reduction = _reduce_selected_terminals(
+        plan,
+        tuple(zip(relocated, relocated_selections, strict=True)),
+    )
+
+    assert tuple(item.completion_id for item in relocated_completions) != tuple(
+        item.completion_id for item in original_completions
+    )
+    assert relocated_reduction.ordered_completion_ids != (original_reduction.ordered_completion_ids)
+    assert (
+        relocated_reduction.ordered_selection_decision_logical_keys
+        == original_reduction.ordered_selection_decision_logical_keys
+    )
+    assert (
+        relocated_reduction.reduction_semantic_sha256
+        == original_reduction.reduction_semantic_sha256
+    )
+    assert relocated_reduction.reduction_id == original_reduction.reduction_id
+
+    changed_policy_selections = tuple(
+        _selection_for_terminal(
+            terminal,
+            selection_id=_uuid(8200 + ordinal),
+            policy_version="selection-2",
+        )
+        for ordinal, terminal in enumerate(relocated)
+    )
+    _, changed_selection_reduction = _reduce_selected_terminals(
+        plan,
+        tuple(zip(relocated, changed_policy_selections, strict=True)),
+    )
+    assert (
+        changed_selection_reduction.ordered_selection_decision_logical_keys
+        != original_reduction.ordered_selection_decision_logical_keys
+    )
+    assert (
+        changed_selection_reduction.reduction_semantic_sha256
+        != original_reduction.reduction_semantic_sha256
+    )
+    assert changed_selection_reduction.reduction_id != original_reduction.reduction_id
+
+
+def test_call_barrier_rejects_forged_selection_logical_key() -> None:
+    plan, _, orchestrator, _, part_zero, _ = _execution_fixture()
+    selection = orchestrator.selected_attempt(
+        logical_invocation_id=part_zero.logical_invocation_id,
+        policy_version="selection-1",
+    )
+    assert selection is not None
+    forged = selection.model_copy(
+        update={"selection_decision_logical_key": (f"inference-attempt-selection:{_digest(9999)}")}
+    )
+    coordinator = _call_barrier(_OrderedLabelReducer())
+    coordinator.declare(plan, created_at=NOW)
+
+    with pytest.raises(InferenceCallBarrierError, match="exact persisted attempt selection"):
+        coordinator.submit_part_terminal(plan, part_zero, selection=forged)

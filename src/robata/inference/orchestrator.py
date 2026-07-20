@@ -48,10 +48,13 @@ from robata.inference.models import (
     ModelInferenceUsage,
     Retryability,
     VisionTask,
+    inference_attempt_selection_digest,
+    inference_attempt_selection_logical_key,
 )
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+_FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON = "FIRST_SCHEMA_VALID_SUCCESS"
 Clock = Callable[[], datetime]
 
 
@@ -742,7 +745,126 @@ class InferenceOrchestrator:
 
     @staticmethod
     def _package_digest(package_inputs: Sequence[PackageInput]) -> Sha256Digest:
-        return semantic_sha256([item.model_dump(mode="json") for item in package_inputs])
+        """Hash package semantics while retaining exact manifests only on the request."""
+
+        return semantic_sha256(
+            [
+                {
+                    "ordinal": item.ordinal,
+                    "role": item.role,
+                    "package_semantic_content_sha256": (item.package_semantic_content_sha256),
+                }
+                for item in package_inputs
+            ]
+        )
+
+    def _selected_terminal_for_initial_delivery(
+        self,
+        *,
+        logical_invocation_id: str,
+        selection_policy_version: str,
+        package_input_set_sha256: str,
+        task: VisionTask,
+        provider: str,
+        model_name: str,
+        model_version: str,
+        adapter_version: str,
+        prompt_version: str,
+        prompt_sha256: str,
+        rendered_input_digest: str,
+        input_plan_semantic_sha256: str | None,
+        input_plan_part_ordinal: int | None,
+        input_plan_part_count: int | None,
+        input_plan_part_semantic_sha256: str | None,
+        output_schema: JsonSchemaRef,
+        capability_snapshot_digest: str,
+        generation_config: Mapping[str, object],
+    ) -> ModelInference | None:
+        selection = self._ledger.get_selection(
+            logical_invocation_id,
+            selection_policy_version,
+        )
+        if selection is None:
+            return None
+        try:
+            selection = InferenceAttemptSelection.model_validate(
+                selection.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InferenceLedgerError("persisted attempt selection is invalid") from exc
+        if (
+            selection.logical_invocation_id != logical_invocation_id
+            or selection.policy_version != selection_policy_version
+            or selection.selection_reason != _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON
+        ):
+            raise InferenceLedgerError("persisted attempt selection lookup is inconsistent")
+
+        terminal = self._ledger.get_terminal(selection.inference_id)
+        if terminal is None:
+            raise InferenceLedgerError("persisted attempt selection has no terminal attempt")
+        try:
+            terminal = ModelInference.model_validate(terminal.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InferenceLedgerError("selected terminal attempt is invalid") from exc
+        expected_semantics = (
+            logical_invocation_id,
+            package_input_set_sha256,
+            task,
+            provider,
+            model_name,
+            model_version,
+            adapter_version,
+            prompt_version,
+            prompt_sha256,
+            rendered_input_digest,
+            input_plan_semantic_sha256,
+            input_plan_part_ordinal,
+            input_plan_part_count,
+            input_plan_part_semantic_sha256,
+            output_schema.schema_id,
+            output_schema.version,
+            output_schema.sha256,
+            capability_snapshot_digest,
+            dict(generation_config),
+        )
+        actual_semantics = (
+            terminal.logical_invocation_id,
+            terminal.input_manifest_set_sha256,
+            terminal.stage,
+            terminal.provider,
+            terminal.model_name,
+            terminal.model_version,
+            terminal.adapter_version,
+            terminal.prompt_version,
+            terminal.prompt_sha256,
+            terminal.rendered_input_digest,
+            terminal.input_plan_semantic_sha256,
+            terminal.input_plan_part_ordinal,
+            terminal.input_plan_part_count,
+            terminal.input_plan_part_semantic_sha256,
+            terminal.output_schema_id,
+            terminal.output_schema_version,
+            terminal.output_schema_sha256,
+            terminal.capability_snapshot_digest,
+            terminal.generation_config,
+        )
+        if (
+            selection.inference_id != terminal.inference_id
+            or terminal.status is not InferenceStatus.SUCCEEDED
+            or not terminal.output_valid
+            or terminal.normalized_output is None
+            or terminal.failure is not None
+            or terminal.shadow
+            or expected_semantics != actual_semantics
+        ):
+            raise InferenceLedgerError("selected terminal attempt is semantically inconsistent")
+        try:
+            self._schema(output_schema).validate(terminal.normalized_output)
+        except JsonSchemaValidationError as exc:
+            raise InferenceLedgerError(
+                "selected terminal normalized output is schema-invalid"
+            ) from exc
+        return terminal
 
     @staticmethod
     def _validate_input_plan(
@@ -872,7 +994,6 @@ class InferenceOrchestrator:
         model_version: str,
         adapter_version: str,
         prompt_version: str,
-        prompt_artifact_id: str,
         prompt_sha256: str,
         rendered_input_digest: str,
         input_plan_semantic_sha256: str | None,
@@ -889,11 +1010,14 @@ class InferenceOrchestrator:
             "model_version": model_version,
             "adapter_version": adapter_version,
             "prompt_version": prompt_version,
-            "prompt_artifact_id": prompt_artifact_id,
             "prompt_sha256": prompt_sha256,
             "rendered_input_digest": rendered_input_digest,
             "input_plan_semantic_sha256": input_plan_semantic_sha256,
-            "output_schema": output_schema,
+            "output_schema": {
+                "schema_id": output_schema.schema_id,
+                "version": output_schema.version,
+                "sha256": output_schema.sha256,
+            },
             "capability_snapshot_digest": capability_snapshot.snapshot_digest,
             "generation_config": dict(generation_config),
         }
@@ -1050,13 +1174,13 @@ class InferenceOrchestrator:
             return None
         existing = self._ledger.get_selection(inference.logical_invocation_id, policy_version)
         if existing is not None:
+            if existing.selection_reason != _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON:
+                raise InferenceLedgerError("persisted attempt selection reason is inconsistent")
             return existing
         selected_at = _timestamp(self._clock)
-        selection_digest = semantic_sha256(
-            {
-                "logical_invocation_id": inference.logical_invocation_id,
-                "policy_version": policy_version,
-            }
+        selection_digest = inference_attempt_selection_digest(
+            logical_invocation_id=inference.logical_invocation_id,
+            policy_version=policy_version,
         )
         selection = InferenceAttemptSelection(
             schema_version="1.0",
@@ -1064,6 +1188,11 @@ class InferenceOrchestrator:
             inference_id=inference.inference_id,
             logical_invocation_id=inference.logical_invocation_id,
             policy_version=policy_version,
+            selection_reason=_FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON,
+            selection_decision_logical_key=inference_attempt_selection_logical_key(
+                logical_invocation_id=inference.logical_invocation_id,
+                policy_version=policy_version,
+            ),
             selected_at=selected_at,
         )
         return self._ledger.append_selection(selection)
@@ -1235,7 +1364,6 @@ class InferenceOrchestrator:
                 model_version=policy.model_version,
                 adapter_version=policy.adapter_version,
                 prompt_version=policy.prompt_version,
-                prompt_artifact_id=policy.prompt_artifact_id,
                 prompt_sha256=policy.prompt_sha256,
                 rendered_input_digest=rendered_input_digest,
                 input_plan_semantic_sha256=(
@@ -1253,6 +1381,37 @@ class InferenceOrchestrator:
                 "inference identity inputs are not canonical JSON"
             ) from exc
         logical_invocation_id = _stable_uuid("logical-invocation", logical_digest)
+        if not shadow and attempt == 1 and retry_count == 0:
+            selected_terminal = self._selected_terminal_for_initial_delivery(
+                logical_invocation_id=logical_invocation_id,
+                selection_policy_version=policy.selection_policy_version,
+                package_input_set_sha256=package_digest,
+                task=task,
+                provider=policy.provider,
+                model_name=policy.model_name,
+                model_version=policy.model_version,
+                adapter_version=policy.adapter_version,
+                prompt_version=policy.prompt_version,
+                prompt_sha256=policy.prompt_sha256,
+                rendered_input_digest=rendered_input_digest,
+                input_plan_semantic_sha256=(
+                    input_plan.semantic_sha256 if input_plan is not None else None
+                ),
+                input_plan_part_ordinal=(
+                    input_plan_part.ordinal if input_plan_part is not None else None
+                ),
+                input_plan_part_count=(
+                    input_plan_part.part_count if input_plan_part is not None else None
+                ),
+                input_plan_part_semantic_sha256=(
+                    input_plan_part.part_semantic_sha256 if input_plan_part is not None else None
+                ),
+                output_schema=policy.output_schema,
+                capability_snapshot_digest=capability_snapshot.snapshot_digest,
+                generation_config=policy.generation_config,
+            )
+            if selected_terminal is not None:
+                return selected_terminal
         attempt_digest = self._attempt_digest(
             logical_digest,
             attempt=attempt,

@@ -76,9 +76,9 @@ the current worktree unless their claims are independently reproduced by current
 
 ## Current Run-Independent Logical-Node Slice: Phase 1A
 
-**Status: local executable primitive implemented and evidenced; Phase 1A remains open
-for concrete producer identity/revision admission, business eligibility, and other
-applicable gates.**
+**Status: local executable primitive implemented and evidenced, with the canonical offline
+producer chain admitted locally; Phase 1A remains open for the remaining concrete producers,
+revision admission, business eligibility, and other applicable gates.**
 
 This slice implements the identity and association subset of Architecture V1.1 Section
 25.4 without treating processing runs as semantic input. ADR 0004, the exact `LogicalNode` and
@@ -117,9 +117,9 @@ unique key is exactly `(run_id, node_type, node_logical_key, role)`.
 Historical evidence and explicit limitations are retained in
 `archive/old_mvp/reports/local-logical-node-membership-2026-07-18.md`. ADR 0005 and its separate evidence
 report cover the subsequent generic revision/current-selection primitive. The combined
-local primitives do not implement concrete-producer identity/revision admission, business
-selection policy, work scheduling, global validity, cross-registry atomicity, or a
-production database.
+local primitives plus canonical offline producer chain do not implement every producer,
+revision admission, business selection policy, durable work scheduling, global validity,
+cross-registry atomicity, or a production database.
 
 ## Current Immutable Revision/Selection Slice: Phase 1A
 
@@ -136,7 +136,7 @@ selection is a replaceable projection of verified append-only authority.
 ### Deliverables
 
 - Closed `ImmutableNodeRevision`, `SelectionDecision`, and `CurrentSelection` contracts
-  with exact schema-catalog pins; the catalog contains 16 documents and no upcaster.
+  with exact schema-catalog pins and no upcaster.
 - Semantic revision and decision keys that exclude UUIDs, timestamps, execution identity,
   mutable current state, database order, and their own digest/key outputs.
 - Immutable publication with exact semantic retry, supersedes ID/logical-key parity,
@@ -315,17 +315,31 @@ development data and the mapping remains explicitly unapproved/unverified.
 ### Current convergence boundary
 
 The live tree now has a canonical post-admission offline conformance spine from a resolved
-`AdmittedRecordingContextV2` through root window, materialized provider-neutral package set,
-strict provider-specific input plan/catalog, single-part barrier and selected attempt, raw-byte
-persistence before parsing, provider claims, orchestrator enrichment, local output admission, and
-recording-scoped fenced identity/outbox assignment. Exact replay and fail-closed negative paths are
-covered locally with zero network calls.
+`AdmittedRecordingContextV2` and an explicit fresh/resumed processing run through root window,
+materialized provider-neutral package set,
+strict provider-specific input plan/catalog, independently retried call parts, an all-terminal
+barrier, selected raw/parsed/enriched lineage, deterministic ordered fusion reduction, local output
+admission, and recording-scoped fenced identity/outbox assignment. Exact replay, all-abstain,
+mixed-abstain, permanent-failure, and fail-closed lineage paths are covered locally with zero
+network calls. Locator-only package/prompt/schema and retry-attempt changes preserve reusable
+logical identities while exact audit lineage remains distinct. Each admitted stage is attached to
+its processing run in the local SQLite logical-node registry; separate fresh runs retain separate
+membership histories and reuse the same semantic nodes. One append-only local SQLite inference
+ledger preserves intent, pre-parse raw bytes, terminal attempts, typed raw artifacts, selections,
+parsed claims, selected outputs, and enrichments; a fresh ledger/adapter/pipeline instance reopens
+selected evidence without provider redispatch. Local SQLite repositories also add restart-safe
+logical memberships, recording fences, assignments, relations, and outbox rows without claiming
+production infrastructure.
 
 This spine does not replace the legacy CLI, produce V2 admission evidence from raw MCAP, dispatch
-multi-part plans, or provide production persistence. Its adapter is fixture-only and its ledgers,
-barriers, raw store, registry, and outbox are in-memory. The remaining convergence work is to add
-the missing durable Section 25.7 boundaries and multi-part reducer/recovery behavior, then compose
-the raw-admission and downstream task paths when their governance and policy inputs are resolved.
+real providers, or provide end-to-end production persistence. Its adapter is fixture-only, and its
+barriers, processing-run/work lifecycle, output decisions, and run results remain in-process even
+though selected inference evidence, logical memberships, and event identity/outbox have local
+SQLite adapters. The remaining convergence work is to add those durable lifecycle and recovery
+boundaries, then compose raw admission, ActionEvent revision/current selection, outbox publication,
+and downstream task paths when their governance and policy inputs are resolved. Derived
+package-set/input-plan/inference hashes created by the former exact-manifest-polluted identity
+formula must be rebuilt; registered wire shapes and versions are unchanged.
 Until then, a legacy fake run remains a smoke test and a canonical fixture run remains local
 conformance evidence only.
 
@@ -411,9 +425,10 @@ Tests may report deterministic case counts and local durations, but those values
 - **O-12:** Required before promoting fusion, candidate identity, merge/split, boundary tolerance,
   confidence calibration, and review behavior beyond the exact-fingerprint local resolver.
 - **O-14:** Database, broker, object store, and deployment selection is not required for the local contract/admission foundation, but is required before production durability and concurrency claims.
-- **Section 25.7 durable surfaces:** Raw/parsed/enriched/output-decision schemas and ledgers,
-  multi-part barrier/reducer recovery, transactional recording-scoped identity, and an outbox
-  publisher remain required for a production path.
+- **Section 25.7 durable surfaces:** Work messages, output decisions, durable multi-part barrier
+  recovery, run-result persistence, a production recording-scoped identity store, and an outbox
+  publisher remain required for a production path. The local SQLite inference and identity/outbox
+  adapters are conformance evidence, not an O-14 infrastructure decision.
 - **O-15:** Retention, access, encryption, data handling, residency, and audit rules are part of the Phase 0 hard gate.
 
 ## Promotion Rule

@@ -7,12 +7,13 @@ and 11 (GPT shadow path).
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, model_validator
 
 from robata.contracts.common import Nanoseconds, SchemaVersion, Sha256Digest, StrictModel
-from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
+from robata.contracts.hashing import semantic_sha256
+from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid, Rfc3339Timestamp
 
 # ---------------------------------------------------------------------------
 # Shared type aliases
@@ -245,6 +246,31 @@ class ModelInference(StrictModel):
 # ---------------------------------------------------------------------------
 
 
+def inference_attempt_selection_digest(
+    *, logical_invocation_id: str, policy_version: str
+) -> Sha256Digest:
+    """Derive the run-independent selection-decision digest."""
+
+    return semantic_sha256(
+        {
+            "logical_invocation_id": logical_invocation_id,
+            "policy_version": policy_version,
+        }
+    )
+
+
+def inference_attempt_selection_logical_key(
+    *, logical_invocation_id: str, policy_version: str
+) -> NodeLogicalKey:
+    """Return the namespaced logical key for one selection decision."""
+
+    digest = inference_attempt_selection_digest(
+        logical_invocation_id=logical_invocation_id,
+        policy_version=policy_version,
+    )
+    return f"inference-attempt-selection:{digest}"
+
+
 class InferenceAttemptSelection(StrictModel):
     """Orchestrator selection of one successful inference attempt.
 
@@ -258,7 +284,19 @@ class InferenceAttemptSelection(StrictModel):
     inference_id: OpaqueUuid
     logical_invocation_id: OpaqueUuid
     policy_version: SchemaVersion
+    selection_reason: NonEmptyString
+    selection_decision_logical_key: NodeLogicalKey
     selected_at: Rfc3339Timestamp
+
+    @model_validator(mode="after")
+    def validate_logical_key(self) -> Self:
+        expected = inference_attempt_selection_logical_key(
+            logical_invocation_id=self.logical_invocation_id,
+            policy_version=self.policy_version,
+        )
+        if self.selection_decision_logical_key != expected:
+            raise ValueError("selection decision logical key is inconsistent")
+        return self
 
 
 class ProductionDecision(StrictModel):
@@ -351,4 +389,6 @@ __all__ = [
     "ShadowRouteStatus",
     "ShadowSelectionReason",
     "VisionTask",
+    "inference_attempt_selection_digest",
+    "inference_attempt_selection_logical_key",
 ]

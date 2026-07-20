@@ -223,14 +223,13 @@ def compute_split_plan_digest(
 def compute_member_manifest_sha256(
     members: Sequence[TemporalPackageSetMember],
 ) -> Sha256Digest:
-    """Hash ordered materialized content and coordinates, excluding package row IDs."""
+    """Hash ordered semantic content and coordinates, excluding exact artifact locators."""
 
     return semantic_sha256(
         [
             {
                 "coordinate": member_coordinate(member),
                 "package_semantic_content_sha256": member.package_semantic_content_sha256,
-                "package_manifest_sha256": member.package_manifest_sha256,
             }
             for member in members
         ]

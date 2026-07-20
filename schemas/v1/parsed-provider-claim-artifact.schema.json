@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/parsed-provider-claim-artifact.schema.json",
+  "title": "Parsed untrusted provider claim artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "semantic_sha256",
+    "raw_response",
+    "provider_claim_schema",
+    "task",
+    "payload",
+    "parser_version",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "artifact_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "semantic_sha256": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+    },
+    "raw_response": {
+      "$ref": "https://schemas.robata.dev/v1/raw-provider-response-artifact.schema.json"
+    },
+    "provider_claim_schema": {
+      "$ref": "#/$defs/JsonSchemaRef"
+    },
+    "task": {
+      "$ref": "#/$defs/VisionTask"
+    },
+    "payload": {
+      "$ref": "https://schemas.robata.dev/v1/provider-claim-payload.schema.json"
+    },
+    "parser_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "created_at": {
+      "allOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+        },
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "JsonSchemaRef": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "VisionTask": {
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_EVIDENCE",
+        "BOUNDARY_REFINEMENT",
+        "FUSION_ADJUDICATION"
+      ],
+      "type": "string"
+    }
+  }
+}

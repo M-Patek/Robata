@@ -26,11 +26,20 @@ from robata.contracts.logical_nodes import (
 )
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
 from robata.inference.adapter import JsonSchemaRef
-from robata.inference.input_plan import InferenceInputPlan, RenderedProviderItem
-from robata.inference.models import VisionTask
+from robata.inference.input_plan import (
+    InferenceCallPart,
+    InferenceInputPlan,
+    RenderedProviderItem,
+)
+from robata.inference.models import (
+    InferenceAttemptSelection,
+    VisionTask,
+    inference_attempt_selection_logical_key,
+)
 
 PROVIDER_CLAIM_SCHEMA_ID = "https://schemas.robata.dev/provider-claim-payload"
 ENRICHED_OUTPUT_SCHEMA_ID = "https://schemas.robata.dev/orchestrator-enriched-output"
+ENRICHED_OUTPUT_SCHEMA_VERSION = "2.0.0"
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 ClaimLabel = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=256)]
@@ -326,6 +335,31 @@ class ProviderReferenceCatalog(StrictModel):
             token_policy_version=token_policy_version,
         )
 
+    def entries_for_part(
+        self,
+        *,
+        input_plan: InferenceInputPlan,
+        part_ordinal: int,
+    ) -> tuple[ProviderReferenceCatalogEntry, ...]:
+        """Return the exact token allowlist visible to one declared call part."""
+
+        part = _enrichment_part(input_plan, part_ordinal)
+        if (
+            self.input_plan_id != input_plan.input_plan_id
+            or self.input_plan_semantic_sha256 != input_plan.semantic_sha256
+            or self.entries != _expected_reference_entries(input_plan, self.token_policy_version)
+        ):
+            raise ProviderClaimEnrichmentError(
+                "provider reference catalog does not match input plan"
+            )
+        return tuple(
+            entry
+            for entry in self.entries
+            if part.start_item_ordinal
+            <= entry.provider_item_ordinal
+            < part.end_item_ordinal_exclusive
+        )
+
 
 class RawProviderResponseArtifact(StrictModel):
     """Immutable reference to exact untrusted provider response bytes."""
@@ -417,7 +451,7 @@ class ParsedProviderClaimArtifact(StrictModel):
     ) -> ParsedProviderClaimArtifact:
         projection = {
             "raw_provider_bytes_sha256": raw_response.exact_bytes_sha256,
-            "provider_claim_schema": provider_claim_schema.model_dump(mode="json"),
+            "provider_claim_schema": _json_schema_logical_projection(provider_claim_schema),
             "task": task.value,
             "payload": payload.model_dump(mode="json"),
             "parser_version": parser_version,
@@ -439,6 +473,10 @@ class SelectedAttemptOutput(StrictModel):
     """Selected attempt evidence joining raw bytes and parsed claims."""
 
     inference_id: OpaqueUuid
+    selection_id: OpaqueUuid
+    logical_invocation_id: OpaqueUuid
+    selection_decision_logical_key: NodeLogicalKey
+    selection_policy_version: SchemaVersion
     raw_response_artifact_id: OpaqueUuid
     raw_response_sha256: Sha256Digest
     parsed_claim_artifact_id: OpaqueUuid
@@ -447,27 +485,41 @@ class SelectedAttemptOutput(StrictModel):
 
     @model_validator(mode="after")
     def validate_digest(self) -> Self:
-        expected = semantic_sha256(
-            {
-                "raw_provider_bytes_sha256": self.raw_response_sha256,
-                "parsed_provider_claim_sha256": self.parsed_claim_sha256,
-            }
+        expected_selection_key = inference_attempt_selection_logical_key(
+            logical_invocation_id=self.logical_invocation_id,
+            policy_version=self.selection_policy_version,
+        )
+        if self.selection_decision_logical_key != expected_selection_key:
+            raise ValueError("selected attempt selection logical key is inconsistent")
+        expected = _selected_attempt_output_digest(
+            raw_response_sha256=self.raw_response_sha256,
+            parsed_claim_sha256=self.parsed_claim_sha256,
+            selection_decision_logical_key=self.selection_decision_logical_key,
         )
         if self.output_sha256 != expected:
             raise ValueError("selected attempt output_sha256 is inconsistent")
         return self
 
     @classmethod
-    def create(cls, parsed_claims: ParsedProviderClaimArtifact) -> SelectedAttemptOutput:
+    def create(
+        cls,
+        parsed_claims: ParsedProviderClaimArtifact,
+        selection: InferenceAttemptSelection,
+    ) -> SelectedAttemptOutput:
         raw = parsed_claims.raw_response
-        output_digest = semantic_sha256(
-            {
-                "raw_provider_bytes_sha256": raw.exact_bytes_sha256,
-                "parsed_provider_claim_sha256": parsed_claims.semantic_sha256,
-            }
+        if selection.inference_id != raw.inference_id:
+            raise ValueError("selection does not reference the parsed inference attempt")
+        output_digest = _selected_attempt_output_digest(
+            raw_response_sha256=raw.exact_bytes_sha256,
+            parsed_claim_sha256=parsed_claims.semantic_sha256,
+            selection_decision_logical_key=selection.selection_decision_logical_key,
         )
         return cls(
             inference_id=raw.inference_id,
+            selection_id=selection.selection_id,
+            logical_invocation_id=selection.logical_invocation_id,
+            selection_decision_logical_key=selection.selection_decision_logical_key,
+            selection_policy_version=selection.policy_version,
             raw_response_artifact_id=raw.artifact_id,
             raw_response_sha256=raw.exact_bytes_sha256,
             parsed_claim_artifact_id=parsed_claims.artifact_id,
@@ -569,7 +621,7 @@ class EnrichedProviderClaim(StrictModel):
 class OrchestratorEnrichedOutput(StrictModel):
     """Authoritative output validated under a schema distinct from provider claims."""
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["2.0"]
     artifact_id: OpaqueUuid
     enrichment_logical_key: NodeLogicalKey
     semantic_sha256: Sha256Digest
@@ -595,10 +647,14 @@ class OrchestratorEnrichedOutput(StrictModel):
             raise ValueError("provider claim schema reference is not authoritative")
         if self.enriched_output_schema.schema_id != ENRICHED_OUTPUT_SCHEMA_ID:
             raise ValueError("enriched output requires its dedicated registered schema")
+        if self.enriched_output_schema.version != ENRICHED_OUTPUT_SCHEMA_VERSION:
+            raise ValueError("enriched output requires the exact v2 registered schema")
         if self.provider_claim_schema.sha256 == self.enriched_output_schema.sha256:
             raise ValueError("provider and enriched schemas must be distinct artifacts")
         if self.selected_attempt.inference_id != self.authority.inference_id:
             raise ValueError("selected attempt does not match authoritative inference")
+        if self.selected_attempt.logical_invocation_id != self.authority.logical_invocation_id:
+            raise ValueError("selected attempt does not match authoritative logical invocation")
         ordinals = tuple(claim.claim_ordinal for claim in self.claims)
         if ordinals != tuple(range(len(self.claims))):
             raise ValueError("enriched claim ordinals must be contiguous from zero")
@@ -649,9 +705,12 @@ class ProviderClaimEnricher:
         enrichment_policy_version: str,
         artifact_id: str,
         created_at: str,
+        input_plan_part_ordinal: int | None = None,
     ) -> OrchestratorEnrichedOutput:
+        part = _enrichment_part(input_plan, input_plan_part_ordinal)
         self._validate_boundary(
             input_plan=input_plan,
+            part=part,
             reference_catalog=reference_catalog,
             parsed_claims=parsed_claims,
             selected_attempt=selected_attempt,
@@ -666,13 +725,14 @@ class ProviderClaimEnricher:
         )
         claims = self._enrich_claims(
             input_plan=input_plan,
+            part=part,
             reference_catalog=reference_catalog,
             parsed_claims=parsed_claims,
             selected_attempt=selected_attempt,
             logical_digest=logical_digest,
         )
         values = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "artifact_id": artifact_id,
             "enrichment_logical_key": f"orchestrator-enrichment:{logical_digest}",
             "task": parsed_claims.task,
@@ -705,6 +765,7 @@ class ProviderClaimEnricher:
         self,
         *,
         input_plan: InferenceInputPlan,
+        part: InferenceCallPart,
         reference_catalog: ProviderReferenceCatalog,
         parsed_claims: ParsedProviderClaimArtifact,
         selected_attempt: SelectedAttemptOutput,
@@ -740,6 +801,8 @@ class ProviderClaimEnricher:
             raise ProviderClaimEnrichmentError("enriched output schema is not bound by input plan")
         if enriched_output_schema.schema_id != ENRICHED_OUTPUT_SCHEMA_ID:
             raise ProviderClaimEnrichmentError("unexpected enriched output schema identity")
+        if enriched_output_schema.version != ENRICHED_OUTPUT_SCHEMA_VERSION:
+            raise ProviderClaimEnrichmentError("enriched output schema must be pinned to v2")
         if parsed_claims.provider_claim_schema.sha256 == enriched_output_schema.sha256:
             raise ProviderClaimEnrichmentError("provider and enriched schemas must be distinct")
         raw = parsed_claims.raw_response
@@ -750,6 +813,7 @@ class ProviderClaimEnricher:
             or selected_attempt.parsed_claim_artifact_id != parsed_claims.artifact_id
             or selected_attempt.parsed_claim_sha256 != parsed_claims.semantic_sha256
             or authority.inference_id != selected_attempt.inference_id
+            or authority.logical_invocation_id != selected_attempt.logical_invocation_id
         ):
             raise ProviderClaimEnrichmentError("selected attempt artifact lineage is inconsistent")
         if (
@@ -771,11 +835,12 @@ class ProviderClaimEnricher:
         self._schema_registry.validate_pinned(
             provider_ref, parsed_claims.payload.model_dump(mode="json")
         )
-        self._validate_camera_coverage(input_plan, parsed_claims)
+        self._validate_camera_coverage(input_plan, part, parsed_claims)
 
     @staticmethod
     def _validate_camera_coverage(
         input_plan: InferenceInputPlan,
+        part: InferenceCallPart,
         parsed_claims: ParsedProviderClaimArtifact,
     ) -> None:
         camera_kind = {
@@ -787,9 +852,10 @@ class ProviderClaimEnricher:
         if camera_kind is None:
             return
         expected = {
-            (package.ordinal, camera.ordinal)
-            for package in input_plan.request_catalog.packages
-            for camera in package.cameras
+            (item.package_ordinal, item.camera_ordinal)
+            for item in input_plan.rendered_items[
+                part.start_item_ordinal : part.end_item_ordinal_exclusive
+            ]
         }
         actual_list = [
             (claim.package_ordinal, claim.camera_ordinal)
@@ -805,12 +871,19 @@ class ProviderClaimEnricher:
     def _enrich_claims(
         *,
         input_plan: InferenceInputPlan,
+        part: InferenceCallPart,
         reference_catalog: ProviderReferenceCatalog,
         parsed_claims: ParsedProviderClaimArtifact,
         selected_attempt: SelectedAttemptOutput,
         logical_digest: str,
     ) -> tuple[EnrichedProviderClaim, ...]:
         entries = {entry.correlation_token: entry for entry in reference_catalog.entries}
+        allowed_coordinates = {
+            (item.package_ordinal, item.camera_ordinal)
+            for item in input_plan.rendered_items[
+                part.start_item_ordinal : part.end_item_ordinal_exclusive
+            ]
+        }
         result: list[EnrichedProviderClaim] = []
         for claim in parsed_claims.payload.claims:
             package = None
@@ -825,6 +898,10 @@ class ProviderClaimEnricher:
                     raise ProviderClaimEnrichmentError(
                         "provider local package or camera ordinal is out of catalog"
                     ) from exc
+                if (package.ordinal, camera.ordinal) not in allowed_coordinates:
+                    raise ProviderClaimEnrichmentError(
+                        "provider local package or camera ordinal is outside the call part"
+                    )
 
             evidence: list[EnrichedEvidenceReference] = []
             for token in claim.evidence_tokens:
@@ -832,6 +909,14 @@ class ProviderClaimEnricher:
                 if entry is None:
                     raise ProviderClaimEnrichmentError(
                         "provider evidence token is outside the request catalog"
+                    )
+                if not (
+                    part.start_item_ordinal
+                    <= entry.provider_item_ordinal
+                    < part.end_item_ordinal_exclusive
+                ):
+                    raise ProviderClaimEnrichmentError(
+                        "provider evidence token is outside the selected call part"
                     )
                 if (
                     package is not None
@@ -928,10 +1013,18 @@ def parsed_provider_claim_projection(
 
     return {
         "raw_provider_bytes_sha256": artifact.raw_response.exact_bytes_sha256,
-        "provider_claim_schema": artifact.provider_claim_schema.model_dump(mode="json"),
+        "provider_claim_schema": _json_schema_logical_projection(artifact.provider_claim_schema),
         "task": artifact.task.value,
         "payload": artifact.payload.model_dump(mode="json"),
         "parser_version": artifact.parser_version,
+    }
+
+
+def _json_schema_logical_projection(reference: JsonSchemaRef) -> dict[str, object]:
+    return {
+        "schema_id": reference.schema_id,
+        "version": reference.version,
+        "sha256": reference.sha256,
     }
 
 
@@ -950,6 +1043,21 @@ def enrichment_logical_digest(
             "request_catalog_sha256": request_catalog_sha256,
             "target_schema_sha256": target_schema_sha256,
             "enrichment_policy_version": enrichment_policy_version,
+        }
+    )
+
+
+def _selected_attempt_output_digest(
+    *,
+    raw_response_sha256: str,
+    parsed_claim_sha256: str,
+    selection_decision_logical_key: str,
+) -> Sha256Digest:
+    return semantic_sha256(
+        {
+            "raw_provider_bytes_sha256": raw_response_sha256,
+            "parsed_provider_claim_sha256": parsed_claim_sha256,
+            "selection_decision_logical_key": selection_decision_logical_key,
         }
     )
 
@@ -992,6 +1100,26 @@ def _expected_reference_entries(
         rendered_items=input_plan.rendered_items,
         token_policy_version=token_policy_version,
     )
+
+
+def _enrichment_part(
+    input_plan: InferenceInputPlan,
+    part_ordinal: int | None,
+) -> InferenceCallPart:
+    if not isinstance(input_plan, InferenceInputPlan):
+        raise ProviderClaimEnrichmentError("input plan failed immutable contract validation")
+    parts = input_plan.call_plan.parts
+    if part_ordinal is None:
+        if len(parts) != 1:
+            raise ProviderClaimEnrichmentError(
+                "multi-part enrichment requires an explicit input-plan part ordinal"
+            )
+        return parts[0]
+    if isinstance(part_ordinal, bool) or not isinstance(part_ordinal, int):
+        raise ProviderClaimEnrichmentError("input-plan part ordinal must be an integer")
+    if part_ordinal < 0 or part_ordinal >= len(parts):
+        raise ProviderClaimEnrichmentError("input-plan part ordinal is out of range")
+    return parts[part_ordinal]
 
 
 def _reference_entries_for_rendering(
@@ -1060,6 +1188,7 @@ def _stable_uuid(namespace: str, digest: str, ordinal: int) -> str:
 
 __all__ = [
     "ENRICHED_OUTPUT_SCHEMA_ID",
+    "ENRICHED_OUTPUT_SCHEMA_VERSION",
     "PROVIDER_CLAIM_SCHEMA_ID",
     "EnrichedEvidenceReference",
     "EnrichedProviderClaim",

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/selected-attempt-output.schema.json",
+  "title": "Selected attempt evidence output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "inference_id",
+    "selection_id",
+    "logical_invocation_id",
+    "selection_decision_logical_key",
+    "selection_policy_version",
+    "raw_response_artifact_id",
+    "raw_response_sha256",
+    "parsed_claim_artifact_id",
+    "parsed_claim_sha256",
+    "output_sha256"
+  ],
+  "properties": {
+    "inference_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "selection_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "logical_invocation_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "selection_decision_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "selection_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "raw_response_artifact_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "raw_response_sha256": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+    },
+    "parsed_claim_artifact_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "parsed_claim_sha256": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+    },
+    "output_sha256": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/sha256"
+    }
+  }
+}

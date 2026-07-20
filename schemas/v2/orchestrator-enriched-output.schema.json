@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v2/orchestrator-enriched-output.schema.json",
+  "title": "Orchestrator-enriched provider output V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "enrichment_logical_key",
+    "semantic_sha256",
+    "task",
+    "selected_attempt",
+    "request_catalog_id",
+    "request_catalog_sha256",
+    "reference_catalog_id",
+    "reference_catalog_sha256",
+    "input_plan_id",
+    "input_plan_semantic_sha256",
+    "provider_claim_schema",
+    "enriched_output_schema",
+    "enrichment_policy_version",
+    "authority",
+    "claims",
+    "abstained",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "enrichment_logical_key": {"$ref": "#/$defs/nodeLogicalKey"},
+    "semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "task": {"$ref": "#/$defs/task"},
+    "selected_attempt": {"$ref": "#/$defs/selectedAttempt"},
+    "request_catalog_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "request_catalog_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "reference_catalog_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "reference_catalog_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "input_plan_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+    "input_plan_semantic_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+    "provider_claim_schema": {"$ref": "#/$defs/schemaRef"},
+    "enriched_output_schema": {"$ref": "#/$defs/schemaRef"},
+    "enrichment_policy_version": {"$ref": "#/$defs/version"},
+    "authority": {"$ref": "#/$defs/authority"},
+    "claims": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/enrichedClaim"}
+    },
+    "abstained": {"type": "boolean"},
+    "created_at": {"$ref": "../v1/common.schema.json#/$defs/rfc3339"}
+  },
+  "$defs": {
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$"
+    },
+    "nodeLogicalKey": {
+      "type": "string",
+      "minLength": 66,
+      "maxLength": 193,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$"
+    },
+    "task": {
+      "type": "string",
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_EVIDENCE",
+        "BOUNDARY_REFINEMENT",
+        "FUSION_ADJUDICATION"
+      ]
+    },
+    "schemaRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "version", "artifact_id", "sha256"],
+      "properties": {
+        "schema_id": {"type": "string", "format": "uri", "minLength": 1},
+        "version": {"$ref": "#/$defs/version"},
+        "artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"}
+      }
+    },
+    "selectedAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inference_id",
+        "selection_id",
+        "logical_invocation_id",
+        "selection_decision_logical_key",
+        "selection_policy_version",
+        "raw_response_artifact_id",
+        "raw_response_sha256",
+        "parsed_claim_artifact_id",
+        "parsed_claim_sha256",
+        "output_sha256"
+      ],
+      "properties": {
+        "inference_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "selection_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "logical_invocation_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "selection_decision_logical_key": {"$ref": "#/$defs/nodeLogicalKey"},
+        "selection_policy_version": {"$ref": "#/$defs/version"},
+        "raw_response_artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "raw_response_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "parsed_claim_artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "parsed_claim_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "output_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recording_identity",
+        "mcap_id",
+        "camera_mapping_run_id",
+        "alignment_id",
+        "inference_id",
+        "logical_invocation_id",
+        "prompt_version",
+        "prompt_artifact_id",
+        "prompt_sha256",
+        "work_node_type",
+        "work_node_logical_key"
+      ],
+      "properties": {
+        "recording_identity": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "mcap_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "camera_mapping_run_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "alignment_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "inference_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "logical_invocation_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "prompt_version": {"$ref": "#/$defs/version"},
+        "prompt_artifact_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "prompt_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "work_node_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"
+        },
+        "work_node_logical_key": {"$ref": "#/$defs/nodeLogicalKey"}
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_ns", "end_ns"],
+      "properties": {
+        "start_ns": {"$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"},
+        "end_ns": {"$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "correlation_token",
+        "provider_item_ordinal",
+        "package_id",
+        "package_ordinal",
+        "package_semantic_content_sha256",
+        "package_manifest_sha256",
+        "camera_id",
+        "camera_ordinal",
+        "frame_id",
+        "frame_ordinal",
+        "aligned_timestamp_ns",
+        "source_timestamp_ns",
+        "source_artifact_uri",
+        "source_artifact_sha256"
+      ],
+      "properties": {
+        "correlation_token": {
+          "type": "string",
+          "pattern": "^ref:[0-9a-f]{64}$"
+        },
+        "provider_item_ordinal": {"type": "integer", "minimum": 0},
+        "package_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "package_ordinal": {"type": "integer", "minimum": 0},
+        "package_semantic_content_sha256": {
+          "$ref": "../v1/common.schema.json#/$defs/sha256"
+        },
+        "package_manifest_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"},
+        "camera_id": {"$ref": "../v1/common.schema.json#/$defs/cameraId"},
+        "camera_ordinal": {"type": "integer", "minimum": 0, "maximum": 5},
+        "frame_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "frame_ordinal": {"type": "integer", "minimum": 0},
+        "aligned_timestamp_ns": {
+          "$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_timestamp_ns": {
+          "$ref": "../v1/common.schema.json#/$defs/int64Nanoseconds"
+        },
+        "source_artifact_uri": {"type": "string", "minLength": 1},
+        "source_artifact_sha256": {"$ref": "../v1/common.schema.json#/$defs/sha256"}
+      }
+    },
+    "modelReportedConfidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confidence_id",
+        "kind",
+        "semantics",
+        "producer_type",
+        "producer_id",
+        "producer_version",
+        "source_claim_ordinal",
+        "value"
+      ],
+      "properties": {
+        "confidence_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "kind": {"const": "MODEL_REPORTED_UNCALIBRATED"},
+        "semantics": {"const": "provider_self_report"},
+        "producer_type": {"const": "MODEL_ATTEMPT"},
+        "producer_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "producer_version": {"$ref": "#/$defs/version"},
+        "source_claim_ordinal": {"type": "integer", "minimum": 0},
+        "value": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "enrichedClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "claim_ordinal",
+        "kind",
+        "package_id",
+        "package_ordinal",
+        "camera_id",
+        "interval",
+        "label",
+        "observation",
+        "evidence",
+        "model_reported_confidence",
+        "conflict_codes"
+      ],
+      "properties": {
+        "claim_id": {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+        "claim_ordinal": {"type": "integer", "minimum": 0},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ACTION_OBSERVATION",
+            "BOUNDARY_OBSERVATION",
+            "CROSS_VIEW_HYPOTHESIS",
+            "EVENT_PROPOSAL",
+            "FUSION_HYPOTHESIS",
+            "QA_OBSERVATION"
+          ]
+        },
+        "package_id": {
+          "oneOf": [
+            {"$ref": "../v1/common.schema.json#/$defs/uuid"},
+            {"type": "null"}
+          ]
+        },
+        "package_ordinal": {"type": ["integer", "null"], "minimum": 0},
+        "camera_id": {
+          "oneOf": [
+            {"$ref": "../v1/common.schema.json#/$defs/cameraId"},
+            {"type": "null"}
+          ]
+        },
+        "interval": {
+          "oneOf": [
+            {"$ref": "#/$defs/interval"},
+            {"type": "null"}
+          ]
+        },
+        "label": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "observation": {
+          "type": "string",
+          "enum": [
+            "CONFLICT",
+            "DEGRADED",
+            "GOOD",
+            "MISSING",
+            "NO_BOUNDARY",
+            "NO_EVENT",
+            "OBSERVED",
+            "OCCLUDED",
+            "PARTIAL",
+            "PROPOSED",
+            "SUPPORTING",
+            "UNKNOWN",
+            "UNUSABLE"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "model_reported_confidence": {
+          "oneOf": [
+            {"$ref": "#/$defs/modelReportedConfidence"},
+            {"type": "null"}
+          ]
+        },
+        "conflict_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    }
+  }
+}

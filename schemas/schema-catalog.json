@@ -309,6 +309,114 @@
     },
     {
       "ref": {
+        "schema_id": "https://schemas.robata.dev/inference-intent",
+        "version": "1.0.0",
+        "artifact_id": "59c9e34b-631f-5795-a115-2751fb7573b7",
+        "sha256": "d20538b2f81a4c4b1f7dcc29448638614e585887a135bfc107d9b4d2f9104f40"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/inference-intent.schema.json",
+      "artifact_path": "v1/inference-intent.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "inference-intent-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/model-inference",
+        "version": "1.0.0",
+        "artifact_id": "2fcf18d2-5b9e-cb8d-fc39-1d16ed4159f3",
+        "sha256": "6eb192a4b840f9b8e79000ca07a8770c87fe7462fc71c296911de6848301c9e8"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/model-inference.schema.json",
+      "artifact_path": "v1/model-inference.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "model-inference-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/inference-attempt-selection",
+        "version": "1.0.0",
+        "artifact_id": "dd131ca4-9ef8-9278-345b-a1a1832a4472",
+        "sha256": "c162c55442c4fca4ca96d6882e5e074d8a19cf683f5e7788ccc76eecafcf8365"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/inference-attempt-selection.schema.json",
+      "artifact_path": "v1/inference-attempt-selection.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "inference-attempt-selection-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/raw-provider-response-artifact",
+        "version": "1.0.0",
+        "artifact_id": "b44d2bc9-7068-63a9-e179-2a4416899358",
+        "sha256": "c71f8ab02fbd3c5116ece866afd15f0527f176ccd23ed209fb3d7c748bfd0bd4"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/raw-provider-response-artifact.schema.json",
+      "artifact_path": "v1/raw-provider-response-artifact.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "raw-provider-response-artifact-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/parsed-provider-claim-artifact",
+        "version": "1.0.0",
+        "artifact_id": "ad3c7c60-8759-606e-4698-9a6edeba8bdd",
+        "sha256": "09ab053605ef1564f62352b64e556be91c93ec40ca2d2579b48f10387d7d705d"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/parsed-provider-claim-artifact.schema.json",
+      "artifact_path": "v1/parsed-provider-claim-artifact.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "parsed-provider-claim-artifact-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/selected-attempt-output",
+        "version": "1.0.0",
+        "artifact_id": "a3515f6d-1f9c-2c77-e45a-6546c13210bb",
+        "sha256": "7d20cba98321cf2c360580bca82124be958ba2e840d9483de8324681c8f330ec"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/selected-attempt-output.schema.json",
+      "artifact_path": "v1/selected-attempt-output.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "selected-attempt-output-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
         "schema_id": "https://schemas.robata.dev/orchestrator-enriched-output",
         "version": "1.0.0",
         "artifact_id": "60ec381f-057a-935e-5bad-9b1655e4b2c1",
@@ -320,6 +428,24 @@
       "owner": "robata-inference",
       "canonicalization_version": "rfc8785-v1",
       "projection_version": "orchestrator-enriched-output-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/orchestrator-enriched-output",
+        "version": "2.0.0",
+        "artifact_id": "9d36ff6a-d241-afcc-1d70-8b8e8d5e84c7",
+        "sha256": "9bbe1ae372f20a7a15e563873ea83522e0e5b18826d9f184e10d2f38df8c103d"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/orchestrator-enriched-output.schema.json",
+      "artifact_path": "v2/orchestrator-enriched-output.schema.json",
+      "owner": "robata-inference",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "orchestrator-enriched-output-v2",
       "compatibility_mode": "NONE",
       "lifecycle": "ACTIVE",
       "supported_software": {"min_inclusive": "0.1.0", "max_exclusive": "0.2.0"},

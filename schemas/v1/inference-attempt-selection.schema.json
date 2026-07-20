@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.robata.dev/v1/inference-attempt-selection.schema.json",
+  "title": "Selected successful inference attempt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "selection_id",
+    "inference_id",
+    "logical_invocation_id",
+    "policy_version",
+    "selection_reason",
+    "selection_decision_logical_key",
+    "selected_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "selection_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "inference_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "logical_invocation_id": {
+      "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/uuid"
+    },
+    "policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "selection_reason": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "selection_decision_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "selected_at": {
+      "allOf": [
+        {
+          "$ref": "https://schemas.robata.dev/v1/common.schema.json#/$defs/rfc3339"
+        },
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+        }
+      ]
+    }
+  }
+}

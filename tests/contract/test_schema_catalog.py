@@ -25,6 +25,13 @@ CURRENT_SELECTION_SCHEMA_ID = "https://schemas.robata.dev/current-selection"
 MCAP_VALIDATION_REPORT_SCHEMA_ID = "https://schemas.robata.dev/mcap-validation-report"
 MCAP_READY_MANIFEST_SCHEMA_ID = "https://schemas.robata.dev/mcap-manifest"
 ALIGNMENT_MANIFEST_SCHEMA_ID = "https://schemas.robata.dev/alignment-manifest"
+ENRICHED_OUTPUT_SCHEMA_ID = "https://schemas.robata.dev/orchestrator-enriched-output"
+INFERENCE_INTENT_SCHEMA_ID = "https://schemas.robata.dev/inference-intent"
+MODEL_INFERENCE_SCHEMA_ID = "https://schemas.robata.dev/model-inference"
+INFERENCE_ATTEMPT_SELECTION_SCHEMA_ID = "https://schemas.robata.dev/inference-attempt-selection"
+RAW_PROVIDER_RESPONSE_SCHEMA_ID = "https://schemas.robata.dev/raw-provider-response-artifact"
+PARSED_PROVIDER_CLAIM_SCHEMA_ID = "https://schemas.robata.dev/parsed-provider-claim-artifact"
+SELECTED_ATTEMPT_OUTPUT_SCHEMA_ID = "https://schemas.robata.dev/selected-attempt-output"
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> bytes:
@@ -148,10 +155,108 @@ def test_production_catalog_pins_exact_v2_admission_evidence() -> None:
     )
 
 
+def test_production_catalog_pins_exact_v2_enriched_output() -> None:
+    registry = SchemaRegistry()
+    registered = registry.resolve_version(ENRICHED_OUTPUT_SCHEMA_ID, "2.0.0")
+
+    assert registered.ref == SchemaRef(
+        schema_id=ENRICHED_OUTPUT_SCHEMA_ID,
+        version="2.0.0",
+        artifact_id="9d36ff6a-d241-afcc-1d70-8b8e8d5e84c7",
+        sha256="9bbe1ae372f20a7a15e563873ea83522e0e5b18826d9f184e10d2f38df8c103d",
+    )
+    assert registered.entry.wire_version == "2.0"
+    assert registered.entry.projection_version == "orchestrator-enriched-output-v2"
+
+    document = registry.get_schema(registered.ref)
+    assert document["properties"]["schema_version"] == {"const": "2.0"}
+    selected_attempt = document["$defs"]["selectedAttempt"]
+    assert {
+        "selection_id",
+        "logical_invocation_id",
+        "selection_decision_logical_key",
+        "selection_policy_version",
+    } <= set(selected_attempt["required"])
+
+
+def test_production_catalog_pins_exact_inference_evidence_contracts() -> None:
+    registry = SchemaRegistry()
+    expected = (
+        SchemaRef(
+            schema_id=INFERENCE_INTENT_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="59c9e34b-631f-5795-a115-2751fb7573b7",
+            sha256="d20538b2f81a4c4b1f7dcc29448638614e585887a135bfc107d9b4d2f9104f40",
+        ),
+        SchemaRef(
+            schema_id=MODEL_INFERENCE_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="2fcf18d2-5b9e-cb8d-fc39-1d16ed4159f3",
+            sha256="6eb192a4b840f9b8e79000ca07a8770c87fe7462fc71c296911de6848301c9e8",
+        ),
+        SchemaRef(
+            schema_id=INFERENCE_ATTEMPT_SELECTION_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="dd131ca4-9ef8-9278-345b-a1a1832a4472",
+            sha256="c162c55442c4fca4ca96d6882e5e074d8a19cf683f5e7788ccc76eecafcf8365",
+        ),
+        SchemaRef(
+            schema_id=RAW_PROVIDER_RESPONSE_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="b44d2bc9-7068-63a9-e179-2a4416899358",
+            sha256="c71f8ab02fbd3c5116ece866afd15f0527f176ccd23ed209fb3d7c748bfd0bd4",
+        ),
+        SchemaRef(
+            schema_id=PARSED_PROVIDER_CLAIM_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="ad3c7c60-8759-606e-4698-9a6edeba8bdd",
+            sha256="09ab053605ef1564f62352b64e556be91c93ec40ca2d2579b48f10387d7d705d",
+        ),
+        SchemaRef(
+            schema_id=SELECTED_ATTEMPT_OUTPUT_SCHEMA_ID,
+            version="1.0.0",
+            artifact_id="a3515f6d-1f9c-2c77-e45a-6546c13210bb",
+            sha256="7d20cba98321cf2c360580bca82124be958ba2e840d9483de8324681c8f330ec",
+        ),
+    )
+
+    for ref in expected:
+        registered = registry.resolve_version(ref.schema_id, ref.version)
+        assert registered.ref == ref
+        assert registered.entry.wire_version == "1.0"
+        document = registry.get_schema(ref)
+        assert document["additionalProperties"] is False
+        assert set(document["required"]) == set(document["properties"])
+
+    intent = registry.get_schema(expected[0])
+    selection = registry.get_schema(expected[2])
+    assert selection["properties"]["selection_reason"] == {
+        "minLength": 1,
+        "type": "string",
+    }
+    for ref in expected[:5]:
+        document = registry.get_schema(ref)
+        assert document["properties"]["schema_version"] == {"const": "1.0"}
+
+    request = intent["$defs"]["VisionInferenceRequest"]
+    assert request["additionalProperties"] is False
+    assert set(request["required"]) == set(request["properties"])
+    for definition_name in ("InferenceInputPlan", "RequestCatalog", "VisionInferenceRequest"):
+        assert intent["$defs"][definition_name]["properties"]["schema_version"] == {"const": "1.0"}
+
+    parsed = registry.get_schema(expected[4])
+    assert parsed["properties"]["raw_response"] == {
+        "$ref": "https://schemas.robata.dev/v1/raw-provider-response-artifact.schema.json"
+    }
+    assert parsed["properties"]["payload"] == {
+        "$ref": "https://schemas.robata.dev/v1/provider-claim-payload.schema.json"
+    }
+
+
 def test_every_catalog_entry_has_exact_digest_and_deterministic_id() -> None:
     registry = SchemaRegistry()
 
-    assert len(registry.entries) == 21
+    assert len(registry.entries) == 28
     assert registry.upcasters == ()
     for registered in registry.entries:
         digest = hashlib.sha256(registered.document_bytes).hexdigest()

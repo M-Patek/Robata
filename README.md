@@ -34,20 +34,27 @@ services, provider-neutral inference orchestration and input-plan contracts, loc
 logic, offline QA and event reduction components, benchmark calculations, and structured
 retrieval primitives.
 
-A canonical post-admission offline conformance slice now connects a resolved
-`AdmittedRecordingContextV2` through root-window derivation, materialized
-`TemporalPackageSet`, exact `InferenceInputPlan` and request catalog, single-part barrier and
-attempt selection, raw-byte persistence before strict parsing, parsed provider claims,
-orchestrator enrichment, output admission, and recording-scoped fenced identity/outbox
-assignment. It accepts only the offline fixture adapter, performs no network calls, supports only
-single-part `FUSION_ADJUDICATION`, starts after admission, and uses in-memory state. It is not a
-durable production path or phase-promotion result.
+A canonical post-admission offline conformance slice now connects an explicit fresh or resumed
+processing run and resolved `AdmittedRecordingContextV2` through root-window derivation,
+materialized `TemporalPackageSet`, exact `InferenceInputPlan` and request catalog, independently
+retried call parts, an all-terminal barrier, selected raw/parsed/enriched evidence, deterministic
+fusion reduction, output admission, and recording-scoped fenced identity/outbox assignment. Run
+stages are attached through the local SQLite logical-node registry. An optional single SQLite
+inference-evidence ledger preserves intents, exact pre-parse bytes, terminal attempts, typed raw
+artifacts, selections, parsed claims, selected outputs, and enrichments across fresh adapter,
+ledger, and pipeline instances without redispatching selected calls.
+
+The canonical slice accepts only the offline fixture adapter, performs no network calls, supports
+only `FUSION_ADJUDICATION`, and starts after admission. Processing-run/work lifecycle records,
+barriers, output decisions, and run results are still in-process, and every SQLite adapter remains
+local conformance evidence rather than a production infrastructure decision.
 
 The legacy fake-model mainline remains an isolated development smoke path. It performs zero
 external provider requests and always records `production_eligible=false`; it has not been
-rewired to the canonical slice above. Real Qwen/GPT adapters, governed data admission,
-multi-part reduction, production Redis/database/object storage, approved QA/event policy,
-quality evidence, SLO evidence, and capacity qualification remain separate blocked work.
+rewired to the canonical slice above. Real Qwen/GPT adapters, governed data admission, durable
+work/barrier recovery, production database/broker/object storage, ActionEvent revision
+publication, approved QA/event policy, quality evidence, SLO evidence, and capacity qualification
+remain separate blocked work.
 
 ## Requirements
 

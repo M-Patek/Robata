@@ -97,6 +97,7 @@ def _build_package_set(
     alignment_id: str = "alignment-1",
     *,
     content_seed: str = "content",
+    manifest_seed: str | None = None,
     package_id_prefix: str = "package",
 ) -> TemporalPackageSet:
     parts = builder.plan_parts(window, plan)
@@ -105,7 +106,9 @@ def _build_package_set(
             ordinal=part.ordinal,
             package_id=f"{package_id_prefix}-{part.ordinal}",
             package_semantic_content_sha256=_digest(f"{content_seed}:semantic:{part.ordinal}"),
-            package_manifest_sha256=_digest(f"{content_seed}:manifest:{part.ordinal}"),
+            package_manifest_sha256=_digest(
+                f"{manifest_seed or content_seed}:manifest:{part.ordinal}"
+            ),
         )
         for part in parts
     )
@@ -351,6 +354,45 @@ def test_package_content_changes_manifest_and_set_but_not_split_plan() -> None:
     assert first.split_group_id == second.split_group_id
     assert first.member_manifest_sha256 != second.member_manifest_sha256
     assert first.package_set_id != second.package_set_id
+
+
+def test_exact_package_manifest_relocation_does_not_change_package_set_identity() -> None:
+    plan = _plan(max_per_camera=20, max_total=120)
+    builder = PackageSetBuilder("reduce-v1")
+    first = _build_package_set(
+        builder,
+        _window(0, SECOND),
+        plan,
+        content_seed="same-content",
+        manifest_seed="first-serialization",
+    )
+    relocated = _build_package_set(
+        builder,
+        _window(0, SECOND),
+        plan,
+        content_seed="same-content",
+        manifest_seed="second-serialization",
+    )
+
+    assert first.members[0].package_manifest_sha256 != (
+        relocated.members[0].package_manifest_sha256
+    )
+    assert first.member_manifest_sha256 == relocated.member_manifest_sha256
+    assert first.package_set_id == relocated.package_set_id
+
+
+def test_forged_member_semantic_content_is_rejected_by_manifest_binding() -> None:
+    plan = _plan(max_per_camera=20, max_total=120)
+    package_set = _build_package_set(
+        PackageSetBuilder("reduce-v1"),
+        _window(0, SECOND),
+        plan,
+    )
+    payload = package_set.model_dump()
+    payload["members"][0]["package_semantic_content_sha256"] = _digest("forged")
+
+    with pytest.raises(ValidationError, match="member_manifest_sha256"):
+        TemporalPackageSet.model_validate(payload)
 
 
 def test_package_set_builder_requires_materialized_lineage_and_content() -> None:

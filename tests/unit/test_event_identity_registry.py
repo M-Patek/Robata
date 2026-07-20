@@ -31,13 +31,15 @@ from robata.event_pipeline.identity_registry import (
     ProductionAdmittedHypothesisFact,
     ProductionOutputAdmissionPolicyRef,
     ProductionOutputAdmissionProof,
+    platform_enriched_output_logical_projection,
 )
+from robata.inference.enrichment import SelectedAttemptOutput
 from tests.contract.test_admission_evidence_v2_contract import (
     _alignment_manifest,
     _ready_manifest,
     _validation_report,
 )
-from tests.unit.test_inference_enrichment import _enrich, _fixture
+from tests.unit.test_inference_enrichment import _enrich, _fixture, _parsed, _selection
 
 NOW = "2026-07-19T16:00:00Z"
 OUTPUT_ADMISSION_POLICY = ProductionOutputAdmissionPolicyRef(
@@ -100,6 +102,40 @@ def _enriched_output(context):
         }
     )
     return _enrich(replace(fixture, authority=authority))
+
+
+def _equivalent_enriched_outputs(context):
+    fixture = _fixture()
+    authority = fixture.authority.model_copy(
+        update={
+            "recording_identity": context.recording_identity,
+            "mcap_id": context.ready_manifest.mcap_id,
+            "camera_mapping_run_id": context.ready_manifest.camera_mapping_run_id,
+            "alignment_id": context.alignment_manifest.alignment_id,
+        }
+    )
+    first = _enrich(fixture, authority=authority)
+    second_parsed = _parsed(
+        payload=fixture.payload,
+        provider_schema=fixture.provider_schema,
+        row_offset=50,
+        inference_id=_uuid(602),
+    )
+    second_selection = _selection(
+        inference_id=second_parsed.raw_response.inference_id,
+        logical_invocation_id=fixture.selection.logical_invocation_id,
+        policy_version=fixture.selection.policy_version,
+        row_offset=50,
+    )
+    second_selected = SelectedAttemptOutput.create(second_parsed, second_selection)
+    second_authority = authority.model_copy(update={"inference_id": second_selected.inference_id})
+    second = _enrich(
+        fixture,
+        parsed=second_parsed,
+        selected=second_selected,
+        authority=second_authority,
+    )
+    return first, second
 
 
 def _hypothesis_fact(
@@ -273,6 +309,146 @@ def test_canonical_batch_reuses_exact_fingerprint_and_replay_is_idempotent() -> 
     assert replay.outbox == ()
     assert len(replay.replayed_assignment_logical_keys) == 2
     assert len(repository.list_outbox(context.recording_identity)) == 2
+
+
+def test_logical_identity_converges_across_exact_attempt_and_artifact_locators() -> None:
+    context = _context()
+    first_output, second_output = _equivalent_enriched_outputs(context)
+    first_reference = PlatformEnrichedOutputReference.from_output(first_output)
+    second_reference = PlatformEnrichedOutputReference.from_output(second_output)
+    fact = _hypothesis_fact(
+        start_ns=10,
+        end_ns=20,
+        fingerprint="same-logical-event",
+        ordinal=0,
+    )
+
+    assert first_output.enrichment_logical_key == second_output.enrichment_logical_key
+    assert first_output.semantic_sha256 != second_output.semantic_sha256
+    assert first_output.selected_attempt.inference_id != second_output.selected_attempt.inference_id
+    assert first_output.selected_attempt.selection_id != second_output.selected_attempt.selection_id
+    assert first_reference != second_reference
+    assert platform_enriched_output_logical_projection(first_reference) == (
+        platform_enriched_output_logical_projection(second_reference)
+    )
+
+    first_proof = ProductionOutputAdmissionProof.create(
+        recording_identity=context.recording_identity,
+        source_enrichments=(first_reference,),
+        admitted_hypothesis_facts=(fact,),
+        policy=OUTPUT_ADMISSION_POLICY,
+    )
+    second_proof = ProductionOutputAdmissionProof.create(
+        recording_identity=context.recording_identity,
+        source_enrichments=(second_reference,),
+        admitted_hypothesis_facts=(fact,),
+        policy=OUTPUT_ADMISSION_POLICY,
+    )
+    first_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=context.recording_identity,
+        effective_interval=fact.effective_interval,
+        semantic_fingerprint_sha256=fact.semantic_fingerprint_sha256,
+        fusion_logical_key=fact.fusion_logical_key,
+        fusion_output_ordinal=fact.fusion_output_ordinal,
+        source_enrichments=(first_reference,),
+        production_admission=ProductionAdmissionProof.from_context(context),
+        production_output_admission=first_proof,
+    )
+    second_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=context.recording_identity,
+        effective_interval=fact.effective_interval,
+        semantic_fingerprint_sha256=fact.semantic_fingerprint_sha256,
+        fusion_logical_key=fact.fusion_logical_key,
+        fusion_output_ordinal=fact.fusion_output_ordinal,
+        source_enrichments=(second_reference,),
+        production_admission=ProductionAdmissionProof.from_context(context),
+        production_output_admission=second_proof,
+    )
+
+    assert first_proof.semantic_sha256 == second_proof.semantic_sha256
+    assert first_hypothesis.semantic_sha256 == second_hypothesis.semantic_sha256
+    assert first_hypothesis.event_hypothesis_logical_key == (
+        second_hypothesis.event_hypothesis_logical_key
+    )
+
+    service = _service(InMemoryEventIdentityRegistryRepository(), _SequenceAllocator())
+    first_result = service.assign_batch(
+        admitted_context=context,
+        hypotheses=(first_hypothesis,),
+        enriched_outputs=(first_output,),
+        decided_at=NOW,
+    )
+    replay = service.assign_batch(
+        admitted_context=context,
+        hypotheses=(second_hypothesis,),
+        enriched_outputs=(second_output,),
+        decided_at=NOW,
+    )
+    assert replay.assignments == first_result.assignments
+    assert replay.replayed_assignment_logical_keys == (
+        first_result.assignments[0].assignment_logical_key,
+    )
+
+    with pytest.raises(EventIdentityInputError, match="forged enrichment"):
+        service.assign_batch(
+            admitted_context=context,
+            hypotheses=(second_hypothesis,),
+            enriched_outputs=(first_output,),
+            decided_at=NOW,
+        )
+
+
+def test_logical_identity_separates_distinct_enrichment_logical_keys() -> None:
+    context = _context()
+    output = _enriched_output(context)
+    first_reference = PlatformEnrichedOutputReference.from_output(output)
+    second_reference = first_reference.model_copy(
+        update={"enrichment_logical_key": f"orchestrator-enrichment:{_digest('different')}"}
+    )
+    fact = _hypothesis_fact(
+        start_ns=10,
+        end_ns=20,
+        fingerprint="same-event-facts",
+        ordinal=0,
+    )
+    first_proof = ProductionOutputAdmissionProof.create(
+        recording_identity=context.recording_identity,
+        source_enrichments=(first_reference,),
+        admitted_hypothesis_facts=(fact,),
+        policy=OUTPUT_ADMISSION_POLICY,
+    )
+    second_proof = ProductionOutputAdmissionProof.create(
+        recording_identity=context.recording_identity,
+        source_enrichments=(second_reference,),
+        admitted_hypothesis_facts=(fact,),
+        policy=OUTPUT_ADMISSION_POLICY,
+    )
+    first_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=context.recording_identity,
+        effective_interval=fact.effective_interval,
+        semantic_fingerprint_sha256=fact.semantic_fingerprint_sha256,
+        fusion_logical_key=fact.fusion_logical_key,
+        fusion_output_ordinal=fact.fusion_output_ordinal,
+        source_enrichments=(first_reference,),
+        production_admission=ProductionAdmissionProof.from_context(context),
+        production_output_admission=first_proof,
+    )
+    second_hypothesis = PlatformEnrichedEventHypothesis.create(
+        recording_identity=context.recording_identity,
+        effective_interval=fact.effective_interval,
+        semantic_fingerprint_sha256=fact.semantic_fingerprint_sha256,
+        fusion_logical_key=fact.fusion_logical_key,
+        fusion_output_ordinal=fact.fusion_output_ordinal,
+        source_enrichments=(second_reference,),
+        production_admission=ProductionAdmissionProof.from_context(context),
+        production_output_admission=second_proof,
+    )
+
+    assert first_proof.semantic_sha256 != second_proof.semantic_sha256
+    assert first_hypothesis.semantic_sha256 != second_hypothesis.semantic_sha256
+    assert first_hypothesis.event_hypothesis_logical_key != (
+        second_hypothesis.event_hypothesis_logical_key
+    )
 
 
 def test_registry_rejects_forged_enrichment_lineage() -> None:

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import RLock
-from typing import NoReturn
+from typing import NoReturn, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
@@ -86,6 +86,30 @@ class StoredRawProviderBytes:
     @property
     def byte_count(self) -> int:
         return len(self.data)
+
+
+@runtime_checkable
+class RawProviderBytesStore(Protocol):
+    """Persistence port for exact provider bytes written before parsing."""
+
+    def append(
+        self,
+        *,
+        request_id: str,
+        provider_request_id: str,
+        data: bytes,
+        media_type: str = "application/json",
+    ) -> StoredRawProviderBytes:
+        """Append one immutable response, or return its identical record."""
+        ...
+
+    def get(self, artifact_id: str) -> StoredRawProviderBytes:
+        """Return exact stored bytes by artifact identity."""
+        ...
+
+    def list_records(self) -> tuple[StoredRawProviderBytes, ...]:
+        """Return all exact response records in canonical artifact order."""
+        ...
 
 
 class InMemoryRawProviderBytesStore:
@@ -304,14 +328,14 @@ class OfflineFixtureVisionAdapter:
         self,
         *,
         capabilities: ModelCapabilities,
-        raw_store: InMemoryRawProviderBytesStore,
+        raw_store: RawProviderBytesStore,
         parser: StrictProviderClaimParser,
         response_factory: OfflineFixtureResponseFactory,
     ) -> None:
         if not isinstance(capabilities, ModelCapabilities):
             raise TypeError("capabilities must be ModelCapabilities")
-        if not isinstance(raw_store, InMemoryRawProviderBytesStore):
-            raise TypeError("raw_store must be an InMemoryRawProviderBytesStore")
+        if not isinstance(raw_store, RawProviderBytesStore):
+            raise TypeError("raw_store must implement RawProviderBytesStore")
         if not isinstance(parser, StrictProviderClaimParser):
             raise TypeError("parser must be a StrictProviderClaimParser")
         if not callable(response_factory):
@@ -329,7 +353,7 @@ class OfflineFixtureVisionAdapter:
         return self._capabilities.provider
 
     @property
-    def raw_store(self) -> InMemoryRawProviderBytesStore:
+    def raw_store(self) -> RawProviderBytesStore:
         return self._raw_store
 
     @property
@@ -478,6 +502,7 @@ __all__ = [
     "OfflineFixtureVisionAdapter",
     "ProviderResponseParseCode",
     "RawProviderBytesNotFoundError",
+    "RawProviderBytesStore",
     "RawProviderBytesStoreError",
     "StoredRawProviderBytes",
     "StrictProviderClaimParseError",

@@ -1,16 +1,35 @@
 """Application services that coordinate domain ports without provider coupling."""
 
 from robata.application.canonical_offline import (
+    CANONICAL_OFFLINE_PIPELINE_VERSION,
+    CanonicalFusionClaimSource,
+    CanonicalFusionPartSource,
+    CanonicalFusionReduction,
     CanonicalOfflineConfigurationError,
     CanonicalOfflineError,
     CanonicalOfflineExecutionPolicy,
+    CanonicalOfflinePartResult,
+    CanonicalOfflinePartStatus,
     CanonicalOfflinePipeline,
     CanonicalOfflineRunResult,
     CanonicalOfflineRunStatus,
     CanonicalOfflineStage,
     CanonicalOutputAdmissionDecision,
+    CanonicalReducedFusionClaim,
     CanonicalRootWindow,
     FusionEventHypothesisProjector,
+)
+from robata.application.canonical_run_membership import (
+    CanonicalProcessingRunContext,
+    CanonicalProcessingRunDeadlineStatus,
+    CanonicalProcessingRunMode,
+    CanonicalProcessingRunPrimaryStatus,
+    CanonicalProcessingRunRecord,
+    CanonicalProcessingRunShadowStatus,
+    CanonicalRunMembershipError,
+    CanonicalRunMembershipErrorCode,
+    CanonicalRunMembershipJournal,
+    canonical_first_work_item_id,
 )
 from robata.application.mainline import (
     LocalMainlineConfig,
@@ -33,15 +52,31 @@ from robata.application.video_export import (
 )
 
 __all__ = [
+    "CANONICAL_OFFLINE_PIPELINE_VERSION",
+    "CanonicalFusionClaimSource",
+    "CanonicalFusionPartSource",
+    "CanonicalFusionReduction",
     "CanonicalOfflineConfigurationError",
     "CanonicalOfflineError",
     "CanonicalOfflineExecutionPolicy",
+    "CanonicalOfflinePartResult",
+    "CanonicalOfflinePartStatus",
     "CanonicalOfflinePipeline",
     "CanonicalOfflineRunResult",
     "CanonicalOfflineRunStatus",
     "CanonicalOfflineStage",
     "CanonicalOutputAdmissionDecision",
+    "CanonicalProcessingRunContext",
+    "CanonicalProcessingRunDeadlineStatus",
+    "CanonicalProcessingRunMode",
+    "CanonicalProcessingRunPrimaryStatus",
+    "CanonicalProcessingRunRecord",
+    "CanonicalProcessingRunShadowStatus",
+    "CanonicalReducedFusionClaim",
     "CanonicalRootWindow",
+    "CanonicalRunMembershipError",
+    "CanonicalRunMembershipErrorCode",
+    "CanonicalRunMembershipJournal",
     "FusionEventHypothesisProjector",
     "LocalMainlineConfig",
     "LocalMainlinePipeline",
@@ -56,4 +91,5 @@ __all__ = [
     "VideoExportRunError",
     "VideoExportRunErrorCode",
     "VideoExporterDescriptor",
+    "canonical_first_work_item_id",
 ]
