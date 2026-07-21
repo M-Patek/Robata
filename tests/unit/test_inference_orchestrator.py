@@ -430,6 +430,26 @@ def test_logical_identity_uses_capability_digest_not_snapshot_row_id() -> None:
     assert first.inference_id == second.inference_id
 
 
+def test_logical_identity_separates_explicit_dependency_digest() -> None:
+    first_orchestrator, _, first_store = _orchestrator(_success)
+    dependent_orchestrator, dependent_adapter, dependent_store = _orchestrator(_success)
+
+    first = _run(first_orchestrator.orchestrate(**_request_kwargs()))
+    dependent_kwargs = _request_kwargs()
+    dependent_kwargs["logical_dependency_sha256"] = _digest(301)
+    dependent = _run(dependent_orchestrator.orchestrate(**dependent_kwargs))
+    replay = _run(dependent_orchestrator.orchestrate(**dependent_kwargs))
+
+    assert first.logical_invocation_id != dependent.logical_invocation_id
+    assert first.inference_id != dependent.inference_id
+    assert dependent == replay
+    assert dependent_adapter.infer_calls == 1
+    assert dependent_store.list_intents()[0].input_config["logical_dependency_sha256"] == _digest(
+        301
+    )
+    assert first_store.list_intents()[0].input_config.get("logical_dependency_sha256") is None
+
+
 def test_logical_identity_excludes_package_prompt_and_schema_artifact_locators() -> None:
     relocated_schema = SCHEMA_REF.model_copy(update={"artifact_id": "schema-relocated"})
     relocated_policy = _policy().model_copy(

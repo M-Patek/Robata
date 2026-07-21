@@ -20,6 +20,7 @@ from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid, Rfc3339Ti
 from robata.contracts.pipeline import SamplingPurpose
 from robata.contracts.sampling_plan import SamplingPlan
 from robata.contracts.temporal import PackageLineage
+from robata.event_pipeline.candidate import CanonicalCandidateEvent
 from robata.event_pipeline.identity_registry import ProductionOutputAdmissionPolicyRef
 from robata.inference.call_barrier import InferenceCallPartCompletion
 from robata.inference.enrichment import (
@@ -35,7 +36,7 @@ NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 
-CANONICAL_OFFLINE_PIPELINE_VERSION = "canonical-offline-v2"
+CANONICAL_OFFLINE_PIPELINE_VERSION = "canonical-offline-v5"
 
 
 class CanonicalOfflineConfigurationError(ValueError):
@@ -252,9 +253,14 @@ class CanonicalRootWindow(StrictModel):
             raise CanonicalOfflineConfigurationError(
                 "V2 admission context failed validation"
             ) from exc
-        if purpose is not SamplingPurpose.ACTION_DENSE:
+        if purpose not in {
+            SamplingPurpose.QA_COARSE,
+            SamplingPurpose.QA_DENSE,
+            SamplingPurpose.ACTION_DENSE,
+        }:
             raise CanonicalOfflineConfigurationError(
-                "canonical offline vertical slice requires ACTION_DENSE root purpose"
+                "canonical offline window supports only QA_COARSE, QA_DENSE, and "
+                "ACTION_DENSE purposes"
             )
         if not isinstance(requested_interval, NanosecondInterval):
             raise TypeError("requested_interval must be a NanosecondInterval")
@@ -311,6 +317,233 @@ class CanonicalRootWindow(StrictModel):
         )
 
 
+def _canonical_candidate_dense_window_projection_values(
+    values: dict[str, object],
+) -> dict[str, object]:
+    projection = canonical_root_window_projection_values(values)
+    candidate_interval = values["candidate_effective_interval"]
+    if not isinstance(candidate_interval, NanosecondInterval):
+        raise TypeError("candidate effective interval must be a NanosecondInterval")
+    return {
+        **projection,
+        "candidate_effective_interval": candidate_interval.model_dump(mode="json"),
+        "context_truncated": values["context_truncated"],
+    }
+
+
+class CanonicalCandidateDenseWindow(StrictModel):
+    """Candidate-scoped ACTION_DENSE window with explicit clipping evidence."""
+
+    schema_version: Literal["1.0"]
+    window_id: OpaqueUuid
+    window_logical_key: NodeLogicalKey
+    semantic_sha256: Sha256Digest
+    recording_identity: Sha256Digest
+    source_content_sha256: Sha256Digest
+    mcap_id: OpaqueUuid
+    camera_mapping_run_id: OpaqueUuid
+    alignment_id: OpaqueUuid
+    camera_mapping_semantic_sha256: Sha256Digest
+    alignment_semantic_sha256: Sha256Digest
+    recording_duration_ns: PositiveInt
+    reference_timebase: Literal["recording_relative_ns"]
+    candidate_event_id: OpaqueUuid
+    candidate_logical_key: NodeLogicalKey
+    candidate_effective_interval: NanosecondInterval
+    requested_interval: NanosecondInterval
+    interval: NanosecondInterval
+    context_truncated: bool
+    purpose: Literal[SamplingPurpose.ACTION_DENSE]
+    window_policy_version: SchemaVersion
+    source_subject_type: Literal["CANDIDATE_EVENT"]
+    source_subject_logical_key: NodeLogicalKey
+    parent_window_logical_key: NodeLogicalKey
+    source_lineage_sha256: Sha256Digest
+    refinement_role: Literal["CANDIDATE_DENSE"]
+    generation: PositiveInt
+    created_at: Rfc3339Timestamp
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Self:
+        if (
+            self.source_subject_logical_key != self.candidate_logical_key
+            or self.interval.start_ns < 0
+            or self.interval.end_ns > self.recording_duration_ns
+            or self.interval.start_ns < self.requested_interval.start_ns
+            or self.interval.end_ns > self.requested_interval.end_ns
+            or self.candidate_effective_interval.start_ns < self.interval.start_ns
+            or self.candidate_effective_interval.end_ns > self.interval.end_ns
+            or self.context_truncated != (self.interval != self.requested_interval)
+        ):
+            raise ValueError("candidate dense window has inconsistent subject or bounds")
+        projection = _canonical_candidate_dense_window_projection_values(
+            {
+                "source_content_sha256": self.source_content_sha256,
+                "camera_mapping_semantic_sha256": (self.camera_mapping_semantic_sha256),
+                "alignment_semantic_sha256": self.alignment_semantic_sha256,
+                "requested_interval": self.requested_interval,
+                "interval": self.interval,
+                "purpose": self.purpose,
+                "window_policy_version": self.window_policy_version,
+                "source_subject_type": self.source_subject_type,
+                "source_subject_logical_key": self.source_subject_logical_key,
+                "parent_window_logical_key": self.parent_window_logical_key,
+                "source_lineage_sha256": self.source_lineage_sha256,
+                "refinement_role": self.refinement_role,
+                "generation": self.generation,
+                "candidate_effective_interval": self.candidate_effective_interval,
+                "context_truncated": self.context_truncated,
+            }
+        )
+        digest = semantic_sha256(projection)
+        if (
+            self.semantic_sha256 != digest
+            or self.window_logical_key != f"temporal-window:{digest}"
+            or self.window_id != _stable_uuid("canonical-candidate-dense-window", digest)
+        ):
+            raise ValueError("candidate dense window identity is inconsistent")
+        return self
+
+    @classmethod
+    def from_context(
+        cls,
+        *,
+        context: AdmittedRecordingContextV2,
+        candidate: CanonicalCandidateEvent,
+        parent_window: CanonicalRootWindow,
+        window_policy_version: str,
+        created_at: str,
+    ) -> Self:
+        context = _strict_context(context)
+        candidate = CanonicalCandidateEvent.model_validate(
+            candidate.model_dump(mode="python"), strict=True
+        )
+        parent_window = CanonicalRootWindow.model_validate(
+            parent_window.model_dump(mode="python"), strict=True
+        )
+        duration = context.ready_manifest.recording.duration_ns
+        if (
+            candidate.mcap_id != context.ready_manifest.mcap_id
+            or candidate.source_content_sha256 != context.source_content_sha256
+            or candidate.camera_mapping_semantic_sha256 != context.camera_mapping_semantic_sha256
+            or candidate.alignment_semantic_sha256 != context.alignment_semantic_sha256
+            or parent_window.recording_identity != context.recording_identity
+            or parent_window.mcap_id != candidate.mcap_id
+        ):
+            raise CanonicalOfflineConfigurationError(
+                "candidate dense window lineage does not match admission context"
+            )
+        requested = candidate.requested_dense_interval
+        effective_start = max(0, requested.start_ns)
+        effective_end = min(duration, requested.end_ns)
+        if effective_start >= effective_end:
+            raise CanonicalOfflineConfigurationError(
+                "candidate dense request does not overlap the admitted recording"
+            )
+        effective = NanosecondInterval(start_ns=effective_start, end_ns=effective_end)
+        if (
+            candidate.effective_interval.start_ns < effective.start_ns
+            or candidate.effective_interval.end_ns > effective.end_ns
+        ):
+            raise CanonicalOfflineConfigurationError(
+                "candidate dense request does not contain its candidate interval"
+            )
+        source_lineage = semantic_sha256(
+            {
+                "semantic_projection_version": "candidate-dense-source-lineage-v1",
+                "admission_context_semantic_sha256": context.semantic_sha256,
+                "candidate_logical_key": candidate.candidate_logical_key,
+                "parent_window_semantic_sha256": parent_window.semantic_sha256,
+            }
+        )
+        values: dict[str, object] = {
+            "source_content_sha256": context.source_content_sha256,
+            "camera_mapping_semantic_sha256": context.camera_mapping_semantic_sha256,
+            "alignment_semantic_sha256": context.alignment_semantic_sha256,
+            "requested_interval": requested,
+            "interval": effective,
+            "purpose": SamplingPurpose.ACTION_DENSE,
+            "window_policy_version": window_policy_version,
+            "source_subject_type": "CANDIDATE_EVENT",
+            "source_subject_logical_key": candidate.candidate_logical_key,
+            "parent_window_logical_key": parent_window.window_logical_key,
+            "source_lineage_sha256": source_lineage,
+            "refinement_role": "CANDIDATE_DENSE",
+            "generation": candidate.generation + 1,
+            "candidate_effective_interval": candidate.effective_interval,
+            "context_truncated": effective != requested,
+        }
+        digest = semantic_sha256(_canonical_candidate_dense_window_projection_values(values))
+        return cls(
+            schema_version="1.0",
+            window_id=_stable_uuid("canonical-candidate-dense-window", digest),
+            window_logical_key=f"temporal-window:{digest}",
+            semantic_sha256=digest,
+            recording_identity=context.recording_identity,
+            source_content_sha256=context.source_content_sha256,
+            mcap_id=context.ready_manifest.mcap_id,
+            camera_mapping_run_id=context.ready_manifest.camera_mapping_run_id,
+            alignment_id=context.alignment_manifest.alignment_id,
+            camera_mapping_semantic_sha256=context.camera_mapping_semantic_sha256,
+            alignment_semantic_sha256=context.alignment_semantic_sha256,
+            recording_duration_ns=duration,
+            reference_timebase="recording_relative_ns",
+            candidate_event_id=candidate.candidate_event_id,
+            candidate_logical_key=candidate.candidate_logical_key,
+            candidate_effective_interval=candidate.effective_interval,
+            requested_interval=requested,
+            interval=effective,
+            context_truncated=effective != requested,
+            purpose=SamplingPurpose.ACTION_DENSE,
+            window_policy_version=window_policy_version,
+            source_subject_type="CANDIDATE_EVENT",
+            source_subject_logical_key=candidate.candidate_logical_key,
+            parent_window_logical_key=parent_window.window_logical_key,
+            source_lineage_sha256=source_lineage,
+            refinement_role="CANDIDATE_DENSE",
+            generation=candidate.generation + 1,
+            created_at=created_at,
+        )
+
+
+def canonical_candidate_dense_lineage(
+    *,
+    context: AdmittedRecordingContextV2,
+    window: CanonicalCandidateDenseWindow,
+    sampling_plan: SamplingPlan,
+) -> PackageLineage:
+    """Build provider-neutral package lineage for one candidate-dense window."""
+
+    context = _strict_context(context)
+    window = CanonicalCandidateDenseWindow.model_validate(
+        window.model_dump(mode="python"), strict=True
+    )
+    sampling_plan = SamplingPlan.model_validate(
+        sampling_plan.model_dump(mode="python"), strict=True
+    )
+    if (
+        window.recording_identity != context.recording_identity
+        or window.source_content_sha256 != context.source_content_sha256
+        or window.mcap_id != context.ready_manifest.mcap_id
+        or window.camera_mapping_run_id != context.ready_manifest.camera_mapping_run_id
+        or window.alignment_id != context.alignment_manifest.alignment_id
+        or window.camera_mapping_semantic_sha256 != context.camera_mapping_semantic_sha256
+        or window.alignment_semantic_sha256 != context.alignment_semantic_sha256
+    ):
+        raise CanonicalOfflineConfigurationError(
+            "candidate dense window does not match its admitted recording context"
+        )
+    return PackageLineage(
+        source_content_sha256=context.source_content_sha256,
+        window_semantic_sha256=window.semantic_sha256,
+        camera_mapping_semantic_sha256=context.camera_mapping_semantic_sha256,
+        alignment_semantic_sha256=context.alignment_semantic_sha256,
+        sampling_plan_sha256=sampling_plan_digest(
+            sampling_plan, purpose=SamplingPurpose.ACTION_DENSE
+        ),
+    )
+
+
 def canonical_lineage(
     *,
     context: AdmittedRecordingContextV2,
@@ -348,7 +581,7 @@ def canonical_lineage(
         window_semantic_sha256=window.semantic_sha256,
         camera_mapping_semantic_sha256=context.camera_mapping_semantic_sha256,
         alignment_semantic_sha256=context.alignment_semantic_sha256,
-        sampling_plan_sha256=sampling_plan_digest(sampling_plan),
+        sampling_plan_sha256=sampling_plan_digest(sampling_plan, purpose=window.purpose),
     )
 
 
@@ -364,6 +597,8 @@ class CanonicalOfflineExecutionPolicy(StrictModel):
     projector_policy_version: SchemaVersion
     reduction_policy: NonEmptyString
     reduction_policy_version: SchemaVersion
+    provisional_fusion_policy_version: SchemaVersion
+    boundary_refinement_policy_version: SchemaVersion
     max_attempts: PositiveInt
     output_admission_policy: ProductionOutputAdmissionPolicyRef
     semantic_sha256: Sha256Digest
@@ -387,6 +622,8 @@ class CanonicalOfflineExecutionPolicy(StrictModel):
         projector_policy_version: str,
         reduction_policy: str,
         reduction_policy_version: str,
+        provisional_fusion_policy_version: str,
+        boundary_refinement_policy_version: str,
         max_attempts: int,
         output_admission_policy: ProductionOutputAdmissionPolicyRef,
     ) -> Self:
@@ -399,6 +636,8 @@ class CanonicalOfflineExecutionPolicy(StrictModel):
             "projector_policy_version": projector_policy_version,
             "reduction_policy": reduction_policy,
             "reduction_policy_version": reduction_policy_version,
+            "provisional_fusion_policy_version": provisional_fusion_policy_version,
+            "boundary_refinement_policy_version": boundary_refinement_policy_version,
             "max_attempts": max_attempts,
             "output_admission_policy": output_admission_policy,
         }
@@ -413,6 +652,8 @@ class CanonicalOfflineExecutionPolicy(StrictModel):
             projector_policy_version=projector_policy_version,
             reduction_policy=reduction_policy,
             reduction_policy_version=reduction_policy_version,
+            provisional_fusion_policy_version=provisional_fusion_policy_version,
+            boundary_refinement_policy_version=boundary_refinement_policy_version,
             max_attempts=max_attempts,
             output_admission_policy=output_admission_policy,
             semantic_sha256=digest,
@@ -447,6 +688,7 @@ def _strict_context(context: AdmittedRecordingContextV2) -> AdmittedRecordingCon
 
 __all__ = [
     "CANONICAL_OFFLINE_PIPELINE_VERSION",
+    "CanonicalCandidateDenseWindow",
     "CanonicalOfflineConfigurationError",
     "CanonicalOfflineError",
     "CanonicalOfflineExecutionPolicy",
@@ -455,5 +697,6 @@ __all__ = [
     "CanonicalOfflineRunStatus",
     "CanonicalOfflineStage",
     "CanonicalRootWindow",
+    "canonical_candidate_dense_lineage",
     "canonical_lineage",
 ]

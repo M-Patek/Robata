@@ -32,6 +32,10 @@ INFERENCE_ATTEMPT_SELECTION_SCHEMA_ID = "https://schemas.robata.dev/inference-at
 RAW_PROVIDER_RESPONSE_SCHEMA_ID = "https://schemas.robata.dev/raw-provider-response-artifact"
 PARSED_PROVIDER_CLAIM_SCHEMA_ID = "https://schemas.robata.dev/parsed-provider-claim-artifact"
 SELECTED_ATTEMPT_OUTPUT_SCHEMA_ID = "https://schemas.robata.dev/selected-attempt-output"
+CANONICAL_COMPLETION_DETAIL_SCHEMA_ID = (
+    "https://schemas.robata.dev/canonical-primary-completion-detail"
+)
+PRIMARY_COMPLETION_RECORD_SCHEMA_ID = "https://schemas.robata.dev/primary-completion-record"
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> bytes:
@@ -179,6 +183,91 @@ def test_production_catalog_pins_exact_v2_enriched_output() -> None:
     } <= set(selected_attempt["required"])
 
 
+def test_production_catalog_pins_v3_primary_completion_record() -> None:
+    registry = SchemaRegistry()
+    registered = registry.resolve_version(PRIMARY_COMPLETION_RECORD_SCHEMA_ID, "3.0.0")
+
+    assert registered.ref == SchemaRef(
+        schema_id=PRIMARY_COMPLETION_RECORD_SCHEMA_ID,
+        version="3.0.0",
+        artifact_id="ad9ffb0b-f9b4-91bf-33a4-7b35d7b449d4",
+        sha256="6b79b0f44de8153d9152eacf68c40fa2c66a27fcc4c9400fdac6118f856afd1d",
+    )
+    assert registered.entry.wire_version == "3.0"
+    assert registered.entry.projection_version == "primary-completion-record-semantic-v3"
+    document = registry.get_schema(registered.ref)
+    assert "terminal_stage" in document["required"]
+    assert document["properties"]["schema_version"]["const"] == "3.0"
+
+
+def test_production_catalog_preserves_v1_v2_and_pins_v4_completion_detail() -> None:
+    registry = SchemaRegistry()
+
+    assert registry.resolve_version(
+        CANONICAL_COMPLETION_DETAIL_SCHEMA_ID, "1.0.0"
+    ).ref == SchemaRef(
+        schema_id=CANONICAL_COMPLETION_DETAIL_SCHEMA_ID,
+        version="1.0.0",
+        artifact_id="05e1333e-87b6-8ee1-c9a7-8fd0db514ea7",
+        sha256="5300c0b51445f181551a91f4b8816059c48cb098140fe016fc995a3ab5dbaf24",
+    )
+    registered = registry.resolve_version(CANONICAL_COMPLETION_DETAIL_SCHEMA_ID, "2.0.0")
+    assert registered.ref == SchemaRef(
+        schema_id=CANONICAL_COMPLETION_DETAIL_SCHEMA_ID,
+        version="2.0.0",
+        artifact_id="64dc8b4e-7c5d-66b8-aed6-ba0ba113c33a",
+        sha256="4500111fda6a2f222835f476397cf4877ae105553e7f7803bbc2f314528ac60f",
+    )
+    assert registered.entry.wire_version == "2.0"
+    assert registered.entry.projection_version == "canonical-primary-completion-detail-semantic-v2"
+    document = registry.get_schema(registered.ref)
+    assert document["properties"]["schema_version"] == {
+        "const": "2.0",
+        "title": "Schema Version",
+        "type": "string",
+    }
+    assert "qa_completion_result" in document["required"]
+
+    registered = registry.resolve_version(CANONICAL_COMPLETION_DETAIL_SCHEMA_ID, "3.0.0")
+    assert registered.ref == SchemaRef(
+        schema_id=CANONICAL_COMPLETION_DETAIL_SCHEMA_ID,
+        version="3.0.0",
+        artifact_id="904680d3-0614-fbc6-3824-2a0594c1d4e9",
+        sha256="7d99b74caf21525092e18d71e6a4a3acb463adf292de19310116e3e494e0d297",
+    )
+    assert registered.entry.wire_version == "3.0"
+    assert registered.entry.projection_version == (
+        "canonical-primary-completion-detail-semantic-v3"
+    )
+    document = registry.get_schema(registered.ref)
+    assert document["properties"]["schema_version"] == {
+        "const": "3.0",
+        "title": "Schema Version",
+        "type": "string",
+    }
+    assert "dense_qa_executions" in document["required"]
+
+    registered = registry.resolve_version(CANONICAL_COMPLETION_DETAIL_SCHEMA_ID, "4.0.0")
+    assert registered.ref == SchemaRef(
+        schema_id=CANONICAL_COMPLETION_DETAIL_SCHEMA_ID,
+        version="4.0.0",
+        artifact_id="7649aa56-986e-bea9-8d7e-c7115d271231",
+        sha256="c33e4f3675e5d64f3d66d8418fece36a58d4d5533c1047091e76641cb66926db",
+    )
+    assert registered.entry.wire_version == "4.0"
+    assert registered.entry.projection_version == (
+        "canonical-primary-completion-detail-semantic-v4"
+    )
+    document = registry.get_schema(registered.ref)
+    assert document["properties"]["schema_version"] == {
+        "const": "4.0",
+        "title": "Schema Version",
+        "type": "string",
+    }
+    assert "event_proposal_result" in document["required"]
+    assert "final_fusion_context" in document["required"]
+
+
 def test_production_catalog_pins_exact_inference_evidence_contracts() -> None:
     registry = SchemaRegistry()
     expected = (
@@ -256,7 +345,7 @@ def test_production_catalog_pins_exact_inference_evidence_contracts() -> None:
 def test_every_catalog_entry_has_exact_digest_and_deterministic_id() -> None:
     registry = SchemaRegistry()
 
-    assert len(registry.entries) == 30
+    assert len(registry.entries) == 35
     assert registry.upcasters == ()
     for registered in registry.entries:
         digest = hashlib.sha256(registered.document_bytes).hexdigest()

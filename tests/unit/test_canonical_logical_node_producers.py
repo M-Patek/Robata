@@ -26,6 +26,7 @@ from robata.application.canonical_offline import (
     canonical_call_part_logical_node,
     canonical_event_hypothesis_logical_node,
     canonical_input_plan_logical_node,
+    canonical_lineage,
     canonical_output_decision_logical_node,
     canonical_output_decision_projection,
     canonical_package_set_logical_node,
@@ -48,7 +49,7 @@ from robata.inference.input_plan import (
     CALL_PART_LOGICAL_KEY_NAMESPACE,
     INPUT_PLAN_LOGICAL_KEY_NAMESPACE,
 )
-from robata.sampling.package_set import PackageSetBuilder
+from robata.sampling.package_set import PackageSetBuilder, sampling_plan_digest
 from tests.unit.test_event_identity_registry import (
     OUTPUT_ADMISSION_POLICY,
     _context,
@@ -79,12 +80,16 @@ def _uuid(value: int) -> str:
     return str(UUID(int=value))
 
 
-def _root_window(*, created_at: str = NOW) -> CanonicalRootWindow:
+def _root_window(
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+    created_at: str = NOW,
+) -> CanonicalRootWindow:
     context = _v2_context()
     return CanonicalRootWindow.from_context(
         context=context,
         requested_interval=NanosecondInterval(start_ns=0, end_ns=SECOND),
-        purpose=SamplingPurpose.ACTION_DENSE,
+        purpose=purpose,
         window_policy_version="root-window-v1",
         created_at=created_at,
     )
@@ -199,6 +204,29 @@ def test_root_window_semantic_change_changes_node_identity() -> None:
     )
 
     assert canonical_root_window_logical_node(changed) != canonical_root_window_logical_node(first)
+
+
+def test_root_window_supports_qa_coarse_with_distinct_semantic_identity() -> None:
+    context = _v2_context()
+    plan = _plan(max_per_camera=20, max_total=120)
+    action_dense = _root_window()
+    qa_coarse = _root_window(purpose=SamplingPurpose.QA_COARSE)
+    lineage = canonical_lineage(
+        context=context,
+        window=qa_coarse,
+        sampling_plan=plan,
+    )
+
+    assert qa_coarse.purpose is SamplingPurpose.QA_COARSE
+    assert qa_coarse.semantic_sha256 != action_dense.semantic_sha256
+    assert canonical_root_window_logical_node(qa_coarse) != (
+        canonical_root_window_logical_node(action_dense)
+    )
+    assert lineage.sampling_plan_sha256 == sampling_plan_digest(
+        plan,
+        purpose=SamplingPurpose.QA_COARSE,
+    )
+    assert lineage.sampling_plan_sha256 != sampling_plan_digest(plan)
 
 
 def test_package_set_node_excludes_all_locators_row_ids_and_clock() -> None:

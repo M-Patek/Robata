@@ -7,10 +7,12 @@ from robata.adapters.local_artifact_registry import (
     deterministic_local_artifact_id,
 )
 from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
+from robata.adapters.sqlite_barrier import SQLiteBarrierStorage, SQLiteBarrierStorageError
 from robata.adapters.sqlite_inference_evidence import (
     SQLiteInferenceEvidenceLedger,
     SQLiteInferenceEvidenceLedgerError,
 )
+from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 
 # Optional: PyAV-based adapters (requires av package)
 try:
@@ -67,8 +69,11 @@ __all__ = [
     "PyAvFrameMaterializer",
     "PyAvH264DecoderProbe",
     "PyAvH264Mp4Exporter",
+    "SQLiteBarrierStorage",
+    "SQLiteBarrierStorageError",
     "SQLiteInferenceEvidenceLedger",
     "SQLiteInferenceEvidenceLedgerError",
+    "SQLitePrimaryCompletionRepository",
     "allocate_local_artifact_id",
     "deterministic_local_artifact_id",
 ]

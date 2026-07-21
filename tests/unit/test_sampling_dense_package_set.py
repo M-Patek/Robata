@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from robata.contracts.common import NanosecondInterval
+from robata.contracts.pipeline import SamplingPurpose
 from robata.contracts.sampling_plan import (
     FrameBudget,
     OverflowPolicy,
@@ -18,6 +19,7 @@ from robata.sampling.dense import (
     DenseSamplingPlanner,
     DenseSplitPolicy,
     frame_counts_for_interval,
+    sampling_plan_projection,
 )
 from robata.sampling.package_set import (
     MaterializedPackageRef,
@@ -32,6 +34,7 @@ SECOND = 1_000_000_000
 
 def _plan(
     *,
+    qa_fps: float = 1.0,
     dense_fps: float = 5.0,
     max_per_camera: int = 4,
     max_total: int = 24,
@@ -41,7 +44,7 @@ def _plan(
     return SamplingPlan(
         sampling_plan_id="sampling-plan-1",
         version="sampling-v1",
-        qa_sampling_rate_fps=1.0,
+        qa_sampling_rate_fps=qa_fps,
         event_sampling_rate_fps=2.0,
         dense_sampling_rate_fps=dense_fps,
         per_camera=per_camera,
@@ -65,7 +68,12 @@ def _policy(*, overlap_ns: int = 100_000_000, plan: SamplingPlan | None = None) 
     )
 
 
-def _window(start_ns: int = 0, end_ns: int = 2 * SECOND) -> SimpleNamespace:
+def _window(
+    start_ns: int = 0,
+    end_ns: int = 2 * SECOND,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> SimpleNamespace:
     interval = NanosecondInterval(start_ns=start_ns, end_ns=end_ns)
     return SimpleNamespace(
         window_id="window-1",
@@ -73,6 +81,7 @@ def _window(start_ns: int = 0, end_ns: int = 2 * SECOND) -> SimpleNamespace:
         camera_mapping_run_id="mapping-1",
         requested_interval=interval,
         interval=interval,
+        purpose=purpose,
     )
 
 
@@ -80,13 +89,17 @@ def _digest(label: str) -> str:
     return sha256(label.encode("ascii")).hexdigest()
 
 
-def _lineage(plan: SamplingPlan) -> PackageLineage:
+def _lineage(
+    plan: SamplingPlan,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> PackageLineage:
     return PackageLineage(
         source_content_sha256=_digest("source"),
         window_semantic_sha256=_digest("window"),
         camera_mapping_semantic_sha256=_digest("mapping"),
         alignment_semantic_sha256=_digest("alignment"),
-        sampling_plan_sha256=sampling_plan_digest(plan),
+        sampling_plan_sha256=sampling_plan_digest(plan, purpose=purpose),
     )
 
 
@@ -116,7 +129,10 @@ def _build_package_set(
         window,
         plan,
         alignment_id,
-        lineage=_lineage(plan),
+        lineage=_lineage(
+            plan,
+            purpose=getattr(window, "purpose", SamplingPurpose.ACTION_DENSE),
+        ),
         materialized_members=members,
         created_at="2026-07-19T00:00:00Z",
     )
@@ -172,6 +188,91 @@ def test_dense_rate_is_taken_from_sampling_plan_not_a_five_fps_placeholder() -> 
 
     assert len(windows) == 2
     assert [window.interval.duration_ns for window in windows] == [2 * SECOND, SECOND]
+
+
+def test_coarse_qa_planning_uses_uniform_qa_rate_not_dense_rate_or_overrides() -> None:
+    plan = _plan(
+        qa_fps=1.0,
+        dense_fps=5.0,
+        max_per_camera=1,
+        max_total=6,
+        per_camera=(PerCameraOverride(camera_id="cam_01", dense_sampling_rate_fps=9.0),),
+    )
+    interval = NanosecondInterval(start_ns=0, end_ns=SECOND)
+
+    projection = sampling_plan_projection(plan, purpose=SamplingPurpose.QA_COARSE)
+    assert projection["purpose"] == "QA_COARSE"
+    assert projection["strategy"] == "UNIFORM"
+    assert projection["qa_rate"] == {"numerator": 1, "denominator": 1}
+    assert set(
+        (rate["numerator"], rate["denominator"]) for rate in projection["per_camera"].values()
+    ) == {(1, 1)}
+    assert (
+        frame_counts_for_interval(
+            interval,
+            plan,
+            purpose=SamplingPurpose.QA_COARSE,
+        )
+        == (1,) * 6
+    )
+
+    parts = PackageSetBuilder("reduce-v1").plan_parts(
+        _window(0, SECOND, purpose=SamplingPurpose.QA_COARSE),
+        plan,
+    )
+    assert len(parts) == 1
+    assert sampling_plan_digest(plan, purpose=SamplingPurpose.QA_COARSE) != (
+        sampling_plan_digest(plan)
+    )
+
+
+def test_qa_dense_planning_uses_uniform_dense_rate_and_distinct_projection() -> None:
+    plan = _plan(
+        dense_fps=5.0,
+        max_per_camera=5,
+        max_total=30,
+        per_camera=(PerCameraOverride(camera_id="cam_01", dense_sampling_rate_fps=9.0),),
+    )
+    interval = NanosecondInterval(start_ns=0, end_ns=SECOND)
+
+    projection = sampling_plan_projection(plan, purpose=SamplingPurpose.QA_DENSE)
+    action_projection = sampling_plan_projection(plan)
+
+    assert projection["purpose"] == "QA_DENSE"
+    assert projection["strategy"] == "DENSE"
+    assert projection["dense_rate"] == {"numerator": 5, "denominator": 1}
+    assert set(
+        (rate["numerator"], rate["denominator"]) for rate in projection["per_camera"].values()
+    ) == {(5, 1)}
+    assert (
+        frame_counts_for_interval(
+            interval,
+            plan,
+            purpose=SamplingPurpose.QA_DENSE,
+        )
+        == (5,) * 6
+    )
+
+    assert "purpose" not in action_projection
+    assert "strategy" not in action_projection
+    assert action_projection["per_camera"]["cam_01"] == {
+        "numerator": 9,
+        "denominator": 1,
+    }
+    assert sampling_plan_digest(plan, purpose=SamplingPurpose.QA_DENSE) != (
+        sampling_plan_digest(plan)
+    )
+
+    parts = PackageSetBuilder("reduce-v1").plan_parts(
+        _window(0, SECOND, purpose=SamplingPurpose.QA_DENSE),
+        plan,
+    )
+    assert len(parts) == 1
+
+
+def test_provider_neutral_plan_rejects_other_sampling_purposes() -> None:
+    with pytest.raises(ValueError, match="only QA_COARSE, QA_DENSE, and ACTION_DENSE"):
+        sampling_plan_projection(_plan(), purpose=SamplingPurpose.EVENT_PROPOSAL)
 
 
 def test_dense_input_order_does_not_change_semantic_ids() -> None:

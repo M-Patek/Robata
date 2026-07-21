@@ -50,6 +50,8 @@ class ChannelInspection:
     monotonic: bool
     codec: str | None
     frame_id: str | None
+    schema_encoding: str | None = None
+    schema_content_sha256: Sha256Digest | None = None
 
     @property
     def schema(self) -> str | None:

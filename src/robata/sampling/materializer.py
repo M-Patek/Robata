@@ -32,6 +32,7 @@ from robata.contracts.common import (
 )
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.contracts.logical_nodes import Rfc3339Timestamp
+from robata.contracts.pipeline import SamplingPurpose, SamplingStrategy
 from robata.contracts.sampling_plan import SamplingPlan
 from robata.contracts.temporal import CameraSamplingSummary, FrameSelectionManifest, PackageLineage
 from robata.sampling.dense import IntervalPart, sampling_plan_projection
@@ -528,6 +529,7 @@ class OfflineTemporalPackageMaterializer:
         *,
         part: IntervalPart,
         sampling_plan: SamplingPlan,
+        purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
         alignment_run: AlignmentEvidence,
         frame_index: CanonicalSixCameraFrameIndex,
         lineage: PackageLineage,
@@ -556,12 +558,14 @@ class OfflineTemporalPackageMaterializer:
         part_manifest = _part_manifest(part)
         _validate_bindings(
             sampling_plan=sampling_plan,
+            purpose=purpose,
             alignment_run=alignment_run,
             frame_index=frame_index,
             lineage=lineage,
         )
-        plan_projection = sampling_plan_projection(sampling_plan)
+        plan_projection = sampling_plan_projection(sampling_plan, purpose=purpose)
         per_camera = cast(dict[str, dict[str, int]], plan_projection["per_camera"])
+        strategy = _materialization_strategy(purpose)
 
         cameras: dict[CameraId, MaterializedTemporalPackageCamera] = {}
         for camera_id in CAMERA_IDS:
@@ -573,6 +577,7 @@ class OfflineTemporalPackageMaterializer:
                 alignment_semantic_sha256=lineage.alignment_semantic_sha256,
                 interval=part_manifest.effective_interval,
                 rate=SamplingRate(rate["numerator"], rate["denominator"]),
+                strategy=strategy,
                 artifact_resolver=artifact_resolver,
             )
 
@@ -650,6 +655,7 @@ class OfflineTemporalPackageMaterializer:
         *,
         part: IntervalPart,
         sampling_plan: SamplingPlan,
+        purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
         admitted_context: AdmittedRecordingContextV2,
         frame_index: CanonicalSixCameraFrameIndex,
         lineage: PackageLineage,
@@ -679,6 +685,7 @@ class OfflineTemporalPackageMaterializer:
         return self.materialize(
             part=part,
             sampling_plan=sampling_plan,
+            purpose=purpose,
             alignment_run=context.alignment_manifest,
             frame_index=frame_index,
             lineage=lineage,
@@ -696,6 +703,7 @@ class OfflineTemporalPackageMaterializer:
         alignment_semantic_sha256: str,
         interval: NanosecondInterval,
         rate: SamplingRate,
+        strategy: SamplingStrategy,
         artifact_resolver: FrameArtifactResolver
         | Callable[[CameraId, IndexedSourceFrame], MaterializedFrameArtifactFact | None],
     ) -> MaterializedTemporalPackageCamera:
@@ -843,7 +851,7 @@ class OfflineTemporalPackageMaterializer:
             targets=tuple(target_results),
             frames=tuple(selected_frames),
             sampling=CameraSamplingSummary(
-                strategy="DENSE",
+                strategy=strategy.value,
                 target_fps=float(Fraction(rate.numerator, rate.denominator)),
                 actual_fps=actual_fps,
                 target_count=len(target_results),
@@ -852,6 +860,21 @@ class OfflineTemporalPackageMaterializer:
             ),
             missing_reason=missing_reason,
         )
+
+
+def _materialization_strategy(purpose: SamplingPurpose) -> SamplingStrategy:
+    if purpose is SamplingPurpose.QA_COARSE:
+        return SamplingStrategy.UNIFORM
+    if purpose in {
+        SamplingPurpose.QA_DENSE,
+        SamplingPurpose.ACTION_DENSE,
+        SamplingPurpose.BOUNDARY_REFINEMENT,
+    }:
+        return SamplingStrategy.DENSE
+    raise ValueError(
+        "provider-neutral materialization currently supports only QA_COARSE, "
+        "QA_DENSE, ACTION_DENSE, and BOUNDARY_REFINEMENT"
+    )
 
 
 def _fail(code: PackageMaterializationErrorCode, message: str) -> Never:
@@ -875,6 +898,7 @@ def _part_manifest(part: IntervalPart) -> MaterializedIntervalPart:
 def _validate_bindings(
     *,
     sampling_plan: SamplingPlan,
+    purpose: SamplingPurpose,
     alignment_run: AlignmentEvidence,
     frame_index: CanonicalSixCameraFrameIndex,
     lineage: PackageLineage,
@@ -910,7 +934,7 @@ def _validate_bindings(
                 PackageMaterializationErrorCode.ALIGNMENT_MISMATCH,
                 "V2 alignment semantic digest differs",
             )
-    if sampling_plan_digest(sampling_plan) != lineage.sampling_plan_sha256:
+    if sampling_plan_digest(sampling_plan, purpose=purpose) != lineage.sampling_plan_sha256:
         _fail(PackageMaterializationErrorCode.INVALID_INPUT, "sampling plan digest differs")
 
 

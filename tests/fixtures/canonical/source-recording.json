@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0",
+  "source_clock_id": "fixture-shared-clock",
+  "recording_start_utc": "2026-07-19T12:00:00Z",
+  "cameras": {
+    "cam_01": {
+      "camera_id": "cam_01",
+      "role": "view-01",
+      "topic": "/fixture/cam_01/image",
+      "channel_id": 1,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000000000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500000000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000000000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    },
+    "cam_02": {
+      "camera_id": "cam_02",
+      "role": "view-02",
+      "topic": "/fixture/cam_02/image",
+      "channel_id": 2,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000001000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500001000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000001000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    },
+    "cam_03": {
+      "camera_id": "cam_03",
+      "role": "view-03",
+      "topic": "/fixture/cam_03/image",
+      "channel_id": 3,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000002000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500002000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000002000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    },
+    "cam_04": {
+      "camera_id": "cam_04",
+      "role": "view-04",
+      "topic": "/fixture/cam_04/image",
+      "channel_id": 4,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000003000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500003000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000003000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    },
+    "cam_05": {
+      "camera_id": "cam_05",
+      "role": "view-05",
+      "topic": "/fixture/cam_05/image",
+      "channel_id": 5,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000004000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500004000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000004000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    },
+    "cam_06": {
+      "camera_id": "cam_06",
+      "role": "view-06",
+      "topic": "/fixture/cam_06/image",
+      "channel_id": 6,
+      "width": 1,
+      "height": 1,
+      "frames": [
+        {"source_timestamp_ns": "10000005000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "10500005000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+        {"source_timestamp_ns": "11000005000", "payload_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+      ]
+    }
+  }
+}

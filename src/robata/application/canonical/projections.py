@@ -35,6 +35,9 @@ CANONICAL_OUTPUT_DECISION_SEMANTIC_PROJECTION_VERSION: Final = (
 CANONICAL_OUTPUT_DECISION_LOGICAL_KEY_NAMESPACE: Final = "output-admission-decision-v2"
 CANONICAL_OUTPUT_DECISION_UUID_NAMESPACE: Final = "canonical-output-admission-v2"
 CANONICAL_OUTPUT_DECISION_IDENTITY_POLICY_VERSION: Final = "canonical-output-decision-node-v2"
+CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION: Final = (
+    "canonical-offline-execution-policy-semantic-v3"
+)
 
 
 def canonical_fusion_reduction_projection(
@@ -139,6 +142,7 @@ def canonical_execution_policy_projection_values(values: Mapping[str, object]) -
     if not isinstance(output_policy, ProductionOutputAdmissionPolicyRef):
         raise TypeError("output_admission_policy must be a ProductionOutputAdmissionPolicyRef")
     return {
+        "semantic_projection_version": CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION,
         "policy_version": values["policy_version"],
         "window_policy_version": values["window_policy_version"],
         "token_policy_version": values["token_policy_version"],
@@ -147,6 +151,8 @@ def canonical_execution_policy_projection_values(values: Mapping[str, object]) -
         "projector_policy_version": values["projector_policy_version"],
         "reduction_policy": values["reduction_policy"],
         "reduction_policy_version": values["reduction_policy_version"],
+        "provisional_fusion_policy_version": values["provisional_fusion_policy_version"],
+        "boundary_refinement_policy_version": values["boundary_refinement_policy_version"],
         "max_attempts": values["max_attempts"],
         "output_admission_policy": output_policy.model_dump(mode="json"),
     }
@@ -165,6 +171,8 @@ def canonical_execution_policy_projection(
             "projector_policy_version": policy.projector_policy_version,
             "reduction_policy": policy.reduction_policy,
             "reduction_policy_version": policy.reduction_policy_version,
+            "provisional_fusion_policy_version": policy.provisional_fusion_policy_version,
+            "boundary_refinement_policy_version": (policy.boundary_refinement_policy_version),
             "max_attempts": policy.max_attempts,
             "output_admission_policy": policy.output_admission_policy,
         }
@@ -280,6 +288,7 @@ def _stable_uuid(namespace: str, *parts: object) -> str:
 
 
 __all__ = [
+    "CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION",
     "CANONICAL_OUTPUT_DECISION_IDENTITY_POLICY_VERSION",
     "CANONICAL_OUTPUT_DECISION_LOGICAL_KEY_NAMESPACE",
     "CANONICAL_OUTPUT_DECISION_SEMANTIC_PROJECTION_VERSION",

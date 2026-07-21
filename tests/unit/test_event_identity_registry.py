@@ -38,6 +38,7 @@ from robata.event_pipeline.identity_registry import (
     ProductionAdmittedHypothesisFact,
     ProductionOutputAdmissionPolicyRef,
     ProductionQualificationUnavailableError,
+    StaleEventRegistryFenceError,
     admission_proof_projection,
     event_hypothesis_semantic_projection,
     output_admission_projection,
@@ -283,6 +284,116 @@ def _service(repository, allocator) -> EventIdentityRegistryService:
         output_admission_policy=OUTPUT_ADMISSION_POLICY,
         max_cas_retries=4,
     )
+
+
+def _single_event_inputs():
+    context = _context("prepared-recording")
+    output = _enriched_output(context)
+    fact = _hypothesis_fact(
+        start_ns=10,
+        end_ns=20,
+        fingerprint="prepared-event",
+        ordinal=0,
+    )
+    hypothesis = _hypothesis(
+        context,
+        output,
+        start_ns=fact.effective_interval.start_ns,
+        end_ns=fact.effective_interval.end_ns,
+        fingerprint="prepared-event",
+        ordinal=fact.fusion_output_ordinal,
+        output_proof=_output_proof(context, output, fact),
+    )
+    return context, output, hypothesis
+
+
+def test_prepare_batch_builds_mutation_without_publishing() -> None:
+    context, output, hypothesis = _single_event_inputs()
+    repository = InMemoryEventIdentityRegistryRepository()
+    initial = repository.snapshot(context.recording_identity)
+    preparer = _service(None, _SequenceAllocator())
+
+    prepared = preparer.prepare_batch(
+        snapshot=initial,
+        admitted_context=context,
+        hypotheses=(hypothesis,),
+        enriched_outputs=(output,),
+        decided_at=NOW,
+    )
+
+    mutation = prepared.mutation
+    assert mutation is not None
+    assert prepared.expected_generation == 0
+    assert prepared.expected_fence == 1
+    assert prepared.ordered_hypothesis_logical_keys == (hypothesis.event_hypothesis_logical_key,)
+    assert mutation.expected_generation == 0
+    assert mutation.next_generation == 1
+    assert len(mutation.identities) == len(mutation.assignments) == len(mutation.outbox) == 1
+    assert mutation.identities[0].event_id == mutation.assignments[0].event_id
+    assert repository.snapshot(context.recording_identity) == initial
+    assert repository.list_outbox(context.recording_identity) == ()
+
+    with pytest.raises(EventIdentityInputError, match="requires a repository"):
+        preparer.assign_batch(
+            admitted_context=context,
+            hypotheses=(hypothesis,),
+            enriched_outputs=(output,),
+            decided_at=NOW,
+        )
+
+
+def test_prepare_batch_replay_has_no_mutation_or_duplicate_outbox() -> None:
+    context, output, hypothesis = _single_event_inputs()
+    repository = InMemoryEventIdentityRegistryRepository()
+    preparer = _service(None, _SequenceAllocator())
+    first = preparer.prepare_batch(
+        snapshot=repository.snapshot(context.recording_identity),
+        admitted_context=context,
+        hypotheses=(hypothesis,),
+        enriched_outputs=(output,),
+        decided_at=NOW,
+    )
+    mutation = first.mutation
+    assert mutation is not None
+    committed = repository.commit(mutation)
+
+    replay = preparer.prepare_batch(
+        snapshot=committed,
+        admitted_context=context,
+        hypotheses=(hypothesis,),
+        enriched_outputs=(output,),
+        decided_at="2026-07-20T00:00:00Z",
+    )
+
+    assert replay.expected_generation == 1
+    assert replay.expected_fence == 2
+    assert replay.assignments == first.assignments
+    assert replay.replayed_assignment_logical_keys == (first.assignments[0].assignment_logical_key,)
+    assert replay.mutation is None
+    assert repository.snapshot(context.recording_identity) == committed
+    assert len(repository.list_outbox(context.recording_identity)) == 1
+
+
+def test_prepared_mutation_is_rejected_after_fence_advances() -> None:
+    context, output, hypothesis = _single_event_inputs()
+    repository = InMemoryEventIdentityRegistryRepository()
+    prepared = _service(None, _SequenceAllocator()).prepare_batch(
+        snapshot=repository.snapshot(context.recording_identity),
+        admitted_context=context,
+        hypotheses=(hypothesis,),
+        enriched_outputs=(output,),
+        decided_at=NOW,
+    )
+    mutation = prepared.mutation
+    assert mutation is not None
+    committed = repository.commit(mutation)
+    committed_outbox = repository.list_outbox(context.recording_identity)
+
+    with pytest.raises(StaleEventRegistryFenceError):
+        repository.commit(mutation)
+
+    assert repository.snapshot(context.recording_identity) == committed
+    assert repository.list_outbox(context.recording_identity) == committed_outbox
 
 
 def test_nonproduction_evidence_class_is_hash_bearing() -> None:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Final
 
+from robata.application.canonical.boundary_windows import CanonicalBoundaryRefinementWindow
 from robata.application.canonical.models import (
+    CanonicalCandidateDenseWindow,
     CanonicalOfflineConfigurationError,
     CanonicalRootWindow,
 )
@@ -17,9 +19,29 @@ from robata.application.canonical.reduction import CanonicalFusionReduction
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import LogicalNode, logical_node_from_semantic_digest
 from robata.contracts.temporal import TemporalPackageSet
+from robata.event_pipeline.boundary_refinement import (
+    BOUNDARY_RESULT_LOGICAL_KEY_NAMESPACE,
+    BOUNDARY_ROLE_RESULT_LOGICAL_KEY_NAMESPACE,
+    BoundaryRefinementResult,
+    BoundaryRefinementRoleResult,
+)
+from robata.event_pipeline.candidate import (
+    CANDIDATE_EVENT_LOGICAL_KEY_NAMESPACE,
+    CANDIDATE_REDUCTION_LOGICAL_KEY_NAMESPACE,
+    CandidateReductionResult,
+    CanonicalCandidateEvent,
+)
+from robata.event_pipeline.evidence import ActionEvidenceResult
 from robata.event_pipeline.identity_registry import (
     EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE,
     PlatformEnrichedEventHypothesis,
+)
+from robata.event_pipeline.proposer import EventProposalResult
+from robata.event_pipeline.provisional_fusion import (
+    PROVISIONAL_FUSION_RESULT_LOGICAL_KEY_NAMESPACE,
+    PROVISIONAL_PHYSICAL_ACTION_LOGICAL_KEY_NAMESPACE,
+    ProvisionalFusionResult,
+    ProvisionalPhysicalAction,
 )
 from robata.inference.call_barrier import InferenceCallReduction
 from robata.inference.enrichment import (
@@ -38,6 +60,9 @@ from robata.inference.models import (
     InferenceAttemptSelection,
     inference_attempt_selection_digest,
 )
+from robata.qa_pipeline.coarse import CoarseQAResult, coarse_qa_semantic_projection
+from robata.qa_pipeline.completion import QACompletionResult
+from robata.qa_pipeline.dense import DenseQAResult
 
 CANONICAL_INPUT_PLAN_IDENTITY_POLICY_VERSION: Final = "canonical-input-plan-node-v2"
 CANONICAL_CALL_PART_IDENTITY_POLICY_VERSION: Final = "canonical-input-call-part-node-v2"
@@ -76,6 +101,36 @@ def canonical_root_window_logical_node(window: CanonicalRootWindow) -> LogicalNo
         semantic_digest=checked.semantic_sha256,
         logical_key=checked.window_logical_key,
         identity_policy_version="canonical-root-window-node-v1",
+    )
+
+
+def canonical_candidate_dense_window_logical_node(
+    window: CanonicalCandidateDenseWindow,
+) -> LogicalNode:
+    checked = CanonicalCandidateDenseWindow.model_validate(
+        window.model_dump(mode="python"), strict=True
+    )
+    return _canonical_logical_node(
+        node_type="TEMPORAL_WINDOW",
+        key_namespace="temporal-window",
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.window_logical_key,
+        identity_policy_version="canonical-candidate-dense-window-node-v1",
+    )
+
+
+def canonical_boundary_window_logical_node(
+    window: CanonicalBoundaryRefinementWindow,
+) -> LogicalNode:
+    checked = CanonicalBoundaryRefinementWindow.model_validate(
+        window.model_dump(mode="python"), strict=True
+    )
+    return _canonical_logical_node(
+        node_type="TEMPORAL_WINDOW",
+        key_namespace="temporal-window",
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.window_logical_key,
+        identity_policy_version="canonical-boundary-refinement-window-node-v1",
     )
 
 
@@ -127,6 +182,149 @@ def canonical_package_set_logical_node(package_set: TemporalPackageSet) -> Logic
         semantic_digest=digest,
         logical_key=f"temporal-package-set:{digest}",
         identity_policy_version="canonical-package-set-node-v1",
+    )
+
+
+def canonical_coarse_qa_logical_node(result: CoarseQAResult) -> LogicalNode:
+    """Bind one internal coarse-QA control result to its exact enriched facts."""
+
+    checked = CoarseQAResult.model_validate(result.model_dump(mode="python"), strict=True)
+    digest = semantic_sha256(coarse_qa_semantic_projection(checked))
+    return _canonical_logical_node(
+        node_type="COARSE_QA_RESULT",
+        key_namespace="coarse-qa-result",
+        semantic_digest=digest,
+        logical_key=f"coarse-qa-result:{digest}",
+        identity_policy_version="canonical-coarse-qa-result-node-v1",
+    )
+
+
+def canonical_qa_completion_logical_node(result: QACompletionResult) -> LogicalNode:
+    """Bind the deterministic final QA gate and its dense-work outcome."""
+
+    checked = QACompletionResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="QA_COMPLETION_RESULT",
+        key_namespace="qa-completion-result",
+        semantic_digest=checked.semantic_sha256,
+        logical_key=f"qa-completion-result:{checked.semantic_sha256}",
+        identity_policy_version="canonical-qa-completion-result-node-v1",
+    )
+
+
+def canonical_dense_qa_result_logical_node(result: DenseQAResult) -> LogicalNode:
+    """Bind one complete projection of an explicit dense work manifest."""
+
+    checked = DenseQAResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="DENSE_QA_RESULT",
+        key_namespace="dense-qa-result",
+        semantic_digest=checked.semantic_digest,
+        logical_key=f"dense-qa-result:{checked.semantic_digest}",
+        identity_policy_version="canonical-dense-qa-result-node-v1",
+    )
+
+
+def canonical_action_evidence_result_logical_node(
+    result: ActionEvidenceResult,
+) -> LogicalNode:
+    checked = ActionEvidenceResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="ACTION_EVIDENCE_RESULT",
+        key_namespace="action-evidence",
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-action-evidence-result-node-v1",
+    )
+
+
+def canonical_provisional_fusion_result_logical_node(
+    result: ProvisionalFusionResult,
+) -> LogicalNode:
+    checked = ProvisionalFusionResult.model_validate(result, strict=True)
+    return _canonical_logical_node(
+        node_type="PROVISIONAL_ACTION_FUSION_RESULT",
+        key_namespace=PROVISIONAL_FUSION_RESULT_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-provisional-action-fusion-result-node-v1",
+    )
+
+
+def canonical_provisional_physical_action_logical_node(
+    action: ProvisionalPhysicalAction,
+) -> LogicalNode:
+    checked = ProvisionalPhysicalAction.model_validate(action, strict=True)
+    return _canonical_logical_node(
+        node_type="PROVISIONAL_PHYSICAL_ACTION",
+        key_namespace=PROVISIONAL_PHYSICAL_ACTION_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-provisional-physical-action-node-v1",
+    )
+
+
+def canonical_boundary_role_result_logical_node(
+    result: BoundaryRefinementRoleResult,
+) -> LogicalNode:
+    checked = BoundaryRefinementRoleResult.model_validate(
+        result.model_dump(mode="python"), strict=True
+    )
+    return _canonical_logical_node(
+        node_type="BOUNDARY_REFINEMENT_ROLE_RESULT",
+        key_namespace=BOUNDARY_ROLE_RESULT_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-boundary-refinement-role-result-node-v1",
+    )
+
+
+def canonical_boundary_refinement_result_logical_node(
+    result: BoundaryRefinementResult,
+) -> LogicalNode:
+    checked = BoundaryRefinementResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="BOUNDARY_REFINEMENT_RESULT",
+        key_namespace=BOUNDARY_RESULT_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-boundary-refinement-result-node-v1",
+    )
+
+
+def canonical_event_proposal_result_logical_node(result: EventProposalResult) -> LogicalNode:
+    checked = EventProposalResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="EVENT_PROPOSAL_RESULT",
+        key_namespace="event-proposal-result",
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-event-proposal-result-node-v1",
+    )
+
+
+def canonical_candidate_reduction_logical_node(result: CandidateReductionResult) -> LogicalNode:
+    checked = CandidateReductionResult.model_validate(result.model_dump(mode="python"), strict=True)
+    return _canonical_logical_node(
+        node_type="CANDIDATE_REDUCTION",
+        key_namespace=CANDIDATE_REDUCTION_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=checked.semantic_sha256,
+        logical_key=checked.logical_key,
+        identity_policy_version="canonical-candidate-reduction-node-v2",
+    )
+
+
+def canonical_candidate_event_logical_node(candidate: CanonicalCandidateEvent) -> LogicalNode:
+    checked = CanonicalCandidateEvent.model_validate(
+        candidate.model_dump(mode="python"), strict=True
+    )
+    digest = checked.candidate_logical_key.rsplit(":", 1)[-1]
+    return _canonical_logical_node(
+        node_type="CANDIDATE_EVENT",
+        key_namespace=CANDIDATE_EVENT_LOGICAL_KEY_NAMESPACE,
+        semantic_digest=digest,
+        logical_key=checked.candidate_logical_key,
+        identity_policy_version="canonical-candidate-event-node-v2",
     )
 
 
@@ -307,17 +505,30 @@ __all__ = [
     "CANONICAL_CALL_PART_IDENTITY_POLICY_VERSION",
     "CANONICAL_EVENT_HYPOTHESIS_IDENTITY_POLICY_VERSION",
     "CANONICAL_INPUT_PLAN_IDENTITY_POLICY_VERSION",
+    "canonical_action_evidence_result_logical_node",
+    "canonical_boundary_refinement_result_logical_node",
+    "canonical_boundary_role_result_logical_node",
+    "canonical_boundary_window_logical_node",
     "canonical_call_barrier_logical_node",
     "canonical_call_part_logical_node",
     "canonical_call_reduction_logical_node",
+    "canonical_candidate_dense_window_logical_node",
+    "canonical_candidate_event_logical_node",
+    "canonical_candidate_reduction_logical_node",
+    "canonical_coarse_qa_logical_node",
+    "canonical_dense_qa_result_logical_node",
     "canonical_enrichment_logical_node",
     "canonical_event_hypothesis_logical_node",
+    "canonical_event_proposal_result_logical_node",
     "canonical_fusion_reduction_logical_node",
     "canonical_input_plan_logical_node",
     "canonical_output_decision_logical_node",
     "canonical_package_set_logical_node",
     "canonical_package_set_semantic_projection",
     "canonical_parsed_claim_logical_node",
+    "canonical_provisional_fusion_result_logical_node",
+    "canonical_provisional_physical_action_logical_node",
+    "canonical_qa_completion_logical_node",
     "canonical_root_window_logical_node",
     "canonical_selected_output_logical_node",
     "canonical_selection_logical_node",

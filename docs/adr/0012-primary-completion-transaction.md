@@ -1,6 +1,6 @@
 # ADR 0012: Authoritative Primary Completion Transaction
 
-- Status: Accepted; compact completion contract implemented locally; authoritative transaction not implemented
+- Status: Accepted; local-conformance aggregate and operator composition implemented; production authority not implemented
 - Date: 2026-07-20
 - Governing authority: Architecture V1.1 Sections 3, 17.6, 20.4,
   25.5, 25.7, and 25.9; ADRs 0003, 0004, and 0005
@@ -9,18 +9,20 @@
 
 An earlier local canonical slice committed related facts through independent
 state owners and could publish identity/outbox rows before durable run
-completion. The `canonical-offline-v2` composition removes that standalone
+completion. The `canonical-offline-v2` composition removed that standalone
 identity dependency and stops after a local output decision and immutable event
 hypotheses. Its result requires `identity_result=None`, and it does not mutate
 the separately tested identity/outbox repository.
 
-This removes the known partial-publication path from the current local
+That removed the known partial-publication path from the then-current local
 composition, but it does not implement authoritative production completion.
 Inference evidence and logical-node memberships may be durable while call
-barriers, output decisions, processing-run completion, and the returned run
-result remain in process. Production identity, revision, and outbox publication
-still need one explicit authority rather than a new sequence of independent
-commits.
+barriers and intermediate output decisions remain in process. Production
+identity, revision, and outbox publication still need one explicit authority
+rather than a new sequence of independent commits. A local command builder,
+aggregate SQLite repository, and fixture/raw-MCAP operator composition now
+exercise that authority shape. The production composition and infrastructure
+authority remain deliberately undecided.
 
 Primary completion needs one metadata transaction. This does not require large
 artifacts to share a database, a distributed transaction with object storage, or
@@ -92,6 +94,12 @@ object after a crash or stale fence. Such an object is not published state and
 may be garbage-collected after a safety interval. The system does not attempt
 an object-store/database two-phase commit.
 
+The local conformance adapter deliberately embeds the exact detailed-result
+JSON bytes in the same SQLite database as the metadata transaction. This proves
+the binding and recovery semantics without selecting an object store. It is not
+the production artifact boundary, an O-14 storage decision, or evidence for
+cross-store recovery.
+
 ### Identity is prepared, then applied once
 
 Identity resolution is split into preparation and application. Preparation
@@ -135,13 +143,12 @@ selection writes, result-artifact reference, and successor outbox commands.
 the committed identity result, outbox references, and whether the operation was
 an exact replay.
 
-The compact completion record now defaults to an immutable registered V2 schema
-and V2 semantic projection. The frozen V1 schema remains exact-readable but is not
-accepted by the default creator or validator and has no automatic upcast. The
-detailed result remains a referenced external JSON artifact and still requires
-its own immutable registered schema and exact-byte verification before governed
-persistence. Registering the compact record does not implement this port, the
-repository transaction, or durable completion.
+The compact completion record now defaults to immutable registered V3 wire and
+semantic-projection namespaces. Frozen V1/V2 schemas remain exact-readable but are not
+accepted by the default creator or validator and have no automatic upcast. Detailed
+completion V4 is independently registered and exact-pinned; production persistence still
+requires the external artifact boundary described above. Registering either record does
+not by itself implement this port, repository transaction, or durable completion.
 
 ### Semantic-policy migration
 
@@ -158,20 +165,28 @@ V2 therefore advances all three namespaces together:
 
 The V2 model strictly parses both timezone-bearing RFC3339 timestamps, rejects
 invalid calendar and offset values, and compares the represented instants across
-offsets. New code creates and validates V2 only. V1 remains available through
-explicit exact registry lookup for historical inspection; the live catalog has
-no V1-to-V2 upcaster. Any future change to a hash projection, logical key,
-idempotency key, fence meaning, or semantic acceptance rule must likewise
-advance its policy/projection namespace instead of silently reinterpreting
+offsets. V1 remains available through explicit exact registry lookup for historical
+inspection; the live catalog has no upcasters.
+
+Terminal authority later changed again: valid `NO_EVENTS` outcomes can occur at event
+proposal or provisional fusion before any final-fusion barrier or output decision exists.
+Compact V3 therefore adds `terminal_stage` and
+`terminal_evidence_semantic_sha256`, makes final-fusion evidence explicitly nullable only
+for pre-final outcomes, and advances catalog, wire, and semantic-projection namespaces to
+`3.0.0`, `3.0`, and `primary-completion-record-semantic-v3`. Detailed completion V4 retains
+the complete stage chain for those early outcomes and successful final fusion. Older exact
+bytes remain immutable and no implicit upcast is registered. Any future change to a hash
+projection, logical key, idempotency key, fence meaning, or semantic acceptance rule must
+likewise advance its policy/projection namespace instead of silently reinterpreting
 published evidence.
 
 ### Local conformance adapter
 
-The local implementation will be a new aggregate SQLite repository with one
-schema owner and one `BEGIN IMMEDIATE` transaction for the final write. It will
-implement the identity snapshot boundary needed by preparation and the primary
-completion port needed by application. The canonical composition will inject
-that same repository for both responsibilities.
+The local implementation is an aggregate SQLite repository with one schema
+owner and one `BEGIN IMMEDIATE` transaction for the final write. It implements
+the identity snapshot boundary needed by preparation and the primary-completion
+port needed by application. The canonical local composition injects that same
+repository for both responsibilities.
 
 It will not:
 
@@ -214,54 +229,108 @@ governed run performs the complete transaction under this decision.
 
 ## Current implementation boundary
 
-The transaction and repository in this ADR remain a target, not implementation
-evidence. The compact `PrimaryCompletionRecord` contract is implemented and
-validated against the exact registered `primary-completion-record` V2 schema.
-The V1 exact schema remains frozen and readable, but the default model rejects
-its wire/projection namespace and no upcaster is registered.
-It carries typed count/root proofs and an exact reference to a detailed-result
-artifact, but it does not write either object, verify the referenced detailed
-result bytes, or atomically commit any run, identity, revision, selection, or
-outbox fact. The current canonical output decision, processing-run record, and
-detailed run result also lack the registered durable contracts and persistence
-required here.
+The compact `PrimaryCompletionRecord` V1/V2/V3 contracts and the
+`canonical-primary-completion-detail` V1/V2/V3/V4 contracts are registered and exact
+pinned. Current detailed commands emit V4 with coarse/dense QA, proposal, candidate,
+action-evidence, provisional-fusion, boundary-refinement, final-fusion, and publication
+facts. Compact V3 binds the exact terminal stage and its semantic evidence, so early
+`NO_EVENTS` requires no fabricated final-fusion fields. Older records remain exact-readable,
+but the default models reject old wire/projection namespaces and no upcaster is registered.
+A schema-validated command builder now computes versioned ordered collection
+roots, exact detailed-result bytes, the deterministic artifact ID, and the
+compact completion record without performing writes.
 
-The canonical flow stops before publishing a concrete immutable `ActionEvent`
-revision and current selection. It also stops before identity assignment and
-outbox publication and does not inject the standalone identity service. That
-standalone SQLite adapter is component conformance evidence only and cannot
-satisfy the production primary-completion predicate.
+`SQLitePrimaryCompletionRepository` is the local-conformance aggregate. In one
+`BEGIN IMMEDIATE` transaction it compare-and-swaps the processing run,
+applies the prepared identity mutation, records deterministic genesis
+`ActionEvent` revision/selection/current facts, embeds the exact detailed
+result, writes the compact completion, and appends pending identity outbox
+rows. `get(run_id)` is the recovery read. Exact command replay creates no
+duplicate business result or outbox row; a stale identity fence rolls back the
+entire transaction. Focused tests also simulate a commit that succeeds before
+the caller loses the response, a failure after aggregate facts are staged,
+cross-run replay-only reuse, and multi-event outbox recovery order.
 
-The current run binding is `canonical-offline-v2`; old
-`canonical-offline-v1` records, including unfinished `RUNNING` records, fail
-closed instead of resuming across the changed completion semantics.
+The canonical runner itself still stops before identity assignment, revision
+publication, and outbox publication, preserving its stage boundary. The
+`local_composition.py` application service now drives either a source fixture or an
+explicitly authorized raw MCAP, runner, identity preparation, revision
+preparation, and aggregate commit as one invocation.
+`scripts/run_canonical_fixture.py` and `scripts/run_canonical_mcap.py` are the
+matching operator commands; the same source binding, state directory, and run
+key recover or exactly replay the committed result.
 
-Until the registered detailed-result contract, exact artifact verification,
-identity preparation API, aggregate repository, ActionEvent revision producer,
-selection policy, canonical composition, and fault-injection tests are connected,
-any transaction exercise is `LOCAL_CONFORMANCE` only. It must not be reported as
-implemented production completion, production eligibility, or an O-14 decision.
+`EventIdentityRegistryService.prepare_batch()` implements the explicit
+repository-side-effect-free preparation boundary. It consumes a supplied
+recording snapshot and returns canonical assignment bindings plus either a
+snapshot-bound mutation or an explicit replay-only preparation. The aggregate
+repository applies that preparation; the runner does not yet call the complete
+sequence.
+
+`prepare_initial_action_event_publications()` is the matching side-effect-free
+local producer. For CREATED/AMBIGUOUS assignments and their exact replay it
+derives deterministic stable-event subjects, internal citation-aware payloads,
+immutable genesis revisions, selection decisions, current projections, and
+identity current-revision references. Every payload is
+`evidence_class=LOCAL_CONFORMANCE` and `production_eligible=false`; six camera
+slots report only `CITED` or neutral `NOT_CITED`. A REUSED assignment fails
+closed until predecessor revision/selection facts are supplied for a governed
+successor policy. Generic revision `ELIGIBLE` means locally selectable only,
+not production-qualified. The producer performs no repository read or write.
+
+The current run binding is `canonical-offline-v5` with local composition v13; older
+processing-run and composition namespaces, including unfinished `RUNNING` records, fail
+closed instead of resuming across changed inference, final-fusion, or terminal-publication
+semantics.
+
+The aggregate supports only `SUCCEEDED` and explicit `NO_EVENTS` primary
+completion. ABSTAINED/failed terminalization, durable work and barrier ledgers,
+REUSED successor publication, a governed production ActionEvent contract,
+external artifact storage, outbox delivery, and O-14 recovery topology remain
+outside this local adapter. Every detailed result and ActionEvent payload is
+`LOCAL_CONFORMANCE` with `production_eligible=false`; the transaction must
+not be reported as production completion, production eligibility, or an O-14
+decision.
 
 ## Implemented contract evidence
 
-The following live files prove only the compact contract boundary:
+The following live files prove the local contract and aggregate boundary:
 
 - `src/robata/contracts/primary_completion.py` defines the strict compact model,
   detailed-result reference, and semantic projection;
 - `schemas/v1/primary-completion-record.schema.json` is the frozen historical
-  wire schema, and `schemas/v2/primary-completion-record.schema.json` is the
-  immutable default V2 wire schema;
-- `schemas/schema-catalog.json` exact-pins both versions and their distinct
-  projection namespaces;
-  and
+  wire schema; V2 remains immutable historical evidence, and
+  `schemas/v3/primary-completion-record.schema.json` is the immutable default V3 wire schema;
+- `schemas/schema-catalog.json` exact-pins every version and its distinct projection
+  namespace;
+- `schemas/v1` through `schemas/v4/canonical-primary-completion-detail.schema.json`
+  preserve the detailed-result evolution, with V4 as the current exact-pinned contract;
+- `src/robata/application/canonical/primary_completion.py` defines the command
+  builder, port, deterministic roots, and recovery models;
+- `src/robata/adapters/sqlite_primary_completion.py` implements the single
+  local SQLite transaction;
+- `src/robata/application/canonical/mcap_source.py` derives the real raw-MCAP,
+  exact-schema, decoder-probe, registered-media, frame-index, and local V2
+  admission facts;
+- `src/robata/application/canonical/local_composition.py`,
+  `scripts/run_canonical_fixture.py`, and `scripts/run_canonical_mcap.py`
+  provide the fixture/raw one-command execution and recovery paths; and
 - `tests/contract/test_primary_completion_contract.py` checks exact catalog
-  resolution, V1 readability without implicit migration, V2 round-trip and
-  timestamp ordering, projection invariants, closed outcomes, and tamper
-  rejection.
+  resolution, V1 readability without implicit migration, V3 round-trip and terminal-stage
+  semantics, timestamp ordering, projection invariants, closed outcomes, and tamper
+  rejection, while `tests/integration/test_sqlite_primary_completion.py`
+  checks normal commit/reopen/replay, strict command admission, compact/detail
+  agreement, lost-response recovery, staged-write rollback, stale-fence
+  rollback, replay-only reuse, and multi-event outbox order.
+  `tests/integration/test_canonical_local_command.py` verifies fixture first
+  execution, exact same-run replay, and cross-run reuse without provider
+  redispatch or duplicate outbox.
+  `tests/integration/test_canonical_mcap_source.py` verifies raw-MCAP source
+  derivation, first commit, exact replay, and corrupt-input rejection.
 
 The live catalog still declares `upcasters=[]`. This evidence is not a
-`PrimaryCompletionRepository`, aggregate SQLite adapter, transaction, durable
-run-result artifact implementation, or canonical completion path.
+production repository, external artifact store, outbox publisher, durable work
+system, or phase-promotion claim.
 
 ## Consequences
 
@@ -271,8 +340,9 @@ run-result artifact implementation, or canonical completion path.
   complete.
 - Crash recovery uses exact replay and bounded fence retry rather than a
   compensating workflow.
-- Large artifacts remain outside the metadata transaction without weakening
-  exact-byte or schema traceability.
-- Production completion remains blocked on explicit contracts and ActionEvent
-  revision/selection composition rather than being inferred from local identity
-  rows.
+- The production design keeps large artifacts outside the metadata
+  transaction; the local adapter embeds detailed-result bytes only to exercise
+  exact binding and recovery.
+- Production completion remains blocked on governed contracts, infrastructure,
+  delivery, and production qualification rather than being inferred from this
+  local transaction.

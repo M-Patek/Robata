@@ -5,7 +5,6 @@ from typing import cast
 
 import pytest
 
-from robata.contracts.mcap import MCAPRecording as ContractMCAPRecording
 from robata.contracts.pipeline import CandidateEvent, TemporalVisualPackage
 from robata.contracts.qa import QAClassifier
 from robata.event_pipeline.candidate import CandidateEventManager
@@ -17,8 +16,6 @@ from robata.event_pipeline.proposer import (
 from robata.event_pipeline.proposer import (
     MCAPRecording as ProposalMCAPRecording,
 )
-from robata.qa_pipeline.coarse import CoarseQAPipeline, SamplingPlan
-from robata.qa_pipeline.dense import DenseQAPipeline
 from robata.sampling.adaptive import AdaptiveSampler, AdaptiveSamplingPolicy, SignalDetector
 
 
@@ -44,8 +41,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
         ),
         (SignalDetector(),),
     )
-    coarse = CoarseQAPipeline(classifier, adaptive)
-    dense = DenseQAPipeline(classifier)
     evidence = ActionEvidenceExtractor()
 
     return (
@@ -72,20 +67,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
         (
             "AdaptiveSampler.sample",
             lambda: adaptive.sample(object(), {}),
-        ),
-        (
-            "CoarseQAPipeline.run_coarse",
-            lambda: coarse.run_coarse(
-                cast(ContractMCAPRecording, object()),
-                SamplingPlan(
-                    target_fps=1.0,
-                    policy_version="coarse-qa-v1",
-                ),
-            ),
-        ),
-        (
-            "DenseQAPipeline.run_dense",
-            lambda: dense.run_dense((), cast(ContractMCAPRecording, object())),
         ),
         (
             "extract_evidence",

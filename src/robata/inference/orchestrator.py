@@ -779,6 +779,7 @@ class InferenceOrchestrator:
         output_schema: JsonSchemaRef,
         capability_snapshot_digest: str,
         generation_config: Mapping[str, object],
+        logical_dependency_sha256: Sha256Digest | None = None,
     ) -> ModelInference | None:
         selection = self._ledger.get_selection(
             logical_invocation_id,
@@ -826,6 +827,7 @@ class InferenceOrchestrator:
             output_schema.sha256,
             capability_snapshot_digest,
             dict(generation_config),
+            logical_dependency_sha256,
         )
         actual_semantics = (
             terminal.logical_invocation_id,
@@ -847,6 +849,7 @@ class InferenceOrchestrator:
             terminal.output_schema_sha256,
             terminal.capability_snapshot_digest,
             terminal.generation_config,
+            terminal.input_config.get("logical_dependency_sha256"),
         )
         if (
             selection.inference_id != terminal.inference_id
@@ -1001,6 +1004,7 @@ class InferenceOrchestrator:
         output_schema: JsonSchemaRef,
         capability_snapshot: CapabilitySnapshot,
         generation_config: Mapping[str, object],
+        logical_dependency_sha256: Sha256Digest | None = None,
     ) -> Sha256Digest:
         projection: dict[str, object] = {
             "package_input_set_sha256": package_input_set_sha256,
@@ -1023,6 +1027,8 @@ class InferenceOrchestrator:
         }
         if input_plan_part_semantic_sha256 is not None:
             projection["input_plan_part_semantic_sha256"] = input_plan_part_semantic_sha256
+        if logical_dependency_sha256 is not None:
+            projection["logical_dependency_sha256"] = logical_dependency_sha256
         return semantic_sha256(projection)
 
     @staticmethod
@@ -1254,6 +1260,7 @@ class InferenceOrchestrator:
         input_plan: InferenceInputPlan | None = None,
         input_plan_part_ordinal: int | None = None,
         input_config: Mapping[str, object] | None = None,
+        logical_dependency_sha256: Sha256Digest | None = None,
         sampling_config: Mapping[str, object] | None = None,
         metadata: Mapping[str, str] | None = None,
         attempt: int = 1,
@@ -1304,6 +1311,20 @@ class InferenceOrchestrator:
         if rendered_input_digest is None:
             raise OrchestrationConfigurationError("rendered_input_digest is required")
         inputs_config = dict(input_config or {})
+        configured_dependency = inputs_config.get("logical_dependency_sha256")
+        if logical_dependency_sha256 is None:
+            if "logical_dependency_sha256" in inputs_config:
+                raise OrchestrationConfigurationError(
+                    "input_config.logical_dependency_sha256 requires an explicit logical dependency"
+                )
+        elif (
+            configured_dependency is not None and configured_dependency != logical_dependency_sha256
+        ):
+            raise OrchestrationConfigurationError(
+                "input_config.logical_dependency_sha256 conflicts with logical identity"
+            )
+        else:
+            inputs_config["logical_dependency_sha256"] = logical_dependency_sha256
         sampling = dict(sampling_config or {})
         request_metadata = dict(metadata or {})
         if input_plan is not None:
@@ -1375,6 +1396,7 @@ class InferenceOrchestrator:
                 output_schema=policy.output_schema,
                 capability_snapshot=capability_snapshot,
                 generation_config=policy.generation_config,
+                logical_dependency_sha256=logical_dependency_sha256,
             )
         except (CanonicalizationError, TypeError, ValueError) as exc:
             raise OrchestrationConfigurationError(
@@ -1409,6 +1431,7 @@ class InferenceOrchestrator:
                 output_schema=policy.output_schema,
                 capability_snapshot_digest=capability_snapshot.snapshot_digest,
                 generation_config=policy.generation_config,
+                logical_dependency_sha256=logical_dependency_sha256,
             )
             if selected_terminal is not None:
                 return selected_terminal

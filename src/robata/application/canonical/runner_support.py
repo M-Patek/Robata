@@ -7,8 +7,10 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from robata.admission.context import AdmittedRecordingContextV2
+from robata.application.canonical.boundary_windows import CanonicalBoundaryRefinementWindow
 from robata.application.canonical.models import (
     CANONICAL_OFFLINE_PIPELINE_VERSION,
+    CanonicalCandidateDenseWindow,
     CanonicalOfflineConfigurationError,
     CanonicalOfflineExecutionPolicy,
     CanonicalRootWindow,
@@ -33,7 +35,7 @@ from robata.sampling.materializer import MaterializedTemporalPackage
 def _validate_materialized_chain(
     *,
     context: AdmittedRecordingContextV2,
-    window: CanonicalRootWindow,
+    window: CanonicalRootWindow | CanonicalCandidateDenseWindow | CanonicalBoundaryRefinementWindow,
     lineage: PackageLineage,
     planned_parts: tuple[IntervalPart, ...],
     materialized: tuple[MaterializedTemporalPackage, ...],
@@ -92,7 +94,7 @@ def _validate_materialized_chain(
 def _validate_package_set_chain(
     *,
     context: AdmittedRecordingContextV2,
-    window: CanonicalRootWindow,
+    window: CanonicalRootWindow | CanonicalCandidateDenseWindow | CanonicalBoundaryRefinementWindow,
     lineage: PackageLineage,
     package_set: TemporalPackageSet,
     materialized: tuple[MaterializedTemporalPackage, ...],
@@ -180,22 +182,24 @@ def _rendered_prompt_bytes(
     request_catalog_sha256: str,
     token_policy_version: str,
     entries: tuple[ProviderReferenceCatalogEntry, ...],
+    logical_dependency_sha256: str | None = None,
 ) -> bytes:
-    return canonical_json_bytes(
-        {
-            "protocol": "robata-provider-claim-v1",
-            "task": inference_policy.task.value,
-            "prompt_artifact": {
-                "version": inference_policy.prompt_version,
-                "artifact_id": inference_policy.prompt_artifact_id,
-                "sha256": inference_policy.prompt_sha256,
-            },
-            "request_catalog_sha256": request_catalog_sha256,
-            "token_policy_version": token_policy_version,
-            "evidence_catalog": [entry.model_dump(mode="json") for entry in entries],
-            "provider_response_schema": inference_policy.output_schema.model_dump(mode="json"),
-        }
-    )
+    projection: dict[str, object] = {
+        "protocol": "robata-provider-claim-v1",
+        "task": inference_policy.task.value,
+        "prompt_artifact": {
+            "version": inference_policy.prompt_version,
+            "artifact_id": inference_policy.prompt_artifact_id,
+            "sha256": inference_policy.prompt_sha256,
+        },
+        "request_catalog_sha256": request_catalog_sha256,
+        "token_policy_version": token_policy_version,
+        "evidence_catalog": [entry.model_dump(mode="json") for entry in entries],
+        "provider_response_schema": inference_policy.output_schema.model_dump(mode="json"),
+    }
+    if logical_dependency_sha256 is not None:
+        projection["logical_dependency_sha256"] = logical_dependency_sha256
+    return canonical_json_bytes(projection)
 
 
 def _validate_input_plan_chain(

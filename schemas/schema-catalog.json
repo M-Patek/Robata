@@ -630,6 +630,111 @@
         "max_exclusive": "0.2.0"
       },
       "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/canonical-primary-completion-detail",
+        "version": "1.0.0",
+        "artifact_id": "05e1333e-87b6-8ee1-c9a7-8fd0db514ea7",
+        "sha256": "5300c0b51445f181551a91f4b8816059c48cb098140fe016fc995a3ab5dbaf24"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/canonical-primary-completion-detail.schema.json",
+      "artifact_path": "v1/canonical-primary-completion-detail.schema.json",
+      "owner": "robata-canonical",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "canonical-primary-completion-detail-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/canonical-primary-completion-detail",
+        "version": "2.0.0",
+        "artifact_id": "64dc8b4e-7c5d-66b8-aed6-ba0ba113c33a",
+        "sha256": "4500111fda6a2f222835f476397cf4877ae105553e7f7803bbc2f314528ac60f"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/canonical-primary-completion-detail.schema.json",
+      "artifact_path": "v2/canonical-primary-completion-detail.schema.json",
+      "owner": "robata-canonical",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "canonical-primary-completion-detail-semantic-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/canonical-primary-completion-detail",
+        "version": "3.0.0",
+        "artifact_id": "904680d3-0614-fbc6-3824-2a0594c1d4e9",
+        "sha256": "7d99b74caf21525092e18d71e6a4a3acb463adf292de19310116e3e494e0d297"
+      },
+      "wire_version": "3.0",
+      "document_id": "https://schemas.robata.dev/v3/canonical-primary-completion-detail.schema.json",
+      "artifact_path": "v3/canonical-primary-completion-detail.schema.json",
+      "owner": "robata-canonical",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "canonical-primary-completion-detail-semantic-v3",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/primary-completion-record",
+        "version": "3.0.0",
+        "artifact_id": "ad9ffb0b-f9b4-91bf-33a4-7b35d7b449d4",
+        "sha256": "6b79b0f44de8153d9152eacf68c40fa2c66a27fcc4c9400fdac6118f856afd1d"
+      },
+      "wire_version": "3.0",
+      "document_id": "https://schemas.robata.dev/v3/primary-completion-record.schema.json",
+      "artifact_path": "v3/primary-completion-record.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "primary-completion-record-semantic-v3",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/canonical-primary-completion-detail",
+        "version": "4.0.0",
+        "artifact_id": "7649aa56-986e-bea9-8d7e-c7115d271231",
+        "sha256": "c33e4f3675e5d64f3d66d8418fece36a58d4d5533c1047091e76641cb66926db"
+      },
+      "wire_version": "4.0",
+      "document_id": "https://schemas.robata.dev/v4/canonical-primary-completion-detail.schema.json",
+      "artifact_path": "v4/canonical-primary-completion-detail.schema.json",
+      "owner": "robata-canonical",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "canonical-primary-completion-detail-semantic-v4",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
     }
   ],
   "upcasters": []

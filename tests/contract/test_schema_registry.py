@@ -152,6 +152,7 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "alignment-manifest",
         "camera-video-export-manifest",
         "camera-video-timestamp-row",
+        "canonical-primary-completion-detail",
         "common",
         "current-selection",
         "immutable-node-revision",

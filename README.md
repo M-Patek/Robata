@@ -30,34 +30,56 @@ the current tree satisfies a phase gate.
 
 The live tree provides strict domain values and schemas, deterministic canonical hashing,
 six-camera invariants, immutable artifact and revision primitives, local ingestion/alignment
-services, provider-neutral inference orchestration and input-plan contracts, local queue/barrier
-logic, offline QA and event reduction components, benchmark calculations, and structured
-retrieval primitives.
+services, provider-neutral inference orchestration and input-plan contracts, deterministic
+barrier coordination with run-scoped local SQLite persistence, offline QA and event reduction
+components, benchmark calculations, and structured retrieval primitives.
 
-A canonical post-admission offline conformance slice now connects an explicit fresh or resumed
-processing run and resolved `AdmittedRecordingContextV2` through root-window derivation,
-materialized `TemporalPackageSet`, exact `InferenceInputPlan` and request catalog, independently
-retried call parts, an all-terminal barrier, selected raw/parsed/enriched evidence, deterministic
-fusion reduction, a local output decision, and immutable local event hypotheses. It deliberately
-stops before stable event-identity assignment or outbox publication. Run stages are attached
-through the local SQLite logical-node registry. An optional single SQLite inference-evidence
-ledger preserves intents, exact pre-parse bytes, terminal attempts, typed raw artifacts,
-selections, parsed claims, selected outputs, and enrichments across fresh adapter, ledger, and
-pipeline instances without redispatching selected calls.
+A canonical local-conformance command now accepts either one immutable six-camera fixture or one
+explicitly authorized raw MCAP. The raw path inspects and hashes the exact source, binds exact
+schema bytes, probes all six H.264 streams, registers MP4 and sidecar artifacts, constructs V2
+admission/alignment evidence, and materializes a canonical six-camera frame index plus selected
+PNG artifacts. Both sources then drive the same explicit processing run through exact coarse/dense QA and QA
+completion; provider-neutral EVENT_PROPOSAL planning; deterministic candidate reduction;
+per-candidate ACTION_EVIDENCE; provisional 0/1/N physical-action fusion; and separate padded
+ONSET/OFFSET boundary passes. The runner builds one versioned final-fusion context from the exact
+ordered refined-action closure, binds it to the input plan and adapter requests, and accepts only
+explicit zero output or exact 1:1 final hypotheses. Every inference stage preserves separate
+raw/parsed/enriched evidence, independently retried call parts, and an all-terminal barrier.
+The application prepares stable recording-scoped identity and deterministic `ActionEvent` genesis
+revision/selection/current facts before one SQLite transaction commits the terminal run, exact
+detailed result, compact completion, and pending outbox rows. The SQLite inference-evidence ledger
+and logical-node registry preserve reusable stage evidence across command processes without
+redispatching selected calls. A run-scoped SQLite authority persists the generic barrier
+definition/state/members and inference-call definition/completions/reduction. A fresh process can
+therefore recover an interrupted same run after the reduction and inference evidence are durable
+without redispatching the model calls.
 
-The canonical slice accepts only the offline fixture adapter, performs no network calls, supports
-only `FUSION_ADJUDICATION`, and starts after admission. Processing-run/work lifecycle records,
-barriers, output decisions, and run results are still in-process, and every SQLite adapter remains
-local conformance evidence rather than a production infrastructure decision.
+The local composition still selects the offline fixture inference adapter and performs no network
+calls. It supports `QA_COARSE`, `QA_DENSE`, `EVENT_PROPOSAL`, `ACTION_EVIDENCE`,
+`BOUNDARY_REFINEMENT`, and `FUSION_ADJUDICATION` through the same provider-neutral request
+boundary. Every local result is conformance evidence only and carries
+`production_eligible=false`. The canonical runner
+independently injects the provider-neutral model adapter, exact raw-byte store, and strict claim
+parser, so replacing the fixture does not require changing its business control flow. The local
+composition also injects
+the run-scoped SQLite barrier authority; the runner retains in-memory reference storage only for
+component use. This does not provide a durable work ledger, deadline/lease/fence recovery,
+registered persisted-barrier wire contracts, Redis/broker integration, or a production recovery
+topology. Pending outbox rows have no publisher, and every SQLite adapter remains local
+conformance evidence rather than a production infrastructure decision. Every command receipt and
+published local payload reports `evidence_class=LOCAL_CONFORMANCE` and
+`production_eligible=false`.
 
 Canonical implementation ownership is split under `robata.application.canonical`:
 `models.py` owns status, error, root-window, part-result, and execution-policy models;
 `projections.py` owns semantic projections and identity-policy namespaces;
 `reduction.py` and `output_admission.py` own deterministic fusion and local output decisions;
 `logical_nodes.py` owns typed logical-node producers; `runner_support.py` owns chain validation
-and conversion helpers; `result_validation.py` owns the retained terminal run result; and
-`runner.py` owns state progression and port composition. `canonical_offline.py` is the stable
-re-export facade and does not own those implementations.
+and conversion helpers; `result_validation.py` owns the retained terminal run result;
+`runner.py` owns stage progression; `mcap_source.py` owns the concrete raw-MCAP-to-canonical source
+bridge; and `local_composition.py` owns local source selection, durable-adapter, identity, and
+completion wiring. `canonical_offline.py` is the stable re-export facade and does not own those
+implementations.
 
 Schema-evolution conformance includes a registry-backed synthetic upcaster fixture with exact
 source/target refs, catalog paths and byte pins for code/runtime/golden artifacts, golden endpoint
@@ -67,16 +89,17 @@ evidence only and does not close Section 25.7 or any Architecture phase.
 
 The former fake-model analysis runner is no longer part of the live package or CLI surface. Its
 prior reports and older MVP material remain under `archive/old_mvp` for history only and are not a
-supported execution path. Real Qwen/GPT adapters, governed data admission, durable work/barrier
-recovery, production database/broker/object storage, ActionEvent revision publication, approved
-QA/event policy, quality evidence, SLO evidence, and capacity qualification remain separate
-blocked work.
+supported execution path. Real Qwen/GPT adapters, governed approval of raw-MCAP admission policy,
+durable work scheduling and lease/fence recovery, production database/Redis/broker/object storage,
+governed ActionEvent contracts and successor publication, approved QA/event policy, quality
+evidence, SLO evidence, and capacity qualification remain separate blocked work.
 
 ## Requirements
 
 - Python `>=3.12,<3.14`
 - The dependencies pinned by `uv.lock`
-- Optional MCAP/media dependencies only for explicitly authorized source inspection or export
+- Optional MCAP/media dependencies for canonical fixture or raw-MCAP execution and explicitly
+  authorized source inspection or export
 
 The code fails closed when an optional adapter dependency is absent. It does not install or
 download provider SDKs, model checkpoints, databases, or services at runtime.
@@ -109,12 +132,30 @@ The current CLI surface can be inspected without touching source media:
 .\.venv\Scripts\python.exe scripts\export_camera_videos.py --help
 ```
 
-These media CLIs do not invoke the canonical offline conformance slice. That slice is currently
-an application API exercised by integration tests, not a production operator entry point.
+The canonical local fixture command is:
+
+```powershell
+.venv/Scripts/python.exe scripts/run_canonical_fixture.py tests/fixtures/canonical/source-recording.json --state-dir tmp/canonical-state --run-key primary
+```
+
+The matching raw-MCAP command is:
+
+```powershell
+.venv/Scripts/python.exe scripts/run_canonical_mcap.py data/source/sample-medium.mcap --mapping-config config/genrobot-observed-v0.json --allow-unapproved-profile --state-dir tmp/canonical-mcap-state --run-key primary
+```
+
+Repeating either exact command performs recovery/replay and does not duplicate the business result
+or its outbox rows. These are local operator entry points, not production commands.
+Local processing timestamps come from an explicit versioned deterministic execution clock; they
+are not derived from the fixture's `recording_start_utc` source fact. Changing that clock policy
+changes the local run namespace.
+The standalone media inspection/export CLIs remain separate entry points; the raw canonical
+command composes the same inspection and registered-export adapters internally.
 
 Source inspection and local export require an explicitly authorized source path and mapping
 decision. An unapproved mapping may be exercised only with the CLI's explicit local-development
-override. That mode never publishes a governed READY manifest and never makes a provider call.
+override. That mode may derive local V2 evidence, but never publishes a governed READY decision,
+makes a provider call, or sets `production_eligible=true`.
 
 Schema publication has one repository command. It normalizes a new candidate to deterministic
 UTF-8/LF bytes, derives its exact digest and artifact ID, validates the complete offline registry,

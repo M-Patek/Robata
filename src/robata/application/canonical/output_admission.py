@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 from pydantic import model_validator
 
@@ -22,9 +22,19 @@ from robata.application.canonical.projections import (
     canonical_output_decision_projection,
 )
 from robata.application.canonical.reduction import CanonicalFusionReduction
-from robata.contracts.common import NanosecondInterval, SchemaVersion, Sha256Digest, StrictModel
+from robata.contracts.common import (
+    NanosecondInterval,
+    Nanoseconds,
+    SchemaVersion,
+    Sha256Digest,
+    StrictModel,
+)
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid
+from robata.event_pipeline.boundary_refinement import (
+    BoundaryRefinementOutcome,
+    BoundaryRefinementResult,
+)
 from robata.event_pipeline.identity_registry import (
     AdmissionEvidenceClass,
     AdmissionProof,
@@ -39,8 +49,222 @@ from robata.inference.enrichment import (
     EnrichedProviderClaim,
     OrchestratorEnrichedOutput,
     ProviderClaimKind,
+    ProviderObservation,
 )
 from robata.inference.models import VisionTask
+
+CANONICAL_FINAL_FUSION_CONTEXT_METADATA_KEY: Final = "canonical_final_fusion_context"
+CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION: Final = (
+    "canonical-final-fusion-context-semantic-v1"
+)
+
+
+class CanonicalFinalFusionActionInput(StrictModel):
+    """One boundary-refined physical action supplied to final fusion."""
+
+    action_ordinal: NonNegativeInt
+    source_action_logical_key: NodeLogicalKey
+    source_action_semantic_sha256: Sha256Digest
+    boundary_result_logical_key: NodeLogicalKey
+    boundary_result_semantic_sha256: Sha256Digest
+    onset_result_semantic_sha256: Sha256Digest
+    offset_result_semantic_sha256: Sha256Digest
+    label: NonEmptyString
+    coarse_interval: NanosecondInterval
+    refined_interval: NanosecondInterval
+    uncertainty_ns: Nanoseconds
+    production_eligible: Literal[False] = False
+
+
+class CanonicalFinalFusionContext(StrictModel):
+    """Exact ordered boundary closure sent to the final-fusion adapter."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    projection_version: Literal["canonical-final-fusion-context-semantic-v1"] = (
+        CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION
+    )
+    policy_version: SchemaVersion
+    recording_identity: Sha256Digest
+    source_content_sha256: Sha256Digest
+    camera_mapping_semantic_sha256: Sha256Digest
+    alignment_semantic_sha256: Sha256Digest
+    actions: tuple[CanonicalFinalFusionActionInput, ...]
+    semantic_sha256: Sha256Digest
+    production_eligible: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_context(self) -> Self:
+        if not self.actions:
+            raise ValueError("final fusion context requires at least one refined action")
+        if tuple(item.action_ordinal for item in self.actions) != tuple(range(len(self.actions))):
+            raise ValueError("final fusion actions must be complete and ordered")
+        action_keys = tuple(item.source_action_logical_key for item in self.actions)
+        boundary_keys = tuple(item.boundary_result_logical_key for item in self.actions)
+        if (
+            len(set(action_keys)) != len(action_keys)
+            or len(set(boundary_keys)) != len(boundary_keys)
+            or any(item.production_eligible for item in self.actions)
+        ):
+            raise ValueError("final fusion context contains duplicate or eligible actions")
+        expected = semantic_sha256(canonical_final_fusion_context_projection(self))
+        if self.semantic_sha256 != expected:
+            raise ValueError("final fusion context semantic identity is inconsistent")
+        return self
+
+    @classmethod
+    def from_boundary_results(
+        cls,
+        *,
+        results: Sequence[BoundaryRefinementResult],
+        recording_identity: str,
+        policy_version: str,
+    ) -> Self:
+        """Build the sole final-fusion context from exact refined results."""
+
+        checked = tuple(
+            BoundaryRefinementResult.model_validate(
+                item.model_dump(mode="python"),
+                strict=True,
+            )
+            for item in results
+        )
+        if not checked:
+            raise ValueError("final fusion requires at least one boundary result")
+        first = checked[0]
+        actions: list[CanonicalFinalFusionActionInput] = []
+        for ordinal, result in enumerate(checked):
+            if (
+                result.outcome is not BoundaryRefinementOutcome.REFINED
+                or result.refined_interval is None
+                or result.uncertainty_ns is None
+                or result.source_action_ordinal != ordinal
+                or result.onset.recording_identity != recording_identity
+                or result.offset.recording_identity != recording_identity
+                or result.mcap_id != first.mcap_id
+                or result.source_content_sha256 != first.source_content_sha256
+                or result.camera_mapping_semantic_sha256 != first.camera_mapping_semantic_sha256
+                or result.alignment_semantic_sha256 != first.alignment_semantic_sha256
+            ):
+                raise ValueError(
+                    "final fusion boundary results are incomplete, unordered, or cross-source"
+                )
+            actions.append(
+                CanonicalFinalFusionActionInput(
+                    action_ordinal=ordinal,
+                    source_action_logical_key=result.source_action_logical_key,
+                    source_action_semantic_sha256=result.source_action_semantic_sha256,
+                    boundary_result_logical_key=result.logical_key,
+                    boundary_result_semantic_sha256=result.semantic_sha256,
+                    onset_result_semantic_sha256=result.onset.semantic_sha256,
+                    offset_result_semantic_sha256=result.offset.semantic_sha256,
+                    label=result.action_label,
+                    coarse_interval=result.coarse_interval,
+                    refined_interval=result.refined_interval,
+                    uncertainty_ns=result.uncertainty_ns,
+                    production_eligible=False,
+                )
+            )
+        projection = _canonical_final_fusion_context_projection_values(
+            policy_version=policy_version,
+            recording_identity=recording_identity,
+            source_content_sha256=first.source_content_sha256,
+            camera_mapping_semantic_sha256=first.camera_mapping_semantic_sha256,
+            alignment_semantic_sha256=first.alignment_semantic_sha256,
+            actions=actions,
+            production_eligible=False,
+        )
+        return cls(
+            policy_version=policy_version,
+            recording_identity=recording_identity,
+            source_content_sha256=first.source_content_sha256,
+            camera_mapping_semantic_sha256=first.camera_mapping_semantic_sha256,
+            alignment_semantic_sha256=first.alignment_semantic_sha256,
+            actions=tuple(actions),
+            semantic_sha256=semantic_sha256(projection),
+            production_eligible=False,
+        )
+
+
+def canonical_final_fusion_context_projection(
+    context: CanonicalFinalFusionContext,
+) -> dict[str, object]:
+    """Return the run-independent final-fusion input identity."""
+
+    return _canonical_final_fusion_context_projection_values(
+        policy_version=context.policy_version,
+        recording_identity=context.recording_identity,
+        source_content_sha256=context.source_content_sha256,
+        camera_mapping_semantic_sha256=context.camera_mapping_semantic_sha256,
+        alignment_semantic_sha256=context.alignment_semantic_sha256,
+        actions=context.actions,
+        production_eligible=context.production_eligible,
+    )
+
+
+def _canonical_final_fusion_context_projection_values(
+    *,
+    policy_version: str,
+    recording_identity: str,
+    source_content_sha256: str,
+    camera_mapping_semantic_sha256: str,
+    alignment_semantic_sha256: str,
+    actions: Sequence[CanonicalFinalFusionActionInput],
+    production_eligible: bool,
+) -> dict[str, object]:
+    return {
+        "semantic_projection_version": CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION,
+        "policy_version": policy_version,
+        "recording_identity": recording_identity,
+        "source_content_sha256": source_content_sha256,
+        "camera_mapping_semantic_sha256": camera_mapping_semantic_sha256,
+        "alignment_semantic_sha256": alignment_semantic_sha256,
+        "actions": [item.model_dump(mode="json") for item in actions],
+        "production_eligible": production_eligible,
+    }
+
+
+def validate_final_fusion_reduction(
+    *,
+    context: CanonicalFinalFusionContext,
+    fusion_reduction: CanonicalFusionReduction,
+) -> None:
+    """Require explicit empty output or exact 1:1 refined-action coverage."""
+
+    checked_context = CanonicalFinalFusionContext.model_validate(
+        context.model_dump(mode="python"),
+        strict=True,
+    )
+    checked_reduction = CanonicalFusionReduction.model_validate(
+        fusion_reduction.model_dump(mode="python"),
+        strict=True,
+    )
+    if checked_reduction.outcome in {
+        "ALL_PARTS_ABSTAINED",
+        "NO_SURVIVING_EVENTS",
+    }:
+        return
+
+    actual: list[tuple[int, int, str]] = []
+    for item in checked_reduction.claims:
+        claim = item.representative
+        if (
+            claim.observation is not ProviderObservation.PROPOSED
+            or claim.interval is None
+            or claim.label is None
+            or claim.conflict_codes
+        ):
+            raise ValueError("local final fusion accepts only unambiguous proposed hypotheses")
+        actual.append((claim.interval.start_ns, claim.interval.end_ns, claim.label))
+    expected = [
+        (
+            item.refined_interval.start_ns,
+            item.refined_interval.end_ns,
+            item.label,
+        )
+        for item in checked_context.actions
+    ]
+    if tuple(sorted(actual)) != tuple(sorted(expected)):
+        raise ValueError("final fusion claims do not exactly cover the refined action set")
 
 
 class CanonicalOutputAdmissionDecision(StrictModel):
@@ -416,4 +640,13 @@ def _contains_interval(outer: NanosecondInterval, inner: object) -> bool:
     )
 
 
-__all__ = ["CanonicalOutputAdmissionDecision", "FusionEventHypothesisProjector"]
+__all__ = [
+    "CANONICAL_FINAL_FUSION_CONTEXT_METADATA_KEY",
+    "CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION",
+    "CanonicalFinalFusionActionInput",
+    "CanonicalFinalFusionContext",
+    "CanonicalOutputAdmissionDecision",
+    "FusionEventHypothesisProjector",
+    "canonical_final_fusion_context_projection",
+    "validate_final_fusion_reduction",
+]

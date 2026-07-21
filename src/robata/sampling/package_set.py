@@ -9,6 +9,7 @@ from pydantic import Field, StringConstraints
 
 from robata.contracts.common import NanosecondInterval, SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.hashing import semantic_sha256
+from robata.contracts.pipeline import SamplingPurpose
 from robata.contracts.sampling_plan import SamplingPlan
 from robata.contracts.temporal import (
     PackageLineage,
@@ -71,6 +72,7 @@ class PackageSetBuilder:
             sampling_plan,
             overlap_ns=policy.overlap_ns,
             split_policy=policy,
+            purpose=_window_sampling_purpose(window),
         )
 
     def build_package_set(
@@ -191,6 +193,13 @@ def _window_intervals(window: object) -> tuple[NanosecondInterval, NanosecondInt
     return requested, effective
 
 
+def _window_sampling_purpose(window: object) -> SamplingPurpose:
+    purpose = getattr(window, "purpose", SamplingPurpose.ACTION_DENSE)
+    if not isinstance(purpose, SamplingPurpose):
+        raise TypeError("window purpose must be a SamplingPurpose")
+    return purpose
+
+
 def _member_from_part(
     ref: MaterializedPackageRef,
     part: IntervalPart,
@@ -210,12 +219,16 @@ def _member_from_part(
     )
 
 
-def sampling_plan_digest(sampling_plan: SamplingPlan) -> Sha256Digest:
+def sampling_plan_digest(
+    sampling_plan: SamplingPlan,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> Sha256Digest:
     """Return a canonical digest suitable for PackageLineage."""
 
     from robata.sampling.dense import sampling_plan_projection
 
-    return semantic_sha256(sampling_plan_projection(sampling_plan))
+    return semantic_sha256(sampling_plan_projection(sampling_plan, purpose=purpose))
 
 
 __all__ = [

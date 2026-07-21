@@ -772,6 +772,66 @@ class EventIdentityBatchResult(StrictModel):
         return self
 
 
+class PreparedEventIdentityBatch(StrictModel):
+    """Repository-side-effect-free identity preparation for one snapshot.
+
+    Preparation allocates proposed IDs and derives mutation rows, but it does not
+    read or write a repository.  The final completion authority may apply the
+    mutation in its own transaction or reject it when the generation/fence is stale.
+    """
+
+    recording_identity: Sha256Digest
+    expected_generation: NonNegativeInt
+    expected_fence: PositiveInt
+    ordered_hypothesis_logical_keys: tuple[NodeLogicalKey, ...]
+    assignments: tuple[EventIdentityAssignment, ...]
+    replayed_assignment_logical_keys: tuple[NodeLogicalKey, ...]
+    mutation: EventIdentityRegistryMutation | None
+
+    @model_validator(mode="after")
+    def validate_preparation(self) -> Self:
+        if not self.assignments:
+            raise ValueError("identity preparation requires assignments")
+        if any(item.recording_identity != self.recording_identity for item in self.assignments):
+            raise ValueError("identity preparation assignments cross recording scope")
+        assignment_keys = tuple(item.assignment_logical_key for item in self.assignments)
+        if len(set(assignment_keys)) != len(assignment_keys):
+            raise ValueError("identity preparation assignments must be unique")
+        hypothesis_keys = tuple(item.event_hypothesis_logical_key for item in self.assignments)
+        if hypothesis_keys != self.ordered_hypothesis_logical_keys:
+            raise ValueError("identity preparation does not preserve canonical hypothesis order")
+        if len(set(hypothesis_keys)) != len(hypothesis_keys):
+            raise ValueError("identity preparation hypotheses must be unique")
+        replayed = self.replayed_assignment_logical_keys
+        if len(set(replayed)) != len(replayed) or not set(replayed).issubset(assignment_keys):
+            raise ValueError("identity preparation replay keys are inconsistent")
+
+        if self.mutation is None:
+            if replayed != assignment_keys:
+                raise ValueError("replay-only preparation must replay every assignment")
+            return self
+
+        mutation = self.mutation
+        if (
+            mutation.recording_identity != self.recording_identity
+            or mutation.expected_generation != self.expected_generation
+            or mutation.fence != self.expected_fence
+        ):
+            raise ValueError("identity preparation mutation does not bind its snapshot")
+        new_assignment_key_set = {item.assignment_logical_key for item in mutation.assignments}
+        expected_replayed = tuple(
+            item for item in assignment_keys if item not in new_assignment_key_set
+        )
+        if replayed != expected_replayed:
+            raise ValueError("identity preparation replay order is not canonical")
+        new_assignments = tuple(
+            item for item in self.assignments if item.assignment_logical_key not in set(replayed)
+        )
+        if mutation.assignments != new_assignments:
+            raise ValueError("identity preparation mutation does not match new assignments")
+        return self
+
+
 class EventIdAllocator(Protocol):
     """Registry-owned ID allocation boundary; resolvers and models cannot call it."""
 
@@ -1071,7 +1131,7 @@ class EventIdentityRegistryService:
     def __init__(
         self,
         *,
-        repository: EventIdentityRegistryRepository,
+        repository: EventIdentityRegistryRepository | None = None,
         resolver: EventIdentityResolver,
         allocator: EventIdAllocator,
         output_admission_policy: ProductionOutputAdmissionPolicyRef,
@@ -1113,6 +1173,34 @@ class EventIdentityRegistryService:
     def output_admission_policy(self) -> ProductionOutputAdmissionPolicyRef:
         return self._output_admission_policy
 
+    def prepare_batch(
+        self,
+        *,
+        snapshot: EventRegistrySnapshot,
+        admitted_context: AdmittedRecordingContextV2,
+        hypotheses: Sequence[PlatformEnrichedEventHypothesis],
+        enriched_outputs: Sequence[OrchestratorEnrichedOutput],
+        decided_at: str,
+    ) -> PreparedEventIdentityBatch:
+        """Prepare one identity batch without repository reads or writes."""
+
+        context, ordered = _validate_authority_inputs(
+            admitted_context=admitted_context,
+            hypotheses=hypotheses,
+            enriched_outputs=enriched_outputs,
+            output_admission_policy=self._output_admission_policy,
+            admission_evidence_class=self._admission_evidence_class,
+        )
+        validated_snapshot = _validate_registry_snapshot(
+            snapshot,
+            recording_identity=context.recording_identity,
+        )
+        return self._prepare_validated_batch(
+            snapshot=validated_snapshot,
+            hypotheses=ordered,
+            decided_at=decided_at,
+        )
+
     def assign_batch(
         self,
         *,
@@ -1123,6 +1211,9 @@ class EventIdentityRegistryService:
     ) -> EventIdentityBatchResult:
         """Assign one canonical batch, retrying stale per-recording generations."""
 
+        repository = self._repository
+        if repository is None:
+            raise EventIdentityInputError("standalone identity assignment requires a repository")
         context, ordered = _validate_authority_inputs(
             admitted_context=admitted_context,
             hypotheses=hypotheses,
@@ -1134,37 +1225,65 @@ class EventIdentityRegistryService:
         last_stale: StaleEventRegistryFenceError | None = None
 
         for _ in range(self._max_cas_retries + 1):
-            snapshot = self._repository.snapshot(context.recording_identity)
+            snapshot = _validate_registry_snapshot(
+                repository.snapshot(context.recording_identity),
+                recording_identity=context.recording_identity,
+            )
             if initial_generation is None:
                 initial_generation = snapshot.generation
-            (
-                result_assignments,
-                replayed_keys,
-                new_identities,
-                new_assignments,
-                relations,
-                outbox,
-            ) = self._prepare_mutation(
+            prepared = self._prepare_validated_batch(
                 snapshot=snapshot,
                 hypotheses=ordered,
                 decided_at=decided_at,
             )
-            if not new_assignments:
-                return EventIdentityBatchResult(
-                    recording_identity=context.recording_identity,
+            mutation = prepared.mutation
+            if mutation is None:
+                return _batch_result_from_preparation(
+                    prepared,
                     initial_generation=initial_generation,
                     final_generation=snapshot.generation,
                     fence=snapshot.fence,
-                    assignments=result_assignments,
-                    new_identities=(),
-                    relations=(),
-                    outbox=(),
-                    replayed_assignment_logical_keys=replayed_keys,
                 )
 
+            try:
+                committed = repository.commit(mutation)
+            except StaleEventRegistryFenceError as exc:
+                last_stale = exc
+                continue
+            return _batch_result_from_preparation(
+                prepared,
+                initial_generation=initial_generation,
+                final_generation=committed.generation,
+                fence=committed.fence,
+            )
+
+        assert last_stale is not None
+        raise last_stale
+
+    def _prepare_validated_batch(
+        self,
+        *,
+        snapshot: EventRegistrySnapshot,
+        hypotheses: tuple[PlatformEnrichedEventHypothesis, ...],
+        decided_at: str,
+    ) -> PreparedEventIdentityBatch:
+        (
+            result_assignments,
+            replayed_keys,
+            new_identities,
+            new_assignments,
+            relations,
+            outbox,
+        ) = self._prepare_mutation(
+            snapshot=snapshot,
+            hypotheses=hypotheses,
+            decided_at=decided_at,
+        )
+        mutation = None
+        if new_assignments:
             mutation = EventIdentityRegistryMutation(
                 schema_version="1.0",
-                recording_identity=context.recording_identity,
+                recording_identity=snapshot.recording_identity,
                 expected_generation=snapshot.generation,
                 fence=snapshot.fence,
                 next_generation=snapshot.generation + 1,
@@ -1173,25 +1292,17 @@ class EventIdentityRegistryService:
                 relations=relations,
                 outbox=outbox,
             )
-            try:
-                committed = self._repository.commit(mutation)
-            except StaleEventRegistryFenceError as exc:
-                last_stale = exc
-                continue
-            return EventIdentityBatchResult(
-                recording_identity=context.recording_identity,
-                initial_generation=initial_generation,
-                final_generation=committed.generation,
-                fence=committed.fence,
-                assignments=result_assignments,
-                new_identities=new_identities,
-                relations=relations,
-                outbox=outbox,
-                replayed_assignment_logical_keys=replayed_keys,
-            )
-
-        assert last_stale is not None
-        raise last_stale
+        return PreparedEventIdentityBatch(
+            recording_identity=snapshot.recording_identity,
+            expected_generation=snapshot.generation,
+            expected_fence=snapshot.fence,
+            ordered_hypothesis_logical_keys=tuple(
+                item.event_hypothesis_logical_key for item in hypotheses
+            ),
+            assignments=result_assignments,
+            replayed_assignment_logical_keys=replayed_keys,
+            mutation=mutation,
+        )
 
     def _prepare_mutation(
         self,
@@ -1336,6 +1447,48 @@ class EventIdentityRegistryService:
             tuple(relations),
             tuple(outbox),
         )
+
+
+def _validate_registry_snapshot(
+    snapshot: EventRegistrySnapshot,
+    *,
+    recording_identity: str,
+) -> EventRegistrySnapshot:
+    if not isinstance(snapshot, EventRegistrySnapshot):
+        raise EventIdentityInputError("identity preparation requires a registry snapshot")
+    try:
+        validated = EventRegistrySnapshot.model_validate(
+            snapshot.model_dump(mode="python"),
+            strict=True,
+        )
+    except ValueError as exc:
+        raise EventIdentityInputError("event registry snapshot failed validation") from exc
+    if validated.recording_identity != recording_identity:
+        raise CrossRecordingEventIdentityError(
+            "identity preparation snapshot crosses recording scope"
+        )
+    return validated
+
+
+def _batch_result_from_preparation(
+    prepared: PreparedEventIdentityBatch,
+    *,
+    initial_generation: int,
+    final_generation: int,
+    fence: int,
+) -> EventIdentityBatchResult:
+    mutation = prepared.mutation
+    return EventIdentityBatchResult(
+        recording_identity=prepared.recording_identity,
+        initial_generation=initial_generation,
+        final_generation=final_generation,
+        fence=fence,
+        assignments=prepared.assignments,
+        new_identities=mutation.identities if mutation is not None else (),
+        relations=mutation.relations if mutation is not None else (),
+        outbox=mutation.outbox if mutation is not None else (),
+        replayed_assignment_logical_keys=prepared.replayed_assignment_logical_keys,
+    )
 
 
 def _validate_authority_inputs(
@@ -1854,6 +2007,7 @@ __all__ = [
     "OutputAdmissionProof",
     "PlatformEnrichedEventHypothesis",
     "PlatformEnrichedOutputReference",
+    "PreparedEventIdentityBatch",
     "ProductionAdmittedHypothesisFact",
     "ProductionOutputAdmissionPolicyRef",
     "ProductionQualificationUnavailableError",

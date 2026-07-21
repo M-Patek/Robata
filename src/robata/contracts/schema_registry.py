@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # mypy: disable-error-code=import-untyped
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from datetime import datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Annotated, Any, BinaryIO, Literal, TypeVar, cast
 
 from jsonschema import Draft202012Validator, FormatChecker, validators
@@ -39,6 +41,8 @@ _SCHEMA_ID_PATTERN = r"^https://schemas\.robata\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+
 _UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SCHEMA_ARTIFACT_ID_DOMAIN = b"robata-local-artifact-id-v1\x00JSON_SCHEMA\x00"
+_SCHEMA_LOCK_TIMEOUT_SECONDS = 30.0
+_SCHEMA_LOCK_RETRY_SECONDS = 0.01
 _RFC3339_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -654,7 +658,18 @@ def _lock_schema_reader(stream: BinaryIO) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        deadline = monotonic() + _SCHEMA_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                if monotonic() >= deadline:
+                    raise
+                sleep(_SCHEMA_LOCK_RETRY_SECONDS)
+                stream.seek(0)
         return
 
     import fcntl

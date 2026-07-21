@@ -326,41 +326,75 @@ This evidence does **not** close Phase 0, producer identity/admission, O-03, O-0
 real-model quality, provider policy, capacity, or Phase 1B promotion. The sample is local
 development data and the mapping remains explicitly unapproved/unverified.
 
+### Current canonical raw-input evidence
+
+On 2026-07-20 the live `run_canonical_mcap.py` command processed the local
+`sample-medium.mcap` through exact inspection and schema hashing, six H.264 decoder probes,
+registered MP4/sidecar publication, V2 admission/alignment derivation, canonical frame selection,
+offline inference, event/revision preparation, and the aggregate completion transaction with zero
+network calls and exact replay. That run used the pre-v12 final-fusion shortcut, so its event count
+and completion namespace are historical local evidence and must not qualify the current final-fusion
+path. A fresh authorized raw-MCAP replay under composition v13 remains an external validation item.
+
+The mapping profile and admission/alignment policy remain explicitly unapproved, all published
+payloads remain `production_eligible=false`, and no raw-MCAP run is Phase 1B or model-quality
+evidence.
+
 ### Current convergence boundary
 
-The live tree now has a canonical post-admission offline conformance spine from a resolved
-`AdmittedRecordingContextV2` and an explicit fresh/resumed processing run through root window,
-materialized provider-neutral package set,
-strict provider-specific input plan/catalog, independently retried call parts, an all-terminal
-barrier, selected raw/parsed/enriched lineage, deterministic ordered fusion reduction, local output
-admission, and immutable local event hypotheses. It stops before stable identity assignment and
-outbox publication. Exact replay, all-abstain, mixed-abstain, permanent-failure, and fail-closed
-lineage paths are covered locally with zero network calls. Locator-only package/prompt/schema and
-retry-attempt changes preserve reusable logical identities while exact audit lineage remains
-distinct. Each admitted stage is attached to its processing run in the local SQLite logical-node
+The live tree now has a canonical local-conformance command from either an immutable six-camera
+fixture or one explicitly authorized raw MCAP through admission, root sampling, coarse QA, exact
+dense QA when planned, and deterministic QA completion. `QA_COMPLETE` proceeds through a
+provider-neutral EVENT_PROPOSAL input plan, authoritative raw/parsed/enriched evidence, a durable
+call barrier, normalized six-camera proposals, and deterministic candidate reduction. Every
+candidate then executes a candidate-scoped ACTION_DENSE plan through the same trust/barrier chain
+and produces exact six-camera normalized action evidence. A deterministic local provisional fuser
+validates that exact closure and emits ordered 0/1/N coarse physical actions with six-camera
+lineage. Every action then executes separate padded ONSET/OFFSET windows through the same
+raw/parsed/enriched/barrier chain, and deterministic reduction emits one exact six-camera
+boundary-refinement result per action. The runner then builds a versioned final-fusion context from
+the complete ordered refined-action set, binds its digest and exact JSON to the input plan and every
+adapter request, and admits only explicit zero output or exact 1:1 hypotheses. Empty proposals and
+zero provisional actions terminate as source-bound `NO_EVENTS`; indeterminate or incomplete
+closure fails closed. Proposal, action, boundary, or final-fusion failure stops explicitly, and
+exact replay plus retry/run changes preserve reusable logical identities without duplicate
+dispatch.
+Each admitted stage is attached to its processing run in the local SQLite logical-node
 registry; separate fresh runs retain separate membership histories and reuse the same semantic
 nodes. One append-only local SQLite inference ledger preserves intent, pre-parse raw bytes,
 terminal attempts, typed raw artifacts, selections, parsed claims, selected outputs, and
 enrichments; a fresh ledger/adapter/pipeline instance reopens selected evidence without provider
-redispatch. Separate SQLite identity repositories provide restart-safe component conformance for
-recording fences, assignments, relations, and outbox rows, but are not injected into this
-canonical composition and do not claim production infrastructure.
+redispatch. A separate run-scoped SQLite authority persists generic barrier
+definitions/state/members and inference-call definitions/completions/reduction. A fresh storage
+and pipeline instance can reopen an interrupted same run after durable evidence and reduction,
+finish without provider redispatch, and idempotently repair the completion-to-generic-member crash
+window. The aggregate SQLite repository is injected for the canonical composition's identity
+snapshot, terminal completion, revision/current selection, and pending outbox transaction.
+Standalone identity repositories remain component evidence and do not claim production
+infrastructure.
 
-This spine does not expose an operator CLI, produce V2 admission evidence from raw MCAP, dispatch
-real providers, or provide end-to-end production persistence. Its adapter is fixture-only, and its
-barriers, processing-run/work lifecycle, output decisions, and run results remain in-process even
-though selected inference evidence and logical memberships have local SQLite adapters.
-Identity/outbox is tested only as an independent component, not as a canonical completion side
-effect. The remaining convergence work is to add those durable lifecycle and recovery boundaries,
-then compose raw admission, governed qualification, prepared identity, ActionEvent
-revision/current selection, outbox publication, and downstream task paths when their governance
-and policy inputs are resolved. Derived package-set/input-plan/inference hashes created by the
-former exact-manifest-polluted identity formula must be rebuilt. Registered wire shapes and
-versions are unchanged; the unregistered local output-proof, output-decision, and
-event-hypothesis contracts advance to V2 and reject V1 payloads. canonical-offline-v1 processing
-runs, including old RUNNING records, cannot resume under canonical-offline-v2. Archived fake-run
-results remain historical comparison material only; canonical fixture runs remain local
-conformance evidence.
+The raw operator CLI now produces local V2 admission evidence from exact MCAP, schema, probe, and
+registered-media facts, but the spine does not dispatch real providers, deliver outbox rows, or
+provide end-to-end production persistence. Its generic/call barrier has a run-scoped SQLite owner
+and same-run recovery, but work scheduling, deadlines, leases, and fences are not durably
+orchestrated. Exact-pinned detailed completion V4 now records the complete proposal/candidate/
+action/provisional/boundary/final-fusion lineage, while compact completion V3 identifies the exact
+terminal stage; event-producing and early `NO_EVENTS` paths use the same aggregate transaction.
+The remaining operational track is durable work recovery, registered persisted-barrier contracts,
+outbox delivery/reconciliation, and production storage/broker topology. Real provider adapters and
+governed qualification remain external gates.
+The local composition deliberately continues to select the offline fixture.
+Derived package-set/input-plan/inference hashes created by the former
+exact-manifest-polluted identity formula must be rebuilt. Existing registered wire shapes remain
+unchanged; compact primary completion V3 and detailed completion V4 are exact-pinned with older
+bytes frozen. The unregistered local output-proof, output-decision, and event-hypothesis contracts
+remain V2.
+canonical-offline-v1 through canonical-offline-v4 processing runs, including old RUNNING records,
+cannot resume under canonical-offline-v5. Execution-policy semantic projection v3, fusion
+projector policy v2, local composition v13, and runtime-policy projection v8 isolate
+terminal-publication and final-fusion semantics from earlier local recovery namespaces. Archived
+fake-run results remain historical comparison material only; canonical fixture and raw-MCAP runs
+remain local conformance evidence.
 
 ### Canonical module ownership
 
@@ -374,6 +408,8 @@ The canonical spine remains one behavioral path without returning to one impleme
 - `canonical/runner_support.py` owns validation and conversion helpers used by composition.
 - `canonical/result_validation.py` owns terminal run-result and retained-lineage validation.
 - `canonical/runner.py` owns state progression and port calls.
+- `canonical/mcap_source.py` owns the concrete raw-MCAP-to-canonical source bridge.
+- `canonical/local_composition.py` owns concrete local policy and durable-adapter wiring.
 - `canonical_offline.py` is a stable re-export facade, not an implementation owner.
 
 New durable work, provider, QA, revision, or completion behavior must enter its owning module or
@@ -442,9 +478,9 @@ The following remain `NOT_MEASURED` until an applicable phase has a governed, re
 |---|---|---|
 | Recording and camera-video hours | `NOT_MEASURED` | The 37-member local inventory is not admitted or characterized. |
 | Throughput and wall time | `NOT_MEASURED` | No governed production-shaped replay exists. |
-| Queue, service, and API latency percentiles | `NOT_MEASURED` | Only in-memory barriers and an offline fixture are exercised; there is no production broker or provider API. |
-| CPU, memory, disk, network, and storage rates | `NOT_MEASURED` | Workload shape and actual source codecs remain unresolved until O-03. |
-| Qwen/GPT requests, tokens, latency, and cost | `NOT_MEASURED` | The canonical fixture makes zero real-model requests and provides no provider latency, token, or cost evidence. |
+| Queue, service, and API latency percentiles | `NOT_MEASURED` | Only the local run-scoped SQLite barrier and offline inference adapter are exercised; there is no durable work queue, Redis/broker, provider API, or production-shaped workload. |
+| CPU, memory, disk, network, and storage rates | `NOT_MEASURED` | A local raw sample has run, but its workload shape and codec facts are not governed until O-03. |
+| Qwen/GPT requests, tokens, latency, and cost | `NOT_MEASURED` | The canonical fixture and raw commands make zero real-model requests and provide no provider latency, token, or cost evidence. |
 | Quality metrics and confidence intervals | `NOT_MEASURED` | No registered ground truth or promoted O-10 policy exists. |
 | Capacity against either 500-hours/day interpretation | `NOT_MEASURED` | O-01 and production-shaped measurements are unresolved. |
 
@@ -458,15 +494,16 @@ Tests may report deterministic case counts and local durations, but those values
 - **O-04:** Required clock relationships, sync evidence, reset behavior, alignment tolerance, drift model, and missing-frame policy.
 - **O-06/O-08:** Required before real primary-model integration and promoted provider encoding,
   limits, split policy, latency, quota, cost, and data-handling claims.
-- **O-10:** Required before six-camera QA aggregation or acceptance promotion; the source summary does not settle it.
+- **O-10:** Required before governed six-camera QA acceptance or promotion; the local coarse-QA
+  projection is conformance evidence only and does not settle the policy.
 - **O-12:** Required before promoting fusion, candidate identity, merge/split, boundary tolerance,
   confidence calibration, and review behavior beyond the exact-fingerprint local resolver.
 - **O-14:** Database, broker, object store, and deployment selection is not required for the local contract/admission foundation, but is required before production durability and concurrency claims.
-- **Section 25.7 durable surfaces:** Work messages, output decisions, durable multi-part barrier
-  recovery, run-result persistence, a production recording-scoped identity store, and an outbox
-  publisher remain required for a production path. The local SQLite inference adapter and the
-  separately tested identity/outbox adapter are conformance evidence, not an O-14 infrastructure
-  decision or one composed completion transaction.
+- **Section 25.7 durable surfaces:** Work messages, output decisions, registered persisted-barrier
+  wire contracts, a production recording-scoped identity store, and an outbox publisher remain
+  required for a production path. The run-scoped SQLite barrier, inference-evidence, and aggregate
+  authorities provide local persistence and recovery conformance; they do not select the O-14
+  production transaction, broker, or recovery topology.
 - **O-15:** Retention, access, encryption, data handling, residency, and audit rules are part of the Phase 0 hard gate.
 
 ## Promotion Rule
@@ -474,5 +511,5 @@ Tests may report deterministic case counts and local durations, but those values
 Phase 0 is complete only when its security/privacy/governance controls and non-bypass tests pass. Phase 1A is complete only when its executable contract foundation and conformance evidence pass. Phase 1B is complete only after Phase 0 and 1A, governed representative real data, O-03, O-04, separate validation/READY publication, independent source/alignment reconciliation, and real replay evidence all pass.
 
 The presence of 37 local MCAPs, synthetic fixtures, a readable container, a successful legacy
-command, or a successful canonical fixture/integration run does not waive a predecessor gate or
+command, or a successful local canonical fixture/raw run does not waive a predecessor gate or
 promote any phase.

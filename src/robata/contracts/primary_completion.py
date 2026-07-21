@@ -22,9 +22,9 @@ from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry, default_schema_registry
 
 PRIMARY_COMPLETION_RECORD_SCHEMA_ID = "https://schemas.robata.dev/primary-completion-record"
-PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION = "2.0.0"
-PRIMARY_COMPLETION_RECORD_WIRE_VERSION = "2.0"
-PRIMARY_COMPLETION_RECORD_SEMANTIC_PROJECTION_VERSION = "primary-completion-record-semantic-v2"
+PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION = "3.0.0"
+PRIMARY_COMPLETION_RECORD_WIRE_VERSION = "3.0"
+PRIMARY_COMPLETION_RECORD_SEMANTIC_PROJECTION_VERSION = "primary-completion-record-semantic-v3"
 
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1, le=INT64_MAX)]
@@ -58,6 +58,14 @@ class PrimaryCompletionOutcome(StrEnum):
     PRIMARY_COMPLETE_WITH_SKIPS = "PRIMARY_COMPLETE_WITH_SKIPS"
 
 
+class PrimaryCompletionTerminalStage(StrEnum):
+    """Canonical stage whose evidence made the primary run terminal."""
+
+    EVENT_PROPOSAL = "EVENT_PROPOSAL"
+    PROVISIONAL_FUSION = "PROVISIONAL_FUSION"
+    FINAL_FUSION = "FINAL_FUSION"
+
+
 class DetailedResultArtifactReference(StrictModel):
     """Exact immutable reference to the schema-governed detailed run result."""
 
@@ -71,9 +79,9 @@ class DetailedResultArtifactReference(StrictModel):
 class PrimaryCompletionRecord(StrictModel):
     """Compact registered record committed with all primary publication facts."""
 
-    schema_version: Literal["2.0"]
+    schema_version: Literal["3.0"]
     schema_ref: SchemaRef
-    semantic_projection_version: Literal["primary-completion-record-semantic-v2"]
+    semantic_projection_version: Literal["primary-completion-record-semantic-v3"]
     semantic_sha256: Sha256Digest
 
     run_id: OpaqueUuid
@@ -83,12 +91,14 @@ class PrimaryCompletionRecord(StrictModel):
     config_sha256: Sha256Digest
     started_at: ValidatedRfc3339Timestamp
     outcome: PrimaryCompletionOutcome
+    terminal_stage: PrimaryCompletionTerminalStage
+    terminal_evidence_semantic_sha256: Sha256Digest
 
-    barrier_definition_semantic_sha256: Sha256Digest
-    barrier_reduction_semantic_sha256: Sha256Digest
-    output_decision_semantic_sha256: Sha256Digest
-    output_admission_policy_version: SchemaVersion
-    output_admission_policy_sha256: Sha256Digest
+    barrier_definition_semantic_sha256: Sha256Digest | None
+    barrier_reduction_semantic_sha256: Sha256Digest | None
+    output_decision_semantic_sha256: Sha256Digest | None
+    output_admission_policy_version: SchemaVersion | None
+    output_admission_policy_sha256: Sha256Digest | None
 
     run_membership_count: NonNegativeInt
     run_membership_digest_root: Sha256Digest
@@ -133,6 +143,31 @@ class PrimaryCompletionRecord(StrictModel):
         if completed_at < started_at:
             raise ValueError("completed_at must be at or after started_at")
 
+        final_fusion_fields = (
+            self.barrier_definition_semantic_sha256,
+            self.barrier_reduction_semantic_sha256,
+            self.output_decision_semantic_sha256,
+            self.output_admission_policy_version,
+            self.output_admission_policy_sha256,
+        )
+        if self.terminal_stage is PrimaryCompletionTerminalStage.FINAL_FUSION:
+            if any(item is None for item in final_fusion_fields):
+                raise ValueError("FINAL_FUSION completion requires exact final evidence")
+        elif any(item is not None for item in final_fusion_fields):
+            raise ValueError("pre-final completion cannot claim final-fusion evidence")
+        elif self.barrier_member_count != 0:
+            raise ValueError("pre-final completion cannot claim final-fusion barrier members")
+        if (
+            self.outcome is PrimaryCompletionOutcome.PRIMARY_COMPLETE
+            and self.terminal_stage is not PrimaryCompletionTerminalStage.FINAL_FUSION
+        ):
+            raise ValueError("event-producing completion requires FINAL_FUSION evidence")
+        if (
+            self.terminal_stage is not PrimaryCompletionTerminalStage.FINAL_FUSION
+            and self.outcome is not PrimaryCompletionOutcome.PRIMARY_COMPLETE_NO_EVENTS
+        ):
+            raise ValueError("pre-final terminal stages require a no-event outcome")
+
         if self.outcome is PrimaryCompletionOutcome.PRIMARY_COMPLETE_NO_EVENTS:
             event_collection_counts = {
                 "hypothesis_count": self.hypothesis_count,
@@ -164,7 +199,7 @@ class PrimaryCompletionRecord(StrictModel):
 def primary_completion_record_semantic_projection(
     record: PrimaryCompletionRecord,
 ) -> dict[str, Any]:
-    """Return the V2 completion-clock- and row-identity-independent projection."""
+    """Return the V3 completion-clock- and row-identity-independent projection."""
 
     return {
         "semantic_projection_version": record.semantic_projection_version,
@@ -177,6 +212,8 @@ def primary_completion_record_semantic_projection(
         "config_sha256": record.config_sha256,
         "started_at": record.started_at,
         "outcome": record.outcome.value,
+        "terminal_stage": record.terminal_stage.value,
+        "terminal_evidence_semantic_sha256": record.terminal_evidence_semantic_sha256,
         "barrier_definition_semantic_sha256": (record.barrier_definition_semantic_sha256),
         "barrier_reduction_semantic_sha256": (record.barrier_reduction_semantic_sha256),
         "output_decision_semantic_sha256": record.output_decision_semantic_sha256,
@@ -223,11 +260,13 @@ def create_primary_completion_record(
     config_sha256: Sha256Digest,
     started_at: Rfc3339Timestamp,
     outcome: PrimaryCompletionOutcome,
-    barrier_definition_semantic_sha256: Sha256Digest,
-    barrier_reduction_semantic_sha256: Sha256Digest,
-    output_decision_semantic_sha256: Sha256Digest,
-    output_admission_policy_version: SchemaVersion,
-    output_admission_policy_sha256: Sha256Digest,
+    terminal_stage: PrimaryCompletionTerminalStage,
+    terminal_evidence_semantic_sha256: Sha256Digest,
+    barrier_definition_semantic_sha256: Sha256Digest | None,
+    barrier_reduction_semantic_sha256: Sha256Digest | None,
+    output_decision_semantic_sha256: Sha256Digest | None,
+    output_admission_policy_version: SchemaVersion | None,
+    output_admission_policy_sha256: Sha256Digest | None,
     run_membership_count: NonNegativeInt,
     run_membership_digest_root: Sha256Digest,
     barrier_member_count: NonNegativeInt,
@@ -267,6 +306,8 @@ def create_primary_completion_record(
         "config_sha256": config_sha256,
         "started_at": started_at,
         "outcome": outcome,
+        "terminal_stage": terminal_stage,
+        "terminal_evidence_semantic_sha256": terminal_evidence_semantic_sha256,
         "barrier_definition_semantic_sha256": barrier_definition_semantic_sha256,
         "barrier_reduction_semantic_sha256": barrier_reduction_semantic_sha256,
         "output_decision_semantic_sha256": output_decision_semantic_sha256,
@@ -331,6 +372,7 @@ __all__ = [
     "DetailedResultArtifactReference",
     "PrimaryCompletionOutcome",
     "PrimaryCompletionRecord",
+    "PrimaryCompletionTerminalStage",
     "create_primary_completion_record",
     "primary_completion_record_semantic_projection",
     "validate_registered_primary_completion_record",

@@ -24,6 +24,7 @@ from robata.contracts.alignment import (
 from robata.contracts.cameras import CAMERA_IDS, CameraId, SixCameraMap
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import semantic_sha256
+from robata.contracts.pipeline import SamplingPurpose
 from robata.contracts.sampling_plan import FrameBudget, OverflowPolicy, SamplingPlan
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.temporal import PackageLineage
@@ -90,13 +91,17 @@ def _sampling_plan(row_id: str = "sampling-plan-row-a") -> SamplingPlan:
     )
 
 
-def _lineage(plan: SamplingPlan) -> PackageLineage:
+def _lineage(
+    plan: SamplingPlan,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> PackageLineage:
     return PackageLineage(
         source_content_sha256=_digest("source-content"),
         window_semantic_sha256=_digest("window"),
         camera_mapping_semantic_sha256=_digest("mapping"),
         alignment_semantic_sha256=_digest("alignment"),
-        sampling_plan_sha256=sampling_plan_digest(plan),
+        sampling_plan_sha256=sampling_plan_digest(plan, purpose=purpose),
     )
 
 
@@ -261,11 +266,16 @@ def _materialize(
     *,
     alias: int = 0,
     plan: SamplingPlan | None = None,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+    lineage_purpose: SamplingPurpose | None = None,
     missing: tuple[CameraId, int] | None = None,
     forge_projection: bool = False,
 ):
     resolved_plan = plan or _sampling_plan()
-    lineage = _lineage(resolved_plan)
+    lineage = _lineage(
+        resolved_plan,
+        purpose=purpose if lineage_purpose is None else lineage_purpose,
+    )
     alignment = _alignment(alias)
     frame_index = _frame_index(
         alignment,
@@ -276,6 +286,7 @@ def _materialize(
     return OfflineTemporalPackageMaterializer(_policy()).materialize(
         part=_part(),
         sampling_plan=resolved_plan,
+        purpose=purpose,
         alignment_run=alignment,
         frame_index=frame_index,
         lineage=lineage,
@@ -301,6 +312,8 @@ def test_materializer_records_every_target_and_canonical_empty_camera() -> None:
     assert cam_01.targets[2].actual_timestamp_ns == 900_000_000
     assert len(cam_01.frames) == 2
     assert all(frame.materialized_artifact is not None for frame in cam_01.frames)
+    assert cam_01.sampling.strategy == "DENSE"
+    assert (cam_01.rate_numerator, cam_01.rate_denominator) == (2, 1)
 
     empty = package.cameras[CameraId.CAM_06]
     assert empty.status is MaterializedCameraStatus.NO_FRAME
@@ -311,6 +324,37 @@ def test_materializer_records_every_target_and_canonical_empty_camera() -> None:
     )
     assert package.frame_count_total == 10
     assert output.package_ref.package_id == package.package_id
+
+
+def test_qa_coarse_materialization_uses_uniform_qa_sampling() -> None:
+    output = _materialize(purpose=SamplingPurpose.QA_COARSE)
+
+    for camera in output.package.cameras.values():
+        assert camera.sampling.strategy == "UNIFORM"
+        assert camera.sampling.target_fps == 1.0
+        assert (camera.rate_numerator, camera.rate_denominator) == (1, 1)
+        assert camera.sampling.target_count == 2
+
+
+def test_qa_dense_materialization_uses_six_camera_dense_sampling() -> None:
+    output = _materialize(purpose=SamplingPurpose.QA_DENSE)
+
+    for camera in output.package.cameras.values():
+        assert camera.sampling.strategy == "DENSE"
+        assert camera.sampling.target_fps == 2.0
+        assert (camera.rate_numerator, camera.rate_denominator) == (2, 1)
+        assert camera.sampling.target_count == 3
+
+
+def test_qa_coarse_materialization_rejects_dense_lineage_digest() -> None:
+    with pytest.raises(PackageMaterializationError) as raised:
+        _materialize(
+            purpose=SamplingPurpose.QA_COARSE,
+            lineage_purpose=SamplingPurpose.ACTION_DENSE,
+        )
+
+    assert raised.value.code is PackageMaterializationErrorCode.INVALID_INPUT
+    assert str(raised.value) == "sampling plan digest differs"
 
 
 def test_materialized_ref_is_accepted_by_package_set_builder() -> None:
@@ -399,14 +443,19 @@ def _v2_context():
     )
 
 
-def _v2_frame_index(context, lineage: PackageLineage) -> CanonicalSixCameraFrameIndex:
+def _v2_frame_index(
+    context,
+    lineage: PackageLineage,
+    *,
+    empty_camera: CameraId | None = CameraId.CAM_06,
+) -> CanonicalSixCameraFrameIndex:
     cameras: dict[CameraId, CameraSourceFrameIndex] = {}
     aligned_times = (250_000_000, 700_000_000, 900_000_000)
     for camera_id in CAMERA_IDS:
         alignment = context.alignment_manifest.cameras[camera_id.value]
         segment = alignment.segments[0]
         frames = ()
-        if camera_id is not CameraId.CAM_06:
+        if camera_id is not empty_camera:
             frames = tuple(
                 IndexedSourceFrame(
                     source_frame_id=f"v2-frame-{camera_id.value}-{source_order}",

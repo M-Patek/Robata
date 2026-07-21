@@ -16,6 +16,7 @@ from robata.contracts.primary_completion import (
     DetailedResultArtifactReference,
     PrimaryCompletionOutcome,
     PrimaryCompletionRecord,
+    PrimaryCompletionTerminalStage,
     create_primary_completion_record,
     primary_completion_record_semantic_projection,
     validate_registered_primary_completion_record,
@@ -74,6 +75,8 @@ def _record(**updates: Any) -> PrimaryCompletionRecord:
         "config_sha256": _digest("configuration"),
         "started_at": "2026-07-20T11:00:00Z",
         "outcome": PrimaryCompletionOutcome.PRIMARY_COMPLETE,
+        "terminal_stage": PrimaryCompletionTerminalStage.FINAL_FUSION,
+        "terminal_evidence_semantic_sha256": _digest("output-decision"),
         "barrier_definition_semantic_sha256": _digest("barrier-definition"),
         "barrier_reduction_semantic_sha256": _digest("barrier-reduction"),
         "output_decision_semantic_sha256": _digest("output-decision"),
@@ -126,26 +129,26 @@ def test_registered_schema_round_trip_matches_pydantic_contract() -> None:
         PrimaryCompletionRecord.model_validate_json(record.model_dump_json(), strict=True) == record
     )
     assert validate_registered_primary_completion_record(record, registry) == record
-    assert record.schema_version == PRIMARY_COMPLETION_RECORD_WIRE_VERSION == "2.0"
-    assert record.schema_ref.version == PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION == "2.0.0"
+    assert record.schema_version == PRIMARY_COMPLETION_RECORD_WIRE_VERSION == "3.0"
+    assert record.schema_ref.version == PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION == "3.0.0"
     assert (
         record.semantic_projection_version
         == PRIMARY_COMPLETION_RECORD_SEMANTIC_PROJECTION_VERSION
-        == "primary-completion-record-semantic-v2"
+        == "primary-completion-record-semantic-v3"
     )
 
 
 def test_frozen_v1_remains_exactly_readable_but_is_not_a_default_model_input() -> None:
     registry = SchemaRegistry()
     frozen_v1 = registry.resolve_version(PRIMARY_COMPLETION_RECORD_SCHEMA_ID, "1.0.0")
-    current_v2 = registry.resolve_version(
+    current_v3 = registry.resolve_version(
         PRIMARY_COMPLETION_RECORD_SCHEMA_ID,
         PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION,
     )
 
     assert frozen_v1.entry.projection_version == "primary-completion-record-semantic-v1"
     assert frozen_v1.entry.wire_version == "1.0"
-    assert current_v2.entry.projection_version == (
+    assert current_v3.entry.projection_version == (
         PRIMARY_COMPLETION_RECORD_SEMANTIC_PROJECTION_VERSION
     )
     assert registry.get_schema(frozen_v1.ref)["$id"] == (
@@ -154,6 +157,8 @@ def test_frozen_v1_remains_exactly_readable_but_is_not_a_default_model_input() -
     assert registry.upcasters == ()
 
     v1_payload = _record().model_dump(mode="json")
+    v1_payload.pop("terminal_stage")
+    v1_payload.pop("terminal_evidence_semantic_sha256")
     v1_payload.update(
         {
             "schema_version": "1.0",
@@ -197,7 +202,7 @@ def test_completion_clock_is_ordered_by_instant_across_offsets() -> None:
     assert same_instant.completed_at == "2026-07-20T10:00:00Z"
 
 
-def test_registered_v2_schema_rejects_calendar_invalid_timestamp() -> None:
+def test_registered_v3_schema_rejects_calendar_invalid_timestamp() -> None:
     registry = SchemaRegistry()
     record = _record()
     payload = record.model_dump(mode="json")
@@ -207,21 +212,21 @@ def test_registered_v2_schema_rejects_calendar_invalid_timestamp() -> None:
         registry.validate_pinned(record.schema_ref, payload)
 
 
-def test_v2_policy_namespace_changes_the_semantic_identity() -> None:
+def test_v3_policy_namespace_changes_the_semantic_identity() -> None:
     record = _record()
-    v2_projection = primary_completion_record_semantic_projection(record)
+    v3_projection = primary_completion_record_semantic_projection(record)
     frozen_v1 = SchemaRegistry().resolve_version(
         PRIMARY_COMPLETION_RECORD_SCHEMA_ID,
         "1.0.0",
     )
     legacy_projection = {
-        **v2_projection,
+        **v3_projection,
         "semantic_projection_version": "primary-completion-record-semantic-v1",
         "schema_version": "1.0",
         "schema_ref": frozen_v1.ref.model_dump(mode="json"),
     }
 
-    assert semantic_sha256(v2_projection) == record.semantic_sha256
+    assert semantic_sha256(v3_projection) == record.semantic_sha256
     assert semantic_sha256(legacy_projection) != record.semantic_sha256
 
 
@@ -302,6 +307,48 @@ def test_no_events_has_explicit_empty_publication_collections() -> None:
     wire_payload["identity_assignment_count"] = 1
     with pytest.raises(SchemaValidationError):
         SchemaRegistry().validate_pinned(record.schema_ref, wire_payload)
+
+
+@pytest.mark.parametrize(
+    "terminal_stage",
+    [
+        PrimaryCompletionTerminalStage.EVENT_PROPOSAL,
+        PrimaryCompletionTerminalStage.PROVISIONAL_FUSION,
+    ],
+)
+def test_pre_final_no_events_omit_final_fusion_evidence(
+    terminal_stage: PrimaryCompletionTerminalStage,
+) -> None:
+    record = _record(
+        outcome=PrimaryCompletionOutcome.PRIMARY_COMPLETE_NO_EVENTS,
+        terminal_stage=terminal_stage,
+        terminal_evidence_semantic_sha256=_digest(f"terminal:{terminal_stage.value}"),
+        barrier_definition_semantic_sha256=None,
+        barrier_reduction_semantic_sha256=None,
+        output_decision_semantic_sha256=None,
+        output_admission_policy_version=None,
+        output_admission_policy_sha256=None,
+        barrier_member_count=0,
+        **_NO_EVENT_COUNTS,
+    )
+
+    assert record.terminal_stage is terminal_stage
+    assert record.barrier_definition_semantic_sha256 is None
+    SchemaRegistry().validate_pinned(record.schema_ref, record.model_dump(mode="json"))
+
+    with pytest.raises(ValidationError, match="barrier members"):
+        _record(
+            outcome=PrimaryCompletionOutcome.PRIMARY_COMPLETE_NO_EVENTS,
+            terminal_stage=terminal_stage,
+            terminal_evidence_semantic_sha256=_digest(f"terminal:{terminal_stage.value}"),
+            barrier_definition_semantic_sha256=None,
+            barrier_reduction_semantic_sha256=None,
+            output_decision_semantic_sha256=None,
+            output_admission_policy_version=None,
+            output_admission_policy_sha256=None,
+            barrier_member_count=1,
+            **_NO_EVENT_COUNTS,
+        )
 
 
 def test_skip_outcome_is_explicit_and_mutually_bound_to_skip_evidence() -> None:

@@ -26,6 +26,8 @@ class _ChannelAccumulator:
     topic: str
     schema_name: str | None
     message_encoding: str
+    schema_encoding: str | None
+    schema_content_sha256: str | None
     message_count: int = 0
     first_message_time_ns: int | None = None
     last_message_time_ns: int | None = None
@@ -42,6 +44,10 @@ class _ChannelAccumulator:
             topic=channel.topic,
             schema_name=schema.name if schema is not None else None,
             message_encoding=channel.message_encoding,
+            schema_encoding=None if schema is None else schema.encoding,
+            schema_content_sha256=(
+                None if schema is None else hashlib.sha256(schema.data).hexdigest()
+            ),
         )
 
     def observe_timestamp(self, timestamp_ns: int) -> None:
@@ -66,6 +72,8 @@ class _ChannelAccumulator:
             monotonic=self.monotonic,
             codec=self.codec,
             frame_id=self.frame_id,
+            schema_encoding=self.schema_encoding,
+            schema_content_sha256=self.schema_content_sha256,
         )
 
 
@@ -185,10 +193,16 @@ class OfficialMcapInspector:
         schema: Schema | None,
     ) -> None:
         schema_name = schema.name if schema is not None else None
+        schema_encoding = schema.encoding if schema is not None else None
+        schema_content_sha256 = (
+            hashlib.sha256(schema.data).hexdigest() if schema is not None else None
+        )
         if (
             accumulator.topic != channel.topic
             or accumulator.schema_name != schema_name
             or accumulator.message_encoding != channel.message_encoding
+            or accumulator.schema_encoding != schema_encoding
+            or accumulator.schema_content_sha256 != schema_content_sha256
         ):
             raise IngestionError(
                 IngestionErrorCode.CORRUPT_MCAP,

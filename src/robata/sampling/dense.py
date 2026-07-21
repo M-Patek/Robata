@@ -18,6 +18,7 @@ from pydantic import Field, StringConstraints, model_validator
 from robata.contracts.cameras import CAMERA_ID_VALUES
 from robata.contracts.common import NanosecondInterval, Nanoseconds, SchemaVersion, StrictModel
 from robata.contracts.hashing import canonical_json_bytes
+from robata.contracts.pipeline import SamplingPurpose, SamplingStrategy
 from robata.contracts.sampling_plan import OverflowPolicy, SamplingPlan
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
@@ -149,27 +150,60 @@ def _rate_fraction(value: Any) -> tuple[int, int]:
     return fraction.numerator // divisor, fraction.denominator // divisor
 
 
-def sampling_plan_projection(sampling_plan: SamplingPlan) -> dict[str, Any]:
-    """Return an order-independent, rationalized semantic plan projection."""
+def sampling_plan_projection(
+    sampling_plan: SamplingPlan,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> dict[str, Any]:
+    """Return the rationalized projection for one supported sampling purpose.
+
+    The compatibility default remains `ACTION_DENSE` and retains its exact
+    historical projection. QA purposes deliberately ignore action-only
+    per-camera overrides: each QA pass uses one uniform grid across all six
+    cameras, at either the coarse or dense global rate.
+    """
 
     if not isinstance(sampling_plan, SamplingPlan):
         raise TypeError("sampling_plan must be robata.contracts.sampling_plan.SamplingPlan")
-    overrides: dict[str, tuple[int, int]] = {}
-    for override in sampling_plan.per_camera:
-        camera_id = override.camera_id
-        if camera_id not in CAMERA_ID_VALUES:
-            raise ValueError(f"unknown camera override: {camera_id!r}")
-        if camera_id in overrides:
-            raise ValueError(f"duplicate camera override: {camera_id!r}")
-        overrides[camera_id] = _rate_fraction(override.dense_sampling_rate_fps)
-    global_rate = _rate_fraction(sampling_plan.dense_sampling_rate_fps)
-    rates = {camera_id: overrides.get(camera_id, global_rate) for camera_id in CAMERA_ID_VALUES}
+    if not isinstance(purpose, SamplingPurpose):
+        raise TypeError("purpose must be a SamplingPurpose")
+    if purpose is SamplingPurpose.QA_COARSE:
+        global_rate = _rate_fraction(sampling_plan.qa_sampling_rate_fps)
+        rates = {camera_id: global_rate for camera_id in CAMERA_ID_VALUES}
+        rate_key = "qa_rate"
+        strategy = SamplingStrategy.UNIFORM
+    elif purpose is SamplingPurpose.QA_DENSE:
+        global_rate = _rate_fraction(sampling_plan.dense_sampling_rate_fps)
+        rates = {camera_id: global_rate for camera_id in CAMERA_ID_VALUES}
+        rate_key = "dense_rate"
+        strategy = SamplingStrategy.DENSE
+    elif purpose in {
+        SamplingPurpose.ACTION_DENSE,
+        SamplingPurpose.BOUNDARY_REFINEMENT,
+    }:
+        overrides: dict[str, tuple[int, int]] = {}
+        for override in sampling_plan.per_camera:
+            camera_id = override.camera_id
+            if camera_id not in CAMERA_ID_VALUES:
+                raise ValueError(f"unknown camera override: {camera_id!r}")
+            if camera_id in overrides:
+                raise ValueError(f"duplicate camera override: {camera_id!r}")
+            overrides[camera_id] = _rate_fraction(override.dense_sampling_rate_fps)
+        global_rate = _rate_fraction(sampling_plan.dense_sampling_rate_fps)
+        rates = {camera_id: overrides.get(camera_id, global_rate) for camera_id in CAMERA_ID_VALUES}
+        rate_key = "dense_rate"
+        strategy = SamplingStrategy.DENSE
+    else:
+        raise ValueError(
+            "provider-neutral planning currently supports only QA_COARSE, "
+            "QA_DENSE, ACTION_DENSE, and BOUNDARY_REFINEMENT"
+        )
     budget = sampling_plan.frame_budget
     if budget.max_frames_total < CAMERA_COUNT:
         raise ValueError("max_frames_total must allow at least one frame per camera")
-    return {
+    projection: dict[str, Any] = {
         "version": sampling_plan.version,
-        "dense_rate": {"numerator": global_rate[0], "denominator": global_rate[1]},
+        rate_key: {"numerator": global_rate[0], "denominator": global_rate[1]},
         "per_camera": {
             camera_id: {"numerator": rates[camera_id][0], "denominator": rates[camera_id][1]}
             for camera_id in CAMERA_ID_VALUES
@@ -180,10 +214,23 @@ def sampling_plan_projection(sampling_plan: SamplingPlan) -> dict[str, Any]:
             "overflow_policy": budget.overflow_policy.value,
         },
     }
+    if purpose in {
+        SamplingPurpose.QA_COARSE,
+        SamplingPurpose.QA_DENSE,
+        SamplingPurpose.BOUNDARY_REFINEMENT,
+    }:
+        projection["purpose"] = purpose.value
+        projection["strategy"] = strategy.value
+    return projection
 
 
-def _budget_spec(sampling_plan: SamplingPlan, policy: DenseSplitPolicy) -> _BudgetSpec:
-    projection = sampling_plan_projection(sampling_plan)
+def _budget_spec(
+    sampling_plan: SamplingPlan,
+    policy: DenseSplitPolicy,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
+) -> _BudgetSpec:
+    projection = sampling_plan_projection(sampling_plan, purpose=purpose)
     budget = sampling_plan.frame_budget
     if policy.max_frames_per_camera is not None:
         if policy.max_frames_per_camera != budget.max_frames_per_camera:
@@ -214,6 +261,8 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 def frame_counts_for_interval(
     interval: NanosecondInterval,
     sampling_plan: SamplingPlan,
+    *,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
 ) -> tuple[int, ...]:
     """Return conservative integer frame counts for all six camera grids.
 
@@ -222,7 +271,7 @@ def frame_counts_for_interval(
     can be admitted when its budget decision depends on floating-point phase.
     """
 
-    projection = sampling_plan_projection(sampling_plan)
+    projection = sampling_plan_projection(sampling_plan, purpose=purpose)
     duration_ns = interval.duration_ns
     return tuple(
         _ceil_div(
@@ -265,6 +314,7 @@ def plan_interval_parts(
     *,
     overlap_ns: int | None = None,
     split_policy: DenseSplitPolicy | None = None,
+    purpose: SamplingPurpose = SamplingPurpose.ACTION_DENSE,
 ) -> tuple[IntervalPart, ...]:
     """Split one half-open interval under the source frame budget.
 
@@ -294,7 +344,7 @@ def plan_interval_parts(
     )
     if policy.overlap_ns != resolved_overlap:
         raise ValueError("overlap_ns disagrees with split policy")
-    spec = _budget_spec(sampling_plan, policy)
+    spec = _budget_spec(sampling_plan, policy, purpose=purpose)
     full_duration = effective_interval.duration_ns
     if _fits_duration(full_duration, spec):
         return (

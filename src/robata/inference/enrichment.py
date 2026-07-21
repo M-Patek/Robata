@@ -427,10 +427,7 @@ class ParsedProviderClaimArtifact(StrictModel):
         allowed = _TASK_KINDS[self.task]
         if any(claim.kind not in allowed for claim in self.payload.claims):
             raise ValueError("provider claim kind does not match the selected task")
-        if self.task is VisionTask.FUSION_ADJUDICATION:
-            if self.payload.abstained == bool(self.payload.claims):
-                raise ValueError("fusion output must either abstain or contain hypotheses")
-        elif self.payload.abstained:
+        if self.task is not VisionTask.FUSION_ADJUDICATION and self.payload.abstained:
             raise ValueError("only fusion adjudication may emit abstained=true")
         expected = semantic_sha256(parsed_provider_claim_projection(self))
         if self.semantic_sha256 != expected:
