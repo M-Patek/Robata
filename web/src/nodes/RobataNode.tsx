@@ -1,165 +1,176 @@
 import { memo, useCallback } from 'react'
 import { Handle, Position, NodeProps } from 'reactflow'
 import { clsx } from 'clsx'
-import { RobataNodeData, STATUS_RING, NodeKind } from '@/types'
+import { RobataNodeData, STATUS_STYLE, STATUS_LABEL, NodeKind } from '@/types'
 import { usePipelineStore } from '@/store'
 
-// ── Icon map per node kind ────────────────────────────────────────────────────
-const KIND_ICON: Record<NodeKind, string> = {
-  source:               '📼',
-  media_quality:        '🎞',
-  adaptive_sampler:     '🔢',
-  qa_coarse:            '🔍',
-  qa_dense:             '🔬',
-  qa_gate:              '🚦',
-  event_proposal:       '💡',
-  candidate_reducer:    '🔀',
-  action_evidence:      '📸',
-  provisional_fusion:   '🔗',
-  boundary_refinement:  '📐',
-  final_fusion:         '✅',
-  primary_completion:   '💾',
-  outbox_relay:         '📤',
-  review_queue:         '👁',
-  work_scheduler:       '🗓',
+const KIND_ABBR: Record<NodeKind, string> = {
+  source:               'SRC',
+  media_quality:        'MQ',
+  adaptive_sampler:     'AS',
+  qa_coarse:            'QAc',
+  qa_dense:             'QAd',
+  qa_gate:              'QA',
+  event_proposal:       'EP',
+  candidate_reducer:    'CR',
+  action_evidence:      'AE',
+  provisional_fusion:   'PF',
+  boundary_refinement:  'BR',
+  final_fusion:         'FF',
+  primary_completion:   'PC',
+  outbox_relay:         'OB',
+  review_queue:         'RQ',
+  work_scheduler:       'WS',
 }
 
-const STATUS_BG: Record<string, string> = {
-  PENDING:        'bg-gray-700/60',
-  RUNNING:        'bg-blue-900/60',
-  COMPLETE:       'bg-green-900/60',
-  FAILED:         'bg-red-900/60',
-  WAITING_REVIEW: 'bg-yellow-900/60',
-  BLOCKED:        'bg-purple-900/60',
-  NO_EVENTS:      'bg-slate-700/60',
+const KIND_GROUP: Record<NodeKind, string> = {
+  source:               'Ingestion',
+  media_quality:        'Ingestion',
+  adaptive_sampler:     'Sampling',
+  qa_coarse:            'Quality',
+  qa_dense:             'Quality',
+  qa_gate:              'Quality',
+  event_proposal:       'Events',
+  candidate_reducer:    'Events',
+  action_evidence:      'Events',
+  provisional_fusion:   'Fusion',
+  boundary_refinement:  'Fusion',
+  final_fusion:         'Fusion',
+  primary_completion:   'Completion',
+  outbox_relay:         'Delivery',
+  review_queue:         'Delivery',
+  work_scheduler:       'Delivery',
 }
 
-const STATUS_HEADER: Record<string, string> = {
-  PENDING:        'bg-gray-600/40 text-gray-300',
-  RUNNING:        'bg-blue-700/60 text-blue-100',
-  COMPLETE:       'bg-green-800/60 text-green-100',
-  FAILED:         'bg-red-800/60 text-red-100',
-  WAITING_REVIEW: 'bg-yellow-800/60 text-yellow-100',
-  BLOCKED:        'bg-purple-800/60 text-purple-100',
-  NO_EVENTS:      'bg-slate-600/60 text-slate-200',
-}
-
-const STATUS_DOT: Record<string, string> = {
-  PENDING:        'bg-gray-400',
-  RUNNING:        'bg-blue-400 animate-pulse-fast',
-  COMPLETE:       'bg-green-400',
-  FAILED:         'bg-red-400',
-  WAITING_REVIEW: 'bg-yellow-400 animate-pulse',
-  BLOCKED:        'bg-purple-400',
-  NO_EVENTS:      'bg-slate-400',
+function RunningDot() {
+  return (
+    <span className="relative flex h-2 w-2 flex-shrink-0">
+      <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60"
+        style={{ background: '#4A7FA8' }} />
+      <span className="relative inline-flex rounded-full h-2 w-2"
+        style={{ background: '#4A7FA8' }} />
+    </span>
+  )
 }
 
 function RobataNode({ id, data, selected }: NodeProps<RobataNodeData>) {
   const setSelectedNodeId = usePipelineStore((s) => s.setSelectedNodeId)
   const activeRun = usePipelineStore((s) => s.activeRun)
-
   const liveStatus = activeRun?.node_statuses?.[id] ?? data.status
+  const style = STATUS_STYLE[liveStatus]
 
-  const handleClick = useCallback(() => {
-    setSelectedNodeId(id)
-  }, [id, setSelectedNodeId])
+  const handleClick = useCallback(() => setSelectedNodeId(id), [id, setSelectedNodeId])
 
   return (
     <div
       onClick={handleClick}
-      className={clsx(
-        'node-base min-w-[200px] max-w-[260px] cursor-pointer',
-        STATUS_RING[liveStatus],
-        STATUS_BG[liveStatus],
-        selected && 'ring-2 ring-blue-400 ring-offset-1 ring-offset-canvas-bg',
-      )}
+      className={clsx('node-base cursor-pointer', selected && 'node-selected')}
+      style={{
+        minWidth: 180,
+        maxWidth: 220,
+        borderColor: selected ? undefined : style.nodeBorder,
+      }}
     >
-      {/* Handles */}
-      <Handle type="target" position={Position.Top}
-        style={{ background: '#6b7280', border: '2px solid #9ca3af' }} />
+      <Handle
+        type="target"
+        position={Position.Left}
+        style={{ background: '#F8F3E8', borderColor: '#C4B59E' }}
+      />
 
-      {/* Header */}
-      <div className={clsx('node-header rounded-t-md', STATUS_HEADER[liveStatus])}>
-        <div className="flex items-center gap-2">
-          <span className="text-base">{KIND_ICON[data.kind]}</span>
-          <span className="text-[11px] font-semibold leading-tight">
+      {/* Header band */}
+      <div
+        className="px-3 py-2 rounded-t-lg flex items-center justify-between gap-2"
+        style={{ background: style.header, borderBottom: '1px solid rgba(26,23,20,0.07)' }}
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <span
+            className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded"
+            style={{ background: 'rgba(26,23,20,0.07)', color: '#6B5E55' }}
+          >
+            {KIND_ABBR[data.kind]}
+          </span>
+          <span className="text-[11px] font-semibold text-ink-900 truncate leading-tight"
+            style={{ fontFamily: 'Inter, sans-serif' }}>
             {data.label}
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
-          {data.instance_id && (
-            <span className="text-[9px] px-1 py-0.5 rounded bg-black/30 font-mono">
-              #{data.instance_id}
-            </span>
-          )}
-          <span className={clsx('w-2 h-2 rounded-full flex-shrink-0', STATUS_DOT[liveStatus])} />
-        </div>
+        {liveStatus === 'RUNNING'
+          ? <RunningDot />
+          : <span className="w-2 h-2 rounded-full flex-shrink-0"
+              style={{ background: style.dot }} />
+        }
       </div>
 
       {/* Body */}
-      <div className="node-body text-gray-300">
-        {/* Status */}
+      <div className="px-3 py-2.5 space-y-1.5">
+        {/* Status pill */}
         <div className="flex items-center justify-between">
-          <span className="text-gray-500 uppercase text-[9px] tracking-widest">status</span>
-          <span className={clsx(
-            'status-badge text-[9px]',
-            liveStatus === 'RUNNING' && 'bg-blue-900 text-blue-200',
-            liveStatus === 'COMPLETE' && 'bg-green-900 text-green-200',
-            liveStatus === 'FAILED' && 'bg-red-900 text-red-200',
-            liveStatus === 'PENDING' && 'bg-gray-700 text-gray-300',
-            liveStatus === 'WAITING_REVIEW' && 'bg-yellow-900 text-yellow-200',
-            liveStatus === 'BLOCKED' && 'bg-purple-900 text-purple-200',
-            liveStatus === 'NO_EVENTS' && 'bg-slate-700 text-slate-300',
-          )}>
-            {liveStatus}
+          <span className="label-muted">status</span>
+          <span
+            className="status-pill"
+            style={{ background: style.bg, color: style.text }}
+          >
+            {STATUS_LABEL[liveStatus]}
           </span>
         </div>
 
-        {/* Metrics */}
-        {data.metrics?.camera_count !== undefined && (
-          <div className="flex justify-between">
-            <span className="text-gray-500 text-[9px]">cameras</span>
-            <span className="font-mono text-[10px] text-cyan-300">
-              {data.metrics.camera_count} ×
+        {/* Group */}
+        <div className="flex items-center justify-between">
+          <span className="label-muted">group</span>
+          <span className="text-[10px] text-ink-500">{KIND_GROUP[data.kind]}</span>
+        </div>
+
+        {/* Instance */}
+        {data.instance_id && (
+          <div className="flex items-center justify-between">
+            <span className="label-muted">instance</span>
+            <span className="text-[10px] font-mono text-ink-500">
+              {data.instance_id}
             </span>
           </div>
         )}
-        {data.metrics?.duration_ms !== undefined && (
-          <div className="flex justify-between">
-            <span className="text-gray-500 text-[9px]">duration</span>
-            <span className="font-mono text-[10px] text-cyan-300">
-              {data.metrics.duration_ms}ms
+
+        {/* Metrics */}
+        {data.metrics?.camera_count !== undefined && (
+          <div className="flex items-center justify-between">
+            <span className="label-muted">cameras</span>
+            <span className="text-[10px] font-mono" style={{ color: '#4A7FA8' }}>
+              {data.metrics.camera_count}×
             </span>
           </div>
         )}
         {data.metrics?.attempt !== undefined && (
-          <div className="flex justify-between">
-            <span className="text-gray-500 text-[9px]">attempt</span>
-            <span className="font-mono text-[10px] text-amber-300">
+          <div className="flex items-center justify-between">
+            <span className="label-muted">attempt</span>
+            <span className="text-[10px] font-mono" style={{ color: '#A87A2A' }}>
               #{data.metrics.attempt}
             </span>
           </div>
         )}
-        {data.metrics?.schema_version && (
-          <div className="flex justify-between gap-2 min-w-0">
-            <span className="text-gray-500 text-[9px] flex-shrink-0">schema</span>
-            <span className="font-mono text-[9px] text-violet-300 truncate text-right">
-              {data.metrics.schema_version}
+        {data.metrics?.duration_ms !== undefined && (
+          <div className="flex items-center justify-between">
+            <span className="label-muted">duration</span>
+            <span className="text-[10px] font-mono text-ink-500">
+              {data.metrics.duration_ms}ms
             </span>
           </div>
         )}
-        {data.metrics?.sha256 && (
-          <div className="flex justify-between gap-2">
-            <span className="text-gray-500 text-[9px]">sha256</span>
-            <span className="font-mono text-[9px] text-slate-400 truncate">
-              {data.metrics.sha256.slice(0, 10)}…
+        {data.metrics?.schema_version && (
+          <div className="flex items-center justify-between gap-2">
+            <span className="label-muted flex-shrink-0">schema</span>
+            <span className="text-[9px] font-mono truncate text-right"
+              style={{ color: '#6A4AA8' }}>
+              {data.metrics.schema_version}
             </span>
           </div>
         )}
       </div>
 
-      <Handle type="source" position={Position.Bottom}
-        style={{ background: '#6b7280', border: '2px solid #9ca3af' }} />
+      <Handle
+        type="source"
+        position={Position.Right}
+        style={{ background: '#F8F3E8', borderColor: '#C4B59E' }}
+      />
     </div>
   )
 }

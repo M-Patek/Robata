@@ -28,7 +28,7 @@ function SchemaEdge({
         id={id}
         path={edgePath}
         markerEnd={markerEnd}
-        style={{ stroke: color, strokeWidth: 2, opacity: 0.75 }}
+        style={{ stroke: color, strokeWidth: 1.75, opacity: 0.65 }}
       />
       {data?.label && (
         <EdgeLabelRenderer>
@@ -37,8 +37,13 @@ function SchemaEdge({
             className="absolute pointer-events-none"
           >
             <span
-              className="px-1.5 py-0.5 rounded text-[9px] font-mono font-medium bg-canvas-panel border"
-              style={{ color, borderColor: color + '55' }}
+              className="px-1.5 py-0.5 rounded text-[9px] font-mono"
+              style={{
+                color,
+                background: '#FDFAF5',
+                border: `1px solid ${color}44`,
+                fontFamily: 'JetBrains Mono, monospace',
+              }}
             >
               {data.label}
             </span>
