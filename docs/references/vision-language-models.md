@@ -135,11 +135,26 @@ and the multi-armed bandit literature (exploration vs. exploitation trade-off).
 
 ### Robata Application
 
-- `sampling/adaptive.py` — `SignalDetector` protocol; implementations will
-  detect motion, boundary uncertainty, and QA degradation as triggers.
-- `sampling/grid.py` — base rational grid provides the uniform-rate fallback.
-- `AdaptiveSampler.sample()` currently raises `NotImplementedError` pending
-  O-13 policy; the architecture is in place for plug-in detectors.
+- `sampling/adaptive.py` defines the `SignalDetector` protocol and executes
+  injected detectors with deterministic trigger ordering and reduction.
+- `sampling/grid.py` provides the exact rational uniform-rate fallback.
+- `application/canonical/media_quality.py` publishes deterministic local observations for
+  black/overexposed luma, frozen-content and low-edge-energy proxies, cadence/sequence gaps, and
+  cross-camera skew.
+- `sampling/supplemental.py` and `qa_pipeline/supplemental.py` connect a registered local
+  media-quality report to frozen explicit neighbor targets, provider-neutral PNG materialization,
+  exact artifact-byte verification, and registered supplemental QA evidence in the canonical
+  raw-MCAP fresh/recovery path.
+- Local composition v18 binds the ordered media-quality and supplemental-QA closure into
+  primary-completion command v2 through role, exact Schema reference, semantic digest,
+  exact-byte digest, and byte count. Recovery reconciles authoritative durable work and committed
+  outbox delivery first, then revalidates the referenced side artifacts for receipt construction.
+- The generic `AdaptiveSampler` detector-trigger stream is not yet composed into canonical package
+  planning. Low edge energy is only a local proxy, not a semantic blur or occlusion classification.
+  O-13 still governs promoted triggers, thresholds, rates, padding, and budgets. Real-model
+  qualification, representative capacity and long-soak evidence, production storage/broker and
+  filesystem durability (including parent-directory `fsync`), and protected Schema-baseline
+  approval remain external gates.
 
 ---
 

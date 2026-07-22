@@ -28,7 +28,7 @@ the current tree satisfies a phase gate.
 
 ## Current Baseline
 
-The live tree provides strict domain values and 44 exact-pinned schemas, deterministic canonical
+The live tree provides strict domain values and 47 exact-pinned schemas, deterministic canonical
 hashing, six-camera invariants, immutable artifact and revision primitives, local
 inference/barrier evidence, a durable SQLite work scheduler, a local outbox relay, nonblocking
 review routing, offline QA/event reduction, benchmark calculations, a synthetic capacity harness,
@@ -38,8 +38,16 @@ A canonical local-conformance command now accepts either one immutable six-camer
 explicitly authorized raw MCAP. The raw path inspects and hashes the exact source, binds exact
 schema bytes, probes all six H.264 streams, registers MP4 and sidecar artifacts, constructs V2
 admission/alignment evidence, and materializes a canonical six-camera frame index plus selected
-PNG artifacts. Both sources then drive the same explicit processing run through exact coarse/dense QA and QA
-completion; provider-neutral EVENT_PROPOSAL planning; deterministic candidate reduction;
+PNG artifacts. It publishes an exact-pinned local media-quality report before primary completion.
+When deterministic local observations produce explicit neighbor targets, the path freezes those
+targets, materializes their PNGs, verifies their exact bytes through a deterministic supplemental
+QA consumer, and persists exact-pinned supplemental QA evidence. The raw-source composition binds
+the report and supplemental evidence, when present, into primary-completion command v2 as ordered
+role/schema/semantic-digest/exact-byte-digest/byte-count references. On recovery it first uses the
+authoritative primary completion to reconcile durable `ACTION_PUBLISH` work and committed outbox
+delivery, then revalidates those side artifacts before constructing a receipt. Both sources drive the
+same explicit processing run through exact coarse/dense QA and QA completion; provider-neutral
+EVENT_PROPOSAL planning; deterministic candidate reduction;
 per-candidate ACTION_EVIDENCE; provisional 0/1/N physical-action fusion; and separate padded
 ONSET/OFFSET boundary passes. The runner builds one versioned final-fusion context from the exact
 ordered refined-action closure, binds it to the input plan and adapter requests, and accepts only
@@ -62,16 +70,21 @@ strict binding, bounded retries, timeout handling, and raw-byte preservation, bu
 composed and has never used a real endpoint or credential. The canonical runner independently
 injects the provider-neutral model adapter, exact raw-byte store, and strict claim parser.
 
-The run-scoped SQLite barrier remains the canonical local recovery authority. Separate local
-components now provide a durable work ledger with deadlines/leases/fences/invalidation, registered
-work-message and persisted-barrier projections, at-least-once outbox relay with idempotent sink and
-DLQ simulation, and a nonblocking priority/SLA review queue. Persisted and published event-identity
+The run-scoped SQLite barrier remains the canonical local recovery authority. The local canonical
+command connects a durable work ledger with deadlines/leases/fences/invalidation, registered
+work-message and persisted-barrier projections, an at-least-once outbox relay with idempotent sink
+and DLQ simulation, and a nonblocking priority/SLA review queue. After primary completion it
+reconciles `ACTION_PUBLISH`, relays committed outbox rows including recovered completions, and then
+routes review without replacing primary truth. Persisted and published event-identity
 outbox payloads use an exact-pinned `EventIdentityOutboxWireRecord`; the embedded
 `EventIdentityOutboxRecord` keeps its original frozen shape inside completion detail. The review
 queue exact-validates registered task, annotation, and reopen-command payloads on write and read.
-These components are not yet wired into one production topology and do not select Redis, a broker,
-reconciliation ownership, or O-14 recovery policy. Every command receipt and published local
-payload remains `LOCAL_CONFORMANCE` with `production_eligible=false`.
+These locally connected components remain separate SQLite authorities rather than one production
+transaction topology; they do not select Redis, a broker, reconciliation ownership, or O-14
+recovery policy. Local atomic file replacement also does not establish production power-loss
+durability without a selected filesystem/storage contract, including parent-directory `fsync`.
+Every command receipt and published local payload remains `LOCAL_CONFORMANCE`
+with `production_eligible=false`.
 
 Canonical implementation ownership is split under `robata.application.canonical`:
 `models.py` owns status, error, root-window, part-result, and execution-policy models;
@@ -98,7 +111,7 @@ entries.
 The former fake-model analysis runner is no longer part of the live package or CLI surface. Its
 prior reports and older MVP material remain under `archive/old_mvp` for history only and are not a
 supported execution path. Real Qwen/GPT/RunPod qualification, governed raw-MCAP admission,
-production database/broker/object storage and scheduler composition, governed ActionEvent
+production database/broker/object storage and scheduler/work-DAG transaction composition, governed ActionEvent
 successors, approved QA/event/review policy, representative quality evidence, long-soak SLO data,
 and measured capacity qualification remain blocked or external work.
 
@@ -118,8 +131,8 @@ Use the existing environment for local checks:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp D:\tmp\robata-tests
-.\.venv\Scripts\python.exe -m ruff check src scripts tests
-.\.venv\Scripts\python.exe -m ruff format --check src scripts tests
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m ruff format --check .
 .\.venv\Scripts\python.exe -m mypy
 .\.venv\Scripts\python.exe scripts\verify_schema_registry.py
 .\.venv\Scripts\python.exe scripts\check_doc_links.py
@@ -151,11 +164,23 @@ The canonical local fixture command is:
 The matching raw-MCAP command is:
 
 ```powershell
-.venv/Scripts/python.exe scripts/run_canonical_mcap.py data/source/sample-medium.mcap --mapping-config config/genrobot-observed-v0.json --allow-unapproved-profile --state-dir tmp/canonical-mcap-state --run-key primary
+.venv/Scripts/python.exe scripts/run_canonical_mcap.py data/source/sample-medium.mcap --mapping-config config/genrobot-observed-v0.json --allow-unapproved-profile --state-dir tmp/canonical-mcap-state --run-key primary --max-duration-seconds 180
 ```
 
 Repeating either exact command performs recovery/replay and does not duplicate the business result
 or its outbox rows. These are local operator entry points, not production commands.
+The checked-in `sample-medium.mcap` spans 40.890455 seconds, so the 180-second cap covers the entire
+file. The verified v18 candidate-local fresh run exited 0 in 853.8 seconds and returned `SUCCEEDED`:
+16 deterministic fixture-backed inference calls, zero network calls, one outbox row delivered on
+relay attempt 1, review `ENQUEUED`, no local quality flags, and no supplemental QA evidence. Exact
+replay exited 0 in 26 seconds, retained the same command, run, completion, event, revision, and
+outbox identifiers, made zero fixture calls and zero relay attempts, and returned review
+`ALREADY_ENQUEUED`. SQLite corroborated one committed completion, one `SUCCEEDED` run, one delivered
+outbox row, one sink row, `ACTION_PUBLISH` `SUCCEEDED`, and one `PENDING` review task; completion
+evidence contains its `MEDIA_QUALITY_REPORT` reference. The six camera ledgers contain 7,350
+observations, with cross-camera skew p50/p95/max of 33,000/84,000/108,000 ns. Both executions remain
+`LOCAL_CONFORMANCE` with `production_eligible=false`; these facts do not claim production or model
+quality qualification.
 Local processing timestamps come from an explicit versioned deterministic execution clock; they
 are not derived from the fixture's `recording_start_utc` source fact. Changing that clock policy
 changes the local run namespace.
@@ -188,9 +213,12 @@ stale marker left after the catalog commit:
 ```
 
 The evolution command deliberately does not edit an existing target or edge: its bundle must name
-one previously unknown target and at least one direct predecessor. The live catalog still has
-`upcasters=[]`; the command is executable publication infrastructure, not evidence that a business
-migration has been approved or published. On Windows these tools guarantee atomic catalog
+one previously unknown target and at least one direct predecessor. The 47-entry live catalog now
+includes `media-quality-report@1.0.0`, the frozen
+`local-supplemental-qa-evidence@1.0.0`, and its corrected separately published `2.0.0` version. It
+still has `upcasters=[]` because these targets declare `compatibility_mode=NONE`; the command is
+executable publication infrastructure, not evidence that a business migration has been approved
+or published. On Windows these tools guarantee atomic catalog
 visibility and retry after normal process interruption, but do not claim power-loss durability for
 directory metadata. That production filesystem decision remains part of O-14.
 

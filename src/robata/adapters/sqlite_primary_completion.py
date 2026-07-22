@@ -609,6 +609,7 @@ class SQLitePrimaryCompletionRepository:
                 identity_result=identity_result,
                 action_event_publications=checked.detail.action_event_publications,
                 outbox=outbox,
+                evidence_references=checked.evidence_references,
             )
             command_bytes = canonical_json_bytes(checked)
             committed_bytes = canonical_json_bytes(committed)
@@ -1130,8 +1131,19 @@ class SQLitePrimaryCompletionRepository:
             digest_column="committed_json_sha256",
             model=CommittedPrimaryCompletion,
         )
-        if committed.processing_run.run_id != str(row["run_id"]) or committed.command_sha256 != str(
-            row["command_sha256"]
+        command = _decode_model(
+            row,
+            payload_column="command_json",
+            digest_column="command_json_sha256",
+            model=PrimaryCompletionCommand,
+        )
+        if (
+            committed.processing_run.run_id != str(row["run_id"])
+            or committed.command_sha256 != str(row["command_sha256"])
+            or command.command_sha256 != committed.command_sha256
+            or command.detail != committed.detail
+            or command.completion != committed.completion
+            or command.evidence_references != committed.evidence_references
         ):
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
@@ -1146,6 +1158,8 @@ class SQLitePrimaryCompletionRepository:
                 committed.detail.schema_ref,
                 committed.detail.model_dump(mode="json"),
             )
+            for evidence_reference in committed.evidence_references:
+                self._registry.resolve_exact(evidence_reference.schema_ref)
         except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,

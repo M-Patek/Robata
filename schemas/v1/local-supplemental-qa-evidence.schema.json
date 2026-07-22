@@ -1,0 +1,838 @@
+{
+  "$defs": {
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "FrozenSupplementalTarget": {
+      "additionalProperties": false,
+      "description": "One explicitly resolved target copied from immutable trigger evidence.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "target_ns": {
+          "title": "Target Ns",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ordinal",
+        "camera_id",
+        "target_ns"
+      ],
+      "title": "FrozenSupplementalTarget",
+      "type": "object"
+    },
+    "FrozenSupplementalTargetPlan": {
+      "additionalProperties": false,
+      "description": "Frozen explicit targets whose complete coordinates define logical identity.",
+      "properties": {
+        "alignment_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Alignment Semantic Sha256",
+          "type": "string"
+        },
+        "camera_mapping_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Camera Mapping Semantic Sha256",
+          "type": "string"
+        },
+        "dedupe_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Dedupe Policy Version",
+          "type": "string"
+        },
+        "effective_interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "evidence_class": {
+          "const": "LOCAL_CONFORMANCE",
+          "default": "LOCAL_CONFORMANCE",
+          "title": "Evidence Class",
+          "type": "string"
+        },
+        "plan_id": {
+          "minLength": 1,
+          "title": "Plan Id",
+          "type": "string"
+        },
+        "production_eligible": {
+          "const": false,
+          "default": false,
+          "title": "Production Eligible",
+          "type": "boolean"
+        },
+        "projection_version": {
+          "const": "supplemental-explicit-target-plan-semantic-v1",
+          "default": "supplemental-explicit-target-plan-semantic-v1",
+          "title": "Projection Version",
+          "type": "string"
+        },
+        "selection_tolerance_ns": {
+          "minimum": 0,
+          "title": "Selection Tolerance Ns",
+          "type": "integer"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        },
+        "source_content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Content Sha256",
+          "type": "string"
+        },
+        "source_report_schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        "source_report_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Report Semantic Sha256",
+          "type": "string"
+        },
+        "source_target_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Target Plan Semantic Sha256",
+          "type": "string"
+        },
+        "target_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Target Policy Version",
+          "type": "string"
+        },
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/FrozenSupplementalTarget"
+          },
+          "title": "Targets",
+          "type": "array"
+        },
+        "tie_break_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Tie Break Policy Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_id",
+        "semantic_sha256",
+        "source_report_schema_ref",
+        "source_report_semantic_sha256",
+        "source_target_plan_semantic_sha256",
+        "source_content_sha256",
+        "camera_mapping_semantic_sha256",
+        "alignment_semantic_sha256",
+        "effective_interval",
+        "targets",
+        "selection_tolerance_ns",
+        "tie_break_policy_version",
+        "dedupe_policy_version",
+        "target_policy_version",
+        "projection_version",
+        "evidence_class",
+        "production_eligible"
+      ],
+      "title": "FrozenSupplementalTargetPlan",
+      "type": "object"
+    },
+    "MaterializedArtifactManifest": {
+      "additionalProperties": false,
+      "description": "Immutable artifact identity embedded in a selected-frame manifest.",
+      "properties": {
+        "artifact_id": {
+          "minLength": 1,
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "bytes": {
+          "minimum": 1,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "uri": {
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$",
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "uri",
+        "sha256",
+        "bytes",
+        "media_type"
+      ],
+      "title": "MaterializedArtifactManifest",
+      "type": "object"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "ProviderNeutralSupplementalPackage": {
+      "additionalProperties": false,
+      "description": "Immutable explicit-target visual package kept separate from grid-only V1.",
+      "properties": {
+        "alignment_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Alignment Semantic Sha256",
+          "type": "string"
+        },
+        "camera_mapping_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Camera Mapping Semantic Sha256",
+          "type": "string"
+        },
+        "created_at": {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+          "title": "Created At",
+          "type": "string"
+        },
+        "evidence_class": {
+          "const": "LOCAL_CONFORMANCE",
+          "default": "LOCAL_CONFORMANCE",
+          "title": "Evidence Class",
+          "type": "string"
+        },
+        "materializer_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Materializer Version",
+          "type": "string"
+        },
+        "outcomes": {
+          "items": {
+            "$ref": "#/$defs/SupplementalTargetOutcome"
+          },
+          "title": "Outcomes",
+          "type": "array"
+        },
+        "package_id": {
+          "minLength": 1,
+          "title": "Package Id",
+          "type": "string"
+        },
+        "production_eligible": {
+          "const": false,
+          "default": false,
+          "title": "Production Eligible",
+          "type": "boolean"
+        },
+        "projection_version": {
+          "const": "supplemental-temporal-package-semantic-v1",
+          "default": "supplemental-temporal-package-semantic-v1",
+          "title": "Projection Version",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "selected_artifact_count": {
+          "minimum": 0,
+          "title": "Selected Artifact Count",
+          "type": "integer"
+        },
+        "semantic_content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Content Sha256",
+          "type": "string"
+        },
+        "source_content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Content Sha256",
+          "type": "string"
+        },
+        "target_plan_id": {
+          "minLength": 1,
+          "title": "Target Plan Id",
+          "type": "string"
+        },
+        "target_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Target Plan Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "package_id",
+        "semantic_content_sha256",
+        "target_plan_id",
+        "target_plan_semantic_sha256",
+        "source_content_sha256",
+        "camera_mapping_semantic_sha256",
+        "alignment_semantic_sha256",
+        "outcomes",
+        "selected_artifact_count",
+        "materializer_version",
+        "projection_version",
+        "evidence_class",
+        "production_eligible",
+        "created_at"
+      ],
+      "title": "ProviderNeutralSupplementalPackage",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "SelectionStatus": {
+      "enum": [
+        "DECODE_FAILED",
+        "SELECTED",
+        "NO_FRAME_WITHIN_TOLERANCE",
+        "DEDUPLICATED_FRAME"
+      ],
+      "title": "SelectionStatus",
+      "type": "string"
+    },
+    "SupplementalQaDenseConsumption": {
+      "additionalProperties": false,
+      "description": "One target result the deterministic mock inspected from the package.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "effective_artifact_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effective Artifact Sha256"
+        },
+        "package_status": {
+          "$ref": "#/$defs/SelectionStatus"
+        },
+        "target_ns": {
+          "title": "Target Ns",
+          "type": "integer"
+        },
+        "target_ordinal": {
+          "minimum": 0,
+          "title": "Target Ordinal",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target_ordinal",
+        "camera_id",
+        "target_ns",
+        "package_status",
+        "effective_artifact_sha256"
+      ],
+      "title": "SupplementalQaDenseConsumption",
+      "type": "object"
+    },
+    "SupplementalQaDenseInputPlan": {
+      "additionalProperties": false,
+      "description": "Run-independent input identity for one exact supplemental package.",
+      "properties": {
+        "consumer_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Consumer Policy Version",
+          "type": "string"
+        },
+        "evidence_class": {
+          "const": "LOCAL_CONFORMANCE",
+          "default": "LOCAL_CONFORMANCE",
+          "title": "Evidence Class",
+          "type": "string"
+        },
+        "input_plan_id": {
+          "minLength": 1,
+          "title": "Input Plan Id",
+          "type": "string"
+        },
+        "package_id": {
+          "minLength": 1,
+          "title": "Package Id",
+          "type": "string"
+        },
+        "package_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Package Manifest Sha256",
+          "type": "string"
+        },
+        "package_semantic_content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Package Semantic Content Sha256",
+          "type": "string"
+        },
+        "production_eligible": {
+          "const": false,
+          "default": false,
+          "title": "Production Eligible",
+          "type": "boolean"
+        },
+        "projection_version": {
+          "const": "supplemental-qa-dense-input-semantic-v1",
+          "default": "supplemental-qa-dense-input-semantic-v1",
+          "title": "Projection Version",
+          "type": "string"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        },
+        "target_plan_id": {
+          "minLength": 1,
+          "title": "Target Plan Id",
+          "type": "string"
+        },
+        "target_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Target Plan Semantic Sha256",
+          "type": "string"
+        },
+        "task": {
+          "const": "QA_DENSE",
+          "default": "QA_DENSE",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_plan_id",
+        "semantic_sha256",
+        "task",
+        "package_id",
+        "package_semantic_content_sha256",
+        "package_manifest_sha256",
+        "target_plan_id",
+        "target_plan_semantic_sha256",
+        "consumer_policy_version",
+        "projection_version",
+        "evidence_class",
+        "production_eligible"
+      ],
+      "title": "SupplementalQaDenseInputPlan",
+      "type": "object"
+    },
+    "SupplementalQaDenseResult": {
+      "additionalProperties": false,
+      "description": "Local mock result bound to exact input, package, and consumed artifacts.",
+      "properties": {
+        "consumer_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Consumer Policy Version",
+          "type": "string"
+        },
+        "consumptions": {
+          "items": {
+            "$ref": "#/$defs/SupplementalQaDenseConsumption"
+          },
+          "title": "Consumptions",
+          "type": "array"
+        },
+        "evidence_class": {
+          "const": "LOCAL_CONFORMANCE",
+          "default": "LOCAL_CONFORMANCE",
+          "title": "Evidence Class",
+          "type": "string"
+        },
+        "input_plan_id": {
+          "minLength": 1,
+          "title": "Input Plan Id",
+          "type": "string"
+        },
+        "input_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Plan Semantic Sha256",
+          "type": "string"
+        },
+        "package_id": {
+          "minLength": 1,
+          "title": "Package Id",
+          "type": "string"
+        },
+        "package_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Package Manifest Sha256",
+          "type": "string"
+        },
+        "package_semantic_content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Package Semantic Content Sha256",
+          "type": "string"
+        },
+        "production_eligible": {
+          "const": false,
+          "default": false,
+          "title": "Production Eligible",
+          "type": "boolean"
+        },
+        "projection_version": {
+          "const": "supplemental-qa-dense-result-semantic-v1",
+          "default": "supplemental-qa-dense-result-semantic-v1",
+          "title": "Projection Version",
+          "type": "string"
+        },
+        "result_id": {
+          "minLength": 1,
+          "title": "Result Id",
+          "type": "string"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/SupplementalQaDenseStatus"
+        },
+        "task": {
+          "const": "QA_DENSE",
+          "default": "QA_DENSE",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result_id",
+        "semantic_sha256",
+        "task",
+        "input_plan_id",
+        "input_plan_semantic_sha256",
+        "package_id",
+        "package_semantic_content_sha256",
+        "package_manifest_sha256",
+        "consumptions",
+        "status",
+        "consumer_policy_version",
+        "projection_version",
+        "evidence_class",
+        "production_eligible"
+      ],
+      "title": "SupplementalQaDenseResult",
+      "type": "object"
+    },
+    "SupplementalQaDenseStatus": {
+      "description": "Whether every requested coordinate resolved to consumable frame evidence.",
+      "enum": [
+        "COMPLETE",
+        "INCOMPLETE"
+      ],
+      "title": "SupplementalQaDenseStatus",
+      "type": "string"
+    },
+    "SupplementalSelectedArtifact": {
+      "additionalProperties": false,
+      "description": "Provider-neutral immutable visual artifact facts.",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/MaterializedArtifactManifest"
+        },
+        "height": {
+          "minimum": 1,
+          "title": "Height",
+          "type": "integer"
+        },
+        "quality_flags": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Quality Flags",
+          "type": "array"
+        },
+        "width": {
+          "minimum": 1,
+          "title": "Width",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact",
+        "width",
+        "height",
+        "quality_flags"
+      ],
+      "title": "SupplementalSelectedArtifact",
+      "type": "object"
+    },
+    "SupplementalSourceFrameRef": {
+      "additionalProperties": false,
+      "description": "Exact selected or failed source-frame provenance.",
+      "properties": {
+        "aligned_timestamp_ns": {
+          "title": "Aligned Timestamp Ns",
+          "type": "integer"
+        },
+        "alignment_projection_id": {
+          "minLength": 1,
+          "title": "Alignment Projection Id",
+          "type": "string"
+        },
+        "source_frame_id": {
+          "minLength": 1,
+          "title": "Source Frame Id",
+          "type": "string"
+        },
+        "source_locator": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "title": "Source Locator",
+          "type": "object"
+        },
+        "source_timestamp_ns": {
+          "title": "Source Timestamp Ns",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_frame_id",
+        "aligned_timestamp_ns",
+        "source_timestamp_ns",
+        "source_locator",
+        "alignment_projection_id"
+      ],
+      "title": "SupplementalSourceFrameRef",
+      "type": "object"
+    },
+    "SupplementalTargetOutcome": {
+      "additionalProperties": false,
+      "description": "Auditable nearest-frame outcome for one frozen explicit target.",
+      "properties": {
+        "delta_to_target_ns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta To Target Ns"
+        },
+        "reused_selected_target_ordinal": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reused Selected Target Ordinal"
+        },
+        "selected_artifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupplementalSelectedArtifact"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupplementalSourceFrameRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/SelectionStatus"
+        },
+        "target": {
+          "$ref": "#/$defs/FrozenSupplementalTarget"
+        }
+      },
+      "required": [
+        "target",
+        "status",
+        "delta_to_target_ns",
+        "source_frame",
+        "selected_artifact",
+        "reused_selected_target_ordinal"
+      ],
+      "title": "SupplementalTargetOutcome",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/local-supplemental-qa-evidence.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Persisted local-only chain from frozen targets through QA_DENSE consumption.",
+  "properties": {
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "frozen_plan": {
+      "$ref": "#/$defs/FrozenSupplementalTargetPlan"
+    },
+    "input_plan": {
+      "$ref": "#/$defs/SupplementalQaDenseInputPlan"
+    },
+    "package": {
+      "$ref": "#/$defs/ProviderNeutralSupplementalPackage"
+    },
+    "package_manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Package Manifest Sha256",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "projection_version": {
+      "const": "local-supplemental-qa-evidence-semantic-v1",
+      "default": "local-supplemental-qa-evidence-semantic-v1",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "result": {
+      "$ref": "#/$defs/SupplementalQaDenseResult"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "semantic_sha256",
+    "frozen_plan",
+    "package",
+    "package_manifest_sha256",
+    "input_plan",
+    "result",
+    "projection_version",
+    "evidence_class",
+    "production_eligible"
+  ],
+  "title": "LocalSupplementalQaEvidence",
+  "type": "object"
+}

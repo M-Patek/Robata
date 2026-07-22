@@ -924,6 +924,69 @@
         "max_exclusive": "0.2.0"
       },
       "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/media-quality-report",
+        "version": "1.0.0",
+        "artifact_id": "0056daa0-49fd-038e-f075-293244a6677a",
+        "sha256": "3e275f18bb36986b94ac96d977b0614aa15352565efb365a623d893b0123b798"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/media-quality-report.schema.json",
+      "artifact_path": "v1/media-quality-report.schema.json",
+      "owner": "robata-canonical",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-media-quality-report-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-supplemental-qa-evidence",
+        "version": "1.0.0",
+        "artifact_id": "665afe04-1011-4989-e1bd-128e1d896e21",
+        "sha256": "1f54a216b700d13ac20f70007560aa3a1b8facdcbd79b9dc3ba9e2f311b830f3"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/local-supplemental-qa-evidence.schema.json",
+      "artifact_path": "v1/local-supplemental-qa-evidence.schema.json",
+      "owner": "robata-qa",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-supplemental-qa-evidence-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-supplemental-qa-evidence",
+        "version": "2.0.0",
+        "artifact_id": "809f35af-eadd-284e-12a4-509452b950b9",
+        "sha256": "42381fc81d719eb65604703cfc7b2ba691daa67617b200a447d03d216dfb33ce"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/local-supplemental-qa-evidence.schema.json",
+      "artifact_path": "v2/local-supplemental-qa-evidence.schema.json",
+      "owner": "robata-qa",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-supplemental-qa-evidence-semantic-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
     }
   ],
   "upcasters": []

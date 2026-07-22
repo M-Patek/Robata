@@ -262,7 +262,17 @@ def _verify_archive(
     if expected_tracked.keys() != expected_files.keys():
         raise ReleaseHygieneError("internal manifest entry set does not match tracked blobs")
 
-    raw_archive = _run_git(repo, "archive", "--format=tar", commit_sha)
+    # Keep archive bytes bound to committed blobs rather than host checkout policy.
+    raw_archive = _run_git(
+        repo,
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+        "archive",
+        "--format=tar",
+        commit_sha,
+    )
     seen: set[str] = set()
     with _open_archive(raw_archive) as archive:
         for member in archive:

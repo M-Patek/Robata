@@ -1,0 +1,658 @@
+{
+  "$defs": {
+    "CadenceGapObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "delta_ns": {
+          "$ref": "#/$defs/PositiveNanoseconds"
+        },
+        "expected_delta_ns": {
+          "$ref": "#/$defs/PositiveNanoseconds"
+        },
+        "packet_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "previous_packet_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "previous_timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        },
+        "timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "previous_packet_index",
+        "packet_index",
+        "previous_timestamp_ns",
+        "timestamp_ns",
+        "delta_ns",
+        "expected_delta_ns"
+      ],
+      "type": "object"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "type": "string"
+    },
+    "CameraLedger": {
+      "additionalProperties": false,
+      "properties": {
+        "cadence_gaps": {
+          "items": {
+            "$ref": "#/$defs/CadenceGapObservation"
+          },
+          "type": "array"
+        },
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "decoded_observations": {
+          "items": {
+            "$ref": "#/$defs/FrameQualityObservation"
+          },
+          "type": "array"
+        },
+        "flags": {
+          "$ref": "#/$defs/QualityFlags"
+        },
+        "sequence_gaps": {
+          "items": {
+            "$ref": "#/$defs/SequenceGapObservation"
+          },
+          "type": "array"
+        },
+        "timing_count": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "camera_id",
+        "timing_count",
+        "decoded_observations",
+        "cadence_gaps",
+        "sequence_gaps",
+        "flags"
+      ],
+      "type": "object"
+    },
+    "CameraTimestamp": {
+      "items": false,
+      "maxItems": 2,
+      "minItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/CameraId"
+        },
+        {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      ],
+      "type": "array"
+    },
+    "CrossCameraSkewReport": {
+      "additionalProperties": false,
+      "properties": {
+        "flags": {
+          "items": {
+            "const": "OBSERVED_CROSS_CAMERA_SKEW"
+          },
+          "maxItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "incomplete_target_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ns": {
+          "$ref": "#/$defs/NullableNanoseconds"
+        },
+        "p50_ns": {
+          "$ref": "#/$defs/NullableNanoseconds"
+        },
+        "p95_ns": {
+          "$ref": "#/$defs/NullableNanoseconds"
+        },
+        "samples": {
+          "items": {
+            "$ref": "#/$defs/CrossCameraSkewSample"
+          },
+          "type": "array"
+        },
+        "threshold_ns": {
+          "$ref": "#/$defs/PositiveNanoseconds"
+        }
+      },
+      "required": [
+        "samples",
+        "incomplete_target_count",
+        "p50_ns",
+        "p95_ns",
+        "max_ns",
+        "threshold_ns",
+        "flags"
+      ],
+      "type": "object"
+    },
+    "CrossCameraSkewSample": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_timestamps_ns": {
+          "items": {
+            "$ref": "#/$defs/CameraTimestamp"
+          },
+          "maxItems": 6,
+          "minItems": 6,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "skew_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        },
+        "target_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "target_ns",
+        "camera_timestamps_ns",
+        "skew_ns"
+      ],
+      "type": "object"
+    },
+    "FrameQualityObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "aligned_timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        },
+        "black_fraction_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edge_energy_milli": {
+          "maximum": 255000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "flags": {
+          "$ref": "#/$defs/QualityFlags"
+        },
+        "frame_delta_milli": {
+          "anyOf": [
+            {
+              "maximum": 255000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grayscale_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "mean_luma_milli": {
+          "maximum": 255000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "overexposed_fraction_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packet_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "packet_index",
+        "aligned_timestamp_ns",
+        "source_timestamp_ns",
+        "grayscale_sha256",
+        "mean_luma_milli",
+        "black_fraction_ppm",
+        "overexposed_fraction_ppm",
+        "edge_energy_milli",
+        "frame_delta_milli",
+        "flags"
+      ],
+      "type": "object"
+    },
+    "Interval": {
+      "additionalProperties": false,
+      "properties": {
+        "end_ns": {
+          "$ref": "#/$defs/PositiveNanoseconds"
+        },
+        "start_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "type": "object"
+    },
+    "NeighborTargetProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "clipped": {
+          "type": "boolean"
+        },
+        "flag": {
+          "$ref": "#/$defs/QualityFlag"
+        },
+        "offset_ns": {
+          "$ref": "#/$defs/SignedNanoseconds"
+        },
+        "packet_index": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested_target_ns": {
+          "$ref": "#/$defs/SignedNanoseconds"
+        },
+        "source": {
+          "$ref": "#/$defs/TriggerSource"
+        },
+        "trigger_timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "camera_id",
+        "trigger_timestamp_ns",
+        "source",
+        "flag",
+        "packet_index",
+        "offset_ns",
+        "requested_target_ns",
+        "clipped"
+      ],
+      "type": "object"
+    },
+    "NonnegativeNanoseconds": {
+      "pattern": "^(?:0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "NullableNanoseconds": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "PositiveNanoseconds": {
+      "pattern": "^[1-9][0-9]*$",
+      "type": "string"
+    },
+    "QualityFlag": {
+      "enum": [
+        "OBSERVED_BLACK_LUMA",
+        "OBSERVED_OVEREXPOSED_LUMA",
+        "PROXY_LOW_EDGE_ENERGY",
+        "PROXY_FROZEN_CONTENT",
+        "OBSERVED_CADENCE_GAP",
+        "OBSERVED_SEQUENCE_GAP",
+        "OBSERVED_CROSS_CAMERA_SKEW"
+      ],
+      "type": "string"
+    },
+    "QualityFlags": {
+      "items": {
+        "$ref": "#/$defs/QualityFlag"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "SequenceGapObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "packet_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "previous_packet_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "previous_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timestamp_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "previous_packet_index",
+        "packet_index",
+        "previous_sequence",
+        "sequence",
+        "timestamp_ns"
+      ],
+      "type": "object"
+    },
+    "Sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "SignedNanoseconds": {
+      "pattern": "^(?:0|-?[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "SupplementalNeighborTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "provenance": {
+          "items": {
+            "$ref": "#/$defs/NeighborTargetProvenance"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "target_ns": {
+          "$ref": "#/$defs/NonnegativeNanoseconds"
+        }
+      },
+      "required": [
+        "camera_id",
+        "target_ns",
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "SupplementalNeighborTargetPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clipped_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deduplicated_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped_by_per_camera_budget": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped_by_total_budget": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "interval": {
+          "$ref": "#/$defs/Interval"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "semantic_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/SupplementalNeighborTarget"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "policy_version",
+        "interval",
+        "candidate_count",
+        "clipped_count",
+        "deduplicated_count",
+        "dropped_by_per_camera_budget",
+        "dropped_by_total_budget",
+        "targets",
+        "semantic_sha256"
+      ],
+      "type": "object"
+    },
+    "TriggerSource": {
+      "enum": [
+        "FRAME",
+        "CADENCE",
+        "SEQUENCE",
+        "CROSS_CAMERA_SYNC"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/media-quality-report.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Exact-pinned local-conformance media observations and bounded supplemental neighbor targets. Visual proxy flags are not semantic occlusion or blur classifications.",
+  "properties": {
+    "camera_ledgers": {
+      "items": false,
+      "maxItems": 6,
+      "minItems": 6,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_01"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_02"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_03"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_04"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_05"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CameraLedger"
+            },
+            {
+              "properties": {
+                "camera_id": {
+                  "const": "cam_06"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "type": "array"
+    },
+    "cross_camera_skew": {
+      "$ref": "#/$defs/CrossCameraSkewReport"
+    },
+    "format_version": {
+      "const": "local-media-quality-report-v1",
+      "type": "string"
+    },
+    "policy_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "recording_duration_ns": {
+      "$ref": "#/$defs/PositiveNanoseconds"
+    },
+    "requested_interval": {
+      "$ref": "#/$defs/Interval"
+    },
+    "requested_max_duration_ns": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PositiveNanoseconds"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "supplemental_targets": {
+      "$ref": "#/$defs/SupplementalNeighborTargetPlan"
+    },
+    "supplemental_targets_semantic_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "window_limited": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "format_version",
+    "policy_version",
+    "requested_max_duration_ns",
+    "recording_duration_ns",
+    "requested_interval",
+    "window_limited",
+    "camera_ledgers",
+    "cross_camera_skew",
+    "supplemental_targets_semantic_sha256",
+    "supplemental_targets",
+    "semantic_sha256"
+  ],
+  "title": "LocalMediaQualityReport",
+  "type": "object"
+}

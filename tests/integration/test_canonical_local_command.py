@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from robata.adapters.sqlite_inference_evidence import (
+    SQLiteInferenceEvidenceLedger,
+    SQLiteInferenceEvidenceLedgerError,
+)
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkStorageError
 from robata.application.canonical import local_composition as local_composition_module
@@ -20,6 +24,7 @@ from robata.application.canonical.local_composition import (
 )
 from robata.application.canonical.local_outbox_delivery import LocalOutboxDeliveryOutcome
 from robata.queue.models import WorkAttemptOutcome, WorkItemState
+from robata.review.routing import ReviewRoutingDisposition
 
 SOURCE_FIXTURE = Path(__file__).parents[1] / "fixtures" / "canonical" / "source-recording.json"
 
@@ -50,7 +55,10 @@ def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> N
     assert first.outbox_ids
     assert len(first.event_ids) == len(first.revision_ids) == len(first.outbox_ids)
     assert first.outbox_count == len(first.outbox_ids)
-    assert first.model_version == "canonical-local-run-receipt-v2"
+    assert first.model_version == "canonical-local-run-receipt-v4"
+    assert first.media_quality_binding is None
+    assert first.supplemental_qa_evidence is None
+    assert first.review_routing.disposition is ReviewRoutingDisposition.ENQUEUED
     assert first.outbox_delivery.outcome is LocalOutboxDeliveryOutcome.DELIVERED
     assert first.outbox_delivery.delivered_count == first.outbox_count
     assert first.outbox_delivery.outbox_ids == first.outbox_ids
@@ -77,6 +85,7 @@ def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> N
     assert replay.outbox_count == first.outbox_count
     assert replay.outbox_delivery.outcome is LocalOutboxDeliveryOutcome.DELIVERED
     assert replay.outbox_delivery.relay_attempt_count == 0
+    assert replay.review_routing.disposition is ReviewRoutingDisposition.ALREADY_ENQUEUED
     sink_path = state_dir / "outbox-sink.sqlite3"
     with sqlite3.connect(sink_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM delivered_outbox_messages").fetchone()[
@@ -372,3 +381,61 @@ def test_local_command_maps_invalid_state_schema_to_structured_error(
 
     assert caught.value.code is CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
     assert "unsupported inference evidence schema version" in str(caught.value)
+
+
+def test_local_command_audits_inference_evidence_before_primary_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    audited_paths: list[Path] = []
+    boundary_events: list[str] = []
+    original_verify = SQLiteInferenceEvidenceLedger.verify_integrity
+    original_commit = SQLitePrimaryCompletionRepository.commit
+
+    def recording_verify(ledger: SQLiteInferenceEvidenceLedger) -> None:
+        audited_paths.append(ledger.database_path)
+        boundary_events.append("audit")
+        original_verify(ledger)
+
+    def recording_commit(repository, command):  # type: ignore[no-untyped-def]
+        boundary_events.append("commit")
+        return original_commit(repository, command)
+
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_integrity", recording_verify)
+    monkeypatch.setattr(SQLitePrimaryCompletionRepository, "commit", recording_commit)
+
+    receipt = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="pre-completion-evidence-audit",
+    )
+
+    _assert_local_conformance(receipt)
+    assert receipt.replayed is False
+    assert audited_paths == [(state_dir / "inference-evidence.sqlite3").resolve()]
+    assert boundary_events == ["audit", "commit"]
+
+
+def test_failed_precommit_evidence_audit_publishes_no_primary_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+
+    def fail_audit(_ledger: SQLiteInferenceEvidenceLedger) -> None:
+        raise SQLiteInferenceEvidenceLedgerError("injected integrity failure")
+
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_integrity", fail_audit)
+
+    with pytest.raises(CanonicalLocalCompositionError) as caught:
+        run_local_canonical_fixture(
+            source_path=SOURCE_FIXTURE,
+            state_dir=state_dir,
+            run_key="failed-precommit-evidence-audit",
+        )
+
+    assert caught.value.code is CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
+    with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM primary_completions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM primary_outbox").fetchone()[0] == 0

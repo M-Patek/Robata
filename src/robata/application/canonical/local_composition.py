@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -39,6 +39,35 @@ from robata.application.canonical.local_outbox_delivery import (
     failed_local_outbox_delivery,
     reconcile_local_primary_outbox,
 )
+from robata.application.canonical.local_review_routing import (
+    LocalReviewRoutingSummary,
+    failed_local_review_routing,
+    route_local_review_after_completion,
+)
+from robata.application.canonical.local_supplemental_qa import (
+    LOCAL_SUPPLEMENTAL_DEDUPE_POLICY_VERSION,
+    LOCAL_SUPPLEMENTAL_QA_RUNTIME_VERSION,
+    LOCAL_SUPPLEMENTAL_SELECTION_TOLERANCE_NS,
+    LOCAL_SUPPLEMENTAL_TIE_BREAK_POLICY_VERSION,
+    build_and_publish_local_supplemental_qa_evidence,
+    load_and_verify_local_supplemental_qa_evidence,
+)
+from robata.application.canonical.media_quality import (
+    LOCAL_MEDIA_QUALITY_POLICY_VERSION,
+    LOCAL_MEDIA_QUALITY_REPORT_FORMAT_VERSION,
+    LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_ID,
+    LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_VERSION,
+    LOCAL_NEIGHBOR_TARGET_POLICY_VERSION,
+    load_registered_local_media_quality_report_document,
+)
+from robata.application.canonical.media_quality_binding import (
+    LOCAL_MEDIA_QUALITY_BINDING_PROJECTION_VERSION,
+    LocalMediaQualityBinding,
+    derive_local_media_quality_binding_document,
+)
+from robata.application.canonical.media_quality_source_binding import (
+    MEDIA_QUALITY_SOURCE_BINDING_PROJECTION_VERSION,
+)
 from robata.application.canonical.models import (
     CANONICAL_OFFLINE_PIPELINE_VERSION,
     CanonicalOfflineExecutionPolicy,
@@ -49,8 +78,11 @@ from robata.application.canonical.output_admission import (
     CanonicalFinalFusionContext,
 )
 from robata.application.canonical.primary_completion import (
+    CANONICAL_PRIMARY_COMPLETION_COMMAND_PROJECTION_VERSION,
     CommittedPrimaryCompletion,
     PrimaryCompletionError,
+    PrimaryCompletionEvidenceReference,
+    PrimaryCompletionEvidenceRole,
     create_primary_completion_command,
 )
 from robata.application.canonical.runner import CanonicalOfflinePipeline
@@ -69,7 +101,7 @@ from robata.contracts.hashing import (
     semantic_sha256,
 )
 from robata.contracts.sampling_plan import SamplingPlan
-from robata.contracts.schema_registry import SchemaRegistry
+from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
 from robata.event_pipeline.identity_registry import (
     EventIdAllocator,
     EventIdentityPolicyRef,
@@ -116,6 +148,17 @@ from robata.ports.logical_node_registry import LogicalNodeRegistryError
 from robata.qa_pipeline.coarse import LOCAL_COARSE_QA_POLICY_VERSION
 from robata.qa_pipeline.completion import LOCAL_QA_COMPLETION_POLICY_VERSION
 from robata.qa_pipeline.dense import DenseQAPlanningPolicy
+from robata.qa_pipeline.supplemental import (
+    LOCAL_SUPPLEMENTAL_QA_DENSE_POLICY_VERSION,
+    SUPPLEMENTAL_QA_DENSE_INPUT_PROJECTION_VERSION,
+    SUPPLEMENTAL_QA_DENSE_RESULT_PROJECTION_VERSION,
+)
+from robata.qa_pipeline.supplemental_wire import (
+    LOCAL_SUPPLEMENTAL_QA_EVIDENCE_PROJECTION_VERSION,
+    LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_ID,
+    LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_VERSION,
+    LocalSupplementalQaEvidence,
+)
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     IndexedSourceFrame,
@@ -124,8 +167,14 @@ from robata.sampling.materializer import (
     TemporalPackageMaterializationPolicy,
 )
 from robata.sampling.package_set import PackageSetBuilder
+from robata.sampling.supplemental import (
+    SUPPLEMENTAL_MATERIALIZER_VERSION,
+    SUPPLEMENTAL_PACKAGE_PROJECTION_VERSION,
+    SUPPLEMENTAL_PACKAGE_SCHEMA_VERSION,
+    SUPPLEMENTAL_TARGET_PLAN_PROJECTION_VERSION,
+)
 
-LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v14"
+LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v18"
 LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION = "canonical-local-execution-clock-v1"
 LOCAL_CANONICAL_EXECUTION_TIME = "2026-07-20T00:00:00Z"
 _LOCAL_CANONICAL_EXECUTION_DATETIME: Final = datetime(2026, 7, 20, tzinfo=UTC)
@@ -134,8 +183,8 @@ LOCAL_CANONICAL_PARSER_VERSION = "strict-provider-claim-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY = "ordered-claims-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY_VERSION = "1.0"
 LOCAL_CANONICAL_EVENT_ALLOCATOR_VERSION = "canonical-local-event-uuid5-v1"
-LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v2"]] = (
-    "canonical-local-run-receipt-v2"
+LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v4"]] = (
+    "canonical-local-run-receipt-v4"
 )
 
 
@@ -165,7 +214,7 @@ class CanonicalLocalRunReceipt(StrictModel):
     """Compact operator view of one committed local-conformance run."""
 
     schema_version: Literal["1.0"]
-    model_version: Literal["canonical-local-run-receipt-v2"]
+    model_version: Literal["canonical-local-run-receipt-v4"]
     ok: Literal[True]
     run_id: str
     recording_identity: str
@@ -177,6 +226,9 @@ class CanonicalLocalRunReceipt(StrictModel):
     outbox_ids: tuple[str, ...]
     outbox_count: int
     outbox_delivery: LocalOutboxDeliverySummary
+    media_quality_binding: LocalMediaQualityBinding | None
+    supplemental_qa_evidence: LocalSupplementalQaEvidence | None
+    review_routing: LocalReviewRoutingSummary
     replayed: bool
     fixture_inference_calls: int
     network_call_count: Literal[0]
@@ -189,6 +241,7 @@ class _LocalCanonicalRuntime:
     registry: SchemaRegistry
     execution_policy: CanonicalOfflineExecutionPolicy
     pipeline: CanonicalOfflinePipeline
+    inference_evidence: SQLiteInferenceEvidenceLedger
 
 
 class _CanonicalSourceInputs(Protocol):
@@ -215,6 +268,15 @@ class _CanonicalSourceInputs(Protocol):
 
 
 _CanonicalSourceLoader = Callable[[SchemaRegistry], _CanonicalSourceInputs]
+_MediaQualityDocumentLoader = Callable[[SchemaRegistry], dict[str, object]]
+_SupplementalQaEvidenceBuilder = Callable[
+    [SchemaRegistry, _CanonicalSourceInputs],
+    LocalSupplementalQaEvidence | None,
+]
+_SupplementalQaEvidenceLoader = Callable[
+    [SchemaRegistry],
+    LocalSupplementalQaEvidence | None,
+]
 
 
 class _DeterministicLocalEventIdAllocator(EventIdAllocator):
@@ -285,6 +347,7 @@ def run_local_canonical_mcap(
     run_key: str = "primary",
     *,
     allow_unapproved_profile: bool = False,
+    max_duration_ns: int | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a real MCAP."""
 
@@ -304,6 +367,15 @@ def run_local_canonical_mcap(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "allow_unapproved_profile must be a boolean",
         )
+    if max_duration_ns is not None and (
+        isinstance(max_duration_ns, bool)
+        or not isinstance(max_duration_ns, int)
+        or max_duration_ns <= 0
+    ):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "max_duration_ns must be a positive integer or None",
+        )
     try:
         # Authorization must precede the first source read.
         authorization = authorize_mcap_mapping(
@@ -317,13 +389,63 @@ def run_local_canonical_mcap(
             str(error),
         ) from error
 
+    quality_registry = SchemaRegistry()
+    quality_schema_ref = quality_registry.resolve_version(
+        LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_ID,
+        LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_VERSION,
+    ).ref
+    supplemental_schema_ref = quality_registry.resolve_version(
+        LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_ID,
+        LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_VERSION,
+    ).ref
     source_binding_sha256 = semantic_sha256(
         {
-            "source_binding_policy_version": "canonical-local-source-binding-v1",
+            "source_binding_policy_version": "canonical-local-mcap-source-binding-v5",
             "source_kind": "mcap",
             "source_content_sha256": source_sha256,
             "mapping_profile_semantic_sha256": authorization.semantic_sha256,
+            "primary_completion_command_projection_version": (
+                CANONICAL_PRIMARY_COMPLETION_COMMAND_PROJECTION_VERSION
+            ),
+            "max_duration_ns": None if max_duration_ns is None else str(max_duration_ns),
+            "media_quality_policy_version": LOCAL_MEDIA_QUALITY_POLICY_VERSION,
+            "neighbor_target_policy_version": LOCAL_NEIGHBOR_TARGET_POLICY_VERSION,
+            "media_quality_report_format_version": (LOCAL_MEDIA_QUALITY_REPORT_FORMAT_VERSION),
+            "media_quality_report_schema_ref": quality_schema_ref.model_dump(mode="json"),
+            "media_quality_binding_projection_version": (
+                LOCAL_MEDIA_QUALITY_BINDING_PROJECTION_VERSION
+            ),
+            "media_quality_source_binding_projection_version": (
+                MEDIA_QUALITY_SOURCE_BINDING_PROJECTION_VERSION
+            ),
+            "supplemental_qa_runtime_version": LOCAL_SUPPLEMENTAL_QA_RUNTIME_VERSION,
+            "supplemental_target_plan_projection_version": (
+                SUPPLEMENTAL_TARGET_PLAN_PROJECTION_VERSION
+            ),
+            "supplemental_selection_tolerance_ns": str(LOCAL_SUPPLEMENTAL_SELECTION_TOLERANCE_NS),
+            "supplemental_tie_break_policy_version": (LOCAL_SUPPLEMENTAL_TIE_BREAK_POLICY_VERSION),
+            "supplemental_dedupe_policy_version": (LOCAL_SUPPLEMENTAL_DEDUPE_POLICY_VERSION),
+            "supplemental_materializer_version": SUPPLEMENTAL_MATERIALIZER_VERSION,
+            "supplemental_package_schema_version": SUPPLEMENTAL_PACKAGE_SCHEMA_VERSION,
+            "supplemental_package_projection_version": (SUPPLEMENTAL_PACKAGE_PROJECTION_VERSION),
+            "supplemental_qa_consumer_policy_version": (LOCAL_SUPPLEMENTAL_QA_DENSE_POLICY_VERSION),
+            "supplemental_qa_input_projection_version": (
+                SUPPLEMENTAL_QA_DENSE_INPUT_PROJECTION_VERSION
+            ),
+            "supplemental_qa_result_projection_version": (
+                SUPPLEMENTAL_QA_DENSE_RESULT_PROJECTION_VERSION
+            ),
+            "supplemental_qa_evidence_projection_version": (
+                LOCAL_SUPPLEMENTAL_QA_EVIDENCE_PROJECTION_VERSION
+            ),
+            "supplemental_qa_evidence_schema_ref": (
+                supplemental_schema_ref.model_dump(mode="json")
+            ),
         }
+    )
+
+    mcap_state_root = (
+        state_root / "mcap" / _stable_uuid("canonical-mcap-source-state", source_binding_sha256)
     )
 
     def load_source(registry: SchemaRegistry) -> CanonicalMcapSourceBundle:
@@ -331,19 +453,66 @@ def run_local_canonical_mcap(
             return load_canonical_mcap_source(
                 source,
                 authorization=authorization,
-                state_dir=(
-                    state_root
-                    / "mcap"
-                    / _stable_uuid("canonical-mcap-source-state", source_binding_sha256)
-                ),
+                state_dir=mcap_state_root,
                 expected_source_sha256=source_sha256,
                 schema_registry=registry,
                 clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+                max_duration_ns=max_duration_ns,
             )
         except CanonicalMcapSourceError as error:
             raise CanonicalLocalCompositionError(
                 CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
                 str(error),
+            ) from error
+
+    def load_media_quality_document(registry: SchemaRegistry) -> dict[str, object]:
+        try:
+            return load_registered_local_media_quality_report_document(
+                mcap_state_root / "media-quality-report.json",
+                registry,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise CanonicalLocalCompositionError(
+                CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                f"invalid persisted media quality report: {error}",
+            ) from error
+
+    def build_supplemental_qa_evidence(
+        registry: SchemaRegistry,
+        bundle: _CanonicalSourceInputs,
+    ) -> LocalSupplementalQaEvidence | None:
+        if not isinstance(bundle, CanonicalMcapSourceBundle):
+            raise CanonicalLocalCompositionError(
+                CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                "MCAP supplemental QA received an incompatible source bundle",
+            )
+        try:
+            return build_and_publish_local_supplemental_qa_evidence(
+                bundle=bundle,
+                state_dir=mcap_state_root,
+                registry=registry,
+                created_at=LOCAL_CANONICAL_EXECUTION_TIME,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise CanonicalLocalCompositionError(
+                CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                f"local supplemental QA failed: {error}",
+            ) from error
+
+    def load_supplemental_qa_evidence(
+        registry: SchemaRegistry,
+    ) -> LocalSupplementalQaEvidence | None:
+        try:
+            return load_and_verify_local_supplemental_qa_evidence(
+                media_quality_document=load_media_quality_document(registry),
+                state_dir=mcap_state_root,
+                expected_source_content_sha256=source_sha256,
+                registry=registry,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise CanonicalLocalCompositionError(
+                CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                f"invalid persisted supplemental QA evidence: {error}",
             ) from error
 
     return _run_local_canonical(
@@ -352,6 +521,9 @@ def run_local_canonical_mcap(
         source_sha256=source_sha256,
         source_binding_sha256=source_binding_sha256,
         source_loader=load_source,
+        media_quality_document_loader=load_media_quality_document,
+        supplemental_qa_evidence_builder=build_supplemental_qa_evidence,
+        supplemental_qa_evidence_loader=load_supplemental_qa_evidence,
     )
 
 
@@ -362,9 +534,17 @@ def _run_local_canonical(
     source_sha256: str,
     source_binding_sha256: str,
     source_loader: _CanonicalSourceLoader,
+    media_quality_document_loader: _MediaQualityDocumentLoader | None = None,
+    supplemental_qa_evidence_builder: _SupplementalQaEvidenceBuilder | None = None,
+    supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run the shared canonical flow after source authorization and binding."""
 
+    if (supplemental_qa_evidence_builder is None) != (supplemental_qa_evidence_loader is None):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "supplemental QA builder and loader must be configured together",
+        )
     started_at = LOCAL_CANONICAL_EXECUTION_TIME
     clock_value = _LOCAL_CANONICAL_EXECUTION_DATETIME
     registry = SchemaRegistry()
@@ -404,6 +584,29 @@ def _run_local_canonical(
         recovered = completion_repository.get(run_id)
         if recovered is not None:
             publish_work.reconcile(recovered)
+            outbox_delivery = _reconcile_local_outbox(
+                recovered,
+                state_root=state_root,
+                primary_database_path=completion_repository.path,
+                registry=registry,
+            )
+            media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
+                media_quality_document_loader, registry
+            )
+            supplemental_qa_evidence = (
+                None
+                if supplemental_qa_evidence_loader is None
+                else supplemental_qa_evidence_loader(registry)
+            )
+            evidence_references = _local_completion_evidence_references(
+                media_quality_document=media_quality_document,
+                supplemental_qa_evidence=supplemental_qa_evidence,
+            )
+            if recovered.evidence_references != evidence_references:
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                    "persisted local evidence differs from authoritative completion references",
+                )
             return _receipt(
                 recovered,
                 replayed=True,
@@ -411,6 +614,9 @@ def _run_local_canonical(
                 state_root=state_root,
                 primary_database_path=completion_repository.path,
                 registry=registry,
+                media_quality_binding=media_quality_binding,
+                supplemental_qa_evidence=supplemental_qa_evidence,
+                outbox_delivery=outbox_delivery,
             )
 
         bundle = source_loader(registry)
@@ -419,6 +625,19 @@ def _run_local_canonical(
                 CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
                 "source bytes changed while preparing the canonical run",
             )
+        media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
+            media_quality_document_loader,
+            registry,
+        )
+        supplemental_qa_evidence = (
+            None
+            if supplemental_qa_evidence_builder is None
+            else supplemental_qa_evidence_builder(registry, bundle)
+        )
+        evidence_references = _local_completion_evidence_references(
+            media_quality_document=media_quality_document,
+            supplemental_qa_evidence=supplemental_qa_evidence,
+        )
         runtime = _build_runtime(
             state_root=state_root,
             run_id=run_id,
@@ -502,10 +721,12 @@ def _run_local_canonical(
             prepared_identities=prepared_identities,
             execution_policy=execution_policy,
         )
+        runtime.inference_evidence.verify_integrity()
         command = create_primary_completion_command(
             result=result,
             prepared_identities=prepared_identities,
             action_event_publications=publications,
+            evidence_references=evidence_references,
             registry=registry,
         )
         commit_result = publish_work.commit(command)
@@ -516,6 +737,8 @@ def _run_local_canonical(
             state_root=state_root,
             primary_database_path=completion_repository.path,
             registry=registry,
+            media_quality_binding=media_quality_binding,
+            supplemental_qa_evidence=supplemental_qa_evidence,
         )
     except CanonicalLocalCompositionError:
         raise
@@ -630,6 +853,7 @@ def _build_runtime(
         registry=registry,
         execution_policy=execution_policy,
         pipeline=pipeline,
+        inference_evidence=inference_evidence,
     )
 
 
@@ -1184,6 +1408,83 @@ def _hash_source_file(path: Path, *, label: str) -> str:
     return digest.hexdigest()
 
 
+def _load_local_media_quality_evidence(
+    loader: _MediaQualityDocumentLoader | None,
+    registry: SchemaRegistry,
+) -> tuple[Mapping[str, object] | None, LocalMediaQualityBinding | None]:
+    if loader is None:
+        return None, None
+    document = loader(registry)
+    try:
+        binding = derive_local_media_quality_binding_document(document, registry)
+    except (TypeError, ValueError) as error:
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+            f"invalid persisted media quality binding: {error}",
+        ) from error
+    return document, binding
+
+
+def _local_completion_evidence_references(
+    *,
+    media_quality_document: Mapping[str, object] | None,
+    supplemental_qa_evidence: LocalSupplementalQaEvidence | None,
+) -> tuple[PrimaryCompletionEvidenceReference, ...]:
+    references: list[PrimaryCompletionEvidenceReference] = []
+    if media_quality_document is not None:
+        references.append(
+            _registered_evidence_reference(
+                role=PrimaryCompletionEvidenceRole.MEDIA_QUALITY_REPORT,
+                document=media_quality_document,
+            )
+        )
+    if supplemental_qa_evidence is not None:
+        references.append(
+            _registered_evidence_reference(
+                role=PrimaryCompletionEvidenceRole.SUPPLEMENTAL_QA_EVIDENCE,
+                document=supplemental_qa_evidence.model_dump(mode="json"),
+            )
+        )
+    return tuple(sorted(references, key=lambda reference: reference.role.value))
+
+
+def _registered_evidence_reference(
+    *,
+    role: PrimaryCompletionEvidenceRole,
+    document: Mapping[str, object],
+) -> PrimaryCompletionEvidenceReference:
+    payload = canonical_json_bytes(document)
+    semantic_digest = document.get("semantic_sha256")
+    if not isinstance(semantic_digest, str):
+        raise ValueError("registered evidence semantic_sha256 must be a string")
+    return PrimaryCompletionEvidenceReference(
+        role=role,
+        schema_ref=SchemaRef.model_validate(document.get("schema_ref"), strict=True),
+        semantic_sha256=semantic_digest,
+        exact_bytes_sha256=exact_bytes_sha256(payload),
+        byte_count=len(payload),
+    )
+
+
+def _reconcile_local_outbox(
+    committed: CommittedPrimaryCompletion,
+    *,
+    state_root: Path,
+    primary_database_path: Path,
+    registry: SchemaRegistry,
+) -> LocalOutboxDeliverySummary:
+    try:
+        return reconcile_local_primary_outbox(
+            primary_database_path=primary_database_path,
+            sink_database_path=state_root / "outbox-sink.sqlite3",
+            outbox=committed.outbox,
+            registry=registry,
+        )
+    except Exception as error:
+        # Completion is already authoritative; delivery remains observable recovery work.
+        return failed_local_outbox_delivery(committed.outbox, error)
+
+
 def _receipt(
     committed: CommittedPrimaryCompletion,
     *,
@@ -1192,18 +1493,31 @@ def _receipt(
     state_root: Path,
     primary_database_path: Path,
     registry: SchemaRegistry,
+    media_quality_binding: LocalMediaQualityBinding | None,
+    supplemental_qa_evidence: LocalSupplementalQaEvidence | None,
+    outbox_delivery: LocalOutboxDeliverySummary | None = None,
 ) -> CanonicalLocalRunReceipt:
     publications = committed.action_event_publications.publications
-    try:
-        delivery = reconcile_local_primary_outbox(
+    delivery = (
+        outbox_delivery
+        if outbox_delivery is not None
+        else _reconcile_local_outbox(
+            committed,
+            state_root=state_root,
             primary_database_path=primary_database_path,
-            sink_database_path=state_root / "outbox-sink.sqlite3",
-            outbox=committed.outbox,
             registry=registry,
         )
+    )
+    try:
+        review = route_local_review_after_completion(
+            committed,
+            state_root=state_root,
+            registry=registry,
+            media_quality_binding=media_quality_binding,
+        )
     except Exception as error:
-        # Completion is already authoritative; delivery remains observable recovery work.
-        delivery = failed_local_outbox_delivery(committed.outbox, error)
+        # Review is downstream of primary completion and cannot replace its truth.
+        review = failed_local_review_routing(error)
     return CanonicalLocalRunReceipt(
         schema_version="1.0",
         model_version=LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION,
@@ -1218,6 +1532,9 @@ def _receipt(
         outbox_ids=tuple(item.outbox_id for item in committed.outbox),
         outbox_count=len(committed.outbox),
         outbox_delivery=delivery,
+        media_quality_binding=media_quality_binding,
+        supplemental_qa_evidence=supplemental_qa_evidence,
+        review_routing=review,
         replayed=replayed,
         fixture_inference_calls=fixture_inference_calls,
         network_call_count=0,

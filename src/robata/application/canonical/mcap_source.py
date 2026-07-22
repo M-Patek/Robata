@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from fractions import Fraction
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, Final
 from uuid import NAMESPACE_URL, uuid5
@@ -38,6 +40,14 @@ from robata.admission.ledger import (
     PrimaryAdmissionEvaluation,
     PrimaryAdmissionPolicy,
     SourceAdmissionOutcome,
+)
+from robata.application.canonical.media_quality import (
+    FrameQualityObservation,
+    FrameTimingEvidence,
+    LocalFrameQualityAnalyzer,
+    LocalMediaQualityReport,
+    build_local_media_quality_report,
+    registered_local_media_quality_report_document,
 )
 from robata.application.registered_video_export import (
     PublishedRegisteredVideoExport,
@@ -137,14 +147,70 @@ class CanonicalMcapSourceBundle:
     requested_interval: NanosecondInterval
     sampling_plan: SamplingPlan
     frame_index: CanonicalSixCameraFrameIndex
+    media_quality_report: LocalMediaQualityReport
     _artifacts: Mapping[tuple[CameraId, str], MaterializedFrameArtifactFact]
+    _artifact_resolver: _VerifiedMcapArtifactResolver
 
     def resolve_artifact(
         self,
         camera_id: CameraId,
         frame: IndexedSourceFrame,
     ) -> MaterializedFrameArtifactFact | None:
-        return self._artifacts.get((camera_id, frame.source_frame_id))
+        return self._artifact_resolver(camera_id, frame)
+
+
+@dataclass(slots=True)
+class _VerifiedMcapArtifactResolver:
+    """Resolve selected frames against a previously verified MP4/sidecar ledger."""
+
+    frame_index: CanonicalSixCameraFrameIndex
+    ledgers: Mapping[CameraId, _CameraLedger]
+    requested_interval: NanosecondInterval
+    output_root: Path
+    artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact]
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _frames_by_id: dict[CameraId, dict[str, IndexedSourceFrame]] = field(
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._frames_by_id = {
+            camera_id: {
+                frame.source_frame_id: frame for frame in self.frame_index.cameras[camera_id].frames
+            }
+            for camera_id in CAMERA_IDS
+        }
+
+    def __call__(
+        self,
+        camera_id: CameraId,
+        frame: IndexedSourceFrame,
+    ) -> MaterializedFrameArtifactFact | None:
+        canonical = self._frames_by_id.get(camera_id, {}).get(frame.source_frame_id)
+        if canonical is None:
+            return None
+        if canonical != frame:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} artifact request differs from its canonical frame index"
+            )
+        aligned_ns = canonical.alignment_projection.aligned_timestamp_ns
+        if not (self.requested_interval.start_ns <= aligned_ns < self.requested_interval.end_ns):
+            return None
+
+        key = (camera_id, canonical.source_frame_id)
+        with self._lock:
+            cached = self.artifacts.get(key)
+            if cached is not None:
+                return cached
+            artifact = _materialize_verified_source_frame(
+                camera_id=camera_id,
+                ledger=self.ledgers[camera_id],
+                source_frame=canonical,
+                output_root=self.output_root,
+            )
+            self.artifacts[key] = artifact
+            return artifact
 
 
 def authorize_mcap_mapping(
@@ -171,17 +237,24 @@ def load_canonical_mcap_source(
     authorization: AuthorizedMcapMapping,
     state_dir: Path,
     expected_source_sha256: str,
+    max_duration_ns: int | None = None,
     schema_registry: SchemaRegistry | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
 
     try:
+        if max_duration_ns is not None:
+            if isinstance(max_duration_ns, bool) or not isinstance(max_duration_ns, int):
+                raise TypeError("max_duration_ns must be an integer or None")
+            if max_duration_ns <= 0:
+                raise ValueError("max_duration_ns must be positive")
         return _load_canonical_mcap_source(
             Path(source),
             authorization=authorization,
             state_dir=Path(state_dir),
             expected_source_sha256=expected_source_sha256,
+            max_duration_ns=max_duration_ns,
             schema_registry=schema_registry or SchemaRegistry(),
             clock=clock or (lambda: datetime.now(tz=UTC)),
         )
@@ -197,6 +270,7 @@ def _load_canonical_mcap_source(
     authorization: AuthorizedMcapMapping,
     state_dir: Path,
     expected_source_sha256: str,
+    max_duration_ns: int | None,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
 ) -> CanonicalMcapSourceBundle:
@@ -305,15 +379,43 @@ def _load_canonical_mcap_source(
         stream_records=stream_records,
         ledgers=ledgers,
     )
-    requested_interval = NanosecondInterval(
-        start_ns=0,
-        end_ns=ready_manifest.recording.duration_ns,
-    )
-    artifacts = _materialize_selected_frames(
+    quality_timings = _frame_timing_evidence(frame_index=frame_index, ledgers=ledgers)
+    requested_end_ns = ready_manifest.recording.duration_ns
+    if max_duration_ns is not None:
+        requested_end_ns = min(requested_end_ns, max_duration_ns)
+    requested_interval = NanosecondInterval(start_ns=0, end_ns=requested_end_ns)
+    frame_output_root = state_dir / "frames"
+    artifacts, quality_observations = _materialize_selected_frames(
         frame_index=frame_index,
         ledgers=ledgers,
+        quality_timings=quality_timings,
         requested_interval=requested_interval,
-        output_root=state_dir / "frames",
+        output_root=frame_output_root,
+        stop_after_selected=(requested_end_ns < ready_manifest.recording.duration_ns),
+    )
+    media_quality_report = build_local_media_quality_report(
+        requested_max_duration_ns=max_duration_ns,
+        recording_duration_ns=ready_manifest.recording.duration_ns,
+        requested_interval=requested_interval,
+        timings=quality_timings,
+        frame_observations=quality_observations,
+    )
+    _publish_exact_state_file(
+        state_dir / "media-quality-report.json",
+        canonical_json_bytes(
+            registered_local_media_quality_report_document(
+                media_quality_report,
+                schema_registry,
+            )
+        ),
+        label="media quality report",
+    )
+    artifact_resolver = _VerifiedMcapArtifactResolver(
+        frame_index=frame_index,
+        ledgers=MappingProxyType(dict(ledgers)),
+        requested_interval=requested_interval,
+        output_root=frame_output_root,
+        artifacts=artifacts,
     )
     return CanonicalMcapSourceBundle(
         source_content_sha256=inspection.source_sha256,
@@ -321,7 +423,9 @@ def _load_canonical_mcap_source(
         requested_interval=requested_interval,
         sampling_plan=_sampling_plan(),
         frame_index=frame_index,
+        media_quality_report=media_quality_report,
         _artifacts=MappingProxyType(artifacts),
+        _artifact_resolver=artifact_resolver,
     )
 
 
@@ -801,15 +905,56 @@ def _frame_index(
     )
 
 
+def _frame_timing_evidence(
+    *,
+    frame_index: CanonicalSixCameraFrameIndex,
+    ledgers: Mapping[CameraId, _CameraLedger],
+) -> dict[CameraId, tuple[FrameTimingEvidence, ...]]:
+    timings: dict[CameraId, tuple[FrameTimingEvidence, ...]] = {}
+    for camera_id in CAMERA_IDS:
+        frames = frame_index.cameras[camera_id].frames
+        rows = ledgers[camera_id].rows
+        if len(frames) != len(rows):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} frame index differs from its verified timestamp sidecar"
+            )
+        camera_timings: list[FrameTimingEvidence] = []
+        for frame, row in zip(frames, rows, strict=True):
+            if (
+                frame.source_order != row.packet_index
+                or frame.source_timestamp_ns != row.source_log_time_ns
+            ):
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} frame timing differs from its verified timestamp sidecar"
+                )
+            camera_timings.append(
+                FrameTimingEvidence(
+                    camera_id=camera_id,
+                    packet_index=row.packet_index,
+                    aligned_timestamp_ns=frame.alignment_projection.aligned_timestamp_ns,
+                    source_timestamp_ns=row.source_log_time_ns,
+                    source_sequence=row.source_sequence,
+                )
+            )
+        timings[camera_id] = tuple(camera_timings)
+    return timings
+
+
 def _materialize_selected_frames(
     *,
     frame_index: CanonicalSixCameraFrameIndex,
     ledgers: Mapping[CameraId, _CameraLedger],
+    quality_timings: Mapping[CameraId, tuple[FrameTimingEvidence, ...]],
     requested_interval: NanosecondInterval,
     output_root: Path,
-) -> dict[tuple[CameraId, str], MaterializedFrameArtifactFact]:
+    stop_after_selected: bool = False,
+) -> tuple[
+    dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
+    dict[CameraId, tuple[FrameQualityObservation, ...]],
+]:
     output_root.mkdir(parents=True, exist_ok=True)
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
+    quality_observations: dict[CameraId, tuple[FrameQualityObservation, ...]] = {}
     grid = SamplingGrid(grid_origin_ns=0, rate=SamplingRate(2, 1))
     for camera_id in CAMERA_IDS:
         source_frames = frame_index.cameras[camera_id].frames
@@ -840,26 +985,42 @@ def _materialize_selected_frames(
             if isinstance(packet_index, bool) or not isinstance(packet_index, int):
                 raise CanonicalMcapSourceError("canonical packet locator is not an integer")
             selected_by_index[packet_index] = source_frame
-        _decode_selected_camera_frames(
+        quality_observations[camera_id] = _decode_selected_camera_frames(
             camera_id=camera_id,
             ledger=ledgers[camera_id],
+            quality_timings=quality_timings[camera_id],
             selected_by_index=selected_by_index,
             output_root=output_root,
             artifacts=artifacts,
+            stop_after_selected=stop_after_selected,
         )
-    return artifacts
+    return artifacts, quality_observations
 
 
 def _decode_selected_camera_frames(
     *,
     camera_id: CameraId,
     ledger: _CameraLedger,
+    quality_timings: tuple[FrameTimingEvidence, ...],
     selected_by_index: Mapping[int, IndexedSourceFrame],
     output_root: Path,
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
-) -> None:
+    stop_after_selected: bool = False,
+) -> tuple[FrameQualityObservation, ...]:
+    if not isinstance(stop_after_selected, bool):
+        raise TypeError("stop_after_selected must be a boolean")
+    if stop_after_selected and not selected_by_index:
+        return ()
+    if len(quality_timings) != len(ledger.rows):
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} quality timing differs from its verified timestamp sidecar"
+        )
+
     decoded_count = 0
     rendered_indexes: set[int] = set()
+    observations: list[FrameQualityObservation] = []
+    analyzer = LocalFrameQualityAnalyzer(camera_id)
+    last_required_index = max(selected_by_index) if stop_after_selected else None
     with av.open(str(ledger.video_path), mode="r") as container:
         streams = tuple(container.streams.video)
         if len(streams) != 1 or bool(streams[0].codec_context.has_b_frames):
@@ -881,46 +1042,172 @@ def _decode_selected_camera_frames(
                     f"{camera_id.value} decoded frame differs from registered evidence"
                 )
             decoded_count += 1
+            observations.append(analyzer.observe(frame, quality_timings[decoded_index]))
             source_frame = selected_by_index.get(decoded_index)
             if source_frame is None:
                 continue
-            png_bytes, width, height = _encode_png(frame, max_width=MCAP_PNG_MAX_WIDTH)
-            digest = exact_bytes_sha256(png_bytes)
-            path = _publish_png(output_root, digest, png_bytes)
-            artifact_identity = semantic_sha256(
-                {
-                    "extractor_version": MCAP_PNG_EXTRACTOR_VERSION,
-                    "source_frame_id": source_frame.source_frame_id,
-                    "png_sha256": digest,
-                }
-            )
-            artifacts[(camera_id, source_frame.source_frame_id)] = MaterializedFrameArtifactFact(
-                artifact=MaterializedArtifactManifest(
-                    artifact_id=_stable_uuid(
-                        "canonical-mcap-frame-artifact",
-                        artifact_identity,
-                    ),
-                    uri=path.as_uri(),
-                    sha256=digest,
-                    bytes=len(png_bytes),
-                    media_type="image/png",
-                ),
-                width=width,
-                height=height,
-                quality_flags=(
-                    "LOCAL_CONFORMANCE",
-                    "REAL_MCAP_H264_DECODED",
-                ),
+            artifacts[(camera_id, source_frame.source_frame_id)] = _materialized_frame_artifact(
+                source_frame=source_frame,
+                decoded_frame=frame,
+                output_root=output_root,
             )
             rendered_indexes.add(decoded_index)
-    if decoded_count != len(ledger.rows):
+            if last_required_index is not None and decoded_index >= last_required_index:
+                break
+    if last_required_index is None and decoded_count != len(ledger.rows):
         raise CanonicalMcapSourceError(
             f"{camera_id.value} decoded frame count differs from its sidecar"
+        )
+    if last_required_index is not None and decoded_count != last_required_index + 1:
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} did not decode through its final selected source frame"
         )
     if rendered_indexes != set(selected_by_index):
         raise CanonicalMcapSourceError(
             f"{camera_id.value} did not materialize every selected source frame"
         )
+    return tuple(observations)
+
+
+def _materialize_verified_source_frame(
+    *,
+    camera_id: CameraId,
+    ledger: _CameraLedger,
+    source_frame: IndexedSourceFrame,
+    output_root: Path,
+) -> MaterializedFrameArtifactFact:
+    """Seek from verified keyframe evidence and materialize one exact source frame."""
+
+    packet_index = source_frame.source_locator.get("packet_index")
+    expected_locator = {
+        "camera_id": camera_id.value,
+        "packet_index": source_frame.source_order,
+        "source_log_time_ns": str(source_frame.source_timestamp_ns),
+        "timestamp_sidecar_sha256": ledger.sidecar_sha256,
+        "video_sha256": ledger.record.video_artifact.sha256,
+    }
+    if (
+        isinstance(packet_index, bool)
+        or not isinstance(packet_index, int)
+        or packet_index != source_frame.source_order
+        or packet_index >= len(ledger.rows)
+        or source_frame.source_locator != expected_locator
+    ):
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} artifact request has an invalid verified source locator"
+        )
+    row = ledger.rows[packet_index]
+    if (
+        row.packet_index != packet_index
+        or row.camera_id is not camera_id
+        or row.source_log_time_ns != source_frame.source_timestamp_ns
+    ):
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} artifact request differs from its timestamp sidecar"
+        )
+
+    keyframe_indexes = tuple(
+        candidate.packet_index
+        for candidate in ledger.rows[: packet_index + 1]
+        if candidate.is_keyframe
+    )
+    if not keyframe_indexes:
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} has no verified keyframe before source frame {packet_index}"
+        )
+    keyframe_row = ledger.rows[keyframe_indexes[-1]]
+    row_by_pts = {candidate.relative_pts_ns: candidate for candidate in ledger.rows}
+    try:
+        with av.open(str(ledger.video_path), mode="r") as container:
+            streams = tuple(container.streams.video)
+            if len(streams) != 1 or bool(streams[0].codec_context.has_b_frames):
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} registered MP4 is not one non-reordered video stream"
+                )
+            stream = streams[0]
+            if stream.time_base is None:
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} registered MP4 stream has no time base"
+                )
+            seek_position = Fraction(keyframe_row.relative_pts_ns, 1_000_000_000) / Fraction(
+                stream.time_base
+            )
+            container.seek(
+                seek_position.numerator // seek_position.denominator,
+                stream=stream,
+                any_frame=False,
+                backward=True,
+            )
+            for decoded_frame in container.decode(stream):
+                actual_pts_ns = _frame_pts_ns(decoded_frame)
+                decoded_row = row_by_pts.get(actual_pts_ns)
+                if decoded_row is None:
+                    raise CanonicalMcapSourceError(
+                        f"{camera_id.value} sought frame PTS is absent from its sidecar"
+                    )
+                if (
+                    decoded_frame.width != ledger.record.width
+                    or decoded_frame.height != ledger.record.height
+                ):
+                    raise CanonicalMcapSourceError(
+                        f"{camera_id.value} sought frame dimensions differ from registered evidence"
+                    )
+                if decoded_row.packet_index == packet_index:
+                    return _materialized_frame_artifact(
+                        source_frame=source_frame,
+                        decoded_frame=decoded_frame,
+                        output_root=output_root,
+                    )
+                if actual_pts_ns > row.relative_pts_ns:
+                    break
+    except CanonicalMcapSourceError:
+        raise
+    except Exception as error:
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} could not seek and decode source frame {packet_index}: {error}"
+        ) from error
+    raise CanonicalMcapSourceError(
+        f"{camera_id.value} did not decode requested source frame {packet_index}"
+    )
+
+
+def _materialized_frame_artifact(
+    *,
+    source_frame: IndexedSourceFrame,
+    decoded_frame: Any,
+    output_root: Path,
+) -> MaterializedFrameArtifactFact:
+    png_bytes, width, height = _encode_png(
+        decoded_frame,
+        max_width=MCAP_PNG_MAX_WIDTH,
+    )
+    digest = exact_bytes_sha256(png_bytes)
+    path = _publish_png(output_root, digest, png_bytes)
+    artifact_identity = semantic_sha256(
+        {
+            "extractor_version": MCAP_PNG_EXTRACTOR_VERSION,
+            "source_frame_id": source_frame.source_frame_id,
+            "png_sha256": digest,
+        }
+    )
+    return MaterializedFrameArtifactFact(
+        artifact=MaterializedArtifactManifest(
+            artifact_id=_stable_uuid(
+                "canonical-mcap-frame-artifact",
+                artifact_identity,
+            ),
+            uri=path.as_uri(),
+            sha256=digest,
+            bytes=len(png_bytes),
+            media_type="image/png",
+        ),
+        width=width,
+        height=height,
+        quality_flags=(
+            "LOCAL_CONFORMANCE",
+            "REAL_MCAP_H264_DECODED",
+        ),
+    )
 
 
 def _publish_png(root: Path, digest: str, contents: bytes) -> Path:
@@ -948,6 +1235,40 @@ def _publish_png(root: Path, digest: str, contents: bytes) -> Path:
             if target.is_symlink() or exact_bytes_sha256(target.read_bytes()) != digest:
                 raise CanonicalMcapSourceError(
                     f"concurrent frame artifact is corrupt: {target}"
+                ) from None
+        return target.resolve()
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_exact_state_file(
+    target: Path,
+    contents: bytes,
+    *,
+    label: str,
+) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.is_symlink() or not target.is_file() or target.read_bytes() != contents:
+            raise CanonicalMcapSourceError(f"existing {label} bytes are inconsistent")
+        return target.resolve()
+
+    descriptor, temporary = make_temp_file(
+        target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if target.is_symlink() or not target.is_file() or target.read_bytes() != contents:
+                raise CanonicalMcapSourceError(
+                    f"concurrent {label} bytes are inconsistent"
                 ) from None
         return target.resolve()
     finally:

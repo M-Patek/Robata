@@ -92,6 +92,27 @@ def test_manifest_uses_sorted_exact_head_blobs_and_is_deterministic(tmp_path: Pa
     assert json.loads(rendered)["files"][0]["path"] == "a-first.bin"
 
 
+def test_manifest_archive_is_independent_of_host_line_ending_config(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(
+        tmp_path,
+        {
+            ".gitattributes": b"*.txt text eol=lf\n",
+            "source.txt": b"source\n",
+        },
+    )
+    _git(repo, "config", "core.autocrlf", "true")
+    _git(repo, "config", "core.eol", "crlf")
+
+    manifest = build_release_manifest(repo)
+
+    assert tuple(item.path for item in manifest.files) == (
+        ".gitattributes",
+        "source.txt",
+    )
+
+
 def test_manifest_rejects_files_force_tracked_despite_ignore_rules(tmp_path: Path) -> None:
     ignore_rules = b".env\n.venv/\nbuild/\ndist/\n*.log\ncoverage/\ndata/\n.claude/\n"
     repo = _repository(

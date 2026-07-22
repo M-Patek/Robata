@@ -27,6 +27,12 @@ class WireSchemaSpec:
 
 
 WIRE_SCHEMAS = {
+    "local-supplemental-qa-evidence": WireSchemaSpec(
+        module="robata.qa_pipeline.supplemental_wire",
+        model="LocalSupplementalQaEvidence",
+        document_id=("https://schemas.robata.dev/v2/local-supplemental-qa-evidence.schema.json"),
+        title="LocalSupplementalQaEvidence",
+    ),
     "event-identity-outbox-record": WireSchemaSpec(
         module="robata.event_pipeline.identity_registry",
         model="EventIdentityOutboxWireRecord",

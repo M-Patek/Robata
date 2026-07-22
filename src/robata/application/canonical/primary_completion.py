@@ -10,10 +10,10 @@ performs no writes.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final, Literal, Protocol, Self
+from typing import Annotated, Final, Literal, Protocol, Self
 from uuid import NAMESPACE_URL, uuid5
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from robata.application.canonical.action_event_revision import (
     PreparedInitialActionEventRevisionBatch,
@@ -82,7 +82,7 @@ CANONICAL_PRIMARY_COMPLETION_DETAIL_PROJECTION_VERSION: Final = (
     "canonical-primary-completion-detail-semantic-v4"
 )
 CANONICAL_PRIMARY_COMPLETION_COMMAND_PROJECTION_VERSION: Final = (
-    "canonical-primary-completion-command-v1"
+    "canonical-primary-completion-command-v2"
 )
 CANONICAL_PRIMARY_COLLECTION_ROOT_PROJECTION_VERSION: Final = "canonical-primary-collection-root-v1"
 
@@ -275,17 +275,45 @@ class CanonicalPrimaryCompletionDetail(StrictModel):
         return self
 
 
+class PrimaryCompletionEvidenceRole(StrEnum):
+    """Closed local roles whose exact evidence is bound by completion."""
+
+    MEDIA_QUALITY_REPORT = "MEDIA_QUALITY_REPORT"
+    SUPPLEMENTAL_QA_EVIDENCE = "SUPPLEMENTAL_QA_EVIDENCE"
+
+
+class PrimaryCompletionEvidenceReference(StrictModel):
+    """Exact registered side evidence committed with the primary command."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    role: PrimaryCompletionEvidenceRole
+    schema_ref: SchemaRef
+    semantic_sha256: Sha256Digest
+    exact_bytes_sha256: Sha256Digest
+    byte_count: Annotated[int, Field(strict=True, ge=1)]
+
+
+def _validate_evidence_references(
+    references: tuple[PrimaryCompletionEvidenceReference, ...],
+) -> None:
+    roles = tuple(reference.role for reference in references)
+    if roles != tuple(sorted(set(roles), key=lambda role: role.value)):
+        raise ValueError("primary completion evidence references must be unique and ordered")
+
+
 class PrimaryCompletionCommand(StrictModel):
     """Exact idempotent command consumed by the aggregate repository."""
 
     schema_version: Literal["1.0"]
-    semantic_projection_version: Literal["canonical-primary-completion-command-v1"]
+    semantic_projection_version: Literal["canonical-primary-completion-command-v2"]
     command_sha256: Sha256Digest
     detail: CanonicalPrimaryCompletionDetail
     completion: PrimaryCompletionRecord
+    evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = ()
 
     @model_validator(mode="after")
     def validate_command(self) -> Self:
+        _validate_evidence_references(self.evidence_references)
         detail_bytes = canonical_json_bytes(self.detail)
         detail_digest = exact_bytes_sha256(detail_bytes)
         reference = self.completion.detailed_result
@@ -323,9 +351,11 @@ class CommittedPrimaryCompletion(StrictModel):
     identity_result: EventIdentityBatchResult | None
     action_event_publications: PreparedInitialActionEventRevisionBatch
     outbox: tuple[EventIdentityOutboxRecord, ...]
+    evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = ()
 
     @model_validator(mode="after")
     def validate_committed(self) -> Self:
+        _validate_evidence_references(self.evidence_references)
         if (
             self.processing_run.run_id != self.completion.run_id
             or self.processing_run.run_id != self.detail.run_id
@@ -412,6 +442,9 @@ def primary_completion_command_projection(
             command.completion.detailed_result.schema_ref.model_dump(mode="json")
         ),
         "completion_semantic_sha256": command.completion.semantic_sha256,
+        "evidence_references": [
+            reference.model_dump(mode="json") for reference in command.evidence_references
+        ],
     }
 
 
@@ -420,6 +453,7 @@ def create_primary_completion_command(
     result: CanonicalOfflineRunResult,
     prepared_identities: PreparedEventIdentityBatch | None,
     action_event_publications: PreparedInitialActionEventRevisionBatch,
+    evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
     registry: SchemaRegistry | None = None,
 ) -> PrimaryCompletionCommand:
     """Create and schema-validate one exact aggregate command without writes."""
@@ -428,6 +462,12 @@ def create_primary_completion_command(
         raise TypeError("result must be CanonicalOfflineRunResult")
     if not isinstance(action_event_publications, PreparedInitialActionEventRevisionBatch):
         raise TypeError("action_event_publications must be PreparedInitialActionEventRevisionBatch")
+    if not isinstance(evidence_references, tuple) or any(
+        not isinstance(reference, PrimaryCompletionEvidenceReference)
+        for reference in evidence_references
+    ):
+        raise TypeError("evidence_references must be a tuple of PrimaryCompletionEvidenceReference")
+    _validate_evidence_references(evidence_references)
     if result.status not in {
         CanonicalOfflineRunStatus.SUCCEEDED,
         CanonicalOfflineRunStatus.NO_EVENTS,
@@ -456,6 +496,8 @@ def create_primary_completion_command(
     assert result.event_proposal_result is not None
     assert result.candidate_reduction_result is not None
     active_registry = registry or default_schema_registry()
+    for reference in evidence_references:
+        active_registry.resolve_exact(reference.schema_ref)
     detail_schema_ref = active_registry.resolve_version(
         CANONICAL_PRIMARY_COMPLETION_DETAIL_SCHEMA_ID,
         CANONICAL_PRIMARY_COMPLETION_DETAIL_SCHEMA_VERSION,
@@ -529,6 +571,7 @@ def create_primary_completion_command(
         "command_sha256": "0" * 64,
         "detail": detail,
         "completion": completion,
+        "evidence_references": evidence_references,
     }
     draft_command = PrimaryCompletionCommand.model_construct(
         **command_fields  # type: ignore[arg-type]
@@ -696,6 +739,8 @@ __all__ = [
     "PrimaryCompletionCommitResult",
     "PrimaryCompletionError",
     "PrimaryCompletionErrorCode",
+    "PrimaryCompletionEvidenceReference",
+    "PrimaryCompletionEvidenceRole",
     "PrimaryCompletionRepository",
     "canonical_collection_digest_root",
     "canonical_primary_completion_detail_projection",

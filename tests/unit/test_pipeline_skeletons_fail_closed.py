@@ -16,7 +16,6 @@ from robata.event_pipeline.proposer import (
 from robata.event_pipeline.proposer import (
     MCAPRecording as ProposalMCAPRecording,
 )
-from robata.sampling.adaptive import AdaptiveSampler, AdaptiveSamplingPolicy, SignalDetector
 
 
 def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
@@ -31,16 +30,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
     )
     candidate_manager = CandidateEventManager()
     classifier = QAClassifier()
-    adaptive = AdaptiveSampler(
-        AdaptiveSamplingPolicy(
-            version="adaptive-sampling-v1",
-            min_fps=0.25,
-            max_fps=1.0,
-            triggers=(),
-            hysteresis_sec=0.0,
-        ),
-        (SignalDetector(),),
-    )
     evidence = ActionEvidenceExtractor()
 
     return (
@@ -63,10 +52,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
         (
             "CandidateEventManager.validate_candidate",
             lambda: candidate_manager.validate_candidate(candidate),
-        ),
-        (
-            "AdaptiveSampler.sample",
-            lambda: adaptive.sample(object(), {}),
         ),
         (
             "extract_evidence",

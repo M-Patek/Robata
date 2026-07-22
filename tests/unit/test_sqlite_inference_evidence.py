@@ -974,7 +974,23 @@ def test_missing_typed_raw_artifact_fails_closed(tmp_path: Path) -> None:
         connection.close()
 
     with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="missing their typed raw"):
+        ledger.append(
+            request_id=intent.request_id,
+            provider_request_id=stored.provider_request_id,
+            data=raw_data,
+        )
+    with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="missing their typed raw"):
+        ledger.append_raw_artifact(evidence.parsed.raw_response)
+    with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="missing their typed raw"):
+        ledger.append_parsed_claim(evidence.parsed)
+    with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="missing their typed raw"):
         ledger.get_terminal(intent.inference_id)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT count(*) FROM raw_provider_artifacts").fetchone() == (0,)
+    finally:
+        connection.close()
 
 
 def test_typed_raw_normalized_column_tampering_fails_closed(tmp_path: Path) -> None:
@@ -1026,3 +1042,76 @@ def test_selection_reason_column_tampering_fails_closed(tmp_path: Path) -> None:
             evidence.selection.logical_invocation_id,
             evidence.selection.policy_version,
         )
+
+
+def test_crud_uses_targeted_validation_until_explicit_full_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = SQLiteInferenceEvidenceLedger(_database(tmp_path), SchemaRegistry())
+    original_load_state = ledger._load_state
+
+    def unexpected_full_load(_connection: sqlite3.Connection) -> None:
+        raise AssertionError("CRUD must not scan the full evidence graph")
+
+    monkeypatch.setattr(ledger, "_load_state", unexpected_full_load)
+    evidence = _persist_chain(ledger)
+
+    assert ledger.append_intent(evidence.intent) == evidence.intent
+    assert ledger.append(
+        request_id=evidence.intent.request_id,
+        provider_request_id=evidence.parsed.raw_response.provider_request_id,
+        data=evidence.raw_data,
+    ) == ledger.get(evidence.parsed.raw_response.artifact_id)
+    assert ledger.append_terminal(evidence.terminal) == evidence.terminal
+    assert ledger.append_raw_artifact(evidence.parsed.raw_response) == evidence.parsed.raw_response
+    assert ledger.append_selection(evidence.selection) == evidence.selection
+    assert ledger.append_parsed_claim(evidence.parsed) == evidence.parsed
+    assert ledger.append_selected_output(evidence.selected) == evidence.selected
+    assert ledger.append_enriched_output(evidence.enriched) == evidence.enriched
+    assert ledger.get_intent(evidence.intent.inference_id) == evidence.intent
+    assert ledger.get_terminal(evidence.terminal.inference_id) == evidence.terminal
+    assert len(ledger.list_records()) == 1
+
+    monkeypatch.setattr(ledger, "_load_state", original_load_state)
+    ledger.verify_integrity()
+
+
+def test_explicit_full_audit_and_reopen_detect_unrelated_row_tampering(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    evidence = _persist_chain(ledger)
+
+    connection = sqlite3.connect(database)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'enriched_provider_outputs_no_update'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER enriched_provider_outputs_no_update")
+        connection.execute(
+            "UPDATE enriched_provider_outputs SET semantic_sha256 = ? WHERE artifact_id = ?",
+            (_digest(99_999), evidence.enriched.artifact_id),
+        )
+        connection.execute(trigger_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert ledger.get_intent(evidence.intent.inference_id) == evidence.intent
+    with pytest.raises(
+        SQLiteInferenceEvidenceLedgerError,
+        match="indexed column semantic_sha256",
+    ):
+        ledger.get_enriched_output(evidence.enriched.artifact_id)
+    with pytest.raises(
+        SQLiteInferenceEvidenceLedgerError,
+        match="indexed column semantic_sha256",
+    ):
+        ledger.verify_integrity()
+    with pytest.raises(
+        SQLiteInferenceEvidenceLedgerError,
+        match="indexed column semantic_sha256",
+    ):
+        SQLiteInferenceEvidenceLedger(database, SchemaRegistry())

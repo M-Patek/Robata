@@ -1,8 +1,9 @@
-"""Frozen adaptive-target resolution and future detector coordination.
+"""Deterministic adaptive detection, rate reduction, and frozen target resolution.
 
-The exact resolver is runnable because it consumes only already-frozen policy
-decisions. Signal detection and trigger-to-rate policy remain behind the
-fail-closed :class:`AdaptiveSampler` skeleton.
+The runtime sampler reduces registered detector triggers to a bounded window-average
+rate. The exact resolver separately consumes frozen policy decisions and produces
+identity-bound integer-nanosecond targets; runtime observations never bypass that
+publication boundary.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ class SignalTrigger(StrictModel):
     timestamp_ns: Nanoseconds
     strength: NonNegativeFiniteFloat
     confidence: UnitInterval
+    camera_id: CameraId | None = None
 
 
 class AdaptiveSamplingPolicy(StrictModel):
@@ -421,14 +423,7 @@ class SignalDetector:
 
 
 class AdaptiveSampler:
-    """Future adaptive-sampling coordinator; currently non-runnable.
-
-    The sampler will run every registered :class:`SignalDetector` over the
-    supplied six-camera stream set, collect triggers, and produce an
-    :class:`AdaptiveSamplingResult` that records the effective FPS and all
-    detected features. It will not materialize frames; that responsibility will
-    remain with the caller.
-    """
+    """Run registered detectors and reduce triggers under a versioned policy."""
 
     def __init__(
         self,
@@ -452,25 +447,92 @@ class AdaptiveSampler:
 
     def sample(
         self,
-        window: object,  # TemporalWindow not imported to avoid circular deps
+        window: object,
         frames: dict[CameraId, Sequence[FramePayload]],
     ) -> AdaptiveSamplingResult:
-        """Run all detectors and produce an adaptive sampling result.
+        """Return a deterministic window-average rate without materializing frames."""
 
-        Args:
-            window: The temporal window being sampled (duck-typed; expected
-                to expose a ``window_id`` attribute).
-            frames: Mapping from canonical :class:`CameraId` to ordered
-                frame payloads for that camera.
+        window_id = getattr(window, "window_id", None)
+        interval = getattr(window, "interval", None)
+        if not isinstance(window_id, str) or not window_id:
+            raise TypeError("window must expose a nonempty window_id")
+        if not isinstance(interval, NanosecondInterval):
+            raise TypeError("window must expose a NanosecondInterval interval")
+        if not isinstance(frames, dict) or set(frames) != set(CameraId):
+            raise ValueError("frames must contain every canonical camera exactly once")
 
-        Returns:
-            An :class:`AdaptiveSamplingResult` carrying the computed
-            ``actual_fps`` and every trigger discovered across all cameras.
-        """
-        raise NotImplementedError(
-            "AdaptiveSampler.sample is a non-runnable architecture skeleton; "
-            "signal detection and trigger-to-rate policy are not implemented."
+        triggers: list[SignalTrigger] = []
+        enabled = set(self._policy.triggers)
+        for camera_id in CameraId:
+            camera_frames = frames[camera_id]
+            for detector in self._detectors:
+                detected = detector.detect(camera_frames, camera_id=camera_id.value)
+                for trigger in detected:
+                    if not isinstance(trigger, SignalTrigger):
+                        raise TypeError("signal detectors must return SignalTrigger values")
+                    if trigger.signal_type not in enabled:
+                        continue
+                    if not interval.contains(trigger.timestamp_ns):
+                        continue
+                    if trigger.camera_id not in {None, camera_id}:
+                        raise ValueError("signal trigger camera_id disagrees with detector input")
+                    triggers.append(trigger.model_copy(update={"camera_id": camera_id}))
+
+        canonical = tuple(
+            sorted(
+                triggers,
+                key=lambda item: (
+                    item.timestamp_ns,
+                    item.camera_id.value if item.camera_id is not None else "",
+                    item.signal_type.value,
+                    item.strength,
+                    item.confidence,
+                ),
+            )
         )
+        actual_fps = _window_average_fps(
+            interval=interval,
+            triggers=canonical,
+            policy=self._policy,
+        )
+        return AdaptiveSamplingResult(
+            window_id=window_id,
+            actual_fps=actual_fps,
+            trigger_count=len(canonical),
+            trigger_features=canonical,
+        )
+
+
+def _window_average_fps(
+    *,
+    interval: NanosecondInterval,
+    triggers: tuple[SignalTrigger, ...],
+    policy: AdaptiveSamplingPolicy,
+) -> float:
+    if not triggers:
+        return policy.min_fps
+    hysteresis_ns = int(policy.hysteresis_sec * 1_000_000_000)
+    if hysteresis_ns <= 0:
+        return policy.max_fps
+
+    promoted = sorted(
+        (
+            trigger.timestamp_ns,
+            min(interval.end_ns, trigger.timestamp_ns + hysteresis_ns),
+        )
+        for trigger in triggers
+    )
+    covered_ns = 0
+    current_start, current_end = promoted[0]
+    for start_ns, end_ns in promoted[1:]:
+        if start_ns <= current_end:
+            current_end = max(current_end, end_ns)
+        else:
+            covered_ns += current_end - current_start
+            current_start, current_end = start_ns, end_ns
+    covered_ns += current_end - current_start
+    ratio = covered_ns / (interval.end_ns - interval.start_ns)
+    return policy.min_fps + (policy.max_fps - policy.min_fps) * ratio
 
 
 __all__ = [

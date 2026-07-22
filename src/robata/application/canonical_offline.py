@@ -166,6 +166,12 @@ from robata.application.canonical.primary_completion import (
     PrimaryCompletionErrorCode as PrimaryCompletionErrorCode,
 )
 from robata.application.canonical.primary_completion import (
+    PrimaryCompletionEvidenceReference as PrimaryCompletionEvidenceReference,
+)
+from robata.application.canonical.primary_completion import (
+    PrimaryCompletionEvidenceRole as PrimaryCompletionEvidenceRole,
+)
+from robata.application.canonical.primary_completion import (
     PrimaryCompletionRepository as PrimaryCompletionRepository,
 )
 from robata.application.canonical.primary_completion import (
@@ -310,6 +316,8 @@ __all__ = [
     "PrimaryCompletionCommitResult",
     "PrimaryCompletionError",
     "PrimaryCompletionErrorCode",
+    "PrimaryCompletionEvidenceReference",
+    "PrimaryCompletionEvidenceRole",
     "PrimaryCompletionRepository",
     "boundary_refinement_window_projection",
     "canonical_action_evidence_execution_membership_lineage",
