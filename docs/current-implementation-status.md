@@ -15,6 +15,18 @@ The archive is intentionally outside this authority chain. Archived reports may 
 work, but their commands, paths, test totals, and conclusions do not describe the live tree
 unless independently reproduced.
 
+## Next Internal Engineering Iteration
+
+The non-normative
+[Streaming Throughput Next-Iteration Guide V1](architecture/streaming-throughput-next-iteration-v1.md)
+defines the next local sequence: instrument the current fresh path, register incremental streaming
+identities, replace repeated whole-file media work with single-pass bounded ingest, extend the
+durable scheduler to a window DAG, batch inference/evidence persistence, commit incremental window
+evidence under its own local transaction, and finalize recording-scoped canonical truth at end of
+stream. Its capacity values are candidate-local observations, derived projections, external vendor
+benchmarks, or unvalidated targets; none is production qualification. Section 25, accepted ADRs,
+and registered schemas remain authoritative when implementation begins.
+
 ## Live Slices
 
 | Slice | Live state | Promotion boundary |

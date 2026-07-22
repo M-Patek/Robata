@@ -26,6 +26,11 @@ those authorities and lists every deferred gate. Content under
 [`archive/old_mvp`](archive/old_mvp) is historical and non-normative; it does not prove that
 the current tree satisfies a phase gate.
 
+The next internal engineering iteration is described by the non-normative
+[Streaming Throughput Next-Iteration Guide V1](docs/architecture/streaming-throughput-next-iteration-v1.md).
+It sequences continuous-ingest and bounded-latency local work, but remains subordinate to the
+authority order above and cannot promote a phase or make a production-capacity claim.
+
 ## Current Baseline
 
 The live tree provides strict domain values and 47 exact-pinned schemas, deterministic canonical
