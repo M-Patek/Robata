@@ -138,23 +138,14 @@
   fill: #1A1714;
 }
 
-/* ── Page transition keyframes ───────────────────────────────────────────── */
-@keyframes group-zoom-in {
-  from { opacity: 0; transform: scale(0.96); }
-  to   { opacity: 1; transform: scale(1);    }
+/* ── Header content crossfade (only the dynamic title zone) ─────────────── */
+@keyframes header-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0);   }
 }
-@keyframes group-slide-from-right {
-  from { opacity: 0; transform: translateX(40px); }
-  to   { opacity: 1; transform: translateX(0);    }
+.header-content-fade {
+  animation: header-fade-in 0.2s cubic-bezier(0.4,0,0.2,1) both;
 }
-@keyframes group-slide-from-left {
-  from { opacity: 0; transform: translateX(-40px); }
-  to   { opacity: 1; transform: translateX(0);     }
-}
-
-.anim-zoom-in          { animation: group-zoom-in           0.28s cubic-bezier(0.4,0,0.2,1) both; }
-.anim-slide-from-right { animation: group-slide-from-right  0.24s cubic-bezier(0.4,0,0.2,1) both; }
-.anim-slide-from-left  { animation: group-slide-from-left   0.24s cubic-bezier(0.4,0,0.2,1) both; }
 
 /* ── Pipeline chain rail ─────────────────────────────────────────────────── */
 .chain-rail {
