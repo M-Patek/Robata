@@ -7,23 +7,21 @@ interface PipelineStore {
   setActiveRun: (run: RobataRun | null) => void
   updateNodeStatus: (nodeId: string, status: NodeStatus) => void
 
-  // Selected node for inspector panel
-  selectedNodeId: string | null
-  setSelectedNodeId: (id: string | null) => void
+  // Navigation — which group is expanded (null = overview)
+  expandedGroup: string | null
+  setExpandedGroup: (id: string | null) => void
+
+  // Focused node — shows detail drawer
+  focusedNodeId: string | null
+  setFocusedNodeId: (id: string | null) => void
 
   // Review queue
   reviewTasks: ReviewTask[]
   setReviewTasks: (tasks: ReviewTask[]) => void
 
-  // WebSocket connection status
+  // WebSocket
   wsConnected: boolean
   setWsConnected: (v: boolean) => void
-
-  // UI state
-  showSixCameraPanel: boolean
-  toggleSixCameraPanel: () => void
-  showInspector: boolean
-  toggleInspector: () => void
 }
 
 export const usePipelineStore = create<PipelineStore>((set) => ({
@@ -40,20 +38,16 @@ export const usePipelineStore = create<PipelineStore>((set) => ({
       }
     }),
 
-  selectedNodeId: null,
-  setSelectedNodeId: (id) => set({ selectedNodeId: id }),
+  expandedGroup: null,
+  setExpandedGroup: (id) => set({ expandedGroup: id, focusedNodeId: null }),
+
+  focusedNodeId: null,
+  setFocusedNodeId: (id) =>
+    set((state) => ({ focusedNodeId: state.focusedNodeId === id ? null : id })),
 
   reviewTasks: [],
   setReviewTasks: (tasks) => set({ reviewTasks: tasks }),
 
   wsConnected: false,
   setWsConnected: (v) => set({ wsConnected: v }),
-
-  showSixCameraPanel: false,
-  toggleSixCameraPanel: () =>
-    set((state) => ({ showSixCameraPanel: !state.showSixCameraPanel })),
-
-  showInspector: true,
-  toggleInspector: () =>
-    set((state) => ({ showInspector: !state.showInspector })),
 }))

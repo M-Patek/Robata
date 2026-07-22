@@ -1,6 +1,5 @@
 import { memo, useCallback } from 'react'
 import { Handle, Position, NodeProps } from 'reactflow'
-import { clsx } from 'clsx'
 import { RobataNodeData, STATUS_STYLE, STATUS_LABEL, NodeKind } from '@/types'
 import { usePipelineStore } from '@/store'
 
@@ -42,135 +41,143 @@ const KIND_GROUP: Record<NodeKind, string> = {
   work_scheduler:       'Delivery',
 }
 
-function RunningDot() {
-  return (
-    <span className="relative flex h-2 w-2 flex-shrink-0">
-      <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60"
-        style={{ background: '#4A7FA8' }} />
-      <span className="relative inline-flex rounded-full h-2 w-2"
-        style={{ background: '#4A7FA8' }} />
-    </span>
-  )
-}
+function RobataNode({ id, data }: NodeProps<RobataNodeData>) {
+  const activeRun      = usePipelineStore((s) => s.activeRun)
+  const focusedNodeId  = usePipelineStore((s) => s.focusedNodeId)
+  const setFocusedNodeId = usePipelineStore((s) => s.setFocusedNodeId)
 
-function RobataNode({ id, data, selected }: NodeProps<RobataNodeData>) {
-  const setSelectedNodeId = usePipelineStore((s) => s.setSelectedNodeId)
-  const activeRun = usePipelineStore((s) => s.activeRun)
   const liveStatus = activeRun?.node_statuses?.[id] ?? data.status
-  const style = STATUS_STYLE[liveStatus]
+  const style      = STATUS_STYLE[liveStatus]
+  const isFocused  = focusedNodeId === id
 
-  const handleClick = useCallback(() => setSelectedNodeId(id), [id, setSelectedNodeId])
+  const onClick = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation()
+    setFocusedNodeId(id)
+  }, [id, setFocusedNodeId])
 
   return (
     <div
-      onClick={handleClick}
-      className={clsx('node-base cursor-pointer', selected && 'node-selected')}
+      onClick={onClick}
+      className="cursor-pointer select-none"
       style={{
-        minWidth: 180,
-        maxWidth: 220,
-        borderColor: selected ? undefined : style.nodeBorder,
+        width: 220,
+        background: '#FDFAF5',
+        border: `1.5px solid ${isFocused ? '#C96442' : style.nodeBorder}`,
+        borderRadius: 10,
+        boxShadow: isFocused
+          ? '0 4px 20px rgba(201,100,66,0.18), 0 0 0 3px rgba(201,100,66,0.12)'
+          : '0 1px 6px rgba(26,23,20,0.07)',
+        transition: 'all 0.15s ease',
+      }}
+      onMouseEnter={(e) => {
+        if (!isFocused) e.currentTarget.style.boxShadow = '0 4px 14px rgba(26,23,20,0.10)'
+      }}
+      onMouseLeave={(e) => {
+        if (!isFocused) e.currentTarget.style.boxShadow = '0 1px 6px rgba(26,23,20,0.07)'
       }}
     >
-      <Handle
-        type="target"
-        position={Position.Left}
-        style={{ background: '#F8F3E8', borderColor: '#C4B59E' }}
-      />
+      <Handle type="target" position={Position.Left}
+        style={{ background: '#F8F3E8', borderColor: '#C4B59E', width: 9, height: 9 }} />
 
-      {/* Header band */}
-      <div
-        className="px-3 py-2 rounded-t-lg flex items-center justify-between gap-2"
-        style={{ background: style.header, borderBottom: '1px solid rgba(26,23,20,0.07)' }}
-      >
-        <div className="flex items-center gap-2 min-w-0">
-          <span
-            className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded"
-            style={{ background: 'rgba(26,23,20,0.07)', color: '#6B5E55' }}
-          >
+      {/* Header */}
+      <div style={{
+        background: style.header,
+        borderBottom: '1px solid rgba(26,23,20,0.07)',
+        borderRadius: '8px 8px 0 0',
+        padding: '10px 14px 9px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{
+            fontSize: 10,
+            fontFamily: 'JetBrains Mono, monospace',
+            fontWeight: 600,
+            padding: '1px 6px',
+            borderRadius: 4,
+            background: 'rgba(26,23,20,0.07)',
+            color: '#6B5E55',
+            flexShrink: 0,
+          }}>
             {KIND_ABBR[data.kind]}
           </span>
-          <span className="text-[11px] font-semibold text-ink-900 truncate leading-tight"
-            style={{ fontFamily: 'Inter, sans-serif' }}>
+          <span style={{
+            fontFamily: 'Inter, sans-serif',
+            fontSize: 13,
+            fontWeight: 600,
+            color: '#1A1714',
+            lineHeight: 1.2,
+            overflow: 'hidden',
+            whiteSpace: 'nowrap',
+            textOverflow: 'ellipsis',
+          }}>
             {data.label}
           </span>
         </div>
-        {liveStatus === 'RUNNING'
-          ? <RunningDot />
-          : <span className="w-2 h-2 rounded-full flex-shrink-0"
-              style={{ background: style.dot }} />
-        }
+        <span style={{
+          width: 8, height: 8, borderRadius: '50%',
+          background: style.dot, flexShrink: 0,
+          boxShadow: liveStatus === 'RUNNING' ? `0 0 0 3px ${style.dot}33` : 'none',
+        }} />
       </div>
 
       {/* Body */}
-      <div className="px-3 py-2.5 space-y-1.5">
-        {/* Status pill */}
-        <div className="flex items-center justify-between">
-          <span className="label-muted">status</span>
-          <span
-            className="status-pill"
-            style={{ background: style.bg, color: style.text }}
-          >
+      <div style={{ padding: '10px 14px 12px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+            status
+          </span>
+          <span className="status-pill" style={{ background: style.bg, color: style.text, fontSize: 10 }}>
             {STATUS_LABEL[liveStatus]}
           </span>
         </div>
 
-        {/* Group */}
-        <div className="flex items-center justify-between">
-          <span className="label-muted">group</span>
-          <span className="text-[10px] text-ink-500">{KIND_GROUP[data.kind]}</span>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+            group
+          </span>
+          <span style={{ fontSize: 11, color: '#6B5E55', fontFamily: 'Inter' }}>
+            {KIND_GROUP[data.kind]}
+          </span>
         </div>
 
-        {/* Instance */}
         {data.instance_id && (
-          <div className="flex items-center justify-between">
-            <span className="label-muted">instance</span>
-            <span className="text-[10px] font-mono text-ink-500">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+              instance
+            </span>
+            <span style={{ fontSize: 11, fontFamily: 'JetBrains Mono', color: '#6B5E55' }}>
               {data.instance_id}
             </span>
           </div>
         )}
 
-        {/* Metrics */}
         {data.metrics?.camera_count !== undefined && (
-          <div className="flex items-center justify-between">
-            <span className="label-muted">cameras</span>
-            <span className="text-[10px] font-mono" style={{ color: '#4A7FA8' }}>
-              {data.metrics.camera_count}×
-            </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em' }}>cameras</span>
+            <span style={{ fontSize: 11, fontFamily: 'JetBrains Mono', color: '#4A7FA8' }}>{data.metrics.camera_count}×</span>
           </div>
         )}
         {data.metrics?.attempt !== undefined && (
-          <div className="flex items-center justify-between">
-            <span className="label-muted">attempt</span>
-            <span className="text-[10px] font-mono" style={{ color: '#A87A2A' }}>
-              #{data.metrics.attempt}
-            </span>
-          </div>
-        )}
-        {data.metrics?.duration_ms !== undefined && (
-          <div className="flex items-center justify-between">
-            <span className="label-muted">duration</span>
-            <span className="text-[10px] font-mono text-ink-500">
-              {data.metrics.duration_ms}ms
-            </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em' }}>attempt</span>
+            <span style={{ fontSize: 11, fontFamily: 'JetBrains Mono', color: '#A87A2A' }}>#{data.metrics.attempt}</span>
           </div>
         )}
         {data.metrics?.schema_version && (
-          <div className="flex items-center justify-between gap-2">
-            <span className="label-muted flex-shrink-0">schema</span>
-            <span className="text-[9px] font-mono truncate text-right"
-              style={{ color: '#6A4AA8' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 10, color: '#A89B93', fontFamily: 'Inter', textTransform: 'uppercase', letterSpacing: '0.07em', flexShrink: 0 }}>schema</span>
+            <span style={{ fontSize: 10, fontFamily: 'JetBrains Mono', color: '#6A4AA8', textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {data.metrics.schema_version}
             </span>
           </div>
         )}
       </div>
 
-      <Handle
-        type="source"
-        position={Position.Right}
-        style={{ background: '#F8F3E8', borderColor: '#C4B59E' }}
-      />
+      <Handle type="source" position={Position.Right}
+        style={{ background: '#F8F3E8', borderColor: '#C4B59E', width: 9, height: 9 }} />
     </div>
   )
 }
