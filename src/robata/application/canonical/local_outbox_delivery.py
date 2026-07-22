@@ -178,11 +178,13 @@ def reconcile_local_primary_outbox(
         )
         sink: IdempotentOutboxSink
         exact_sink: SQLiteIdempotentOutboxSink | None
+        sink_initialization_error: OutboxDeliveryError | None = None
         try:
             exact_sink = SQLiteIdempotentOutboxSink(sink_database_path)
             sink = exact_sink
         except OutboxDeliveryError as error:
             exact_sink = None
+            sink_initialization_error = error
             sink = _UnavailableSink(f"local outbox sink is unavailable: {error}")
 
         relay = OutboxRelay(
@@ -197,8 +199,21 @@ def reconcile_local_primary_outbox(
             if delivered is None:
                 break
             relay_attempt_count += 1
-        budget_exhausted = relay_attempt_count == max_delivery_attempts
         snapshots = tuple(store.get(outbox_id) for outbox_id in ids)
+        budget_exhausted = relay_attempt_count == max_delivery_attempts and any(
+            snapshot is None
+            or snapshot.status
+            not in (OutboxDeliveryStatus.DELIVERED, OutboxDeliveryStatus.DEAD_LETTER)
+            for snapshot in snapshots
+        )
+        if sink_initialization_error is not None and any(
+            snapshot is not None and snapshot.status is OutboxDeliveryStatus.DELIVERED
+            for snapshot in snapshots
+        ):
+            raise OutboxDeliveryError(
+                "cannot reconcile delivered rows while the local sink is unavailable: "
+                f"{sink_initialization_error}"
+            )
         if exact_sink is not None:
             for snapshot in snapshots:
                 if snapshot is None or snapshot.status is not OutboxDeliveryStatus.DELIVERED:

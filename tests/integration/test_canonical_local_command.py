@@ -77,10 +77,24 @@ def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> N
     assert replay.outbox_count == first.outbox_count
     assert replay.outbox_delivery.outcome is LocalOutboxDeliveryOutcome.DELIVERED
     assert replay.outbox_delivery.relay_attempt_count == 0
-    with sqlite3.connect(state_dir / "outbox-sink.sqlite3") as connection:
+    sink_path = state_dir / "outbox-sink.sqlite3"
+    with sqlite3.connect(sink_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM delivered_outbox_messages").fetchone()[
             0
         ] == len(first.outbox_ids)
+        connection.execute("DROP TRIGGER delivered_outbox_messages_no_update")
+        connection.commit()
+
+    unreconciled = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="integration-exact-replay",
+    )
+    assert unreconciled.ok is True
+    assert unreconciled.replayed is True
+    assert unreconciled.outbox_delivery.outcome is LocalOutboxDeliveryOutcome.FAILED
+    assert unreconciled.outbox_delivery.last_error is not None
+    assert "cannot reconcile delivered rows" in unreconciled.outbox_delivery.last_error
 
 
 def test_committed_completion_reconciles_publish_work_after_crash(
