@@ -26,4 +26,5 @@ export const OVERVIEW_EDGES: Edge[] = OVERVIEW_EDGE_DEFS.map((d, i) => ({
   target: d.target,
   type: 'schema',
   data: { schema: d.schema },
+  interactionWidth: 0,   // remove invisible hit-zone so cards underneath are clickable
 }))

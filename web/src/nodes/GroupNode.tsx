@@ -1,5 +1,5 @@
 import { memo, useCallback } from 'react'
-import { Handle, Position, NodeProps } from 'reactflow'
+import { NodeProps } from 'reactflow'
 import { PipelineGroup, getGroupStatus } from '@/data/groups'
 import { STATUS_STYLE, STATUS_LABEL } from '@/types'
 import { usePipelineStore } from '@/store'
@@ -32,6 +32,8 @@ function GroupNode({ data }: NodeProps<GroupNodeData>) {
         borderRadius: 14,
         boxShadow: '0 2px 12px rgba(26,23,20,0.07), 0 1px 3px rgba(26,23,20,0.05)',
         transition: 'box-shadow 0.18s ease, border-color 0.18s ease, transform 0.15s ease',
+        // No Handle components — overview cards are not connectable
+        // Edges connect via node IDs, ReactFlow places them on the card boundary
       }}
       onMouseEnter={(e) => {
         e.currentTarget.style.boxShadow = '0 6px 24px rgba(26,23,20,0.11), 0 2px 6px rgba(26,23,20,0.07)'
@@ -42,9 +44,6 @@ function GroupNode({ data }: NodeProps<GroupNodeData>) {
         e.currentTarget.style.transform = 'translateY(0)'
       }}
     >
-      <Handle type="target" position={Position.Left}
-        style={{ background: '#F8F3E8', borderColor: '#C4B59E', width: 10, height: 10 }} />
-
       {/* Header */}
       <div style={{
         background: style.header,
@@ -117,9 +116,6 @@ function GroupNode({ data }: NodeProps<GroupNodeData>) {
           </span>
         </div>
       </div>
-
-      <Handle type="source" position={Position.Right}
-        style={{ background: '#F8F3E8', borderColor: '#C4B59E', width: 10, height: 10 }} />
     </div>
   )
 }

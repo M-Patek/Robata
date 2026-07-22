@@ -178,20 +178,37 @@ function StableCanvas() {
 
   const [nodes, setNodes] = useState<Node[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
+  // opacity for crossfade when switching groups
+  const [canvasOpacity, setCanvasOpacity] = useState(1)
   const loadedGroup = useRef<string | null>(null)
   const { fitView } = useReactFlow()
 
-  // Load group data when group changes — never re-mounts the ReactFlow instance
+  // Crossfade: fade out → swap data → fade in
   useEffect(() => {
     if (!expandedGroup) return
     if (expandedGroup === loadedGroup.current) return
-    const isFirst = !groupLayouts[expandedGroup]
-    loadedGroup.current = expandedGroup
-    setNodes(restoreNodes(expandedGroup, groupLayouts[expandedGroup]))
-    setEdges(buildEdges(expandedGroup))
-    // fitView only when no saved layout, short delay for DOM
-    if (isFirst) setTimeout(() => fitView({ padding: 0.18, maxZoom: 1.0, duration: 300 }), 50)
-  }, [expandedGroup, groupLayouts, fitView])
+
+    const incoming = expandedGroup
+    const isFirst  = !groupLayouts[incoming]
+
+    // 1. fade out
+    setCanvasOpacity(0)
+
+    const swapTimer = setTimeout(() => {
+      loadedGroup.current = incoming
+      setNodes(restoreNodes(incoming, groupLayouts[incoming]))
+      setEdges(buildEdges(incoming))
+
+      // 2. fade in
+      setCanvasOpacity(1)
+
+      // 3. fitView only on first visit (no saved layout), no duration so it snaps before visible
+      if (isFirst) setTimeout(() => fitView({ padding: 0.18, maxZoom: 1.0, duration: 0 }), 30)
+    }, 160) // matches CSS transition duration
+
+    return () => clearTimeout(swapTimer)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedGroup])
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -216,7 +233,11 @@ function StableCanvas() {
   const setExpanded = usePipelineStore((s) => s.setExpandedGroup)
 
   return (
-    <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+    <div style={{
+      flex: 1, minHeight: 0, position: 'relative',
+      opacity: canvasOpacity,
+      transition: 'opacity 0.16s ease',
+    }}>
       <ReactFlow
         nodes={nodes} edges={edges}
         nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES}
