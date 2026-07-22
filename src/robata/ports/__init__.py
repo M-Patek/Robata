@@ -33,6 +33,14 @@ from robata.ports.logical_node_registry import (
     PublishedRunNodeMembership,
     VerifiedLogicalNode,
 )
+from robata.ports.review_queue import (
+    EnqueuedReviewTask,
+    ReopenedReviewTask,
+    ReviewQueue,
+    ReviewQueueError,
+    ReviewQueueErrorCode,
+    SubmittedReviewAnnotation,
+)
 from robata.ports.revision_registry import (
     PublishedRevision,
     PublishedSelection,
@@ -72,6 +80,7 @@ __all__ = [
     "DecodeFailure",
     "DecoderProbe",
     "DecoderProbeResult",
+    "EnqueuedReviewTask",
     "ExistingNodeDisposition",
     "ExportedCameraVideoFacts",
     "FrameMaterializationError",
@@ -93,9 +102,14 @@ __all__ = [
     "PublishedRevision",
     "PublishedRunNodeMembership",
     "PublishedSelection",
+    "ReopenedReviewTask",
+    "ReviewQueue",
+    "ReviewQueueError",
+    "ReviewQueueErrorCode",
     "RevisionSelectionRegistry",
     "RevisionSelectionRegistryError",
     "RevisionSelectionRegistryErrorCode",
+    "SubmittedReviewAnnotation",
     "TaskId",
     "TaskQueue",
     "TaskQueueError",

@@ -1,8 +1,8 @@
 """Small, dependency-free benchmark accounting primitives for throughput Track T1/T2.
 
-The helpers intentionally do not declare a capacity claim. Callers must provide a governed
-corpus identifier and explicitly opt into ``certifying=True`` only after the normative gates
-and workload approval are complete.
+The helpers intentionally do not declare a capacity claim. A measured summary must carry the
+complete content-addressed BenchmarkEvidenceContext for its approved frozen inputs. Even a
+bound summary remains evidence for a later promotion decision, not self-issued certification.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ import tracemalloc
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from robata.benchmark.evidence import BenchmarkEvidenceContext
 
 _NANOSECONDS_PER_HOUR = 3_600_000_000_000
 _MILLISECONDS_PER_HOUR = 3_600_000
@@ -99,28 +101,25 @@ class ResourceSample:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkSummary:
-    """Deterministic summary of local benchmark samples.
-
-    ``certifying`` defaults to false because local synthetic/fake-model runs are evidence for
-    engineering only. A certifying summary requires an explicit governed corpus identifier.
-    """
+    """Deterministic summary bound to governed evidence or explicitly local."""
 
     workload_id: str
     samples: tuple[ThroughputSample, ...]
-    certifying: bool = False
-    corpus_id: str | None = None
+    evidence_context: BenchmarkEvidenceContext | None = None
 
     def __post_init__(self) -> None:
         if not self.workload_id:
             raise ValueError("workload_id must be nonempty")
         if not self.samples:
             raise ValueError("samples must be nonempty")
-        if self.certifying and not self.corpus_id:
-            raise ValueError("certifying summaries require corpus_id")
+        if self.evidence_context is not None and not isinstance(
+            self.evidence_context, BenchmarkEvidenceContext
+        ):
+            raise TypeError("evidence_context must be a BenchmarkEvidenceContext")
 
     @property
     def measurement_status(self) -> str:
-        return "CERTIFYING" if self.certifying else "NOT_MEASURED"
+        return "MEASURED" if self.evidence_context is not None else "NOT_MEASURED"
 
     @property
     def mean_elapsed_ms(self) -> float:
@@ -155,9 +154,12 @@ class BenchmarkSummary:
     def as_dict(self) -> dict[str, Any]:
         return {
             "workload_id": self.workload_id,
-            "corpus_id": self.corpus_id,
+            "evidence_context": (
+                self.evidence_context.model_dump(mode="json")
+                if self.evidence_context is not None
+                else None
+            ),
             "measurement_status": self.measurement_status,
-            "certifying": self.certifying,
             "sample_count": len(self.samples),
             "elapsed_ms": {
                 "mean": self.mean_elapsed_ms,
@@ -239,11 +241,11 @@ def run_repeated(
     camera_count: int = 6,
     clock: Callable[[], float] = time.perf_counter,
 ) -> BenchmarkSummary:
-    """Run a callable repeatedly and return a non-certifying benchmark summary.
+    """Run a callable repeatedly and return an explicitly local benchmark summary.
 
     Warmups are intentionally excluded from the emitted samples.  The helper is suitable
-    for local engineering evidence only; callers must still supply a governed corpus and
-    explicitly build a certifying summary before making a capacity claim.
+    for local engineering evidence only. A measured report must be rebuilt with a complete
+    BenchmarkEvidenceContext; the summary does not itself grant promotion.
     """
 
     if not callable(workload):
@@ -276,16 +278,14 @@ def summarize_samples(
     workload_id: str,
     samples: Iterable[ThroughputSample],
     *,
-    certifying: bool = False,
-    corpus_id: str | None = None,
+    evidence_context: BenchmarkEvidenceContext | None = None,
 ) -> BenchmarkSummary:
-    """Build a summary while preserving sample order in the emitted report."""
+    """Build a summary while preserving sample order and evidence identity."""
 
     return BenchmarkSummary(
         workload_id=workload_id,
         samples=tuple(samples),
-        certifying=certifying,
-        corpus_id=corpus_id,
+        evidence_context=evidence_context,
     )
 
 

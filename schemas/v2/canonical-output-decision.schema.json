@@ -1,0 +1,301 @@
+{
+  "$defs": {
+    "AdmissionEvidenceClass": {
+      "description": "Strength of evidence behind an admission decision.",
+      "enum": [
+        "LOCAL_CONFORMANCE",
+        "GOVERNED_BENCHMARK",
+        "PRODUCTION_QUALIFIED"
+      ],
+      "title": "AdmissionEvidenceClass",
+      "type": "string"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "OutputAdmissionProof": {
+      "additionalProperties": false,
+      "description": "Immutable admission of exact enriched outputs with evidence qualification.",
+      "properties": {
+        "admitted_hypothesis_facts": {
+          "items": {
+            "$ref": "#/$defs/ProductionAdmittedHypothesisFact"
+          },
+          "title": "Admitted Hypothesis Facts",
+          "type": "array"
+        },
+        "decision": {
+          "const": "ADMITTED",
+          "title": "Decision",
+          "type": "string"
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/AdmissionEvidenceClass"
+        },
+        "output_admission_policy_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Output Admission Policy Sha256",
+          "type": "string"
+        },
+        "output_admission_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Output Admission Policy Version",
+          "type": "string"
+        },
+        "production_eligible": {
+          "title": "Production Eligible",
+          "type": "boolean"
+        },
+        "recording_identity": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Recording Identity",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "2.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        },
+        "source_enrichments": {
+          "items": {
+            "$ref": "#/$defs/PlatformEnrichedOutputReference"
+          },
+          "title": "Source Enrichments",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "decision",
+        "evidence_class",
+        "production_eligible",
+        "recording_identity",
+        "source_enrichments",
+        "admitted_hypothesis_facts",
+        "output_admission_policy_version",
+        "output_admission_policy_sha256",
+        "semantic_sha256"
+      ],
+      "title": "OutputAdmissionProof",
+      "type": "object"
+    },
+    "PlatformEnrichedOutputReference": {
+      "additionalProperties": false,
+      "description": "Reference to orchestrator enrichment, never raw provider bytes.",
+      "properties": {
+        "authority": {
+          "const": "ORCHESTRATOR_ENRICHED",
+          "title": "Authority",
+          "type": "string"
+        },
+        "enriched_output_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Enriched Output Semantic Sha256",
+          "type": "string"
+        },
+        "enrichment_logical_key": {
+          "maxLength": 193,
+          "minLength": 66,
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+          "title": "Enrichment Logical Key",
+          "type": "string"
+        },
+        "enrichment_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Enrichment Policy Version",
+          "type": "string"
+        },
+        "recording_identity": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Recording Identity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "recording_identity",
+        "enrichment_logical_key",
+        "enriched_output_semantic_sha256",
+        "enrichment_policy_version"
+      ],
+      "title": "PlatformEnrichedOutputReference",
+      "type": "object"
+    },
+    "ProductionAdmittedHypothesisFact": {
+      "additionalProperties": false,
+      "description": "Non-circular semantic facts admitted from one enriched fusion claim.",
+      "properties": {
+        "effective_interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "fusion_logical_key": {
+          "maxLength": 193,
+          "minLength": 66,
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+          "title": "Fusion Logical Key",
+          "type": "string"
+        },
+        "fusion_output_ordinal": {
+          "minimum": 0,
+          "title": "Fusion Output Ordinal",
+          "type": "integer"
+        },
+        "semantic_fingerprint_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Fingerprint Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fusion_output_ordinal",
+        "effective_interval",
+        "semantic_fingerprint_sha256",
+        "fusion_logical_key"
+      ],
+      "title": "ProductionAdmittedHypothesisFact",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v2/canonical-output-decision.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Local output-level decision governed by an out-of-band exact schema pin.",
+  "properties": {
+    "admitted_claim_ordinals": {
+      "items": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "title": "Admitted Claim Ordinals",
+      "type": "array"
+    },
+    "decision": {
+      "enum": [
+        "ADMITTED",
+        "NO_EVENTS",
+        "ABSTAINED"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "decision_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "evidence_class": {
+      "$ref": "#/$defs/AdmissionEvidenceClass"
+    },
+    "fusion_reduction_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Fusion Reduction Logical Key",
+      "type": "string"
+    },
+    "fusion_reduction_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Fusion Reduction Semantic Sha256",
+      "type": "string"
+    },
+    "policy_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Policy Sha256",
+      "type": "string"
+    },
+    "policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Policy Version",
+      "type": "string"
+    },
+    "production_eligible": {
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "production_output_admission": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutputAdmissionProof"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason_code": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Reason Code",
+      "type": "string"
+    },
+    "recording_identity": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Identity",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Semantic Sha256",
+      "type": "string"
+    },
+    "source_enrichments": {
+      "items": {
+        "$ref": "#/$defs/PlatformEnrichedOutputReference"
+      },
+      "title": "Source Enrichments",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "decision_id",
+    "decision",
+    "evidence_class",
+    "production_eligible",
+    "semantic_sha256",
+    "recording_identity",
+    "source_enrichments",
+    "fusion_reduction_logical_key",
+    "fusion_reduction_semantic_sha256",
+    "policy_version",
+    "policy_sha256",
+    "admitted_claim_ordinals",
+    "reason_code",
+    "production_output_admission"
+  ],
+  "title": "Canonical Output Admission Decision V2",
+  "type": "object"
+}

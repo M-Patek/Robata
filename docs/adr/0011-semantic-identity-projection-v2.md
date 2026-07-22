@@ -20,7 +20,7 @@ barrier, idempotency, or fence identities through transitive hashes.
 ## Decision
 
 Wire schema versions and semantic projection versions are independent. The
-published input-planning V1 wire shapes remain unchanged. The unregistered
+published input-planning V1 wire shapes remain unchanged. The then-unregistered
 local `OutputAdmissionProof`, `PlatformEnrichedEventHypothesis`, and
 `CanonicalOutputAdmissionDecision` shapes changed with the evidence metadata
 and therefore use `schema_version="2.0"`; their V1 payloads fail closed. The
@@ -104,8 +104,18 @@ The frozen registered V1 input-planning wire objects already carry
 formula constants and does not modify the published schema. A future registered
 wire-shape change, including adding a dedicated projection-version field to the
 payload, requires a newly registered schema version rather than an in-place V1
-edit. The local output contracts are not registered schemas, but still advance
-their explicit wire version because their shape changed.
+edit. At adoption the local output contracts were not registered schemas, but
+still advanced their explicit wire version because their shape changed.
+
+### Registration follow-up (2026-07-21)
+
+The unchanged V2 payload shapes are now registered independently as
+`canonical-output-decision@2.0.0`, `output-admission-proof@2.0.0`, and
+`event-hypothesis@2.0.0`. Their validation entry points require the exact
+`SchemaRef` as out-of-band artifact or transport metadata before validating the
+payload. The quartet is deliberately not inserted into the domain objects:
+doing so would alter their already published embedding in canonical completion
+detail V4. This registration does not relabel or upcast any V1 payload.
 
 ## Migration
 
@@ -135,9 +145,11 @@ outside semantic identity. Their audit and storage roles are unchanged.
 - `src/robata/application/canonical/projections.py`
 - `src/robata/application/canonical/logical_nodes.py`
 - `src/robata/application/canonical/output_admission.py`
+- `src/robata/event_pipeline/identity_registry.py`
 - `src/robata/application/canonical/result_validation.py`
 - `src/robata/application/canonical/runner.py`
 - `src/robata/application/canonical_offline.py` (public re-export facade only)
 - `tests/unit/test_inference_input_plan.py`
 - `tests/unit/test_canonical_logical_node_producers.py`
+- `tests/contract/test_output_wire_contract.py`
 - `tests/integration/test_canonical_offline.py`

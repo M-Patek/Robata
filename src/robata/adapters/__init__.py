@@ -12,7 +12,21 @@ from robata.adapters.sqlite_inference_evidence import (
     SQLiteInferenceEvidenceLedger,
     SQLiteInferenceEvidenceLedgerError,
 )
+from robata.adapters.sqlite_outbox import (
+    SQLiteIdempotentOutboxSink,
+    SQLitePrimaryOutboxDeliveryStore,
+)
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
+from robata.adapters.sqlite_review_queue import SQLiteReviewQueue
+from robata.adapters.sqlite_work_scheduler import (
+    SQLiteWorkScheduler,
+    WorkConflictError,
+    WorkFenceError,
+    WorkNotFoundError,
+    WorkSchedulerError,
+    WorkStateError,
+    WorkStorageError,
+)
 
 # Optional: PyAV-based adapters (requires av package)
 try:
@@ -71,9 +85,19 @@ __all__ = [
     "PyAvH264Mp4Exporter",
     "SQLiteBarrierStorage",
     "SQLiteBarrierStorageError",
+    "SQLiteIdempotentOutboxSink",
     "SQLiteInferenceEvidenceLedger",
     "SQLiteInferenceEvidenceLedgerError",
     "SQLitePrimaryCompletionRepository",
+    "SQLitePrimaryOutboxDeliveryStore",
+    "SQLiteReviewQueue",
+    "SQLiteWorkScheduler",
+    "WorkConflictError",
+    "WorkFenceError",
+    "WorkNotFoundError",
+    "WorkSchedulerError",
+    "WorkStateError",
+    "WorkStorageError",
     "allocate_local_artifact_id",
     "deterministic_local_artifact_id",
 ]

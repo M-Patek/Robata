@@ -1,10 +1,9 @@
-"""Provider-neutral task queue, lease, retry, and dead-letter contracts.
+"""Provider-neutral broker-delivery contracts.
 
-The queue boundary deliberately contains no Redis/Celery/HTTP types.  Production
-adapters can implement :class:`TaskQueue` without leaking infrastructure details
-into the scheduling layer.  The local in-memory adapter is provided separately
-under ``robata.adapters.in_memory_task_queue`` for deterministic tests and T2
-scaffolding only.
+This port transports payload bytes and offers broker-local retry/lease
+mechanics. It is not the authoritative durable-work ledger: dependency state,
+execution deadlines, lease epochs, fencing tokens, and terminal outcomes belong
+to the work scheduler. A broker acknowledgement alone can never commit work.
 """
 
 from __future__ import annotations
@@ -180,12 +179,11 @@ class TaskSnapshot:
 
 
 class TaskQueue(Protocol):
-    """Port for durable task queue operations.
+    """Optional broker-delivery port, never the scheduling source of truth.
 
-    Implementations must make claim/heartbeat/complete/fail atomic with respect
-    to competing workers.  The in-memory fake provides this contract for local
-    tests; Redis/PostgreSQL adapters remain intentionally out of scope for the
-    local analysis runner and must not be imported by this module.
+    Implementations make their own delivery claim and acknowledgement operations
+    atomic. Durable workers must still present the scheduler-issued epoch and
+    fencing token when committing an authoritative work outcome.
     """
 
     def enqueue(self, task: PipelineTask) -> TaskId:

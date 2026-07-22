@@ -14,13 +14,153 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import Field, StringConstraints, model_validator
 
 from robata.benchmark.evidence import BenchmarkEvidenceContext, EvidenceContextIdentity
-from robata.contracts.common import Sha256Digest, StrictModel
-from robata.contracts.hashing import canonical_json_bytes
+from robata.contracts.common import INT64_MAX, SchemaVersion, Sha256Digest, StrictModel
+from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 UnitInterval = Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)]
 NonNegativeFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
 MeasurementStatus = Literal["NOT_MEASURED", "MEASURED"]
+MetricPolicyIdentity = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        pattern=r"^benchmark-metric-policy:[0-9a-f]{64}$",
+    ),
+]
+NonNegativeNanoseconds = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+
+
+def benchmark_metric_policy_projection(
+    *,
+    policy_version: str,
+    critical_issue_codes: tuple[str, ...],
+    event_iou_thresholds: tuple[float, ...],
+    event_start_end_tolerance_ns: int,
+    boundary_tolerance_ns: int,
+    calibration_bin_count: int,
+    governance_approval_id: str | None,
+    governance_approval_digest: str | None,
+    governance_policy_version: str | None,
+) -> dict[str, object]:
+    """Return the complete semantic preimage for a metric-definition policy."""
+
+    return {
+        "domain": "robata.benchmark-metric-policy",
+        "schema_version": "1.0",
+        "policy_version": policy_version,
+        "critical_issue_codes": critical_issue_codes,
+        "event_iou_thresholds": event_iou_thresholds,
+        "event_start_end_tolerance_ns": str(event_start_end_tolerance_ns),
+        "boundary_tolerance_ns": str(boundary_tolerance_ns),
+        "calibration_bin_count": calibration_bin_count,
+        "governance_approval_id": governance_approval_id,
+        "governance_approval_digest": governance_approval_digest,
+        "governance_policy_version": governance_policy_version,
+    }
+
+
+class BenchmarkMetricPolicy(StrictModel):
+    """Versioned definitions used by every benchmark metric calculation.
+
+    A policy can be useful for local engineering without an approval binding. A
+    calculation may claim MEASURED only when all three approval fields match
+    the supplied BenchmarkEvidenceContext.
+    """
+
+    schema_version: Literal["1.0"]
+    policy_identity: MetricPolicyIdentity
+    policy_digest: Sha256Digest
+    policy_version: SchemaVersion
+    critical_issue_codes: tuple[NonEmptyString, ...] = Field(min_length=1)
+    event_iou_thresholds: tuple[UnitInterval, ...] = Field(min_length=1)
+    event_start_end_tolerance_ns: NonNegativeNanoseconds
+    boundary_tolerance_ns: NonNegativeNanoseconds
+    calibration_bin_count: PositiveInt
+    governance_approval_id: NonEmptyString | None = None
+    governance_approval_digest: Sha256Digest | None = None
+    governance_policy_version: SchemaVersion | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        policy_version: SchemaVersion,
+        critical_issue_codes: tuple[NonEmptyString, ...],
+        event_iou_thresholds: tuple[UnitInterval, ...],
+        event_start_end_tolerance_ns: NonNegativeNanoseconds,
+        boundary_tolerance_ns: NonNegativeNanoseconds,
+        calibration_bin_count: PositiveInt,
+        governance_approval_id: NonEmptyString | None = None,
+        governance_approval_digest: Sha256Digest | None = None,
+        governance_policy_version: SchemaVersion | None = None,
+    ) -> Self:
+        """Build a policy and derive its content-addressed identity."""
+
+        projection = benchmark_metric_policy_projection(
+            policy_version=policy_version,
+            critical_issue_codes=critical_issue_codes,
+            event_iou_thresholds=event_iou_thresholds,
+            event_start_end_tolerance_ns=event_start_end_tolerance_ns,
+            boundary_tolerance_ns=boundary_tolerance_ns,
+            calibration_bin_count=calibration_bin_count,
+            governance_approval_id=governance_approval_id,
+            governance_approval_digest=governance_approval_digest,
+            governance_policy_version=governance_policy_version,
+        )
+        digest = semantic_sha256(projection)
+        return cls(
+            schema_version="1.0",
+            policy_identity=f"benchmark-metric-policy:{digest}",
+            policy_digest=digest,
+            policy_version=policy_version,
+            critical_issue_codes=critical_issue_codes,
+            event_iou_thresholds=event_iou_thresholds,
+            event_start_end_tolerance_ns=event_start_end_tolerance_ns,
+            boundary_tolerance_ns=boundary_tolerance_ns,
+            calibration_bin_count=calibration_bin_count,
+            governance_approval_id=governance_approval_id,
+            governance_approval_digest=governance_approval_digest,
+            governance_policy_version=governance_policy_version,
+        )
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> Self:
+        if tuple(sorted(set(self.critical_issue_codes))) != self.critical_issue_codes:
+            raise ValueError("critical_issue_codes must be unique and sorted")
+        if any(threshold <= 0.0 for threshold in self.event_iou_thresholds):
+            raise ValueError("event_iou_thresholds must lie in (0, 1]")
+        if tuple(sorted(set(self.event_iou_thresholds))) != self.event_iou_thresholds:
+            raise ValueError("event_iou_thresholds must be unique and strictly increasing")
+        approval_fields = (
+            self.governance_approval_id,
+            self.governance_approval_digest,
+            self.governance_policy_version,
+        )
+        if any(value is not None for value in approval_fields) and not all(
+            value is not None for value in approval_fields
+        ):
+            raise ValueError(
+                "metric policy governance approval fields must be all present or absent"
+            )
+        projection = benchmark_metric_policy_projection(
+            policy_version=self.policy_version,
+            critical_issue_codes=self.critical_issue_codes,
+            event_iou_thresholds=self.event_iou_thresholds,
+            event_start_end_tolerance_ns=self.event_start_end_tolerance_ns,
+            boundary_tolerance_ns=self.boundary_tolerance_ns,
+            calibration_bin_count=self.calibration_bin_count,
+            governance_approval_id=self.governance_approval_id,
+            governance_approval_digest=self.governance_approval_digest,
+            governance_policy_version=self.governance_policy_version,
+        )
+        expected_digest = semantic_sha256(projection)
+        if self.policy_digest != expected_digest:
+            raise ValueError("policy_digest does not match the metric policy")
+        if self.policy_identity != f"benchmark-metric-policy:{expected_digest}":
+            raise ValueError("policy_identity does not match policy_digest")
+        return self
 
 
 class EvidenceBoundMetrics(StrictModel):
@@ -29,6 +169,9 @@ class EvidenceBoundMetrics(StrictModel):
     measurement_status: MeasurementStatus = "NOT_MEASURED"
     evidence_context_digest: Sha256Digest | None = None
     evidence_context_identity: EvidenceContextIdentity | None = None
+    metric_policy_identity: MetricPolicyIdentity
+    metric_policy_digest: Sha256Digest
+    metric_policy_version: SchemaVersion
 
     @model_validator(mode="after")
     def validate_measurement_binding(self) -> Self:
@@ -42,14 +185,31 @@ class EvidenceBoundMetrics(StrictModel):
                 raise ValueError("evidence context identity does not match its digest")
         elif has_digest or has_identity:
             raise ValueError("NOT_MEASURED metrics cannot claim an evidence context binding")
+        if self.metric_policy_identity != f"benchmark-metric-policy:{self.metric_policy_digest}":
+            raise ValueError("metric policy identity does not match its digest")
         return self
 
 
 def _measurement_binding(
     context: BenchmarkEvidenceContext | None,
+    policy: BenchmarkMetricPolicy,
 ) -> tuple[MeasurementStatus, str | None, str | None]:
     if context is None:
         return "NOT_MEASURED", None, None
+    expected_approval = (
+        context.governance_approval_id,
+        context.governance_approval_digest,
+        context.governance_policy_version,
+    )
+    actual_approval = (
+        policy.governance_approval_id,
+        policy.governance_approval_digest,
+        policy.governance_policy_version,
+    )
+    if actual_approval != expected_approval:
+        raise ValueError(
+            "MEASURED metrics require a metric policy bound to the evidence governance approval"
+        )
     return "MEASURED", context.context_digest, context.context_identity
 
 
@@ -64,12 +224,13 @@ class QAMetrics(EvidenceBoundMetrics):
     per_issue_recall: dict[NonEmptyString, float]
     per_issue_f1: dict[NonEmptyString, float]
     macro_f1: float
+    micro_precision: float
+    micro_recall: float
     micro_f1: float
     critical_issue_recall: float
     temporal_iou: float
     recording_precision: float
     recording_recall: float
-    pr_auc: float
     false_accept_rate: float
     false_reject_rate: float
     sample_count: int = Field(default=0, ge=0, strict=True)
@@ -78,13 +239,12 @@ class QAMetrics(EvidenceBoundMetrics):
 class EventMetrics(EvidenceBoundMetrics):
     """Event proposal metrics for one benchmark run.
 
-    Covers recall at IoU thresholds, average recall, mAP,
+    Covers recall at policy-defined IoU thresholds, average recall,
     start/end hit rate, miss rate, and false candidate rates.
     """
 
-    recall_at_iou: dict[str, float]  # keys: "0.3", "0.5", "0.7"
+    recall_at_iou: dict[str, float]  # policy-defined decimal threshold keys
     average_recall: float
-    mAP: float
     start_end_hit_rate: float
     miss_rate_by_class: dict[NonEmptyString, float]
     false_candidates_per_hour: float
@@ -243,7 +403,7 @@ def _metric(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _boundary_hit(prediction: Any, target: Any, tolerance_ns: float) -> bool:
+def _boundary_hit(prediction: Any, target: Any, tolerance_ns: int) -> bool:
     predicted_interval = _event_interval(prediction)
     target_interval = _event_interval(target)
     if predicted_interval is None or target_interval is None:
@@ -257,11 +417,22 @@ def _boundary_hit(prediction: Any, target: Any, tolerance_ns: float) -> bool:
 class MetricsCalculator:
     """Calculate benchmark metrics from predictions and ground truth.
 
-    The calculator accepts immutable contract models or plain mappings.  It
+    The calculator accepts immutable contract models or plain mappings. It
     deliberately rejects an empty cohort so an absent benchmark cannot look
-    like a measured all-zero result. Values calculated without a governed
-    evidence context remain useful locally but are explicitly not measured.
+    like a measured all-zero result. Every result is bound to an explicit,
+    content-addressed metric-definition policy. Values calculated without a
+    governed evidence context remain useful locally but are explicitly not
+    measured.
     """
+
+    def __init__(self, policy: BenchmarkMetricPolicy) -> None:
+        if not isinstance(policy, BenchmarkMetricPolicy):
+            raise TypeError("policy must be a BenchmarkMetricPolicy")
+        self._policy = policy
+
+    @property
+    def policy(self) -> BenchmarkMetricPolicy:
+        return self._policy
 
     def calculate_qa_metrics(
         self,
@@ -352,13 +523,7 @@ class MetricsCalculator:
             if micro_precision + micro_recall
             else 0.0
         )
-        critical = {
-            "CORRUPTED_STREAM",
-            "UNUSABLE_VIEW",
-            "MOTION_BLUR",
-            "HAND_OCCLUSION",
-            "OBJECT_OCCLUSION",
-        }
+        critical = set(self._policy.critical_issue_codes)
         critical_tp = critical_fn = 0
         for record_id in sorted(set(pred_by_record) | set(truth_by_record)):
             pred_codes = {_code(item) for item in pred_by_record.get(record_id, ())}
@@ -377,13 +542,15 @@ class MetricsCalculator:
         false_accept_rate = len(pred_recordings - true_recordings) / negative_count
         false_reject_rate = len(true_recordings - pred_recordings) / max(1, len(true_recordings))
         measurement_status, context_digest, context_identity = _measurement_binding(
-            evidence_context
+            evidence_context, self._policy
         )
         return QAMetrics(
             per_issue_precision=precision,
             per_issue_recall=recall,
             per_issue_f1=f1,
             macro_f1=_metric(macro_f1),
+            micro_precision=_metric(micro_precision),
+            micro_recall=_metric(micro_recall),
             micro_f1=_metric(micro_f1),
             critical_issue_recall=_metric(
                 critical_tp / (critical_tp + critical_fn) if critical_tp + critical_fn else 0.0
@@ -391,13 +558,15 @@ class MetricsCalculator:
             temporal_iou=_metric(mean(matched_ious) if matched_ious else 0.0),
             recording_precision=_metric(recording_precision),
             recording_recall=_metric(recording_recall),
-            pr_auc=_metric(micro_precision * micro_recall),
             false_accept_rate=_metric(false_accept_rate),
             false_reject_rate=_metric(false_reject_rate),
             sample_count=len(truth),
             measurement_status=measurement_status,
             evidence_context_digest=context_digest,
             evidence_context_identity=context_identity,
+            metric_policy_identity=self._policy.policy_identity,
+            metric_policy_digest=self._policy.policy_digest,
+            metric_policy_version=self._policy.policy_version,
         )
 
     def calculate_event_metrics(
@@ -415,7 +584,7 @@ class MetricsCalculator:
             evidence_context: Frozen governed manifests and approval identity.
 
         Returns:
-            EventMetrics populated with recall, mAP, and error rates.
+            EventMetrics populated with policy-defined recall and error rates.
         """
         predicted = _records(proposals, "proposals")
         truth = _records(ground_truth, "ground_truth")
@@ -468,7 +637,7 @@ class MetricsCalculator:
             (predicted[proposal_index], truth[truth_index], overlap)
             for proposal_index, truth_index, overlap in assignments
         ]
-        thresholds = (0.3, 0.5, 0.7)
+        thresholds = self._policy.event_iou_thresholds
         recall_at_iou = {
             str(threshold): _metric(
                 sum(overlap >= threshold for _, _, overlap in pairs) / len(truth) if truth else 0.0
@@ -527,15 +696,18 @@ class MetricsCalculator:
             for truth_index in range(len(truth))
         )
         measurement_status, context_digest, context_identity = _measurement_binding(
-            evidence_context
+            evidence_context, self._policy
         )
         return EventMetrics(
             recall_at_iou=recall_at_iou,
             average_recall=_metric(mean(recall_at_iou.values())),
-            mAP=recall_at_iou["0.5"],
             start_end_hit_rate=_metric(
                 sum(
-                    _boundary_hit(prediction, target, 100_000_000)
+                    _boundary_hit(
+                        prediction,
+                        target,
+                        self._policy.event_start_end_tolerance_ns,
+                    )
                     for prediction, target, _ in pairs
                 )
                 / max(1, len(truth))
@@ -549,6 +721,9 @@ class MetricsCalculator:
             measurement_status=measurement_status,
             evidence_context_digest=context_digest,
             evidence_context_identity=context_identity,
+            metric_policy_identity=self._policy.policy_identity,
+            metric_policy_digest=self._policy.policy_digest,
+            metric_policy_version=self._policy.policy_version,
         )
 
     def calculate_boundary_metrics(
@@ -598,7 +773,7 @@ class MetricsCalculator:
         if not errors:
             raise ValueError("boundary records must contain valid intervals")
         measurement_status, context_digest, context_identity = _measurement_binding(
-            evidence_context
+            evidence_context, self._policy
         )
         return BoundaryMetrics(
             start_mae=mean(start_errors),
@@ -606,7 +781,10 @@ class MetricsCalculator:
             median_error=median(errors),
             p95_error=sorted(errors)[min(len(errors) - 1, int(len(errors) * 0.95))],
             temporal_iou=mean(overlaps),
-            within_tolerance_rate=sum(error <= 100_000_000 for error in errors) / len(errors),
+            within_tolerance_rate=sum(
+                error <= self._policy.boundary_tolerance_ns for error in errors
+            )
+            / len(errors),
             classification_accuracy=class_hits / len(pairs),
             object_accuracy=object_hits / len(pairs),
             hand_accuracy=hand_hits / len(pairs),
@@ -614,6 +792,9 @@ class MetricsCalculator:
             measurement_status=measurement_status,
             evidence_context_digest=context_digest,
             evidence_context_identity=context_identity,
+            metric_policy_identity=self._policy.policy_identity,
+            metric_policy_digest=self._policy.policy_digest,
+            metric_policy_version=self._policy.policy_version,
         )
 
     def calculate_calibration(
@@ -658,9 +839,10 @@ class MetricsCalculator:
         if not pairs:
             raise ValueError("at least one numeric confidence is required")
         brier = mean((confidence - label) ** 2 for confidence, label in pairs)
-        bins: list[list[tuple[float, int]]] = [[] for _ in range(10)]
+        bin_count = self._policy.calibration_bin_count
+        bins: list[list[tuple[float, int]]] = [[] for _ in range(bin_count)]
         for pair in pairs:
-            bins[min(9, int(pair[0] * 10))].append(pair)
+            bins[min(bin_count - 1, int(pair[0] * bin_count))].append(pair)
         ece = sum(
             len(bucket)
             / len(pairs)
@@ -669,7 +851,7 @@ class MetricsCalculator:
             if bucket
         )
         measurement_status, context_digest, context_identity = _measurement_binding(
-            evidence_context
+            evidence_context, self._policy
         )
         return CalibrationMetrics(
             ece=ece,
@@ -680,10 +862,14 @@ class MetricsCalculator:
             measurement_status=measurement_status,
             evidence_context_digest=context_digest,
             evidence_context_identity=context_identity,
+            metric_policy_identity=self._policy.policy_identity,
+            metric_policy_digest=self._policy.policy_digest,
+            metric_policy_version=self._policy.policy_version,
         )
 
 
 __all__ = [
+    "BenchmarkMetricPolicy",
     "BoundaryMetrics",
     "CalibrationMetrics",
     "EventMetrics",
@@ -691,4 +877,5 @@ __all__ = [
     "MeasurementStatus",
     "MetricsCalculator",
     "QAMetrics",
+    "benchmark_metric_policy_projection",
 ]

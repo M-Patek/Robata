@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from robata.benchmark import (
     BenchmarkEvidenceContext,
+    BenchmarkMetricPolicy,
     BenchmarkResults,
     GateCategory,
     MetricsCalculator,
@@ -45,7 +47,44 @@ def _context(
     )
 
 
-def _gate(category: GateCategory, *, actual_key: str, comparison: str = "GTE") -> PromotionGate:
+def _metric_policy(
+    context: BenchmarkEvidenceContext | None = None,
+) -> BenchmarkMetricPolicy:
+    return BenchmarkMetricPolicy.create(
+        policy_version="benchmark-metrics-1.0",
+        critical_issue_codes=(
+            "CORRUPTED_STREAM",
+            "HAND_OCCLUSION",
+            "MOTION_BLUR",
+            "OBJECT_OCCLUSION",
+            "UNUSABLE_VIEW",
+        ),
+        event_iou_thresholds=(0.3, 0.5, 0.7),
+        event_start_end_tolerance_ns=100_000_000,
+        boundary_tolerance_ns=100_000_000,
+        calibration_bin_count=10,
+        governance_approval_id=(context.governance_approval_id if context is not None else None),
+        governance_approval_digest=(
+            context.governance_approval_digest if context is not None else None
+        ),
+        governance_policy_version=(
+            context.governance_policy_version if context is not None else None
+        ),
+    )
+
+
+def _calculator(
+    context: BenchmarkEvidenceContext | None = None,
+) -> MetricsCalculator:
+    return MetricsCalculator(_metric_policy(context))
+
+
+def _gate(
+    category: GateCategory,
+    *,
+    actual_key: str,
+    comparison: Literal["GTE", "LTE", "EQ"] = "GTE",
+) -> PromotionGate:
     return PromotionGate(
         gate_id=_id(f"gate:{category.value}"),
         category=category,
@@ -98,7 +137,7 @@ def _results(
 
 
 def test_metrics_reject_empty_cohorts_instead_of_returning_zero_evidence() -> None:
-    calculator = MetricsCalculator()
+    calculator = _calculator()
     with pytest.raises(ValueError, match="at least one record"):
         calculator.calculate_qa_metrics([], [])
     with pytest.raises(ValueError, match="at least one record"):
@@ -106,8 +145,8 @@ def test_metrics_reject_empty_cohorts_instead_of_returning_zero_evidence() -> No
 
 
 def test_offline_metrics_calculate_perfect_fixture() -> None:
-    calculator = MetricsCalculator()
     context = _context()
+    calculator = _calculator(context)
     qa_record = {
         "recording_id": "recording-1",
         "issues": ({"code": "MOTION_BLUR", "start_ns": 0, "end_ns": 10},),
@@ -156,11 +195,70 @@ def test_offline_metrics_calculate_perfect_fixture() -> None:
     assert qa.micro_f1 == 1.0
     assert qa.critical_issue_recall == 1.0
     assert events.recall_at_iou == {"0.3": 1.0, "0.5": 1.0, "0.7": 1.0}
-    assert events.mAP == 1.0
+    assert events.average_recall == 1.0
+    assert "mAP" not in events.model_dump(mode="python")
+    assert "pr_auc" not in qa.model_dump(mode="python")
+    assert qa.micro_precision == 1.0
+    assert qa.micro_recall == 1.0
     assert boundaries.temporal_iou == 1.0
     assert boundaries.start_mae == 0.0
     assert calibration.ece == 0.0
     assert calibration.brier_score == 0.0
+
+
+def test_metric_policy_is_content_addressed_and_controls_metric_definitions() -> None:
+    policy = BenchmarkMetricPolicy.create(
+        policy_version="custom-metrics-1.0",
+        critical_issue_codes=("CUSTOM_CRITICAL",),
+        event_iou_thresholds=(0.6,),
+        event_start_end_tolerance_ns=1,
+        boundary_tolerance_ns=1,
+        calibration_bin_count=4,
+    )
+    calculator = MetricsCalculator(policy)
+    qa_record = {
+        "recording_id": "recording-1",
+        "issues": ({"code": "CUSTOM_CRITICAL", "start_ns": 0, "end_ns": 10},),
+    }
+    target = {
+        "recording_id": "recording-1",
+        "action_id": "action-1",
+        "label": "grasp",
+        "object": "cup",
+        "hand": "right",
+        "interval": {"start_ns": 0, "end_ns": 10},
+    }
+    prediction = {
+        **target,
+        "interval": {"start_ns": 2, "end_ns": 12},
+    }
+
+    qa = calculator.calculate_qa_metrics((qa_record,), (qa_record,))
+    events = calculator.calculate_event_metrics((prediction,), (target,))
+    boundaries = calculator.calculate_boundary_metrics((prediction,), (target,))
+
+    assert qa.critical_issue_recall == 1.0
+    assert qa.metric_policy_digest == policy.policy_digest
+    assert events.recall_at_iou == {"0.6": 1.0}
+    assert events.start_end_hit_rate == 0.0
+    assert boundaries.within_tolerance_rate == 0.0
+
+    tampered = policy.model_dump(mode="python")
+    tampered["boundary_tolerance_ns"] = 2
+    with pytest.raises(ValidationError, match="policy_digest"):
+        BenchmarkMetricPolicy.model_validate(tampered)
+
+
+def test_measured_metrics_require_policy_bound_to_same_approval() -> None:
+    context = _context()
+    record = {"recording_id": "recording-1", "issues": ()}
+
+    with pytest.raises(ValueError, match="metric policy bound"):
+        _calculator().calculate_qa_metrics(
+            (record,),
+            (record,),
+            evidence_context=context,
+        )
 
 
 def test_evidence_context_is_frozen_and_content_addressed() -> None:
@@ -182,7 +280,7 @@ def test_evidence_context_is_frozen_and_content_addressed() -> None:
 
 def test_measured_metric_binding_cannot_be_added_to_local_output() -> None:
     record = {"recording_id": "recording-1", "issues": ()}
-    local_metrics = MetricsCalculator().calculate_qa_metrics((record,), (record,))
+    local_metrics = _calculator().calculate_qa_metrics((record,), (record,))
     forged = local_metrics.model_dump(mode="python")
     forged["measurement_status"] = "MEASURED"
 
@@ -191,7 +289,7 @@ def test_measured_metric_binding_cannot_be_added_to_local_output() -> None:
 
 
 def test_event_metrics_require_class_matching_and_separate_false_candidates() -> None:
-    calculator = MetricsCalculator()
+    calculator = _calculator()
     duration_ns = 3_600_000_000_000
     proposals = (
         {
@@ -230,7 +328,7 @@ def test_event_metrics_require_class_matching_and_separate_false_candidates() ->
 
 def test_event_metrics_do_not_invent_a_time_denominator() -> None:
     with pytest.raises(ValueError, match="duration_ns"):
-        MetricsCalculator().calculate_event_metrics(
+        _calculator().calculate_event_metrics(
             (
                 {
                     "recording_id": "recording-1",
@@ -249,7 +347,7 @@ def test_event_metrics_do_not_invent_a_time_denominator() -> None:
 
 
 def test_event_metrics_deduplicate_recording_duration_and_use_semantic_ties() -> None:
-    calculator = MetricsCalculator()
+    calculator = _calculator()
     recording_duration = 3_600_000_000_000
     truth = (
         {
@@ -290,7 +388,7 @@ def test_event_metrics_deduplicate_recording_duration_and_use_semantic_ties() ->
 
 
 def test_event_and_boundary_metrics_reject_cross_record_or_unpaired_inputs() -> None:
-    calculator = MetricsCalculator()
+    calculator = _calculator()
     with pytest.raises(ValueError, match="duration_ns"):
         calculator.calculate_event_metrics(
             (

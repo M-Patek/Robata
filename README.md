@@ -28,11 +28,11 @@ the current tree satisfies a phase gate.
 
 ## Current Baseline
 
-The live tree provides strict domain values and schemas, deterministic canonical hashing,
-six-camera invariants, immutable artifact and revision primitives, local ingestion/alignment
-services, provider-neutral inference orchestration and input-plan contracts, deterministic
-barrier coordination with run-scoped local SQLite persistence, offline QA and event reduction
-components, benchmark calculations, and structured retrieval primitives.
+The live tree provides strict domain values and 44 exact-pinned schemas, deterministic canonical
+hashing, six-camera invariants, immutable artifact and revision primitives, local
+inference/barrier evidence, a durable SQLite work scheduler, a local outbox relay, nonblocking
+review routing, offline QA/event reduction, benchmark calculations, a synthetic capacity harness,
+and structured retrieval primitives.
 
 A canonical local-conformance command now accepts either one immutable six-camera fixture or one
 explicitly authorized raw MCAP. The raw path inspects and hashes the exact source, binds exact
@@ -57,18 +57,21 @@ without redispatching the model calls.
 The local composition still selects the offline fixture inference adapter and performs no network
 calls. It supports `QA_COARSE`, `QA_DENSE`, `EVENT_PROPOSAL`, `ACTION_EVIDENCE`,
 `BOUNDARY_REFINEMENT`, and `FUSION_ADJUDICATION` through the same provider-neutral request
-boundary. Every local result is conformance evidence only and carries
-`production_eligible=false`. The canonical runner
-independently injects the provider-neutral model adapter, exact raw-byte store, and strict claim
-parser, so replacing the fixture does not require changing its business control flow. The local
-composition also injects
-the run-scoped SQLite barrier authority; the runner retains in-memory reference storage only for
-component use. This does not provide a durable work ledger, deadline/lease/fence recovery,
-registered persisted-barrier wire contracts, Redis/broker integration, or a production recovery
-topology. Pending outbox rows have no publisher, and every SQLite adapter remains local
-conformance evidence rather than a production infrastructure decision. Every command receipt and
-published local payload reports `evidence_class=LOCAL_CONFORMANCE` and
-`production_eligible=false`.
+boundary. A separate credential-redacting `RunPodVisionAdapter` is mock-transport tested for
+strict binding, bounded retries, timeout handling, and raw-byte preservation, but it is not
+composed and has never used a real endpoint or credential. The canonical runner independently
+injects the provider-neutral model adapter, exact raw-byte store, and strict claim parser.
+
+The run-scoped SQLite barrier remains the canonical local recovery authority. Separate local
+components now provide a durable work ledger with deadlines/leases/fences/invalidation, registered
+work-message and persisted-barrier projections, at-least-once outbox relay with idempotent sink and
+DLQ simulation, and a nonblocking priority/SLA review queue. Persisted and published event-identity
+outbox payloads use an exact-pinned `EventIdentityOutboxWireRecord`; the embedded
+`EventIdentityOutboxRecord` keeps its original frozen shape inside completion detail. The review
+queue exact-validates registered task, annotation, and reopen-command payloads on write and read.
+These components are not yet wired into one production topology and do not select Redis, a broker,
+reconciliation ownership, or O-14 recovery policy. Every command receipt and published local
+payload remains `LOCAL_CONFORMANCE` with `production_eligible=false`.
 
 Canonical implementation ownership is split under `robata.application.canonical`:
 `models.py` owns status, error, root-window, part-result, and execution-policy models;
@@ -84,15 +87,20 @@ implementations.
 Schema-evolution conformance includes a registry-backed synthetic upcaster fixture with exact
 source/target refs, catalog paths and byte pins for code/runtime/golden artifacts, golden endpoint
 validation, repeated-execution determinism and input-mutation checks, and fail-closed graph
-validation. The live schema catalog registers no domain upcaster; this fixture is local mechanism
-evidence only and does not close Section 25.7 or any Architecture phase.
+validation. A separate atomic evolution command can publish one new target plus one or more direct
+incoming upcasters, including their exact code, runtime, and golden-vector artifacts. The live
+schema catalog still registers no domain upcaster. Existing completion target entries were
+published with `compatibility_mode=NONE` and empty predecessor sets, so retroactive
+V1-to-V2-to-V3/V4 chains would violate published catalog immutability; detailed V1 also lacks facts
+required by later versions. A governed chain must target new versions rather than rewriting these
+entries.
 
 The former fake-model analysis runner is no longer part of the live package or CLI surface. Its
 prior reports and older MVP material remain under `archive/old_mvp` for history only and are not a
-supported execution path. Real Qwen/GPT adapters, governed approval of raw-MCAP admission policy,
-durable work scheduling and lease/fence recovery, production database/Redis/broker/object storage,
-governed ActionEvent contracts and successor publication, approved QA/event policy, quality
-evidence, SLO evidence, and capacity qualification remain separate blocked work.
+supported execution path. Real Qwen/GPT/RunPod qualification, governed raw-MCAP admission,
+production database/broker/object storage and scheduler composition, governed ActionEvent
+successors, approved QA/event/review policy, representative quality evidence, long-soak SLO data,
+and measured capacity qualification remain blocked or external work.
 
 ## Requirements
 
@@ -115,6 +123,8 @@ Use the existing environment for local checks:
 .\.venv\Scripts\python.exe -m mypy
 .\.venv\Scripts\python.exe scripts\verify_schema_registry.py
 .\.venv\Scripts\python.exe scripts\check_doc_links.py
+.\.venv\Scripts\python.exe scripts\verify_rational_grid_vectors.py
+node scripts\verify_rational_grid_vectors.mjs
 ```
 
 Provisioning a clean environment is an explicit operator action, not part of runtime behavior:
@@ -157,26 +167,32 @@ decision. An unapproved mapping may be exercised only with the CLI's explicit lo
 override. That mode may derive local V2 evidence, but never publishes a governed READY decision,
 makes a provider call, or sets `production_eligible=true`.
 
-Schema publication has one repository command. It normalizes a new candidate to deterministic
-UTF-8/LF bytes, derives its exact digest and artifact ID, validates the complete offline registry,
-fsyncs staged file contents on supported platforms, fsyncs directory metadata on POSIX, and
-replaces the catalog last as the publication commit point. Readers share the publication lock and
-therefore cannot observe the artifact/catalog replacement window. A digest-bound transaction
-marker makes the sole exact pre-commit orphan readable and recoverable after a hard interruption;
-all other unregistered schemas remain fail-closed. Exact replay also removes a stale marker left
-after the catalog commit:
+Schema publication has two repository commands. `register_schema.py` publishes one new
+`compatibility_mode=NONE` schema. `register_schema_evolution.py` publishes one new `BACKWARD`
+target plus one or more direct incoming upcasters and their exact code, runtime, and paired golden
+artifacts as one bundle. Both normalize candidates to deterministic UTF-8/LF bytes, derive exact
+digests and artifact IDs, validate a complete temporary registry snapshot, and replace the catalog
+last as the publication commit point. Evolution publication additionally constructs the full
+upcaster graph and executes its golden validation before commit. Readers share the publication
+lock and therefore cannot observe the artifact/catalog replacement window. A digest-bound
+transaction marker covers every staged bundle artifact and supports exact recovery after an
+interruption; other uncataloged Schema documents remain fail-closed. Code, runtime, and golden
+artifacts become governed only when an exact catalog entry pins them. Exact replay also removes a
+stale marker left after the catalog commit:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\register_schema.py --help
+.\.venv\Scripts\python.exe scripts\register_schema_evolution.py --help
 .\.venv\Scripts\python.exe scripts\verify_schema_registry.py
 .\.venv\Scripts\python.exe scripts\check_schema_immutability.py --baseline-ref $env:SCHEMA_BASELINE_REF
 ```
 
-This command currently publishes only schemas with `compatibility_mode=NONE`; governed
-predecessor and upcaster publication remains a separate Section 25.7 boundary. On Windows the
-tool guarantees atomic catalog visibility and retry after normal process interruption, but does
-not claim power-loss durability for directory metadata. That production filesystem decision
-remains part of O-14.
+The evolution command deliberately does not edit an existing target or edge: its bundle must name
+one previously unknown target and at least one direct predecessor. The live catalog still has
+`upcasters=[]`; the command is executable publication infrastructure, not evidence that a business
+migration has been approved or published. On Windows these tools guarantee atomic catalog
+visibility and retry after normal process interruption, but do not claim power-loss durability for
+directory metadata. That production filesystem decision remains part of O-14.
 
 The exact `SchemaRef` stored in `schemas/schema-catalog.json` is the golden pin. Published
 `(schema_id, version)` entries are immutable; any wire or formatting change requires a new

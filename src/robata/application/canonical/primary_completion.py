@@ -232,7 +232,14 @@ class CanonicalPrimaryCompletionDetail(StrictModel):
             assert prepared is not None
             hypothesis_bindings = tuple(
                 (item.event_hypothesis_logical_key, item.semantic_sha256)
-                for item in self.hypotheses
+                for item in sorted(
+                    self.hypotheses,
+                    key=lambda item: (
+                        item.effective_start_ns,
+                        item.effective_end_ns,
+                        item.event_hypothesis_logical_key,
+                    ),
+                )
             )
             assignment_bindings = tuple(
                 (

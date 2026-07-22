@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from robata.contracts.schema_registry import (  # noqa: E402
     DEFAULT_SCHEMA_CATALOG,
+    SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT,
     SCHEMA_PUBLICATION_LOCK_FILENAME,
     SCHEMA_PUBLICATION_MARKER_FILENAME,
     SCHEMA_PUBLICATION_MARKER_FORMAT,
@@ -38,6 +39,7 @@ from robata.contracts.schema_registry import (  # noqa: E402
     SchemaRegistryError,
     deterministic_schema_artifact_id,
 )
+from robata.contracts.schema_upcasting import SchemaUpcasterGraph  # noqa: E402
 
 
 class SchemaRegistrationError(RuntimeError):
@@ -54,6 +56,13 @@ class SchemaRegistrationResult:
     artifact_path: str
     changed: bool
     dry_run: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationArtifact:
+    artifact_path: str
+    contents: bytes
+    role: str
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -215,6 +224,19 @@ def _entry(
     }
 
 
+def _validation_snapshot_parent(schema_root: Path) -> Path:
+    configured = os.environ.get("ROBATA_SCHEMA_VALIDATION_TEMP_ROOT")
+    if configured is None:
+        return schema_root.parent
+    try:
+        parent = Path(configured).resolve(strict=True)
+    except OSError as exc:
+        raise SchemaRegistrationError(f"cannot resolve schema validation temp root: {exc}") from exc
+    if not parent.is_dir():
+        raise SchemaRegistrationError("schema validation temp root must be a directory")
+    return parent
+
+
 def _validated_snapshot(
     catalog_path: Path,
     artifact_path: str,
@@ -223,7 +245,8 @@ def _validated_snapshot(
 ) -> SchemaRegistry:
     schema_root = catalog_path.parent
     with tempfile.TemporaryDirectory(
-        prefix=".schema-registration-", dir=schema_root.parent
+        prefix=".schema-registration-",
+        dir=_validation_snapshot_parent(schema_root),
     ) as temporary:
         snapshot_root = Path(temporary) / "schemas"
         shutil.copytree(
@@ -385,6 +408,39 @@ def _publication_marker_bytes(
     return _catalog_bytes(marker)
 
 
+def _publication_bundle_marker_bytes(
+    *,
+    artifacts: tuple[PublicationArtifact, ...],
+    original_catalog: bytes,
+    new_catalog: bytes,
+) -> bytes:
+    marker = {
+        "format_version": SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT,
+        "artifacts": [
+            {
+                "artifact_path": artifact.artifact_path,
+                "artifact_sha256": hashlib.sha256(artifact.contents).hexdigest(),
+                "role": artifact.role,
+            }
+            for artifact in sorted(artifacts, key=lambda item: item.artifact_path)
+        ],
+        "original_catalog_sha256": hashlib.sha256(original_catalog).hexdigest(),
+        "new_catalog_sha256": hashlib.sha256(new_catalog).hexdigest(),
+    }
+    return _catalog_bytes(marker)
+
+
+def _catalog_artifact_paths(registry: SchemaRegistry) -> set[str]:
+    paths = {registered.entry.artifact_path for registered in registry.entries}
+    for upcaster in registry.upcasters:
+        paths.add(upcaster.code_artifact_path)
+        paths.add(upcaster.runtime_artifact_path)
+        for vector in upcaster.golden_vectors:
+            paths.add(vector.input_artifact_path)
+            paths.add(vector.output_artifact_path)
+    return paths
+
+
 def _recover_publication_marker(catalog_path: Path) -> None:
     marker_path = catalog_path.parent / SCHEMA_PUBLICATION_MARKER_FILENAME
     try:
@@ -395,7 +451,7 @@ def _recover_publication_marker(catalog_path: Path) -> None:
         raise SchemaRegistrationError(f"cannot read schema publication marker: {exc}") from exc
 
     # Registry validation proves marker shape, path containment, digest binding, and closure.
-    SchemaRegistry(catalog_path, _skip_publication_lock=True)
+    registry = SchemaRegistry(catalog_path, _skip_publication_lock=True)
     try:
         marker = json.loads(
             marker_raw.decode("utf-8"),
@@ -408,14 +464,49 @@ def _recover_publication_marker(catalog_path: Path) -> None:
         raise SchemaRegistrationError(f"invalid schema publication marker: {exc}") from exc
     if not isinstance(marker, dict):
         raise SchemaRegistrationError("schema publication marker must be an object")
-    artifact_path = marker.get("artifact_path")
+
+    format_version = marker.get("format_version")
     original_digest = marker.get("original_catalog_sha256")
     new_digest = marker.get("new_catalog_sha256")
-    if not all(isinstance(value, str) for value in (artifact_path, original_digest, new_digest)):
+    artifact_paths: tuple[str, ...]
+    if format_version == SCHEMA_PUBLICATION_MARKER_FORMAT:
+        artifact_path = marker.get("artifact_path")
+        if not isinstance(artifact_path, str):
+            raise SchemaRegistrationError("schema publication marker has invalid fields")
+        artifact_paths = (artifact_path,)
+    elif format_version == SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT:
+        raw_artifacts = marker.get("artifacts")
+        if not isinstance(raw_artifacts, list) or not raw_artifacts:
+            raise SchemaRegistrationError("schema publication marker has invalid artifacts")
+        collected: list[str] = []
+        for artifact in raw_artifacts:
+            if not isinstance(artifact, dict) or not isinstance(artifact.get("artifact_path"), str):
+                raise SchemaRegistrationError("schema publication marker has invalid artifacts")
+            collected.append(artifact["artifact_path"])
+        artifact_paths = tuple(collected)
+    else:
+        raise SchemaRegistrationError(
+            f"unsupported schema publication marker format: {format_version!r}"
+        )
+    if not isinstance(original_digest, str) or not isinstance(new_digest, str):
         raise SchemaRegistrationError("schema publication marker has invalid fields")
-    target = _contained_artifact_target(catalog_path.parent, str(artifact_path))
+
     catalog_digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
-    if catalog_digest == new_digest or (catalog_digest == original_digest and not target.exists()):
+    if catalog_digest == new_digest:
+        _unlink_durable(marker_path)
+        return
+    if catalog_digest != original_digest:
+        raise SchemaRegistrationError(
+            "schema publication marker does not match the current catalog digest"
+        )
+
+    cataloged_paths = _catalog_artifact_paths(registry)
+    has_unpublished_artifact = any(
+        artifact_path not in cataloged_paths
+        and _contained_artifact_target(catalog_path.parent, artifact_path).exists()
+        for artifact_path in artifact_paths
+    )
+    if not has_unpublished_artifact:
         _unlink_durable(marker_path)
 
 
@@ -469,53 +560,83 @@ def _fsync_replaced_paths(source: str | Path, destination: str | Path) -> None:
         _fsync_directory(parent)
 
 
-def _publish(
+def _publish_artifacts(
     *,
     catalog_path: Path,
     original_catalog: bytes,
     new_catalog: bytes,
-    artifact_path: str,
-    schema_bytes: bytes,
+    artifacts: tuple[PublicationArtifact, ...],
+    validate_upcasters: bool = False,
+    marker_bytes: bytes | None = None,
 ) -> None:
-    target = _contained_artifact_target(catalog_path.parent, artifact_path)
-    target_preexisted = target.exists() or target.is_symlink()
-    if target_preexisted and (not target.is_file() or target.read_bytes() != schema_bytes):
-        raise PublishedSchemaConflictError(
-            f"artifact path has different exact bytes: {artifact_path}"
-        )
+    if not artifacts:
+        raise SchemaRegistrationError("publication requires at least one artifact")
+    ordered = tuple(sorted(artifacts, key=lambda item: item.artifact_path))
+    paths = tuple(artifact.artifact_path for artifact in ordered)
+    if len(set(paths)) != len(paths):
+        raise SchemaRegistrationError("publication artifact paths must be unique")
+    if any(not artifact.role for artifact in ordered):
+        raise SchemaRegistrationError("publication artifact roles must be nonempty")
+
+    targets: dict[str, Path] = {}
+    preexisting: set[str] = set()
+    for artifact in ordered:
+        target = _contained_artifact_target(catalog_path.parent, artifact.artifact_path)
+        targets[artifact.artifact_path] = target
+        if target.exists() or target.is_symlink():
+            if not target.is_file() or target.read_bytes() != artifact.contents:
+                raise PublishedSchemaConflictError(
+                    f"artifact path has different exact bytes: {artifact.artifact_path}"
+                )
+            preexisting.add(artifact.artifact_path)
     if catalog_path.read_bytes() != original_catalog:
         raise SchemaRegistrationError("schema catalog changed while registration was prepared")
 
+    current_registry = SchemaRegistry(catalog_path, _skip_publication_lock=True)
+    original_artifact_paths = _catalog_artifact_paths(current_registry)
     marker_path = catalog_path.parent / SCHEMA_PUBLICATION_MARKER_FILENAME
-    marker_bytes = _publication_marker_bytes(
-        artifact_path=artifact_path,
-        artifact_sha256=hashlib.sha256(schema_bytes).hexdigest(),
-        original_catalog=original_catalog,
-        new_catalog=new_catalog,
-    )
+    if marker_bytes is None:
+        marker_bytes = _publication_bundle_marker_bytes(
+            artifacts=ordered,
+            original_catalog=original_catalog,
+            new_catalog=new_catalog,
+        )
     catalog_mode = stat.S_IMODE(catalog_path.stat().st_mode)
-    staged_schema: Path | None = None
+    staged_artifacts: dict[str, Path] = {}
     staged_catalog: Path | None = None
-    schema_installed_here = False
+    installed_here: list[str] = []
     catalog_installed = False
     try:
-        if not target_preexisted:
-            _contained_artifact_target(catalog_path.parent, artifact_path)
-            staged_schema = _write_staged(target, schema_bytes, mode=0o644)
+        for artifact in ordered:
+            if artifact.artifact_path not in preexisting:
+                target = targets[artifact.artifact_path]
+                _contained_artifact_target(catalog_path.parent, artifact.artifact_path)
+                staged_artifacts[artifact.artifact_path] = _write_staged(
+                    target,
+                    artifact.contents,
+                    mode=0o644,
+                )
         staged_catalog = _write_staged(catalog_path, new_catalog, mode=catalog_mode)
         _install_publication_marker(marker_path, marker_bytes)
-        if staged_schema is not None:
-            _contained_artifact_target(catalog_path.parent, artifact_path)
-            _atomic_replace(staged_schema, target)
-            schema_installed_here = True
-            _fsync_replaced_paths(staged_schema, target)
+        for artifact in ordered:
+            staged = staged_artifacts.get(artifact.artifact_path)
+            if staged is None:
+                continue
+            target = targets[artifact.artifact_path]
+            _contained_artifact_target(catalog_path.parent, artifact.artifact_path)
+            _atomic_replace(staged, target)
+            installed_here.append(artifact.artifact_path)
+            _fsync_replaced_paths(staged, target)
         _atomic_replace(staged_catalog, catalog_path)
         catalog_installed = True
         _fsync_replaced_paths(staged_catalog, catalog_path)
-        SchemaRegistry(
+        registry = SchemaRegistry(
             catalog_path,
             _skip_publication_lock=True,
-        ).validate_schema_documents()
+        )
+        registry.validate_schema_documents()
+        if validate_upcasters:
+            SchemaUpcasterGraph(registry)
         _unlink_durable(marker_path)
     except BaseException:
         if catalog_installed:
@@ -529,16 +650,53 @@ def _publish(
                 _fsync_replaced_paths(rollback_catalog, catalog_path)
             finally:
                 _unlink_durable(rollback_catalog, missing_ok=True)
-        if schema_installed_here:
-            _unlink_durable(target, missing_ok=True)
-        if not target.exists() and not target.is_symlink():
+        for artifact_path in reversed(installed_here):
+            _unlink_durable(targets[artifact_path], missing_ok=True)
+        has_unpublished_artifact = any(
+            artifact.artifact_path not in original_artifact_paths
+            and (
+                targets[artifact.artifact_path].exists()
+                or targets[artifact.artifact_path].is_symlink()
+            )
+            for artifact in ordered
+        )
+        if not has_unpublished_artifact:
             _unlink_durable(marker_path, missing_ok=True)
         raise
     finally:
-        if staged_schema is not None:
-            _unlink_durable(staged_schema, missing_ok=True)
+        for staged in staged_artifacts.values():
+            _unlink_durable(staged, missing_ok=True)
         if staged_catalog is not None:
             _unlink_durable(staged_catalog, missing_ok=True)
+
+
+def _publish(
+    *,
+    catalog_path: Path,
+    original_catalog: bytes,
+    new_catalog: bytes,
+    artifact_path: str,
+    schema_bytes: bytes,
+) -> None:
+    marker_bytes = _publication_marker_bytes(
+        artifact_path=artifact_path,
+        artifact_sha256=hashlib.sha256(schema_bytes).hexdigest(),
+        original_catalog=original_catalog,
+        new_catalog=new_catalog,
+    )
+    _publish_artifacts(
+        catalog_path=catalog_path,
+        original_catalog=original_catalog,
+        new_catalog=new_catalog,
+        artifacts=(
+            PublicationArtifact(
+                artifact_path=artifact_path,
+                contents=schema_bytes,
+                role="json-schema",
+            ),
+        ),
+        marker_bytes=marker_bytes,
+    )
 
 
 def _register_schema_locked(

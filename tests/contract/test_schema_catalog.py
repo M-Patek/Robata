@@ -36,6 +36,9 @@ CANONICAL_COMPLETION_DETAIL_SCHEMA_ID = (
     "https://schemas.robata.dev/canonical-primary-completion-detail"
 )
 PRIMARY_COMPLETION_RECORD_SCHEMA_ID = "https://schemas.robata.dev/primary-completion-record"
+CANONICAL_OUTPUT_DECISION_SCHEMA_ID = "https://schemas.robata.dev/canonical-output-decision"
+OUTPUT_ADMISSION_PROOF_SCHEMA_ID = "https://schemas.robata.dev/output-admission-proof"
+EVENT_HYPOTHESIS_SCHEMA_ID = "https://schemas.robata.dev/event-hypothesis"
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> bytes:
@@ -181,6 +184,39 @@ def test_production_catalog_pins_exact_v2_enriched_output() -> None:
         "selection_decision_logical_key",
         "selection_policy_version",
     } <= set(selected_attempt["required"])
+
+
+def test_production_catalog_pins_exact_v2_output_contracts() -> None:
+    registry = SchemaRegistry()
+    expected = (
+        SchemaRef(
+            schema_id=CANONICAL_OUTPUT_DECISION_SCHEMA_ID,
+            version="2.0.0",
+            artifact_id="36948170-81ea-9f1c-9da5-a36702671043",
+            sha256="ad530439a64c6154af3dfeb056dfea06ccf354b496e6526bd818070740fb0288",
+        ),
+        SchemaRef(
+            schema_id=OUTPUT_ADMISSION_PROOF_SCHEMA_ID,
+            version="2.0.0",
+            artifact_id="0c2ab969-b49f-6d68-a6fb-bbf3cf140022",
+            sha256="c755fb5c49b99c37c8736b9f5ac55448bbe751036d23ccc1f4cd1da642858596",
+        ),
+        SchemaRef(
+            schema_id=EVENT_HYPOTHESIS_SCHEMA_ID,
+            version="2.0.0",
+            artifact_id="90cfed99-d698-db3b-dd9b-fd964b0c62a9",
+            sha256="ea58b7cd8047609b2455fe87b8b097dc220e34a335a21f303771a25fcd0e4646",
+        ),
+    )
+
+    for reference in expected:
+        registered = registry.resolve_exact(reference)
+        assert registered.entry.wire_version == "2.0"
+        assert registered.entry.projection_version in {
+            "canonical-output-decision-semantic-v2",
+            "output-admission-semantic-v2",
+            "event-hypothesis-semantic-v2",
+        }
 
 
 def test_production_catalog_pins_v3_primary_completion_record() -> None:
@@ -345,7 +381,7 @@ def test_production_catalog_pins_exact_inference_evidence_contracts() -> None:
 def test_every_catalog_entry_has_exact_digest_and_deterministic_id() -> None:
     registry = SchemaRegistry()
 
-    assert len(registry.entries) == 35
+    assert len(registry.entries) == 44
     assert registry.upcasters == ()
     for registered in registry.entries:
         digest = hashlib.sha256(registered.document_bytes).hexdigest()

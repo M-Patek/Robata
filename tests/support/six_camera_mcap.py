@@ -14,7 +14,7 @@ from mcap.writer import CompressionType, IndexType, Writer
 
 SIX_CAMERA_TOPICS: Final = tuple(f"/fixture/camera{index}/compressed" for index in range(6))
 SIX_CAMERA_MCAP_BYTES: Final = 7_966
-SIX_CAMERA_MCAP_SHA256: Final = "d84c3bf77f001c163463a3fd681b161c9611266225e1cd1aa7dc536283433a14"
+SIX_CAMERA_MCAP_SHA256: Final = "47b2f8647c7e8c15166dbf0f76f8d9d4573617a601be8e5664feaf1da1225f69"
 COMPRESSED_IMAGE_DESCRIPTOR_BYTES: Final = 592
 COMPRESSED_IMAGE_DESCRIPTOR_SHA256: Final = (
     "7832ae85852b2fbbaa6908d5d5c15c35de0f9a1ba244daecd535f3c144491ac0"
@@ -75,7 +75,7 @@ def build_six_camera_mcap() -> bytes:
     for camera_index, channel_id in enumerate(channels):
         for frame_index, packet in enumerate(_H264_PACKETS):
             timestamp_ns = (
-                1_781_051_907_271_610_000 + frame_index * 100_000_000 + camera_index * 1_000
+                1_781_051_907_271_610_000 + frame_index * 500_000_000 + camera_index * 1_000
             )
             message = compressed_image(
                 data=packet,

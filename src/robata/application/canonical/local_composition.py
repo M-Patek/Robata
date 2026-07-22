@@ -115,7 +115,7 @@ from robata.sampling.materializer import (
 )
 from robata.sampling.package_set import PackageSetBuilder
 
-LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v13"
+LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v14"
 LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION = "canonical-local-execution-clock-v1"
 LOCAL_CANONICAL_EXECUTION_TIME = "2026-07-20T00:00:00Z"
 _LOCAL_CANONICAL_EXECUTION_DATETIME: Final = datetime(2026, 7, 20, tzinfo=UTC)
@@ -972,18 +972,23 @@ def _fixture_claim_bytes(request: VisionInferenceRequest) -> bytes:
         role = request.metadata.get("boundary_refinement_role")
         if role not in {"ONSET", "OFFSET"}:
             raise ValueError("boundary fixture request lacks its orchestrator-owned role")
+        anchor_text = request.metadata.get("boundary_anchor_ns")
+        if anchor_text is None:
+            raise ValueError("boundary fixture request lacks its orchestrator-owned anchor")
+        try:
+            boundary_anchor_ns = int(anchor_text)
+        except ValueError as exc:
+            raise ValueError("boundary fixture request carries an invalid anchor") from exc
         boundary_items_by_coordinate: dict[tuple[int, int], list[RenderedProviderItem]] = {}
         for item in items:
             boundary_items_by_coordinate.setdefault(
                 (item.package_ordinal, item.camera_ordinal), []
             ).append(item)
-        all_timestamps = tuple(item.aligned_timestamp_ns for item in plan.rendered_items)
-        window_midpoint = (min(all_timestamps) + max(all_timestamps)) // 2
         package_ordinals = sorted({item.package_ordinal for item in plan.rendered_items})
         observed_package_ordinal = min(
             package_ordinals,
             key=lambda package_ordinal: min(
-                abs(item.aligned_timestamp_ns - window_midpoint)
+                abs(item.aligned_timestamp_ns - boundary_anchor_ns)
                 for item in plan.rendered_items
                 if item.package_ordinal == package_ordinal
             ),
@@ -996,12 +1001,12 @@ def _fixture_claim_bytes(request: VisionInferenceRequest) -> bytes:
             ordered_items = sorted(
                 coordinate_items,
                 key=lambda item: (
-                    abs(item.aligned_timestamp_ns - window_midpoint),
+                    abs(item.aligned_timestamp_ns - boundary_anchor_ns),
                     item.aligned_timestamp_ns,
                     item.frame_ordinal,
                 ),
             )
-            cited = tuple(sorted(ordered_items[:2], key=lambda item: item.aligned_timestamp_ns))
+            cited = (ordered_items[0],)
             boundary_claims.append(
                 ProviderTaskClaim(
                     claim_ordinal=claim_ordinal,

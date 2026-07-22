@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import suppress
+from functools import cache
 from pathlib import Path
 from typing import Final
 
@@ -32,18 +33,26 @@ from robata.application.canonical_run_membership import (
 )
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
 from robata.contracts.primary_completion import validate_registered_primary_completion_record
-from robata.contracts.schema_registry import SchemaRegistry, default_schema_registry
+from robata.contracts.schema_registry import (
+    SchemaRegistry,
+    SchemaRegistryError,
+    default_schema_registry,
+)
 from robata.event_pipeline.identity_registry import (
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID,
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION,
     EventIdentityAssignment,
     EventIdentityBatchResult,
     EventIdentityOutboxRecord,
+    EventIdentityOutboxWireRecord,
     EventIdentityRelation,
     EventRegistrySnapshot,
     StableEventIdentity,
+    validate_registered_event_identity_outbox_wire_record,
 )
 
 _APPLICATION_ID: Final = 0x52504341  # "RPCA"
-_SCHEMA_VERSION: Final = 1
+_SCHEMA_VERSION: Final = 2
 _BUSY_TIMEOUT_MS: Final = 30_000
 
 
@@ -64,6 +73,79 @@ def _immutable_table_triggers(table: str, label: str) -> tuple[str, str]:
         END
         """,
     )
+
+
+_OUTBOX_DELIVERY_SCHEMA_STATEMENTS: Final = (
+    """
+    CREATE TABLE primary_outbox_deliveries (
+        outbox_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (
+            status IN ('PENDING', 'LEASED', 'RETRY_WAIT', 'DELIVERED', 'DEAD_LETTER')
+        ),
+        attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+        lease_epoch INTEGER NOT NULL CHECK (lease_epoch >= 0),
+        fencing_token TEXT,
+        claimed_by TEXT,
+        lease_expires_at TEXT,
+        next_attempt_at TEXT NOT NULL,
+        retry_policy_version TEXT NOT NULL,
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        base_delay_seconds REAL NOT NULL CHECK (base_delay_seconds >= 0),
+        max_delay_seconds REAL NOT NULL CHECK (
+            max_delay_seconds >= base_delay_seconds
+        ),
+        last_error TEXT,
+        delivered_at TEXT,
+        dead_lettered_at TEXT,
+        FOREIGN KEY (outbox_id) REFERENCES primary_outbox (outbox_id)
+            ON UPDATE RESTRICT ON DELETE RESTRICT,
+        CHECK (
+            status <> 'LEASED'
+            OR (
+                fencing_token IS NOT NULL
+                AND claimed_by IS NOT NULL
+                AND lease_expires_at IS NOT NULL
+            )
+        ),
+        CHECK ((status = 'DELIVERED') = (delivered_at IS NOT NULL)),
+        CHECK ((status = 'DEAD_LETTER') = (dead_lettered_at IS NOT NULL))
+    )
+    """,
+    """
+    CREATE INDEX primary_outbox_delivery_claim_idx
+        ON primary_outbox_deliveries (status, next_attempt_at, outbox_id)
+    """,
+    """
+    CREATE TRIGGER primary_outbox_immutable_fields
+    BEFORE UPDATE OF
+        outbox_id,
+        completion_run_id,
+        recording_identity,
+        outbox_ordinal,
+        assignment_logical_key,
+        payload_json,
+        payload_json_sha256
+    ON primary_outbox
+    BEGIN
+        SELECT RAISE(ABORT, 'primary outbox facts are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER primary_outbox_delivery_is_monotonic
+    BEFORE UPDATE OF delivered_at ON primary_outbox
+    WHEN OLD.delivered_at IS NOT NULL OR NEW.delivered_at IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'primary outbox delivery acknowledgement is monotonic');
+    END
+    """,
+    """
+    CREATE TRIGGER primary_outbox_deliveries_no_delete
+    BEFORE DELETE ON primary_outbox_deliveries
+    BEGIN
+        SELECT RAISE(ABORT, 'primary outbox delivery rows cannot be deleted');
+    END
+    """,
+)
 
 
 _SCHEMA_STATEMENTS: Final = (
@@ -222,6 +304,7 @@ _SCHEMA_STATEMENTS: Final = (
     CREATE INDEX primary_outbox_pending_idx
         ON primary_outbox (recording_identity, delivered_at, outbox_id)
     """,
+    *_OUTBOX_DELIVERY_SCHEMA_STATEMENTS,
     *_immutable_table_triggers("stable_event_identities", "stable event identities"),
     *_immutable_table_triggers("event_identity_assignments", "event identity assignments"),
     *_immutable_table_triggers("event_identity_relations", "event identity relations"),
@@ -229,6 +312,35 @@ _SCHEMA_STATEMENTS: Final = (
     *_immutable_table_triggers("detailed_results", "detailed results"),
     *_immutable_table_triggers("primary_completions", "primary completions"),
 )
+
+_V1_TO_V2_SCHEMA_STATEMENTS: Final = _OUTBOX_DELIVERY_SCHEMA_STATEMENTS
+
+
+def _primary_schema_fingerprint(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+    rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+@cache
+def _expected_primary_schema_fingerprint() -> tuple[tuple[object, ...], ...]:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        for statement in _SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        return _primary_schema_fingerprint(connection)
+    finally:
+        connection.close()
+
+
+def _primary_schema_is_current(connection: sqlite3.Connection) -> bool:
+    return _primary_schema_fingerprint(connection) == _expected_primary_schema_fingerprint()
 
 
 class SQLitePrimaryCompletionRepository:
@@ -243,12 +355,21 @@ class SQLitePrimaryCompletionRepository:
         if not isinstance(path, Path):
             raise TypeError("path must be pathlib.Path")
         self._path = path.resolve()
-        self._registry = registry or default_schema_registry()
         try:
+            self._registry = registry or default_schema_registry()
+            self._outbox_schema_ref = self._registry.resolve_version(
+                EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID,
+                EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION,
+            ).ref
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize()
         except PrimaryCompletionError:
             raise
+        except SchemaRegistryError as error:
+            raise PrimaryCompletionError(
+                PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                f"cannot resolve primary completion schema governance: {error}",
+            ) from error
         except (OSError, sqlite3.Error) as error:
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.TRANSACTION_FAILED,
@@ -622,7 +743,7 @@ class SQLitePrimaryCompletionRepository:
                 validated.completion,
                 self._registry,
             )
-        except (ValidationError, TypeError, ValueError) as error:
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INVALID_COMMAND,
                 f"primary completion schema validation failed: {error}",
@@ -951,7 +1072,17 @@ class SQLitePrimaryCompletionRepository:
         ordinal: int,
         outbox: EventIdentityOutboxRecord,
     ) -> None:
-        payload = canonical_json_bytes(outbox)
+        try:
+            wire = EventIdentityOutboxWireRecord.from_record(
+                outbox, schema_ref=self._outbox_schema_ref
+            )
+            checked = validate_registered_event_identity_outbox_wire_record(wire, self._registry)
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
+            raise PrimaryCompletionError(
+                PrimaryCompletionErrorCode.INVALID_COMMAND,
+                f"successor outbox record is not exact-schema valid: {error}",
+            ) from error
+        payload = canonical_json_bytes(checked)
         connection.execute(
             """
             INSERT INTO primary_outbox (
@@ -961,11 +1092,11 @@ class SQLitePrimaryCompletionRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
-                outbox.outbox_id,
+                checked.outbox_id,
                 run_id,
-                outbox.recording_identity,
+                checked.recording_identity,
                 ordinal,
-                outbox.assignment_logical_key,
+                checked.assignment_logical_key,
                 sqlite3.Binary(payload),
                 exact_bytes_sha256(payload),
             ),
@@ -1006,14 +1137,20 @@ class SQLitePrimaryCompletionRepository:
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
                 "stored completion columns disagree with canonical JSON",
             )
-        validate_registered_primary_completion_record(
-            committed.completion,
-            self._registry,
-        )
-        self._registry.validate_pinned(
-            committed.detail.schema_ref,
-            committed.detail.model_dump(mode="json"),
-        )
+        try:
+            validate_registered_primary_completion_record(
+                committed.completion,
+                self._registry,
+            )
+            self._registry.validate_pinned(
+                committed.detail.schema_ref,
+                committed.detail.model_dump(mode="json"),
+            )
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
+            raise PrimaryCompletionError(
+                PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                "stored completion does not carry valid exact schema governance",
+            ) from error
         detail_row = connection.execute(
             "SELECT * FROM detailed_results WHERE artifact_id = ?",
             (committed.completion.detailed_result.artifact_id,),
@@ -1246,22 +1383,74 @@ class SQLitePrimaryCompletionRepository:
         return publication
 
     def _outbox_from_row(self, row: sqlite3.Row) -> EventIdentityOutboxRecord:
-        outbox = _decode_model(
+        wire = _decode_model(
             row,
             payload_column="payload_json",
             digest_column="payload_json_sha256",
-            model=EventIdentityOutboxRecord,
+            model=EventIdentityOutboxWireRecord,
         )
+        try:
+            wire = validate_registered_event_identity_outbox_wire_record(wire, self._registry)
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
+            raise PrimaryCompletionError(
+                PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                "stored outbox does not carry a valid exact schema pin",
+            ) from error
         if (
-            outbox.outbox_id != str(row["outbox_id"])
-            or outbox.recording_identity != str(row["recording_identity"])
-            or outbox.assignment_logical_key != str(row["assignment_logical_key"])
+            wire.outbox_id != str(row["outbox_id"])
+            or wire.recording_identity != str(row["recording_identity"])
+            or wire.assignment_logical_key != str(row["assignment_logical_key"])
         ):
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
                 "stored outbox columns disagree with canonical JSON",
             )
-        return outbox
+        return wire.to_record()
+
+    def _migrate_v1_outbox_payloads(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT * FROM primary_outbox ORDER BY completion_run_id, outbox_ordinal"
+        ).fetchall()
+        for row in rows:
+            record = _decode_model(
+                row,
+                payload_column="payload_json",
+                digest_column="payload_json_sha256",
+                model=EventIdentityOutboxRecord,
+            )
+            try:
+                wire = EventIdentityOutboxWireRecord.from_record(
+                    record,
+                    schema_ref=self._outbox_schema_ref,
+                )
+                checked = validate_registered_event_identity_outbox_wire_record(
+                    wire,
+                    self._registry,
+                )
+            except (SchemaRegistryError, ValidationError, TypeError, ValueError) as error:
+                raise PrimaryCompletionError(
+                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                    "cannot upcast v1 primary outbox to its exact Wire schema",
+                ) from error
+            payload = canonical_json_bytes(checked)
+            cursor = connection.execute(
+                """
+                UPDATE primary_outbox
+                SET payload_json = ?, payload_json_sha256 = ?
+                WHERE outbox_id = ? AND payload_json_sha256 = ?
+                """,
+                (
+                    sqlite3.Binary(payload),
+                    exact_bytes_sha256(payload),
+                    str(row["outbox_id"]),
+                    str(row["payload_json_sha256"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PrimaryCompletionError(
+                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                    "v1 primary outbox migration lost its target row",
+                )
 
     def _initialize(self) -> None:
         connection = self._open_unchecked()
@@ -1270,6 +1459,38 @@ class SQLitePrimaryCompletionRepository:
             application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
             user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if user_version == _SCHEMA_VERSION and application_id == _APPLICATION_ID:
+                if not _primary_schema_is_current(connection):
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                        "primary completion DDL does not match the canonical schema",
+                    )
+                return
+            if user_version == 1 and application_id == _APPLICATION_ID:
+                connection.execute("BEGIN IMMEDIATE")
+                locked_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if locked_version == _SCHEMA_VERSION:
+                    if not _primary_schema_is_current(connection):
+                        raise PrimaryCompletionError(
+                            PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                            "concurrently migrated primary completion DDL is not canonical",
+                        )
+                    connection.commit()
+                    return
+                if locked_version != 1:
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                        "primary completion schema changed during migration",
+                    )
+                self._migrate_v1_outbox_payloads(connection)
+                for statement in _V1_TO_V2_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                if not _primary_schema_is_current(connection):
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                        "migrated primary completion DDL is not canonical",
+                    )
+                connection.commit()
                 return
             if user_version != 0 or application_id != 0:
                 raise PrimaryCompletionError(
@@ -1292,6 +1513,11 @@ class SQLitePrimaryCompletionRepository:
                 connection.execute(statement)
             connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            if not _primary_schema_is_current(connection):
+                raise PrimaryCompletionError(
+                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                    "new primary completion DDL is not canonical",
+                )
             connection.commit()
         except Exception:
             with suppress(sqlite3.Error):
@@ -1301,29 +1527,54 @@ class SQLitePrimaryCompletionRepository:
             connection.close()
 
     def _open_unchecked(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self._path,
-            timeout=_BUSY_TIMEOUT_MS / 1000,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA synchronous = FULL")
-        connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA trusted_schema = OFF")
-        return connection
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                self._path,
+                timeout=_BUSY_TIMEOUT_MS / 1000,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            return connection
+        except sqlite3.Error:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.close()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
-        connection = self._open_unchecked()
-        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
-        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if application_id != _APPLICATION_ID or user_version != _SCHEMA_VERSION:
-            connection.close()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._open_unchecked()
+            application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+            user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if application_id != _APPLICATION_ID or user_version != _SCHEMA_VERSION:
+                raise PrimaryCompletionError(
+                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                    "primary completion database header is incompatible",
+                )
+            if not _primary_schema_is_current(connection):
+                raise PrimaryCompletionError(
+                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                    "primary completion DDL does not match the canonical schema",
+                )
+            return connection
+        except PrimaryCompletionError:
+            if connection is not None:
+                connection.close()
+            raise
+        except sqlite3.Error as error:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.close()
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                "primary completion database header is incompatible",
-            )
-        return connection
+                "cannot open or verify the primary completion database",
+            ) from error
 
     def _commit_connection(self, connection: sqlite3.Connection) -> None:
         """Narrow test hook for commit-outcome uncertainty."""
@@ -1354,12 +1605,18 @@ def _decode_model[ModelT: BaseModel](
             f"stored {payload_column} exact digest is corrupt",
         )
     try:
-        return model.model_validate_json(raw, strict=True)
+        value = model.model_validate_json(raw, strict=True)
     except ValidationError as error:
         raise PrimaryCompletionError(
             PrimaryCompletionErrorCode.INTEGRITY_ERROR,
             f"stored {payload_column} is not a valid {model.__name__}",
         ) from error
+    if canonical_json_bytes(value) != raw:
+        raise PrimaryCompletionError(
+            PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+            f"stored {payload_column} is not canonical JSON",
+        )
+    return value
 
 
 def _run_binding(record: CanonicalProcessingRunRecord) -> tuple[str, ...]:

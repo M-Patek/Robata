@@ -12,6 +12,7 @@ from typing import Final, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from robata.contracts.hashing import CanonicalizationError, canonical_json_bytes, exact_bytes_sha256
+from robata.contracts.schema_registry import SchemaRef
 from robata.inference.call_barrier import (
     InferenceCallBarrierConflictError,
     InferenceCallBarrierDefinition,
@@ -29,6 +30,10 @@ from robata.queue.barrier import (
 )
 from robata.queue.models import DependencyCriticality
 from robata.queue.stage import StageStatus
+from robata.queue.wire import (
+    PersistedBarrier,
+    validate_registered_persisted_barrier,
+)
 
 _APPLICATION_ID: Final = 0x52424152  # "RBAR"
 _SCHEMA_VERSION: Final = 1
@@ -459,6 +464,42 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
                 raise KeyError(f"unknown barrier: {key}")
             _barrier, _state, members, _version = self._load_generic_barrier(connection, key)
             return members
+
+        return self._transaction(write=False, operation=read)
+
+    def get_persisted_barrier_snapshot(
+        self,
+        barrier_id: str,
+        *,
+        schema_ref: SchemaRef,
+    ) -> PersistedBarrier | None:
+        """Read one definition/state/member snapshot in one SQLite transaction.
+
+        state_version lets consumers detect a concurrent member submission,
+        so a mixed read can never be mistaken for durable barrier truth.
+        """
+
+        key = _nonempty_string(barrier_id, "barrier_id")
+
+        def read(connection: sqlite3.Connection) -> PersistedBarrier | None:
+            row = connection.execute(
+                "SELECT 1 FROM barrier_definitions WHERE barrier_id = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            barrier, state, members, state_version = self._load_generic_barrier(
+                connection,
+                key,
+            )
+            snapshot = PersistedBarrier.from_snapshot(
+                barrier,
+                state,
+                members,
+                state_version,
+                schema_ref=schema_ref,
+            )
+            return validate_registered_persisted_barrier(snapshot)
 
         return self._transaction(write=False, operation=read)
 

@@ -678,6 +678,7 @@ class CanonicalBoundaryRefinementPassExecution(StrictModel):
                 or dependency.get("provisional_physical_action_semantic_sha256")
                 != window.provisional_action_semantic_sha256
                 or dependency.get("boundary_refinement_role") != role.value
+                or dependency.get("boundary_anchor_ns") != window.boundary_anchor_ns
                 or dependency.get("boundary_refinement_window_semantic_sha256")
                 != window.semantic_sha256
                 or dependency.get("boundary_refinement_policy_version")

@@ -420,6 +420,7 @@ def _boundary_refinement_claim_bytes(
 ) -> bytes:
     assert request.task is VisionTask.BOUNDARY_REFINEMENT
     assert request.metadata.get("boundary_refinement_role") in {"ONSET", "OFFSET"}
+    assert request.metadata.get("boundary_anchor_ns") is not None
     assert request.input_plan is not None
     assert request.input_plan_part_ordinal is not None
     plan = request.input_plan
@@ -2092,6 +2093,7 @@ def test_exact_replay_reuses_dense_qa_chain_without_new_side_effects(
         len(first.coarse_qa_result.source_outputs)
         + sum(len(item.part_results) for item in first.dense_qa_executions)
         + sum(len(item.part_results) for item in first.action_evidence_executions)
+        + _boundary_dispatch_count(first)
         + 2 * len(first.part_results)
     )
     assert harness.protocol_adapter is not None
@@ -2626,7 +2628,10 @@ def test_run_result_rejects_tampered_binding_and_membership_proof(tmp_path: Path
     assert result.status is CanonicalOfflineRunStatus.SUCCEEDED
     assert result.output_decision is not None
 
-    with pytest.raises(ValidationError, match="QA_COMPLETE prerequisite"):
+    with pytest.raises(
+        ValidationError,
+        match="boundary refinement executions require their complete upstream closure",
+    ):
         _revalidate_result(result, qa_completion_result=None)
 
     v1_decision = result.output_decision.model_dump(mode="python")
@@ -2649,7 +2654,10 @@ def test_run_result_rejects_tampered_binding_and_membership_proof(tmp_path: Path
             processing_run=result.processing_run.model_copy(update={"mcap_id": wrong_mcap_id}),
         )
     wrong_policy_sha256 = _digest("consistently-tampered-execution-policy")
-    with pytest.raises(ValidationError, match="input plan or run binding"):
+    with pytest.raises(
+        ValidationError,
+        match="boundary calls do not bind the exact upstream run closure",
+    ):
         _revalidate_result(
             result,
             execution_policy_sha256=wrong_policy_sha256,
@@ -3030,7 +3038,7 @@ def test_duplicate_json_key_makes_required_part_incomplete_and_retains_raw_bytes
     assert result.barrier_reduction is None
     assert result.identity_result is None
     records = harness.raw_store.list_records()
-    assert len(records) == 4
+    assert len(records) == 6
     assert sum(item.data == response for item in records) == 1
     assert harness.repository.snapshot(harness.context.recording_identity).generation == 0
     _assert_offline(result, harness)
@@ -3056,10 +3064,10 @@ def test_selected_terminal_raw_reference_mismatch_fails_closed(tmp_path: Path) -
     assert result.parsed_claims is None
     assert result.identity_result is None
     records = harness.raw_store.list_records()
-    assert len(records) == 4
+    assert len(records) == 6
     assert all(item.artifact_id != _uuid(99_999) for item in records)
     assert harness.protocol_adapter is not None
-    assert harness.protocol_adapter.dispatch_calls == 4
+    assert harness.protocol_adapter.dispatch_calls == 6
     assert harness.repository.snapshot(harness.context.recording_identity).generation == 0
     _assert_offline(result, harness)
 

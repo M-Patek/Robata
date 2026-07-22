@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import tracemalloc
+from inspect import signature
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from robata.benchmark import BenchmarkEvidenceContext
+from robata.contracts.hashing import semantic_sha256
 from robata.runtime.benchmark import (
     BenchmarkSummary,
     ThroughputSample,
@@ -14,6 +18,25 @@ from robata.runtime.benchmark import (
 )
 
 
+def _digest(label: str) -> str:
+    return semantic_sha256({"runtime-benchmark-test": label})
+
+
+def _context() -> BenchmarkEvidenceContext:
+    return BenchmarkEvidenceContext.create(
+        benchmark_id=str(uuid5(NAMESPACE_URL, "robata:runtime-benchmark")),
+        benchmark_manifest_digest=_digest("benchmark-manifest"),
+        governed_corpus_digest=_digest("governed-corpus"),
+        ground_truth_manifest_digest=_digest("ground-truth-manifest"),
+        grouped_split_manifest_digest=_digest("grouped-split-manifest"),
+        data_split="FROZEN_TEST",
+        governance_approved=True,
+        governance_approval_id="approval-2026-07-21",
+        governance_approval_digest=_digest("governance-approval"),
+        governance_policy_version="governance-policy-1.0",
+    )
+
+
 def test_throughput_sample_reports_both_units() -> None:
     sample = ThroughputSample(elapsed_ms=120_000, recording_duration_ns=120_000_000_000)
 
@@ -22,7 +45,7 @@ def test_throughput_sample_reports_both_units() -> None:
     assert sample.as_dict()["recording_duration_ns"] == "120000000000"
 
 
-def test_summary_is_non_certifying_by_default_and_uses_nearest_rank() -> None:
+def test_summary_is_local_by_default_and_uses_nearest_rank() -> None:
     summary = summarize_samples(
         "synthetic-fixture",
         (
@@ -36,22 +59,30 @@ def test_summary_is_non_certifying_by_default_and_uses_nearest_rank() -> None:
     assert summary.measurement_status == "NOT_MEASURED"
     assert summary.p50_elapsed_ms == 200
     assert summary.p95_elapsed_ms == 300
-    assert summary.as_dict()["certifying"] is False
+    assert summary.as_dict()["evidence_context"] is None
 
 
-def test_certifying_summary_requires_corpus_id() -> None:
+def test_measured_summary_requires_complete_evidence_context() -> None:
     sample = ThroughputSample(elapsed_ms=100, recording_duration_ns=1_000_000_000)
-
-    with pytest.raises(ValueError, match="corpus_id"):
-        summarize_samples("workload", (sample,), certifying=True)
+    context = _context()
 
     summary = summarize_samples(
         "workload",
         (sample,),
-        certifying=True,
-        corpus_id="approved-corpus-v1",
+        evidence_context=context,
     )
-    assert summary.measurement_status == "CERTIFYING"
+
+    assert summary.measurement_status == "MEASURED"
+    assert summary.as_dict()["evidence_context"]["context_digest"] == context.context_digest
+    assert "certifying" not in signature(summarize_samples).parameters
+    assert "corpus_id" not in signature(summarize_samples).parameters
+
+    with pytest.raises(TypeError, match="BenchmarkEvidenceContext"):
+        BenchmarkSummary(
+            workload_id="workload",
+            samples=(sample,),
+            evidence_context="approved-corpus",  # type: ignore[arg-type]
+        )
 
 
 def test_measure_callable_uses_injected_clock() -> None:

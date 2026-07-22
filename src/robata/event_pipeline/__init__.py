@@ -48,6 +48,14 @@ from robata.event_pipeline.fusion import (
     FusionPolicy,
 )
 from robata.event_pipeline.identity_registry import (
+    EVENT_HYPOTHESIS_SCHEMA_ID,
+    EVENT_HYPOTHESIS_SCHEMA_VERSION,
+    EVENT_IDENTITY_OUTBOX_RECORD_PROJECTION_VERSION,
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID,
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION,
+    EVENT_IDENTITY_OUTBOX_RECORD_WIRE_VERSION,
+    OUTPUT_ADMISSION_PROOF_SCHEMA_ID,
+    OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION,
     AdmissionEvidenceClass,
     AdmissionProof,
     CrossRecordingEventIdentityError,
@@ -62,6 +70,7 @@ from robata.event_pipeline.identity_registry import (
     EventIdentityConflictError,
     EventIdentityInputError,
     EventIdentityOutboxRecord,
+    EventIdentityOutboxWireRecord,
     EventIdentityPolicyRef,
     EventIdentityRegistryError,
     EventIdentityRegistryMutation,
@@ -83,6 +92,9 @@ from robata.event_pipeline.identity_registry import (
     RandomEventIdAllocator,
     StableEventIdentity,
     StaleEventRegistryFenceError,
+    validate_registered_event_hypothesis,
+    validate_registered_event_identity_outbox_wire_record,
+    validate_registered_output_admission_proof,
 )
 from robata.event_pipeline.proposer import (
     EventProposalError,
@@ -109,8 +121,16 @@ from robata.event_pipeline.provisional_fusion import (
 )
 
 __all__ = [
+    "EVENT_HYPOTHESIS_SCHEMA_ID",
+    "EVENT_HYPOTHESIS_SCHEMA_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_PROJECTION_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID",
+    "EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_WIRE_VERSION",
     "FUSION_STAGES",
     "LOCAL_PROVISIONAL_FUSION_POLICY_VERSION",
+    "OUTPUT_ADMISSION_PROOF_SCHEMA_ID",
+    "OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION",
     "PROVISIONAL_FUSION_RESULT_LOGICAL_KEY_NAMESPACE",
     "PROVISIONAL_PHYSICAL_ACTION_LOGICAL_KEY_NAMESPACE",
     "ActionEvidenceClaimRef",
@@ -154,6 +174,7 @@ __all__ = [
     "EventIdentityConflictError",
     "EventIdentityInputError",
     "EventIdentityOutboxRecord",
+    "EventIdentityOutboxWireRecord",
     "EventIdentityPolicyRef",
     "EventIdentityRegistryError",
     "EventIdentityRegistryMutation",
@@ -201,4 +222,7 @@ __all__ = [
     "TemporalSignal",
     "ValidationIssue",
     "ValidationResult",
+    "validate_registered_event_hypothesis",
+    "validate_registered_event_identity_outbox_wire_record",
+    "validate_registered_output_admission_proof",
 ]

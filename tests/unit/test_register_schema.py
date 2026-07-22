@@ -123,6 +123,19 @@ def _register(
     )
 
 
+def test_validation_snapshot_parent_honors_explicit_existing_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_root = tmp_path / "schema-snapshots"
+    snapshot_root.mkdir()
+    monkeypatch.setenv("ROBATA_SCHEMA_VALIDATION_TEMP_ROOT", str(snapshot_root))
+
+    assert schema_registration._validation_snapshot_parent(tmp_path / "schemas") == (
+        snapshot_root.resolve()
+    )
+
+
 def test_register_normalizes_utf8_lf_and_pins_exact_bytes(tmp_path: Path) -> None:
     catalog = _registry(tmp_path)
     document = _schema("candidate")

@@ -278,8 +278,8 @@ class ModelInference(Base):
     )
 
 
-class WorkItem(Base):
-    """One work item in the processing pipeline."""
+class _LegacyWorkItemRow(Base):
+    """Private compatibility mapping; durable scheduling lives in queue models."""
 
     __tablename__ = "work_item"
 
@@ -417,7 +417,6 @@ __all__ = [
     "VideoStream",
     "WorkBarrier",
     "WorkBarrierMember",
-    "WorkItem",
     "create_tables",
     "drop_tables",
     "get_engine",

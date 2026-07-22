@@ -16,7 +16,6 @@ from robata.storage.models import (
     VideoStream,
     WorkBarrier,
     WorkBarrierMember,
-    WorkItem,
     create_tables,
     drop_tables,
 )
@@ -36,7 +35,6 @@ __all__ = [
     "VideoStream",
     "WorkBarrier",
     "WorkBarrierMember",
-    "WorkItem",
     "create_tables",
     "drop_tables",
     "get_engine",

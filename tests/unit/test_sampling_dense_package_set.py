@@ -271,7 +271,10 @@ def test_qa_dense_planning_uses_uniform_dense_rate_and_distinct_projection() -> 
 
 
 def test_provider_neutral_plan_rejects_other_sampling_purposes() -> None:
-    with pytest.raises(ValueError, match="only QA_COARSE, QA_DENSE, and ACTION_DENSE"):
+    with pytest.raises(
+        ValueError,
+        match="only QA_COARSE, QA_DENSE, ACTION_DENSE, and BOUNDARY_REFINEMENT",
+    ):
         sampling_plan_projection(_plan(), purpose=SamplingPurpose.EVENT_PROPOSAL)
 
 

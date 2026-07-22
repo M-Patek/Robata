@@ -29,6 +29,7 @@ from robata.benchmark.ground_truth import (
     RecordingUsability,
 )
 from robata.benchmark.metrics import (
+    BenchmarkMetricPolicy,
     BoundaryMetrics,
     CalibrationMetrics,
     EventMetrics,
@@ -36,6 +37,7 @@ from robata.benchmark.metrics import (
     MeasurementStatus,
     MetricsCalculator,
     QAMetrics,
+    benchmark_metric_policy_projection,
 )
 from robata.benchmark.models import (
     BenchmarkManifest,
@@ -68,6 +70,7 @@ from robata.benchmark.statistics import (
 __all__ = [
     "BenchmarkEvidenceContext",
     "BenchmarkManifest",
+    "BenchmarkMetricPolicy",
     "BenchmarkResults",
     "BootstrapResult",
     "BoundaryExample",
@@ -109,4 +112,5 @@ __all__ = [
     "StatisticalAnalyzer",
     "StratificationDimension",
     "benchmark_evidence_context_projection",
+    "benchmark_metric_policy_projection",
 ]

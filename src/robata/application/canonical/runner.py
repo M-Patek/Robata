@@ -1431,6 +1431,12 @@ class CanonicalOfflinePipeline:
                     "boundary refinement dependency carries an invalid role"
                 )
             request_metadata["boundary_refinement_role"] = str(boundary_role)
+            boundary_anchor_ns = dependency_fields.get("boundary_anchor_ns")
+            if isinstance(boundary_anchor_ns, bool) or not isinstance(boundary_anchor_ns, int):
+                raise CanonicalOfflineConfigurationError(
+                    "boundary refinement dependency lacks an integer anchor"
+                )
+            request_metadata["boundary_anchor_ns"] = str(boundary_anchor_ns)
 
         final_context_value = dependency_fields.get("final_fusion_context")
         if final_context_value is not None:
@@ -2259,6 +2265,11 @@ class CanonicalOfflinePipeline:
             "provisional_physical_action_logical_key": action.logical_key,
             "provisional_physical_action_semantic_sha256": action.semantic_sha256,
             "boundary_refinement_role": role.value,
+            "boundary_anchor_ns": (
+                action.coarse_interval.start_ns
+                if role is BoundaryRefinementRole.ONSET
+                else action.coarse_interval.end_ns
+            ),
             "boundary_refinement_window_semantic_sha256": window.semantic_sha256,
             "boundary_refinement_policy_version": policy.version,
             "boundary_refinement_policy_semantic_sha256": policy.semantic_sha256,

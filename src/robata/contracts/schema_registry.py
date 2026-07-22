@@ -35,6 +35,7 @@ DEFAULT_SOFTWARE_VERSION = "0.1.0"
 SCHEMA_PUBLICATION_LOCK_FILENAME = ".schema-registration.lock"
 SCHEMA_PUBLICATION_MARKER_FILENAME = ".schema-publication-transaction.json"
 SCHEMA_PUBLICATION_MARKER_FORMAT = "robata-schema-publication-transaction-v1"
+SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT = "robata-schema-publication-transaction-v2"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 _WIRE_VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 _SCHEMA_ID_PATTERN = r"^https://schemas\.robata\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
@@ -272,6 +273,28 @@ class _SchemaPublicationMarker(StrictModel):
     artifact_sha256: _Digest
     original_catalog_sha256: _Digest
     new_catalog_sha256: _Digest
+
+
+class _SchemaPublicationArtifact(StrictModel):
+    artifact_path: _NonEmpty
+    artifact_sha256: _Digest
+    role: _NonEmpty
+
+
+class _SchemaPublicationBundleMarker(StrictModel):
+    format_version: Literal["robata-schema-publication-transaction-v2"]
+    artifacts: list[_SchemaPublicationArtifact]
+    original_catalog_sha256: _Digest
+    new_catalog_sha256: _Digest
+
+    @model_validator(mode="after")
+    def require_unique_artifacts(self) -> _SchemaPublicationBundleMarker:
+        if not self.artifacts:
+            raise ValueError("publication bundle must contain at least one artifact")
+        paths = tuple(item.artifact_path for item in self.artifacts)
+        if len(set(paths)) != len(paths):
+            raise ValueError("publication bundle artifact paths must be unique")
+        return self
 
 
 @dataclass(frozen=True)
@@ -968,51 +991,69 @@ class _CatalogSchemaRegistry:
             )
         return path, raw
 
-    def _pending_publication_artifact(self) -> Path | None:
+    def _pending_publication_artifacts(self) -> tuple[Path, ...]:
         marker_path = self.schema_root / SCHEMA_PUBLICATION_MARKER_FILENAME
         try:
             marker_raw = marker_path.read_bytes()
         except FileNotFoundError:
-            return None
+            return ()
         except OSError as exc:
             raise SchemaDefinitionError(marker_path.name, str(exc)) from exc
         marker_data = _decode_json_object(marker_path.name, marker_raw)
         try:
-            marker = _SchemaPublicationMarker.model_validate(marker_data, strict=True)
-        except PydanticValidationError as exc:
+            format_version = marker_data.get("format_version")
+            marker_artifacts: tuple[tuple[str, str], ...]
+            if format_version == SCHEMA_PUBLICATION_MARKER_FORMAT:
+                legacy = _SchemaPublicationMarker.model_validate(marker_data, strict=True)
+                marker_artifacts = ((legacy.artifact_path, legacy.artifact_sha256),)
+                original_catalog_sha256 = legacy.original_catalog_sha256
+                new_catalog_sha256 = legacy.new_catalog_sha256
+            elif format_version == SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT:
+                bundle = _SchemaPublicationBundleMarker.model_validate(marker_data, strict=True)
+                marker_artifacts = tuple(
+                    (artifact.artifact_path, artifact.artifact_sha256)
+                    for artifact in bundle.artifacts
+                )
+                original_catalog_sha256 = bundle.original_catalog_sha256
+                new_catalog_sha256 = bundle.new_catalog_sha256
+            else:
+                raise ValueError(f"unsupported publication marker format: {format_version!r}")
+        except (PydanticValidationError, ValueError) as exc:
             raise SchemaDefinitionError(marker_path.name, str(exc)) from exc
         if self._catalog_sha256 not in {
-            marker.original_catalog_sha256,
-            marker.new_catalog_sha256,
+            original_catalog_sha256,
+            new_catalog_sha256,
         }:
             raise SchemaDefinitionError(
                 marker_path.name,
                 "publication marker does not match the current catalog digest",
             )
 
-        target = _resolve_artifact_path(self.schema_root, marker.artifact_path)
-        target_present = target.exists() or target.is_symlink()
-        if not target_present:
-            if self._catalog_sha256 == marker.new_catalog_sha256:
+        pending: list[Path] = []
+        for artifact_path, artifact_sha256 in marker_artifacts:
+            target = _resolve_artifact_path(self.schema_root, artifact_path)
+            target_present = target.exists() or target.is_symlink()
+            if not target_present:
+                if self._catalog_sha256 == new_catalog_sha256:
+                    raise SchemaDefinitionError(
+                        artifact_path,
+                        "published marker artifact is missing",
+                    )
+                continue
+            if not target.is_file():
+                raise SchemaDefinitionError(artifact_path, "marker artifact is not a file")
+            try:
+                actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise SchemaDefinitionError(artifact_path, str(exc)) from exc
+            if actual_sha256 != artifact_sha256:
                 raise SchemaDefinitionError(
-                    marker.artifact_path,
-                    "published marker artifact is missing",
+                    artifact_path,
+                    "publication marker artifact SHA-256 mismatch",
                 )
-            return None
-        if not target.is_file():
-            raise SchemaDefinitionError(marker.artifact_path, "marker artifact is not a file")
-        try:
-            actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise SchemaDefinitionError(marker.artifact_path, str(exc)) from exc
-        if actual_sha256 != marker.artifact_sha256:
-            raise SchemaDefinitionError(
-                marker.artifact_path,
-                "publication marker artifact SHA-256 mismatch",
-            )
-        if self._catalog_sha256 == marker.original_catalog_sha256:
-            return target
-        return None
+            if self._catalog_sha256 == original_catalog_sha256:
+                pending.append(target)
+        return tuple(pending)
 
     @property
     def entries(self) -> tuple[RegisteredSchema, ...]:
@@ -1202,8 +1243,7 @@ class _CatalogSchemaRegistry:
                 )
             discovered.add(resolved)
         uncataloged = discovered - cataloged
-        pending = self._pending_publication_artifact()
-        if pending is not None:
+        for pending in self._pending_publication_artifacts():
             uncataloged.discard(pending)
         missing = sorted(path.relative_to(self.schema_root).as_posix() for path in uncataloged)
         nonexistent = sorted(
@@ -1353,6 +1393,7 @@ __all__ = [
     "DEFAULT_SCHEMA_CATALOG",
     "DEFAULT_SCHEMA_DIRECTORY",
     "JSON_SCHEMA_DIALECT",
+    "SCHEMA_PUBLICATION_BUNDLE_MARKER_FORMAT",
     "SCHEMA_PUBLICATION_LOCK_FILENAME",
     "SCHEMA_PUBLICATION_MARKER_FILENAME",
     "SCHEMA_PUBLICATION_MARKER_FORMAT",

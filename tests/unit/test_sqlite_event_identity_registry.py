@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+import robata.adapters.sqlite_event_identity_registry as sqlite_registry_module
 from robata.adapters.sqlite_event_identity_registry import (
     SQLiteEventIdentityRegistryError,
     SQLiteEventIdentityRegistryRepository,
@@ -15,6 +17,7 @@ from robata.adapters.sqlite_event_identity_registry import (
 )
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
+from robata.contracts.schema_registry import SchemaRegistryError
 from robata.event_pipeline.identity_registry import (
     CrossRecordingEventIdentityError,
     EventCurrentRevisionReference,
@@ -304,10 +307,80 @@ def test_new_empty_database_sets_exact_sqlite_identity_and_version(tmp_path: Pat
     connection = sqlite3.connect(repository.database_path)
     try:
         assert connection.execute("PRAGMA application_id").fetchone()[0] != 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     finally:
         connection.close()
+
+
+def test_v1_domain_outbox_payload_is_atomically_upcast_to_exact_wire(tmp_path: Path) -> None:
+    database_path = _database(tmp_path)
+    repository = SQLiteEventIdentityRegistryRepository(database_path)
+    context, result = _assign_one(repository, fingerprint="v1-outbox-migration-fixture")
+    assert len(result.outbox) == 1
+
+    connection = sqlite3.connect(database_path)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'event_identity_outbox_no_update'"
+        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT outbox_id, payload_json FROM event_identity_outbox"
+        ).fetchone()
+        document = json.loads(bytes(row[1]))
+        assert document.pop("schema_ref")
+        legacy_payload = canonical_json_bytes(document)
+        connection.execute("DROP TRIGGER event_identity_outbox_no_update")
+        connection.execute(
+            "UPDATE event_identity_outbox SET payload_json = ? WHERE outbox_id = ?",
+            (sqlite3.Binary(legacy_payload), row[0]),
+        )
+        connection.execute(trigger_sql)
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = SQLiteEventIdentityRegistryRepository(database_path)
+    assert reopened.list_outbox(context.recording_identity) == result.outbox
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        stored = json.loads(
+            bytes(
+                connection.execute("SELECT payload_json FROM event_identity_outbox").fetchone()[0]
+            )
+        )
+    finally:
+        connection.close()
+    assert version == 2
+    assert set(stored["schema_ref"]) == {"schema_id", "version", "artifact_id", "sha256"}
+
+
+def test_write_side_schema_registry_failure_maps_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SQLiteEventIdentityRegistryRepository(_database(tmp_path))
+
+    def reject_exact_wire(*_args: object, **_kwargs: object) -> None:
+        raise SchemaRegistryError("injected exact-schema failure")
+
+    monkeypatch.setattr(
+        sqlite_registry_module,
+        "validate_registered_event_identity_outbox_wire_record",
+        reject_exact_wire,
+    )
+    with pytest.raises(
+        SQLiteEventIdentityRegistryError,
+        match="before persistence",
+    ):
+        _assign_one(repository, fingerprint="write-schema-failure-fixture")
+
+    snapshot = repository.snapshot(_context().recording_identity)
+    assert snapshot.generation == 0
+    assert snapshot.identities == ()
+    assert snapshot.assignments == ()
 
 
 def test_existing_repository_rejects_external_wal_mode_downgrade(tmp_path: Path) -> None:
@@ -651,6 +724,38 @@ def test_reopen_rejects_orphaned_current_revision_projection(tmp_path: Path) -> 
         connection.close()
 
     with pytest.raises(SQLiteEventIdentityRegistryError, match="foreign-key"):
+        SQLiteEventIdentityRegistryRepository(database_path)
+
+
+def test_reopen_rejects_outbox_with_forged_exact_schema_pin(tmp_path: Path) -> None:
+    database_path = _database(tmp_path)
+    repository = SQLiteEventIdentityRegistryRepository(database_path)
+    _assign_one(repository, fingerprint="outbox-schema-pin-fixture")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'event_identity_outbox_no_update'"
+        ).fetchone()[0]
+        payload = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT payload_json FROM event_identity_outbox LIMIT 1"
+                ).fetchone()[0]
+            )
+        )
+        payload["schema_ref"]["sha256"] = "0" * 64
+        connection.execute("DROP TRIGGER event_identity_outbox_no_update")
+        connection.execute(
+            "UPDATE event_identity_outbox SET payload_json = ?",
+            (sqlite3.Binary(canonical_json_bytes(payload)),),
+        )
+        connection.execute(trigger_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(SQLiteEventIdentityRegistryError, match="exact schema validation"):
         SQLiteEventIdentityRegistryRepository(database_path)
 
 

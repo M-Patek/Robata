@@ -1,0 +1,165 @@
+{
+  "suite_id": "robata-rational-grid-canonicalization",
+  "suite_version": "1.0.0",
+  "authority": "ARCHITECTURE_DESIGN_V1.md#253-exact-rational-sampling-grid",
+  "canonicalization": "RFC8785",
+  "integer_encoding": "canonical-base10-string",
+  "vectors": [
+    {
+      "case_id": "half-even-ties",
+      "operation": "ROUND_HALF_EVEN",
+      "input": {
+        "fractions": [
+          {"numerator": "-5", "denominator": "2"},
+          {"numerator": "-3", "denominator": "2"},
+          {"numerator": "-1", "denominator": "2"},
+          {"numerator": "1", "denominator": "2"},
+          {"numerator": "3", "denominator": "2"},
+          {"numerator": "5", "denominator": "2"}
+        ]
+      },
+      "expected": {
+        "canonical_input_bytes_hex": "7b226672616374696f6e73223a5b7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a222d35227d2c7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a222d33227d2c7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a222d31227d2c7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a2231227d2c7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a2233227d2c7b2264656e6f6d696e61746f72223a2232222c226e756d657261746f72223a2235227d5d7d",
+        "canonical_input_sha256": "4fb6ad06980c55c24926304485fb76790ff8df0d70170b37f906ee42a342a542",
+        "outcome": {
+          "rounding_results": ["-2", "-2", "0", "0", "2", "2"]
+        }
+      }
+    },
+    {
+      "case_id": "negative-k-and-rounded-target-dedupe",
+      "operation": "GRID_SELECTION",
+      "input": {
+        "selection_tolerance_ns": "0",
+        "interval": {"end_ns": "3", "start_ns": "-2"},
+        "frames": [],
+        "grid": {
+          "rate_den": "1",
+          "grid_origin_ns": "0",
+          "rate_num": "2000000000"
+        }
+      },
+      "expected": {
+        "canonical_input_bytes_hex": "7b226672616d6573223a5b5d2c2267726964223a7b22677269645f6f726967696e5f6e73223a2230222c22726174655f64656e223a2231222c22726174655f6e756d223a2232303030303030303030227d2c22696e74657276616c223a7b22656e645f6e73223a2233222c2273746172745f6e73223a222d32227d2c2273656c656374696f6e5f746f6c6572616e63655f6e73223a2230227d",
+        "canonical_input_sha256": "49ac353f11c8d7e6049b2f108251bcf4e40027d5273a48ba1f6877a9e3467962",
+        "outcome": {
+          "period": {"period_num_ns": "1", "period_den": "2"},
+          "targets": [
+            {"k": "-5", "target_ns": "-2"},
+            {"k": "-2", "target_ns": "-1"},
+            {"k": "-1", "target_ns": "0"},
+            {"k": "2", "target_ns": "1"},
+            {"k": "3", "target_ns": "2"}
+          ],
+          "selections": [
+            {"k": "-5", "target_ns": "-2", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null},
+            {"k": "-2", "target_ns": "-1", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null},
+            {"k": "-1", "target_ns": "0", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null},
+            {"k": "2", "target_ns": "1", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null},
+            {"k": "3", "target_ns": "2", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null}
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "clipping-preserves-grid-phase",
+      "operation": "GRID_SELECTION",
+      "input": {
+        "frames": [
+          {"source_locator_hex": "01", "source_timestamp_ns": "600000010", "decodable": true, "aligned_timestamp_ns": "600000000"},
+          {"source_locator_hex": "02", "source_timestamp_ns": "1100000010", "decodable": true, "aligned_timestamp_ns": "1100000000"}
+        ],
+        "grid": {"rate_num": "2", "grid_origin_ns": "100000000", "rate_den": "1"},
+        "selection_tolerance_ns": "0",
+        "interval": {"start_ns": "300000000", "end_ns": "1400000000"}
+      },
+      "expected": {
+        "canonical_input_bytes_hex": "7b226672616d6573223a5b7b22616c69676e65645f74696d657374616d705f6e73223a22363030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223031222c22736f757263655f74696d657374616d705f6e73223a22363030303030303130227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2231313030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223032222c22736f757263655f74696d657374616d705f6e73223a2231313030303030303130227d5d2c2267726964223a7b22677269645f6f726967696e5f6e73223a22313030303030303030222c22726174655f64656e223a2231222c22726174655f6e756d223a2232227d2c22696e74657276616c223a7b22656e645f6e73223a2231343030303030303030222c2273746172745f6e73223a22333030303030303030227d2c2273656c656374696f6e5f746f6c6572616e63655f6e73223a2230227d",
+        "canonical_input_sha256": "6f5f528b9f2855259f81a4c425fc45d039719801465c1c969b8784d852393a25",
+        "outcome": {
+          "period": {"period_num_ns": "500000000", "period_den": "1"},
+          "targets": [
+            {"k": "1", "target_ns": "600000000"},
+            {"k": "2", "target_ns": "1100000000"}
+          ],
+          "selections": [
+            {"k": "1", "target_ns": "600000000", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "600000000", "source_timestamp_ns": "600000010", "source_locator_hex": "01", "decodable": true}, "delta_to_target_ns": "0"},
+            {"k": "2", "target_ns": "1100000000", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "1100000000", "source_timestamp_ns": "1100000010", "source_locator_hex": "02", "decodable": true}, "delta_to_target_ns": "0"}
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "tolerance-and-nearest-frame-tie-break",
+      "operation": "GRID_SELECTION",
+      "input": {
+        "interval": {"end_ns": "6000000000", "start_ns": "0"},
+        "selection_tolerance_ns": "100",
+        "grid": {"grid_origin_ns": "0", "rate_den": "1", "rate_num": "1"},
+        "frames": [
+          {"decodable": true, "aligned_timestamp_ns": "100", "source_locator_hex": "10", "source_timestamp_ns": "1000"},
+          {"decodable": true, "aligned_timestamp_ns": "1000000100", "source_locator_hex": "12", "source_timestamp_ns": "1050"},
+          {"decodable": true, "aligned_timestamp_ns": "999999900", "source_locator_hex": "11", "source_timestamp_ns": "1100"},
+          {"decodable": true, "aligned_timestamp_ns": "2000000000", "source_locator_hex": "22", "source_timestamp_ns": "2200"},
+          {"decodable": true, "aligned_timestamp_ns": "2000000000", "source_locator_hex": "21", "source_timestamp_ns": "2100"},
+          {"decodable": true, "aligned_timestamp_ns": "3000000000", "source_locator_hex": "32", "source_timestamp_ns": "3100"},
+          {"decodable": true, "aligned_timestamp_ns": "3000000000", "source_locator_hex": "31", "source_timestamp_ns": "3100"},
+          {"decodable": false, "aligned_timestamp_ns": "4000000000", "source_locator_hex": "40", "source_timestamp_ns": "4100"},
+          {"decodable": true, "aligned_timestamp_ns": "5000000101", "source_locator_hex": "50", "source_timestamp_ns": "5100"}
+        ]
+      },
+      "expected": {
+        "canonical_input_bytes_hex": "7b226672616d6573223a5b7b22616c69676e65645f74696d657374616d705f6e73223a22313030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223130222c22736f757263655f74696d657374616d705f6e73223a2231303030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2231303030303030313030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223132222c22736f757263655f74696d657374616d705f6e73223a2231303530227d2c7b22616c69676e65645f74696d657374616d705f6e73223a22393939393939393030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223131222c22736f757263655f74696d657374616d705f6e73223a2231313030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2232303030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223232222c22736f757263655f74696d657374616d705f6e73223a2232323030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2232303030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223231222c22736f757263655f74696d657374616d705f6e73223a2232313030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2233303030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223332222c22736f757263655f74696d657374616d705f6e73223a2233313030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2233303030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223331222c22736f757263655f74696d657374616d705f6e73223a2233313030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2234303030303030303030222c226465636f6461626c65223a66616c73652c22736f757263655f6c6f6361746f725f686578223a223430222c22736f757263655f74696d657374616d705f6e73223a2234313030227d2c7b22616c69676e65645f74696d657374616d705f6e73223a2235303030303030313031222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a223530222c22736f757263655f74696d657374616d705f6e73223a2235313030227d5d2c2267726964223a7b22677269645f6f726967696e5f6e73223a2230222c22726174655f64656e223a2231222c22726174655f6e756d223a2231227d2c22696e74657276616c223a7b22656e645f6e73223a2236303030303030303030222c2273746172745f6e73223a2230227d2c2273656c656374696f6e5f746f6c6572616e63655f6e73223a22313030227d",
+        "canonical_input_sha256": "83cff00d63238d21438adf11e5c844a112fb17fbc6bed20f056fd7d918680768",
+        "outcome": {
+          "period": {"period_num_ns": "1000000000", "period_den": "1"},
+          "targets": [
+            {"k": "0", "target_ns": "0"},
+            {"k": "1", "target_ns": "1000000000"},
+            {"k": "2", "target_ns": "2000000000"},
+            {"k": "3", "target_ns": "3000000000"},
+            {"k": "4", "target_ns": "4000000000"},
+            {"k": "5", "target_ns": "5000000000"}
+          ],
+          "selections": [
+            {"k": "0", "target_ns": "0", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "100", "source_timestamp_ns": "1000", "source_locator_hex": "10", "decodable": true}, "delta_to_target_ns": "100"},
+            {"k": "1", "target_ns": "1000000000", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "999999900", "source_timestamp_ns": "1100", "source_locator_hex": "11", "decodable": true}, "delta_to_target_ns": "-100"},
+            {"k": "2", "target_ns": "2000000000", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "2000000000", "source_timestamp_ns": "2100", "source_locator_hex": "21", "decodable": true}, "delta_to_target_ns": "0"},
+            {"k": "3", "target_ns": "3000000000", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "3000000000", "source_timestamp_ns": "3100", "source_locator_hex": "31", "decodable": true}, "delta_to_target_ns": "0"},
+            {"k": "4", "target_ns": "4000000000", "status": "DECODE_FAILED", "frame": {"aligned_timestamp_ns": "4000000000", "source_timestamp_ns": "4100", "source_locator_hex": "40", "decodable": false}, "delta_to_target_ns": "0"},
+            {"k": "5", "target_ns": "5000000000", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null}
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "one-source-frame-dedupe",
+      "operation": "GRID_SELECTION",
+      "input": {
+        "grid": {"rate_den": "1", "rate_num": "1", "grid_origin_ns": "0"},
+        "frames": [
+          {"aligned_timestamp_ns": "500000000", "source_timestamp_ns": "700000000", "source_locator_hex": "aa", "decodable": true}
+        ],
+        "interval": {"start_ns": "0", "end_ns": "3000000000"},
+        "selection_tolerance_ns": "500000000"
+      },
+      "expected": {
+        "canonical_input_bytes_hex": "7b226672616d6573223a5b7b22616c69676e65645f74696d657374616d705f6e73223a22353030303030303030222c226465636f6461626c65223a747275652c22736f757263655f6c6f6361746f725f686578223a226161222c22736f757263655f74696d657374616d705f6e73223a22373030303030303030227d5d2c2267726964223a7b22677269645f6f726967696e5f6e73223a2230222c22726174655f64656e223a2231222c22726174655f6e756d223a2231227d2c22696e74657276616c223a7b22656e645f6e73223a2233303030303030303030222c2273746172745f6e73223a2230227d2c2273656c656374696f6e5f746f6c6572616e63655f6e73223a22353030303030303030227d",
+        "canonical_input_sha256": "e57667db2996176327755cea1eaff0cced228af06283637f5120bde16e023bde",
+        "outcome": {
+          "period": {"period_num_ns": "1000000000", "period_den": "1"},
+          "targets": [
+            {"k": "0", "target_ns": "0"},
+            {"k": "1", "target_ns": "1000000000"},
+            {"k": "2", "target_ns": "2000000000"}
+          ],
+          "selections": [
+            {"k": "0", "target_ns": "0", "status": "SELECTED", "frame": {"aligned_timestamp_ns": "500000000", "source_timestamp_ns": "700000000", "source_locator_hex": "aa", "decodable": true}, "delta_to_target_ns": "500000000"},
+            {"k": "1", "target_ns": "1000000000", "status": "DEDUPLICATED_FRAME", "frame": {"aligned_timestamp_ns": "500000000", "source_timestamp_ns": "700000000", "source_locator_hex": "aa", "decodable": true}, "delta_to_target_ns": "-500000000"},
+            {"k": "2", "target_ns": "2000000000", "status": "NO_FRAME_WITHIN_TOLERANCE", "frame": null, "delta_to_target_ns": null}
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -31,6 +31,7 @@ from robata.contracts.common import (
 )
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid
+from robata.contracts.schema_registry import SchemaRef, SchemaRegistry, default_schema_registry
 from robata.event_pipeline.boundary_refinement import (
     BoundaryRefinementOutcome,
     BoundaryRefinementResult,
@@ -57,6 +58,8 @@ CANONICAL_FINAL_FUSION_CONTEXT_METADATA_KEY: Final = "canonical_final_fusion_con
 CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION: Final = (
     "canonical-final-fusion-context-semantic-v1"
 )
+CANONICAL_OUTPUT_DECISION_SCHEMA_ID: Final = "https://schemas.robata.dev/canonical-output-decision"
+CANONICAL_OUTPUT_DECISION_SCHEMA_VERSION: Final = "2.0.0"
 
 
 class CanonicalFinalFusionActionInput(StrictModel):
@@ -268,7 +271,7 @@ def validate_final_fusion_reduction(
 
 
 class CanonicalOutputAdmissionDecision(StrictModel):
-    """Local output-level decision; it is not a registered durable schema yet."""
+    """Local output-level decision governed by an out-of-band exact schema pin."""
 
     schema_version: Literal["2.0"]
     decision_id: OpaqueUuid
@@ -343,6 +346,36 @@ class CanonicalOutputAdmissionDecision(StrictModel):
         if len(self.source_enrichments) != 1:
             raise ValueError("multi-part decisions have more than one source enrichment")
         return self.source_enrichments[0]
+
+
+def validate_registered_output_admission_decision(
+    decision: CanonicalOutputAdmissionDecision,
+    schema_ref: SchemaRef,
+    registry: SchemaRegistry | None = None,
+) -> CanonicalOutputAdmissionDecision:
+    """Validate one decision against its exact out-of-band wire-schema pin."""
+
+    if not isinstance(decision, CanonicalOutputAdmissionDecision):
+        raise TypeError("decision must be a CanonicalOutputAdmissionDecision")
+    if not isinstance(schema_ref, SchemaRef):
+        raise TypeError("schema_ref must be a SchemaRef")
+    checked_ref = SchemaRef.model_validate(schema_ref.model_dump(mode="python"), strict=True)
+    if (
+        checked_ref.schema_id != CANONICAL_OUTPUT_DECISION_SCHEMA_ID
+        or checked_ref.version != CANONICAL_OUTPUT_DECISION_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "schema_ref must identify "
+            f"{CANONICAL_OUTPUT_DECISION_SCHEMA_ID}@{CANONICAL_OUTPUT_DECISION_SCHEMA_VERSION}"
+        )
+    active_registry = registry or default_schema_registry()
+    active_registry.resolve_exact(checked_ref)
+    checked = CanonicalOutputAdmissionDecision.model_validate_json(decision.model_dump_json())
+    active_registry.validate_pinned(
+        checked_ref,
+        checked.model_dump(mode="json"),
+    )
+    return checked
 
 
 class FusionEventHypothesisProjector:
@@ -643,10 +676,13 @@ def _contains_interval(outer: NanosecondInterval, inner: object) -> bool:
 __all__ = [
     "CANONICAL_FINAL_FUSION_CONTEXT_METADATA_KEY",
     "CANONICAL_FINAL_FUSION_CONTEXT_PROJECTION_VERSION",
+    "CANONICAL_OUTPUT_DECISION_SCHEMA_ID",
+    "CANONICAL_OUTPUT_DECISION_SCHEMA_VERSION",
     "CanonicalFinalFusionActionInput",
     "CanonicalFinalFusionContext",
     "CanonicalOutputAdmissionDecision",
     "FusionEventHypothesisProjector",
     "canonical_final_fusion_context_projection",
     "validate_final_fusion_reduction",
+    "validate_registered_output_admission_decision",
 ]

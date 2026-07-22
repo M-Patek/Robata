@@ -1,9 +1,7 @@
-"""Distributed queue and concurrency skeleton for the Robata pipeline.
+"""Queue delivery, durable-work, barrier, and publication contracts.
 
-This package provides the core abstractions for work-item lifecycle management,
-stage dispatching, barrier coordination, backpressure control, and transactional
-outbox publication.  Production adapters (e.g. Redis) live in sibling modules;
-the contracts here are intentionally infrastructure-agnostic.
+The durable work ledger is authoritative for scheduling state. Task-queue
+adapters are optional delivery transports and cannot commit ledger outcomes.
 """
 
 from robata.queue.backpressure import (
@@ -31,19 +29,59 @@ from robata.queue.dispatcher import (
 )
 from robata.queue.models import (
     DependencyCriticality,
-    OutboxEvent,
-    OutboxEventStatus,
+    WorkAttempt,
+    WorkAttemptOutcome,
     WorkBarrier,
     WorkBarrierMember,
     WorkDependency,
     WorkItem,
+    WorkItemPlan,
+    WorkItemState,
     WorkItemSubjectType,
+    WorkLease,
+    WorkLeaseClaim,
 )
-from robata.queue.outbox import OutboxPublisher
+from robata.queue.outbox import (
+    IdempotentOutboxSink,
+    OutboxDeliveryClaim,
+    OutboxDeliveryError,
+    OutboxDeliverySnapshot,
+    OutboxDeliveryStatus,
+    OutboxDeliveryStore,
+    OutboxFenceError,
+    OutboxMessage,
+    OutboxRelay,
+    OutboxRetryPolicy,
+)
 from robata.queue.redis_adapter import RedisTaskQueue
 from robata.queue.stage import Stage, StageStatus
+from robata.queue.wire import (
+    PERSISTED_BARRIER_PROJECTION_VERSION,
+    PERSISTED_BARRIER_SCHEMA_ID,
+    PERSISTED_BARRIER_SCHEMA_VERSION,
+    PERSISTED_BARRIER_WIRE_VERSION,
+    WORK_MESSAGE_PROJECTION_VERSION,
+    WORK_MESSAGE_SCHEMA_ID,
+    WORK_MESSAGE_SCHEMA_VERSION,
+    WORK_MESSAGE_WIRE_VERSION,
+    PersistedBarrier,
+    PersistedBarrierMember,
+    PersistedBarrierStatus,
+    WorkMessage,
+    WorkMessageDependency,
+    validate_registered_persisted_barrier,
+    validate_registered_work_message,
+)
 
 __all__ = [
+    "PERSISTED_BARRIER_PROJECTION_VERSION",
+    "PERSISTED_BARRIER_SCHEMA_ID",
+    "PERSISTED_BARRIER_SCHEMA_VERSION",
+    "PERSISTED_BARRIER_WIRE_VERSION",
+    "WORK_MESSAGE_PROJECTION_VERSION",
+    "WORK_MESSAGE_SCHEMA_ID",
+    "WORK_MESSAGE_SCHEMA_VERSION",
+    "WORK_MESSAGE_WIRE_VERSION",
     "AdmissionDecision",
     "AggregateStatus",
     "BackpressureConfig",
@@ -57,10 +95,20 @@ __all__ = [
     "DependencyCriticality",
     "DispatchResult",
     "DispatcherConfig",
+    "IdempotentOutboxSink",
     "InMemoryBarrierStorage",
-    "OutboxEvent",
-    "OutboxEventStatus",
-    "OutboxPublisher",
+    "OutboxDeliveryClaim",
+    "OutboxDeliveryError",
+    "OutboxDeliverySnapshot",
+    "OutboxDeliveryStatus",
+    "OutboxDeliveryStore",
+    "OutboxFenceError",
+    "OutboxMessage",
+    "OutboxRelay",
+    "OutboxRetryPolicy",
+    "PersistedBarrier",
+    "PersistedBarrierMember",
+    "PersistedBarrierStatus",
     "QueueMetrics",
     "RedisTaskQueue",
     "ReductionPolicy",
@@ -68,9 +116,19 @@ __all__ = [
     "Stage",
     "StageDispatcher",
     "StageStatus",
+    "WorkAttempt",
+    "WorkAttemptOutcome",
     "WorkBarrier",
     "WorkBarrierMember",
     "WorkDependency",
     "WorkItem",
+    "WorkItemPlan",
+    "WorkItemState",
     "WorkItemSubjectType",
+    "WorkLease",
+    "WorkLeaseClaim",
+    "WorkMessage",
+    "WorkMessageDependency",
+    "validate_registered_persisted_barrier",
+    "validate_registered_work_message",
 ]

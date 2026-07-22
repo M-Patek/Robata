@@ -1,7 +1,7 @@
 # ADR 0003: Artifact Registry and Schema Evolution
 
-- Status: Accepted and implemented for the local V2 schema/registry/export slice and
-  synthetic upcaster conformance fixture
+- Status: Accepted and implemented for the local V2 schema/registry/export slice,
+  synthetic upcaster conformance fixture, and atomic evolution-bundle publisher
 - Date: 2026-07-18
 - Governing authority: Architecture V1.1 Sections 5.3, 8.2, 16.2, 20.2,
   25.4, 25.7, and 25.10; ADR 0002
@@ -45,6 +45,13 @@ cannot contain its own exact-byte digest without creating a circular preimage.
    The live project catalog currently registers no domain upcaster. A separate checked-in
    synthetic catalog and fixture exercise the mechanism without claiming a migration for
    production schemas.
+6. Repository publication uses two locked commands. The single-schema command publishes only a
+   new `compatibility_mode=NONE` entry. The evolution command publishes one previously unknown
+   `BACKWARD` target and one or more direct incoming upcasters together with their exact
+   code/runtime/golden artifacts. It validates the complete temporary registry and constructs the
+   upcaster graph, including golden execution, before replacing the catalog as the commit point.
+   A digest-bound multi-artifact marker makes an interrupted pre-commit bundle recoverable. Neither
+   command may rewrite a published schema or upcaster entry.
 
 ### Artifact records and identity
 
@@ -123,6 +130,9 @@ failure. Cleanup errors do not replace the primary failure.
   provenance, and fail-closed graph conflicts. It is mechanism evidence only: the live
   catalog remains closed with no registered domain upcaster, and no stored production
   artifact is migrated by this fixture.
+- The atomic evolution publisher makes a future governed upcaster bundle executable as one
+  repository transaction. It does not define a business transformation, approve a predecessor,
+  or add an edge to the live catalog; `upcasters=[]` remains the current published fact.
 - At this work item's completion, Phase 1A still required the separate
   logical-node/run-membership and immutable revision/current-selection primitives. ADR
   0004 subsequently implements the former, and ADR 0005 subsequently implements the
@@ -133,8 +143,11 @@ failure. Cleanup errors do not replace the primary failure.
 
 - `src/robata/contracts/schema_registry.py`
 - `src/robata/contracts/schema_upcasting.py`
+- `scripts/register_schema.py`
+- `scripts/register_schema_evolution.py`
 - `tests/fixtures/schema_upcasting/`
 - `tests/contract/test_schema_upcasting.py`
+- `tests/unit/test_register_schema_evolution.py`
 
 The exact schema-catalog closure, 20-entry derivation snapshot, registry database
 accounting, two registry-backed 13-file views, real-media replay timings, and automated

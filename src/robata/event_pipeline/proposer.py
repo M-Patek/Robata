@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import model_validator
 
@@ -24,7 +24,7 @@ from robata.inference.enrichment import (
     EnrichedProviderClaim,
     OrchestratorEnrichedOutput,
 )
-from robata.inference.input_plan import InferenceInputPlan
+from robata.inference.input_plan import InferenceCallPart, InferenceInputPlan, RenderedProviderItem
 from robata.inference.models import VisionTask
 
 
@@ -75,7 +75,7 @@ class NormalizedEventProposal(StrictModel):
     model_reported_score: float | None
     camera_coverage: SixCameraMap[ProposalCameraClaim]
     evidence: tuple[EnrichedEvidenceReference, ...]
-    production_eligible: bool = False
+    production_eligible: Literal[False] = False
 
 
 class EventProposalResult(StrictModel):
@@ -85,7 +85,7 @@ class EventProposalResult(StrictModel):
     proposals: tuple[NormalizedEventProposal, ...]
     semantic_sha256: Sha256Digest
     logical_key: NodeLogicalKey
-    production_eligible: bool = False
+    production_eligible: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -135,21 +135,25 @@ class EventProposalProjector:
             raise EventProposalError("projector requires EVENT_PROPOSAL input plan")
         if input_plan.request_catalog.task is not VisionTask.EVENT_PROPOSAL:
             raise EventProposalError("request catalog task is not EVENT_PROPOSAL")
-        package_ids = tuple(member.package_id for member in package_set.members)
-        if tuple(item.package_id for item in input_plan.subject.packages) != package_ids:
-            raise EventProposalError("proposal input plan does not bind package-set members")
-        if not enriched_outputs:
-            raise EventProposalError("proposal projection requires enriched outputs")
-        if any(output.task is not VisionTask.EVENT_PROPOSAL for output in enriched_outputs):
-            raise EventProposalError("proposal enrichment task mismatch")
-        if any(
-            output.input_plan_semantic_sha256 != input_plan.semantic_sha256
-            or output.request_catalog_sha256 != input_plan.request_catalog.semantic_sha256
-            for output in enriched_outputs
-        ):
-            raise EventProposalError("proposal enrichment is foreign to the input plan")
-        if any(output.abstained for output in enriched_outputs):
-            raise EventProposalError("EVENT_PROPOSAL outputs cannot abstain")
+        parts = input_plan.call_plan.parts
+        if len(enriched_outputs) != len(parts):
+            raise EventProposalError(
+                "EVENT_PROPOSAL projection requires one enriched output per call part"
+            )
+        _validate_plan_binding(input_plan=input_plan, package_set=package_set)
+        seen_artifacts: set[str] = set()
+        for part, output in zip(parts, enriched_outputs, strict=True):
+            _validate_output_binding(
+                input_plan=input_plan,
+                package_set=package_set,
+                part=part,
+                output=output,
+            )
+            if output.artifact_id in seen_artifacts:
+                raise EventProposalError(
+                    f"duplicate EVENT_PROPOSAL enriched output artifact: {output.artifact_id}"
+                )
+            seen_artifacts.add(output.artifact_id)
         proposals = tuple(
             sorted(
                 (
@@ -201,10 +205,16 @@ class EventProposalProjector:
         )
         if interval.start_ns < package_set.start_ns or interval.end_ns > package_set.end_ns:
             raise EventProposalError("proposal interval is outside package-set bounds")
-        valid_ids = {member.package_id for member in package_set.members}
+        members_by_id = {member.package_id: member for member in package_set.members}
         package_ids = tuple(sorted({item.package_id for item in claim.evidence}))
-        if not set(package_ids) <= valid_ids:
+        if not set(package_ids) <= set(members_by_id):
             raise EventProposalError("proposal evidence cites a package outside the package set")
+        for evidence in claim.evidence:
+            member = members_by_id[evidence.package_id]
+            if evidence.package_semantic_content_sha256 != member.package_semantic_content_sha256:
+                raise EventProposalError(
+                    "proposal evidence package semantic lineage is inconsistent"
+                )
         coverage = {
             camera_id: ProposalCameraClaim(
                 camera_id=camera_id,
@@ -277,6 +287,122 @@ class EventProposalProjector:
                 )
             ),
         )
+
+
+def _validate_plan_binding(
+    *,
+    input_plan: InferenceInputPlan,
+    package_set: TemporalPackageSet,
+) -> None:
+    members = package_set.members
+    subject = input_plan.subject.packages
+    catalog = input_plan.request_catalog.packages
+    expected = tuple(
+        (
+            member.package_id,
+            member.ordinal,
+            member.package_semantic_content_sha256,
+            member.package_manifest_sha256,
+        )
+        for member in members
+    )
+    actual_subject = tuple(
+        (
+            item.package_id,
+            item.ordinal,
+            item.semantic_content_sha256,
+            item.manifest_bytes_sha256,
+        )
+        for item in subject
+    )
+    actual_catalog = tuple(
+        (
+            item.package_id,
+            item.ordinal,
+            item.semantic_content_sha256,
+            item.manifest_bytes_sha256,
+        )
+        for item in catalog
+    )
+    if actual_subject != expected or actual_catalog != expected:
+        raise EventProposalError(
+            "EVENT_PROPOSAL input plan does not bind the exact package-set members"
+        )
+    if input_plan.subject.request_catalog_sha256 != input_plan.request_catalog.semantic_sha256:
+        raise EventProposalError("EVENT_PROPOSAL subject catalog digest is inconsistent")
+    for item in input_plan.rendered_items:
+        if item.package_ordinal >= len(members):
+            raise EventProposalError("EVENT_PROPOSAL rendered item package ordinal is outside set")
+        member = members[item.package_ordinal]
+        if item.package_id != member.package_id:
+            raise EventProposalError("EVENT_PROPOSAL rendered item package ID is foreign")
+        if not member.start_ns <= item.aligned_timestamp_ns < member.end_ns:
+            raise EventProposalError("EVENT_PROPOSAL rendered timestamp is outside its package")
+
+
+def _validate_output_binding(
+    *,
+    input_plan: InferenceInputPlan,
+    package_set: TemporalPackageSet,
+    part: InferenceCallPart,
+    output: OrchestratorEnrichedOutput,
+) -> None:
+    if not isinstance(output, OrchestratorEnrichedOutput):
+        raise EventProposalError("EVENT_PROPOSAL outputs must be enriched output artifacts")
+    if (
+        output.task is not VisionTask.EVENT_PROPOSAL
+        or output.abstained
+        or output.input_plan_id != input_plan.input_plan_id
+        or output.input_plan_semantic_sha256 != input_plan.semantic_sha256
+        or output.request_catalog_id != input_plan.request_catalog.request_catalog_id
+        or output.request_catalog_sha256 != input_plan.request_catalog.semantic_sha256
+    ):
+        raise EventProposalError("EVENT_PROPOSAL enrichment is foreign to the input plan")
+    if (
+        output.provider_claim_schema.sha256
+        != input_plan.prompt_output.provider_response_schema_sha256
+        or output.enriched_output_schema.sha256
+        != input_plan.prompt_output.enriched_domain_schema_sha256
+    ):
+        raise EventProposalError("EVENT_PROPOSAL enrichment schemas are not bound by input plan")
+    if (
+        output.authority.mcap_id != package_set.mcap_id
+        or output.authority.camera_mapping_run_id != package_set.camera_mapping_run_id
+        or output.authority.alignment_id != package_set.alignment_id
+        or output.authority.prompt_version != input_plan.prompt_output.prompt_version
+        or output.authority.prompt_sha256 != input_plan.prompt_output.prompt_sha256
+    ):
+        raise EventProposalError("EVENT_PROPOSAL enrichment authority is foreign")
+    visible_items = {
+        item.provider_item_ordinal: item
+        for item in input_plan.rendered_items[
+            part.start_item_ordinal : part.end_item_ordinal_exclusive
+        ]
+    }
+    for claim in output.claims:
+        for evidence in claim.evidence:
+            rendered = visible_items.get(evidence.provider_item_ordinal)
+            if rendered is None or not _evidence_matches_rendered(evidence, rendered):
+                raise EventProposalError(
+                    "EVENT_PROPOSAL claim evidence is outside its selected call part"
+                )
+
+
+def _evidence_matches_rendered(
+    evidence: EnrichedEvidenceReference,
+    rendered: RenderedProviderItem,
+) -> bool:
+    return (
+        rendered.package_id == evidence.package_id
+        and rendered.package_ordinal == evidence.package_ordinal
+        and rendered.camera_id is evidence.camera_id
+        and rendered.camera_ordinal == evidence.camera_ordinal
+        and rendered.frame_id == evidence.frame_id
+        and rendered.frame_ordinal == evidence.frame_ordinal
+        and rendered.aligned_timestamp_ns == evidence.aligned_timestamp_ns
+        and rendered.source_timestamp_ns == evidence.source_timestamp_ns
+        and rendered.source_artifact_sha256 == evidence.source_artifact_sha256
+    )
 
 
 class EventProposer:

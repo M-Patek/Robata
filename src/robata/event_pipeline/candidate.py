@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Final, Self
+from typing import Final, Literal, Self
 from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import model_validator
@@ -50,6 +50,7 @@ class CandidateReductionPolicy(StrictModel):
     max_candidates: int = 128
     ontology_version: SchemaVersion = "fixture-action-ontology-v1"
 
+    @model_validator(mode="after")
     def validate_policy(self) -> CandidateReductionPolicy:
         if (
             self.merge_gap_ns < 0
@@ -80,7 +81,7 @@ class CanonicalCandidateEvent(StrictModel):
     generation: int = 0
     parent_candidate_logical_key: NodeLogicalKey | None = None
     camera_coverage: SixCameraMap[ProposalCameraClaim]
-    production_eligible: bool = False
+    production_eligible: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -106,7 +107,7 @@ class CandidateReductionResult(StrictModel):
     candidates: tuple[CanonicalCandidateEvent, ...]
     semantic_sha256: Sha256Digest
     logical_key: NodeLogicalKey
-    production_eligible: bool = False
+    production_eligible: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -207,7 +208,9 @@ class CandidateReducer:
     """Merge deterministic proposals without run or attempt identity."""
 
     def __init__(self, policy: CandidateReductionPolicy) -> None:
-        self._policy = policy.validate_policy()
+        if not isinstance(policy, CandidateReductionPolicy):
+            raise TypeError("policy must be a CandidateReductionPolicy")
+        self._policy = policy
 
     @property
     def policy(self) -> CandidateReductionPolicy:

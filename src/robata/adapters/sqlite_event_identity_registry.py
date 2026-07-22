@@ -20,23 +20,32 @@ from typing import Final
 from pydantic import BaseModel, ValidationError
 
 from robata.contracts.hashing import CanonicalizationError, canonical_json_bytes
+from robata.contracts.schema_registry import (
+    SchemaRegistry,
+    SchemaRegistryError,
+    default_schema_registry,
+)
 from robata.event_pipeline.identity_registry import (
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID,
+    EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION,
     CrossRecordingEventIdentityError,
     EventCurrentRevisionReference,
     EventIdentityAssignment,
     EventIdentityConflictError,
     EventIdentityInputError,
     EventIdentityOutboxRecord,
+    EventIdentityOutboxWireRecord,
     EventIdentityRegistryError,
     EventIdentityRegistryMutation,
     EventIdentityRelation,
     EventRegistrySnapshot,
     StableEventIdentity,
     StaleEventRegistryFenceError,
+    validate_registered_event_identity_outbox_wire_record,
 )
 
 _RECORDING_IDENTITY_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
-_SCHEMA_VERSION: Final = 1
+_SCHEMA_VERSION: Final = 2
 _APPLICATION_ID: Final = 0x52454952  # "REIR": Robata event identity registry.
 _BUSY_TIMEOUT_MS: Final = 30_000
 
@@ -226,7 +235,7 @@ BEGIN
 END;
 
 PRAGMA application_id = 1380272466;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 """
 
 
@@ -325,7 +334,12 @@ class SQLiteEventIdentityRegistryRepository:
     advances current-revision selection state.
     """
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        registry: SchemaRegistry | None = None,
+    ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be a pathlib.Path")
         try:
@@ -349,6 +363,16 @@ class SQLiteEventIdentityRegistryRepository:
         except OSError as exc:
             raise SQLiteEventIdentityRegistryError(
                 f"cannot prepare event identity database path {database_path}: {exc}"
+            ) from exc
+        try:
+            self._registry = registry or default_schema_registry()
+            self._outbox_schema_ref = self._registry.resolve_version(
+                EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID,
+                EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION,
+            ).ref
+        except SchemaRegistryError as exc:
+            raise SQLiteEventIdentityRegistryError(
+                "cannot resolve the exact event identity outbox schema"
             ) from exc
         self._initialize_database()
 
@@ -535,6 +559,54 @@ class SQLiteEventIdentityRegistryRepository:
         finally:
             connection.close()
 
+    def _migrate_v1_outbox_payloads(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT outbox_id, payload_json FROM event_identity_outbox ORDER BY outbox_id"
+        ).fetchall()
+        if not rows:
+            return
+        trigger_row = connection.execute(
+            "SELECT sql FROM sqlite_schema "
+            "WHERE type = 'trigger' AND name = 'event_identity_outbox_no_update'"
+        ).fetchone()
+        if trigger_row is None:
+            raise SQLiteEventIdentityRegistryError(
+                "v1 event identity outbox update trigger is missing"
+            )
+        trigger_sql = _row_text(trigger_row, "sql")
+        connection.execute("DROP TRIGGER event_identity_outbox_no_update")
+        for row in rows:
+            record = _model_from_blob(
+                EventIdentityOutboxRecord,
+                _row_bytes(row, "payload_json"),
+                "v1 event identity outbox",
+            )
+            try:
+                wire = EventIdentityOutboxWireRecord.from_record(
+                    record,
+                    schema_ref=self._outbox_schema_ref,
+                )
+                checked = validate_registered_event_identity_outbox_wire_record(
+                    wire,
+                    self._registry,
+                )
+            except (SchemaRegistryError, ValidationError, TypeError, ValueError) as exc:
+                raise SQLiteEventIdentityRegistryError(
+                    "cannot upcast v1 event identity outbox to its exact Wire schema"
+                ) from exc
+            cursor = connection.execute(
+                "UPDATE event_identity_outbox SET payload_json = ? WHERE outbox_id = ?",
+                (
+                    sqlite3.Binary(canonical_json_bytes(checked)),
+                    _row_text(row, "outbox_id"),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise SQLiteEventIdentityRegistryError(
+                    "v1 event identity outbox migration lost its target row"
+                )
+        connection.execute(trigger_sql)
+
     def _initialize_database(self) -> None:
         connection: sqlite3.Connection | None = None
         try:
@@ -556,12 +628,12 @@ class SQLiteEventIdentityRegistryRepository:
                     raise SQLiteEventIdentityRegistryError(
                         "refusing to adopt a nonempty or claimed unversioned SQLite database"
                     )
-            elif preflight_user_version != _SCHEMA_VERSION:
+            elif preflight_user_version not in (1, _SCHEMA_VERSION):
                 raise SQLiteEventIdentityRegistryError(
                     f"unsupported event identity database schema version: {preflight_user_version}"
                 )
             else:
-                self._verify_schema(connection)
+                self._verify_schema(connection, allowed_versions=(1, _SCHEMA_VERSION))
 
             journal_row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
             journal_mode: object = None if journal_row is None else journal_row[0]
@@ -589,13 +661,16 @@ class SQLiteEventIdentityRegistryRepository:
                     )
                 for statement in _SCHEMA_STATEMENTS:
                     connection.execute(statement)
-            elif user_version != _SCHEMA_VERSION:
-                raise SQLiteEventIdentityRegistryError(
-                    f"unsupported event identity database schema version: {user_version}"
-                )
             elif application_id != _APPLICATION_ID:
                 raise SQLiteEventIdentityRegistryError(
                     "event identity database has an unexpected SQLite application identity"
+                )
+            elif user_version == 1:
+                self._migrate_v1_outbox_payloads(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            elif user_version != _SCHEMA_VERSION:
+                raise SQLiteEventIdentityRegistryError(
+                    f"unsupported event identity database schema version: {user_version}"
                 )
 
             self._verify_database(connection)
@@ -661,12 +736,17 @@ class SQLiteEventIdentityRegistryRepository:
             )
         self._verify_database_health(connection)
 
-    def _verify_schema(self, connection: sqlite3.Connection) -> None:
+    def _verify_schema(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        allowed_versions: tuple[int, ...] = (_SCHEMA_VERSION,),
+    ) -> None:
         if _pragma_int(connection, "application_id") != _APPLICATION_ID:
             raise SQLiteEventIdentityRegistryError(
                 "event identity database has an unexpected SQLite application identity"
             )
-        if _pragma_int(connection, "user_version") != _SCHEMA_VERSION:
+        if _pragma_int(connection, "user_version") not in allowed_versions:
             raise SQLiteEventIdentityRegistryError(
                 "event identity database schema version changed unexpectedly"
             )
@@ -1269,6 +1349,21 @@ class SQLiteEventIdentityRegistryRepository:
         connection: sqlite3.Connection,
         outbox: tuple[EventIdentityOutboxRecord, ...],
     ) -> None:
+        try:
+            checked_outbox = tuple(
+                validate_registered_event_identity_outbox_wire_record(
+                    EventIdentityOutboxWireRecord.from_record(
+                        item,
+                        schema_ref=self._outbox_schema_ref,
+                    ),
+                    self._registry,
+                )
+                for item in outbox
+            )
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as exc:
+            raise SQLiteEventIdentityRegistryError(
+                "event identity outbox failed exact schema validation before persistence"
+            ) from exc
         connection.executemany(
             """
             INSERT INTO event_identity_outbox (
@@ -1287,7 +1382,7 @@ class SQLiteEventIdentityRegistryRepository:
                     item.registry_generation,
                     sqlite3.Binary(canonical_json_bytes(item)),
                 )
-                for item in outbox
+                for item in checked_outbox
             ),
         )
 
@@ -1365,23 +1460,29 @@ class SQLiteEventIdentityRegistryRepository:
         return relation
 
     def _outbox_from_row(self, row: sqlite3.Row) -> EventIdentityOutboxRecord:
-        outbox = _model_from_blob(
-            EventIdentityOutboxRecord,
+        wire = _model_from_blob(
+            EventIdentityOutboxWireRecord,
             _row_bytes(row, "payload_json"),
             "event identity outbox",
         )
+        try:
+            wire = validate_registered_event_identity_outbox_wire_record(wire, self._registry)
+        except (SchemaRegistryError, ValidationError, TypeError, ValueError) as exc:
+            raise SQLiteEventIdentityRegistryError(
+                "persisted event identity outbox failed exact schema validation"
+            ) from exc
         expected_columns: tuple[tuple[str, object], ...] = (
-            ("outbox_id", outbox.outbox_id),
-            ("recording_identity", outbox.recording_identity),
-            ("assignment_logical_key", outbox.assignment_logical_key),
+            ("outbox_id", wire.outbox_id),
+            ("recording_identity", wire.recording_identity),
+            ("assignment_logical_key", wire.assignment_logical_key),
         )
         if any(_row_text(row, column) != value for column, value in expected_columns) or (
-            _row_int(row, "registry_generation") != outbox.registry_generation
+            _row_int(row, "registry_generation") != wire.registry_generation
         ):
             raise SQLiteEventIdentityRegistryError(
                 "event identity outbox payload does not match indexed columns"
             )
-        return outbox
+        return wire.to_record()
 
     def _recover_uncertain_commit(
         self,

@@ -16,7 +16,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, Self
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import ConfigDict, Field, StringConstraints, model_validator
 
 from robata.contracts.common import (
     NanosecondInterval,
@@ -26,6 +26,7 @@ from robata.contracts.common import (
 )
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import NodeLogicalKey, OpaqueUuid, Rfc3339Timestamp
+from robata.contracts.schema_registry import SchemaRef, SchemaRegistry, default_schema_registry
 
 if TYPE_CHECKING:
     from robata.admission.context import AdmittedRecordingContextV2
@@ -40,6 +41,16 @@ ADMISSION_PROOF_SEMANTIC_PROJECTION_VERSION: Final = "admission-proof-semantic-v
 OUTPUT_ADMISSION_SEMANTIC_PROJECTION_VERSION: Final = "output-admission-semantic-v2"
 EVENT_HYPOTHESIS_SEMANTIC_PROJECTION_VERSION: Final = "event-hypothesis-semantic-v2"
 EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE: Final = "event-hypothesis-v2"
+OUTPUT_ADMISSION_PROOF_SCHEMA_ID: Final = "https://schemas.robata.dev/output-admission-proof"
+OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION: Final = "2.0.0"
+EVENT_HYPOTHESIS_SCHEMA_ID: Final = "https://schemas.robata.dev/event-hypothesis"
+EVENT_HYPOTHESIS_SCHEMA_VERSION: Final = "2.0.0"
+EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID: Final = (
+    "https://schemas.robata.dev/event-identity-outbox-record"
+)
+EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION: Final = "1.0.0"
+EVENT_IDENTITY_OUTBOX_RECORD_WIRE_VERSION: Final = "1.0"
+EVENT_IDENTITY_OUTBOX_RECORD_PROJECTION_VERSION: Final = "event-identity-outbox-record-v1"
 
 
 class AdmissionEvidenceClass(StrEnum):
@@ -473,6 +484,66 @@ class PlatformEnrichedEventHypothesis(StrictModel):
         )
 
 
+def validate_registered_output_admission_proof(
+    proof: OutputAdmissionProof,
+    schema_ref: SchemaRef,
+    registry: SchemaRegistry | None = None,
+) -> OutputAdmissionProof:
+    """Validate one proof against its exact out-of-band wire-schema pin."""
+
+    if not isinstance(proof, OutputAdmissionProof):
+        raise TypeError("proof must be an OutputAdmissionProof")
+    if not isinstance(schema_ref, SchemaRef):
+        raise TypeError("schema_ref must be a SchemaRef")
+    checked_ref = SchemaRef.model_validate(schema_ref.model_dump(mode="python"), strict=True)
+    if (
+        checked_ref.schema_id != OUTPUT_ADMISSION_PROOF_SCHEMA_ID
+        or checked_ref.version != OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "schema_ref must identify "
+            f"{OUTPUT_ADMISSION_PROOF_SCHEMA_ID}@{OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION}"
+        )
+    active_registry = registry or default_schema_registry()
+    active_registry.resolve_exact(checked_ref)
+    checked = OutputAdmissionProof.model_validate_json(proof.model_dump_json())
+    active_registry.validate_pinned(
+        checked_ref,
+        checked.model_dump(mode="json"),
+    )
+    return checked
+
+
+def validate_registered_event_hypothesis(
+    hypothesis: PlatformEnrichedEventHypothesis,
+    schema_ref: SchemaRef,
+    registry: SchemaRegistry | None = None,
+) -> PlatformEnrichedEventHypothesis:
+    """Validate one hypothesis against its exact out-of-band wire-schema pin."""
+
+    if not isinstance(hypothesis, PlatformEnrichedEventHypothesis):
+        raise TypeError("hypothesis must be a PlatformEnrichedEventHypothesis")
+    if not isinstance(schema_ref, SchemaRef):
+        raise TypeError("schema_ref must be a SchemaRef")
+    checked_ref = SchemaRef.model_validate(schema_ref.model_dump(mode="python"), strict=True)
+    if (
+        checked_ref.schema_id != EVENT_HYPOTHESIS_SCHEMA_ID
+        or checked_ref.version != EVENT_HYPOTHESIS_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "schema_ref must identify "
+            f"{EVENT_HYPOTHESIS_SCHEMA_ID}@{EVENT_HYPOTHESIS_SCHEMA_VERSION}"
+        )
+    active_registry = registry or default_schema_registry()
+    active_registry.resolve_exact(checked_ref)
+    checked = PlatformEnrichedEventHypothesis.model_validate_json(hypothesis.model_dump_json())
+    active_registry.validate_pinned(
+        checked_ref,
+        checked.model_dump(mode="json"),
+    )
+    return checked
+
+
 class EventIdentityCandidate(StrictModel):
     """One deterministic scored candidate from the registered policy."""
 
@@ -697,6 +768,79 @@ class EventIdentityOutboxRecord(StrictModel):
         if self.outbox_id != expected:
             raise ValueError("outbox ID is inconsistent")
         return self
+
+
+class EventIdentityOutboxWireRecord(StrictModel):
+    """Transactional successor publication for one committed assignment."""
+
+    model_config = ConfigDict(title="EventIdentityOutboxRecord")
+
+    schema_version: Literal["1.0"]
+    schema_ref: SchemaRef
+    outbox_id: OpaqueUuid
+    topic: Literal["event.identity.assignment"]
+    recording_identity: Sha256Digest
+    key: Sha256Digest
+    assignment_logical_key: NodeLogicalKey
+    payload_reference: NodeLogicalKey
+    registry_generation: PositiveInt
+
+    @model_validator(mode="after")
+    def validate_wire(self) -> Self:
+        if (
+            self.schema_ref.schema_id != EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID
+            or self.schema_ref.version != EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "schema_ref must identify "
+                f"{EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID}"
+                f"@{EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION}"
+            )
+        self.to_record()
+        return self
+
+    @classmethod
+    def from_record(
+        cls,
+        record: EventIdentityOutboxRecord,
+        *,
+        schema_ref: SchemaRef,
+    ) -> EventIdentityOutboxWireRecord:
+        if not isinstance(record, EventIdentityOutboxRecord):
+            raise TypeError("record must be an EventIdentityOutboxRecord")
+        checked = EventIdentityOutboxRecord.model_validate(
+            record.model_dump(mode="python"), strict=True
+        )
+        return cls(schema_ref=schema_ref, **checked.model_dump(mode="python"))
+
+    def to_record(self) -> EventIdentityOutboxRecord:
+        return EventIdentityOutboxRecord(
+            schema_version=self.schema_version,
+            outbox_id=self.outbox_id,
+            topic=self.topic,
+            recording_identity=self.recording_identity,
+            key=self.key,
+            assignment_logical_key=self.assignment_logical_key,
+            payload_reference=self.payload_reference,
+            registry_generation=self.registry_generation,
+        )
+
+
+def validate_registered_event_identity_outbox_wire_record(
+    record: EventIdentityOutboxWireRecord,
+    registry: SchemaRegistry | None = None,
+) -> EventIdentityOutboxWireRecord:
+    """Strictly validate one outbox record against its exact registered pin."""
+
+    if not isinstance(record, EventIdentityOutboxWireRecord):
+        raise TypeError("record must be an EventIdentityOutboxWireRecord")
+    checked = EventIdentityOutboxWireRecord.model_validate(
+        record.model_dump(mode="python"), strict=True
+    )
+    active_registry = registry or default_schema_registry()
+    active_registry.resolve_exact(checked.schema_ref)
+    active_registry.validate_pinned(checked.schema_ref, checked.model_dump(mode="json"))
+    return checked
 
 
 class EventIdentityRegistryMutation(StrictModel):
@@ -1976,7 +2120,15 @@ def _stable_uuid(namespace: str, *parts: object) -> str:
 __all__ = [
     "ADMISSION_PROOF_SEMANTIC_PROJECTION_VERSION",
     "EVENT_HYPOTHESIS_LOGICAL_KEY_NAMESPACE",
+    "EVENT_HYPOTHESIS_SCHEMA_ID",
+    "EVENT_HYPOTHESIS_SCHEMA_VERSION",
     "EVENT_HYPOTHESIS_SEMANTIC_PROJECTION_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_PROJECTION_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_ID",
+    "EVENT_IDENTITY_OUTBOX_RECORD_SCHEMA_VERSION",
+    "EVENT_IDENTITY_OUTBOX_RECORD_WIRE_VERSION",
+    "OUTPUT_ADMISSION_PROOF_SCHEMA_ID",
+    "OUTPUT_ADMISSION_PROOF_SCHEMA_VERSION",
     "OUTPUT_ADMISSION_SEMANTIC_PROJECTION_VERSION",
     "AdmissionEvidenceClass",
     "AdmissionProof",
@@ -1993,6 +2145,7 @@ __all__ = [
     "EventIdentityConflictError",
     "EventIdentityInputError",
     "EventIdentityOutboxRecord",
+    "EventIdentityOutboxWireRecord",
     "EventIdentityPolicyRef",
     "EventIdentityRegistryError",
     "EventIdentityRegistryMutation",
@@ -2021,4 +2174,7 @@ __all__ = [
     "output_admission_projection",
     "platform_enriched_output_logical_projection",
     "validate_evidence_eligibility",
+    "validate_registered_event_hypothesis",
+    "validate_registered_event_identity_outbox_wire_record",
+    "validate_registered_output_admission_proof",
 ]

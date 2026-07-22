@@ -155,6 +155,7 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "canonical-primary-completion-detail",
         "common",
         "current-selection",
+        "event-identity-outbox-record",
         "immutable-node-revision",
         "inference-attempt-selection",
         "inference-intent",
@@ -164,12 +165,17 @@ def test_registry_checks_unique_2020_12_documents(registry: SchemaRegistry) -> N
         "model-inference",
         "orchestrator-enriched-output",
         "parsed-provider-claim-artifact",
+        "persisted-barrier",
         "primary-completion-record",
         "processing-run-node-membership",
         "provider-claim-payload",
         "raw-provider-response-artifact",
+        "review-annotation",
+        "review-reopen-command",
+        "review-task",
         "selected-attempt-output",
         "selection-decision",
+        "work-message",
     )
     assert len(registry.schema_ids) == len(set(registry.schema_ids))
     assert all(

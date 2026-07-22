@@ -1,0 +1,258 @@
+{
+  "$defs": {
+    "DependencyCriticality": {
+      "description": "How strongly a downstream work item depends on an upstream one.",
+      "enum": [
+        "REQUIRED",
+        "DEGRADABLE",
+        "OPTIONAL"
+      ],
+      "title": "DependencyCriticality",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "Stage": {
+      "description": "Canonical pipeline stage identifiers.\n\nStages are ordered roughly by their position in the processing pipeline,\nfrom ingestion through inference to final publication.",
+      "enum": [
+        "MCAP_INGEST",
+        "INSPECT_MAP",
+        "ALIGN",
+        "QA_COARSE_PLAN",
+        "SAMPLE_MATERIALIZE",
+        "QWEN_QA_COARSE",
+        "QA_SUSPICION_REDUCE",
+        "QA_DENSE_PLAN",
+        "QWEN_QA_DENSE",
+        "QA_AGGREGATE",
+        "EVENT_PROPOSAL_PLAN",
+        "QWEN_EVENT_PROPOSAL",
+        "EVENT_PROPOSAL_REDUCE",
+        "ACTION_DENSE_PLAN",
+        "QWEN_ACTION_EVIDENCE",
+        "FUSION_PROVISIONAL",
+        "BOUNDARY_PLAN",
+        "QWEN_BOUNDARY",
+        "FUSION_FINAL",
+        "ACTION_PUBLISH",
+        "RETRIEVAL_INDEX",
+        "VALUE_SCORE"
+      ],
+      "title": "Stage",
+      "type": "string"
+    },
+    "WorkItemSubjectType": {
+      "description": "Classification of the subject referenced by a work item.",
+      "enum": [
+        "MCAP",
+        "WINDOW",
+        "PACKAGE_SET",
+        "PACKAGE",
+        "SPLIT_REDUCTION",
+        "CANDIDATE",
+        "EVENT",
+        "INFERENCE"
+      ],
+      "title": "WorkItemSubjectType",
+      "type": "string"
+    },
+    "WorkMessageDependency": {
+      "additionalProperties": false,
+      "description": "One dependency edge in the broker delivery projection.",
+      "properties": {
+        "criticality": {
+          "$ref": "#/$defs/DependencyCriticality"
+        },
+        "work_item_id": {
+          "minLength": 1,
+          "title": "Work Item Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "criticality"
+      ],
+      "title": "WorkMessageDependency",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/work-message.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Lease-bound delivery projection of one authoritative work item.",
+  "properties": {
+    "attempt": {
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "cancel_requested": {
+      "title": "Cancel Requested",
+      "type": "boolean"
+    },
+    "config_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Digest",
+      "type": "string"
+    },
+    "dependencies": {
+      "items": {
+        "$ref": "#/$defs/WorkMessageDependency"
+      },
+      "title": "Dependencies",
+      "type": "array"
+    },
+    "execution_expiry_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Execution Expiry At"
+    },
+    "fencing_token": {
+      "minLength": 1,
+      "title": "Fencing Token",
+      "type": "string"
+    },
+    "input_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Digest",
+      "type": "string"
+    },
+    "lease_epoch": {
+      "minimum": 1,
+      "title": "Lease Epoch",
+      "type": "integer"
+    },
+    "mcap_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Mcap Id",
+      "type": "string"
+    },
+    "priority": {
+      "minimum": 0,
+      "title": "Priority",
+      "type": "integer"
+    },
+    "run_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sla_deadline_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Sla Deadline At"
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    },
+    "subject_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Subject Id",
+      "type": "string"
+    },
+    "subject_type": {
+      "$ref": "#/$defs/WorkItemSubjectType"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Trace Id"
+    },
+    "work_item_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Work Item Id",
+      "type": "string"
+    },
+    "work_logical_key": {
+      "minLength": 1,
+      "title": "Work Logical Key",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "work_item_id",
+    "work_logical_key",
+    "run_id",
+    "mcap_id",
+    "stage",
+    "subject_type",
+    "subject_id",
+    "dependencies",
+    "input_digest",
+    "config_digest",
+    "priority",
+    "sla_deadline_at",
+    "execution_expiry_at",
+    "cancel_requested",
+    "lease_epoch",
+    "fencing_token",
+    "attempt",
+    "trace_id"
+  ],
+  "title": "WorkMessage",
+  "type": "object"
+}

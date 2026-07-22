@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from robata.application.canonical_offline import (
     create_primary_completion_command,
     prepare_initial_action_event_publications,
 )
-from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
+from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.contracts.primary_completion import (
     PrimaryCompletionOutcome,
     PrimaryCompletionRecord,
@@ -50,7 +51,6 @@ from tests.integration.test_canonical_offline import (
 
 def _uuid(value: int) -> str:
     return f"00000000-0000-5000-8000-{value:012x}"
-
 
 
 def _prepare_command(
@@ -431,6 +431,117 @@ def test_lost_commit_response_recovers_without_duplicate_outbox(tmp_path: Path) 
     assert len(reopened.list_outbox(harness.context.recording_identity)) == 1
 
 
+def test_primary_outbox_rejects_forged_exact_schema_pin_after_digest_recompute(
+    tmp_path: Path,
+) -> None:
+    _harness_value, repository, command = _run_case(tmp_path, run_value=80_011)
+    committed = repository.commit(command).committed
+    outbox_id = committed.outbox[0].outbox_id
+
+    connection = sqlite3.connect(repository.path)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'primary_outbox_immutable_fields'"
+        ).fetchone()[0]
+        payload = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT payload_json FROM primary_outbox WHERE outbox_id = ?",
+                    (outbox_id,),
+                ).fetchone()[0]
+            )
+        )
+        payload["schema_ref"]["artifact_id"] = _uuid(999_999)
+        encoded = canonical_json_bytes(payload)
+        connection.execute("DROP TRIGGER primary_outbox_immutable_fields")
+        connection.execute(
+            """
+            UPDATE primary_outbox
+            SET payload_json = ?, payload_json_sha256 = ?
+            WHERE outbox_id = ?
+            """,
+            (sqlite3.Binary(encoded), exact_bytes_sha256(encoded), outbox_id),
+        )
+        connection.execute(trigger_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        repository.get(command.detail.run_id)
+    assert caught.value.code is PrimaryCompletionErrorCode.INTEGRITY_ERROR
+    assert "valid exact schema pin" in str(caught.value)
+
+
+def test_primary_outbox_rejects_noncanonical_json_after_digest_recompute(
+    tmp_path: Path,
+) -> None:
+    _harness_value, repository, command = _run_case(tmp_path, run_value=80_013)
+    committed = repository.commit(command).committed
+    outbox_id = committed.outbox[0].outbox_id
+
+    connection = sqlite3.connect(repository.path)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'primary_outbox_immutable_fields'"
+        ).fetchone()[0]
+        payload = bytes(
+            connection.execute(
+                "SELECT payload_json FROM primary_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()[0]
+        )
+        noncanonical = payload + b" "
+        connection.execute("DROP TRIGGER primary_outbox_immutable_fields")
+        connection.execute(
+            """
+            UPDATE primary_outbox
+            SET payload_json = ?, payload_json_sha256 = ?
+            WHERE outbox_id = ?
+            """,
+            (
+                sqlite3.Binary(noncanonical),
+                exact_bytes_sha256(noncanonical),
+                outbox_id,
+            ),
+        )
+        connection.execute(trigger_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        repository.list_outbox(command.detail.recording_identity)
+    assert caught.value.code is PrimaryCompletionErrorCode.INTEGRITY_ERROR
+    assert "canonical JSON" in str(caught.value)
+
+
+def test_primary_repository_rejects_dropped_outbox_trigger(tmp_path: Path) -> None:
+    _harness_value, repository, _command = _run_case(tmp_path, run_value=80_014)
+    connection = sqlite3.connect(repository.path)
+    try:
+        connection.execute("DROP TRIGGER primary_outbox_immutable_fields")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        SQLitePrimaryCompletionRepository(repository.path)
+    assert caught.value.code is PrimaryCompletionErrorCode.INTEGRITY_ERROR
+    assert "DDL" in str(caught.value)
+
+
+def test_primary_repository_maps_post_construction_database_corruption(tmp_path: Path) -> None:
+    repository = SQLitePrimaryCompletionRepository(tmp_path / "corrupted-primary.sqlite3")
+    repository.path.write_bytes(b"not-a-sqlite-database")
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        repository.get(_uuid(80_015))
+
+    assert caught.value.code is PrimaryCompletionErrorCode.INTEGRITY_ERROR
+    assert "open or verify" in str(caught.value)
+
+
 def test_stale_identity_fence_rolls_back_second_run(tmp_path: Path) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
     repository = SQLitePrimaryCompletionRepository(tmp_path / "completion.sqlite3")
@@ -462,6 +573,19 @@ def test_stale_identity_fence_rolls_back_second_run(tmp_path: Path) -> None:
     snapshot = repository.snapshot(harness.context.recording_identity)
     assert snapshot.generation == 1
     assert snapshot.fence == 2
+
+
+def test_forged_completion_schema_pin_maps_to_invalid_command(tmp_path: Path) -> None:
+    _harness_value, repository, command = _run_case(tmp_path, run_value=80_012)
+    forged_ref = command.completion.schema_ref.model_copy(update={"sha256": "0" * 64})
+    forged_completion = command.completion.model_copy(update={"schema_ref": forged_ref})
+    forged_command = command.model_copy(update={"completion": forged_completion})
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        repository.commit(forged_command)
+
+    assert caught.value.code is PrimaryCompletionErrorCode.INVALID_COMMAND
+    assert repository.get(command.detail.run_id) is None
 
 
 def test_repository_revalidates_model_copy_before_any_write(tmp_path: Path) -> None:
