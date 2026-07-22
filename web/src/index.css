@@ -137,3 +137,73 @@
 .react-flow__controls-button:hover svg {
   fill: #1A1714;
 }
+
+/* ── Page transition keyframes ───────────────────────────────────────────── */
+@keyframes group-zoom-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1);    }
+}
+@keyframes group-slide-from-right {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0);    }
+}
+@keyframes group-slide-from-left {
+  from { opacity: 0; transform: translateX(-40px); }
+  to   { opacity: 1; transform: translateX(0);     }
+}
+
+.anim-zoom-in          { animation: group-zoom-in           0.28s cubic-bezier(0.4,0,0.2,1) both; }
+.anim-slide-from-right { animation: group-slide-from-right  0.24s cubic-bezier(0.4,0,0.2,1) both; }
+.anim-slide-from-left  { animation: group-slide-from-left   0.24s cubic-bezier(0.4,0,0.2,1) both; }
+
+/* ── Pipeline chain rail ─────────────────────────────────────────────────── */
+.chain-rail {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 28px;
+  height: 52px;
+  background: #FDFAF5;
+  border-bottom: 1px solid rgba(26,23,20,0.07);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.chain-arrow {
+  width: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #D9CCBA;
+  font-size: 14px;
+}
+
+.chain-node {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 13px;
+  border-radius: 20px;
+  border: 1.5px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  color: #8A7D74;
+  transition: all 0.14s ease;
+  flex-shrink: 0;
+}
+.chain-node:hover { color: #3D3530; background: #F0EBE1; }
+.chain-node.active {
+  font-weight: 600;
+  color: #1A1714;
+}
+
+/* Running dot pulse */
+@keyframes dot-pulse {
+  0%, 100% { transform: scale(1);   opacity: 1;   }
+  50%       { transform: scale(1.5); opacity: 0.6; }
+}
+.dot-running { animation: dot-pulse 1s ease-in-out infinite; }

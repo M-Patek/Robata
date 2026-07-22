@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { RobataRun, NodeStatus, ReviewTask } from '@/types'
+import { Node } from 'reactflow'
 
 interface PipelineStore {
   // Active run
@@ -9,11 +10,17 @@ interface PipelineStore {
 
   // Navigation — which group is expanded (null = overview)
   expandedGroup: string | null
-  setExpandedGroup: (id: string | null) => void
+  // direction: 'forward' = going right, 'back' = going left, 'enter' = first entry
+  expandTransition: 'forward' | 'back' | 'enter' | null
+  setExpandedGroup: (id: string | null, dir?: 'forward' | 'back' | 'enter') => void
 
   // Focused node — shows detail drawer
   focusedNodeId: string | null
   setFocusedNodeId: (id: string | null) => void
+
+  // Persisted node layouts keyed by group id
+  groupLayouts: Record<string, { id: string; position: { x: number; y: number } }[]>
+  saveGroupLayout: (groupId: string, nodes: Node[]) => void
 
   // Review queue
   reviewTasks: ReviewTask[]
@@ -39,11 +46,24 @@ export const usePipelineStore = create<PipelineStore>((set) => ({
     }),
 
   expandedGroup: null,
-  setExpandedGroup: (id) => set({ expandedGroup: id, focusedNodeId: null }),
+  expandTransition: null,
+  setExpandedGroup: (id, dir = 'enter') =>
+    set({ expandedGroup: id, expandTransition: id ? dir : null, focusedNodeId: null }),
 
   focusedNodeId: null,
   setFocusedNodeId: (id) =>
     set((state) => ({ focusedNodeId: state.focusedNodeId === id ? null : id })),
+
+  groupLayouts: {},
+  saveGroupLayout: (groupId, nodes) =>
+    set((state) => ({
+      groupLayouts: {
+        ...state.groupLayouts,
+        [groupId]: nodes
+          .filter((n) => n.id !== '__gateway__')
+          .map((n) => ({ id: n.id, position: { ...n.position } })),
+      },
+    })),
 
   reviewTasks: [],
   setReviewTasks: (tasks) => set({ reviewTasks: tasks }),

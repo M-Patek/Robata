@@ -16,7 +16,10 @@ function GroupNode({ data }: NodeProps<GroupNodeData>) {
   const status = getGroupStatus(group.id, activeRun?.node_statuses ?? {})
   const style  = STATUS_STYLE[status]
 
-  const onClick = useCallback(() => setExpandedGroup(group.id), [group.id, setExpandedGroup])
+  const onClick = useCallback(
+    () => setExpandedGroup(group.id, 'enter'),
+    [group.id, setExpandedGroup],
+  )
 
   return (
     <div
