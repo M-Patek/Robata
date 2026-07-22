@@ -309,12 +309,16 @@ class SQLiteWorkScheduler:
         worker_id: str,
         lease_duration_seconds: int,
         *,
+        work_item_id: str | None = None,
         now: datetime | None = None,
     ) -> WorkLeaseClaim | None:
-        """Atomically claim the highest-priority READY item."""
+        """Atomically claim the highest-priority READY item or one exact item."""
 
         checked_worker = _nonempty(worker_id, "worker_id")
         duration = _positive_int(lease_duration_seconds, "lease_duration_seconds")
+        checked_work_item_id = (
+            None if work_item_id is None else _nonempty(work_item_id, "work_item_id")
+        )
         checked_now = _checked_now(now)
 
         def operation(connection: sqlite3.Connection) -> WorkLeaseClaim | None:
@@ -322,7 +326,7 @@ class SQLiteWorkScheduler:
             row = connection.execute(
                 """
                 SELECT * FROM work_items
-                WHERE state = ?
+                WHERE state = ? AND (? IS NULL OR work_item_id = ?)
                 ORDER BY
                     priority DESC,
                     CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
@@ -331,7 +335,11 @@ class SQLiteWorkScheduler:
                     work_item_id
                 LIMIT 1
                 """,
-                (WorkItemState.READY.value,),
+                (
+                    WorkItemState.READY.value,
+                    checked_work_item_id,
+                    checked_work_item_id,
+                ),
             ).fetchone()
             if row is None:
                 return None

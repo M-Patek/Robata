@@ -3,9 +3,10 @@
 This module deliberately does not sample frames or invoke a model. Those
 responsibilities already belong to the canonical sampling and inference
 boundaries. The projector below is the first concrete coarse-QA domain step:
-it accepts only authoritative QA_COARSE enriched outputs, proves that they
-cover every package/camera coordinate exactly once, and emits a non-promotable
-local decision without inventing calibrated confidence or formal QA records.
+it accepts only authoritative QA_COARSE enriched outputs, proves that each
+call-part covers its package/camera coordinates, conservatively reduces
+coordinates split across call-parts, and emits a non-promotable local decision
+without inventing calibrated confidence or formal QA records.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from robata.qa_pipeline.suspicion_reducer import SuspiciousInterval
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 
-LOCAL_COARSE_QA_POLICY_VERSION = "local-coarse-qa-projector-v1"
+LOCAL_COARSE_QA_POLICY_VERSION = "local-coarse-qa-projector-v2"
 COARSE_QA_SEMANTIC_PROJECTION_VERSION = "canonical-coarse-qa-result-v1"
 
 __all__ = [
@@ -243,16 +244,10 @@ class CoarseQAProjector:
                     members=members,
                     rendered_by_ordinal=rendered_by_ordinal,
                 )
-                if coordinate in projected:
-                    package_ordinal, camera_id = coordinate
-                    raise CoarseQAProjectionError(
-                        "QA_COARSE claims must cover each package/camera exactly once; "
-                        f"duplicate=package[{package_ordinal}]/{camera_id.value}"
-                    )
                 assert claim.package_id is not None
                 assert claim.package_ordinal is not None
                 assert claim.camera_id is not None
-                projected[coordinate] = CameraCoarseResult(
+                candidate = CameraCoarseResult(
                     package_id=claim.package_id,
                     package_ordinal=claim.package_ordinal,
                     camera_id=claim.camera_id,
@@ -260,6 +255,11 @@ class CoarseQAProjector:
                     source_output=source_ref,
                     claim=claim,
                 )
+                current = projected.get(coordinate)
+                if current is None or _camera_status_rank(candidate.local_status) > (
+                    _camera_status_rank(current.local_status)
+                ):
+                    projected[coordinate] = candidate
 
         actual_coordinates = set(projected)
         if actual_coordinates != expected_coordinates:
@@ -473,6 +473,17 @@ def _camera_status(observation: ProviderObservation) -> CameraQAStatus:
         }[observation]
     except KeyError as exc:
         raise ValueError("unsupported coarse QA observation") from exc
+
+
+def _camera_status_rank(status: CameraQAStatus) -> int:
+    """Rank partial call-part observations by conservative local severity."""
+
+    return {
+        CameraQAStatus.GOOD: 0,
+        CameraQAStatus.DEGRADED: 1,
+        CameraQAStatus.UNUSABLE: 2,
+        CameraQAStatus.UNKNOWN: 3,
+    }[status]
 
 
 def _result_status(results: Sequence[CameraCoarseResult]) -> CoarseQAStatus:

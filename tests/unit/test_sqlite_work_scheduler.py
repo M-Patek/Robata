@@ -303,3 +303,26 @@ def test_atomic_claim_has_one_winner(tmp_path: Path) -> None:
         results = tuple(executor.map(claim, ("worker-a", "worker-b")))
 
     assert sum(value is not None for value in results) == 1
+
+
+def test_exact_claim_does_not_take_another_ready_item(tmp_path: Path) -> None:
+    scheduler = _scheduler(tmp_path)
+    preferred = _plan(13, priority=100)
+    requested = _plan(14, priority=0)
+    scheduler.plan(preferred)
+    scheduler.plan(requested)
+
+    exact = scheduler.claim(
+        "worker-exact",
+        30,
+        work_item_id=requested.work_item_id,
+        now=_BASE,
+    )
+
+    assert exact is not None
+    assert exact.work_item.work_item_id == requested.work_item_id
+    assert scheduler.get(preferred.work_item_id).state is WorkItemState.READY
+
+    next_claim = scheduler.claim("worker-next", 30, now=_BASE)
+    assert next_claim is not None
+    assert next_claim.work_item.work_item_id == preferred.work_item_id

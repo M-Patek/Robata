@@ -24,10 +24,20 @@ from robata.adapters.sqlite_inference_evidence import (
     SQLiteInferenceEvidenceLedgerError,
 )
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
+from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkSchedulerError
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.action_event_revision import (
     CanonicalActionEventRevisionError,
     prepare_initial_action_event_publications,
+)
+from robata.application.canonical.durable_work import (
+    CanonicalActionPublishWorkCoordinator,
+    CanonicalDurableWorkError,
+)
+from robata.application.canonical.local_outbox_delivery import (
+    LocalOutboxDeliverySummary,
+    failed_local_outbox_delivery,
+    reconcile_local_primary_outbox,
 )
 from robata.application.canonical.models import (
     CANONICAL_OFFLINE_PIPELINE_VERSION,
@@ -124,6 +134,9 @@ LOCAL_CANONICAL_PARSER_VERSION = "strict-provider-claim-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY = "ordered-claims-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY_VERSION = "1.0"
 LOCAL_CANONICAL_EVENT_ALLOCATOR_VERSION = "canonical-local-event-uuid5-v1"
+LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v2"]] = (
+    "canonical-local-run-receipt-v2"
+)
 
 
 class CanonicalLocalCompositionErrorCode(StrEnum):
@@ -152,6 +165,7 @@ class CanonicalLocalRunReceipt(StrictModel):
     """Compact operator view of one committed local-conformance run."""
 
     schema_version: Literal["1.0"]
+    model_version: Literal["canonical-local-run-receipt-v2"]
     ok: Literal[True]
     run_id: str
     recording_identity: str
@@ -162,6 +176,7 @@ class CanonicalLocalRunReceipt(StrictModel):
     revision_ids: tuple[str, ...]
     outbox_ids: tuple[str, ...]
     outbox_count: int
+    outbox_delivery: LocalOutboxDeliverySummary
     replayed: bool
     fixture_inference_calls: int
     network_call_count: Literal[0]
@@ -382,12 +397,20 @@ def _run_local_canonical(
             state_root / "primary-completion.sqlite3",
             registry=registry,
         )
+        publish_work = CanonicalActionPublishWorkCoordinator(
+            scheduler=SQLiteWorkScheduler(state_root / "work-scheduler.sqlite3"),
+            repository=completion_repository,
+        )
         recovered = completion_repository.get(run_id)
         if recovered is not None:
+            publish_work.reconcile(recovered)
             return _receipt(
                 recovered,
                 replayed=True,
                 fixture_inference_calls=0,
+                state_root=state_root,
+                primary_database_path=completion_repository.path,
+                registry=registry,
             )
 
         bundle = source_loader(registry)
@@ -485,11 +508,14 @@ def _run_local_canonical(
             action_event_publications=publications,
             registry=registry,
         )
-        commit_result = completion_repository.commit(command)
+        commit_result = publish_work.commit(command)
         return _receipt(
             commit_result.committed,
             replayed=commit_result.replayed,
             fixture_inference_calls=result.adapter_infer_calls,
+            state_root=state_root,
+            primary_database_path=completion_repository.path,
+            registry=registry,
         )
     except CanonicalLocalCompositionError:
         raise
@@ -502,6 +528,8 @@ def _run_local_canonical(
         SQLiteBarrierStorageError,
         SQLiteInferenceEvidenceLedgerError,
         LogicalNodeRegistryError,
+        WorkSchedulerError,
+        CanonicalDurableWorkError,
     ) as error:
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
@@ -904,18 +932,12 @@ def _fixture_claim_bytes(request: VisionInferenceRequest) -> bytes:
     )
     if request.task in {VisionTask.QA_COARSE, VisionTask.QA_DENSE}:
         first_by_coordinate: dict[tuple[int, int], RenderedProviderItem] = {}
-        for item in plan.rendered_items:
+        for item in items:
             first_by_coordinate.setdefault(
                 (item.package_ordinal, item.camera_ordinal),
                 item,
             )
-        part_coordinates = tuple(
-            item
-            for item in first_by_coordinate.values()
-            if part.start_item_ordinal
-            <= item.provider_item_ordinal
-            < part.end_item_ordinal_exclusive
-        )
+        part_coordinates = tuple(first_by_coordinate.values())
         claims = tuple(
             ProviderTaskClaim(
                 claim_ordinal=claim_ordinal,
@@ -1167,10 +1189,24 @@ def _receipt(
     *,
     replayed: bool,
     fixture_inference_calls: int,
+    state_root: Path,
+    primary_database_path: Path,
+    registry: SchemaRegistry,
 ) -> CanonicalLocalRunReceipt:
     publications = committed.action_event_publications.publications
+    try:
+        delivery = reconcile_local_primary_outbox(
+            primary_database_path=primary_database_path,
+            sink_database_path=state_root / "outbox-sink.sqlite3",
+            outbox=committed.outbox,
+            registry=registry,
+        )
+    except Exception as error:
+        # Completion is already authoritative; delivery remains observable recovery work.
+        delivery = failed_local_outbox_delivery(committed.outbox, error)
     return CanonicalLocalRunReceipt(
         schema_version="1.0",
+        model_version=LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION,
         ok=True,
         run_id=committed.processing_run.run_id,
         recording_identity=committed.processing_run.recording_identity,
@@ -1181,6 +1217,7 @@ def _receipt(
         revision_ids=tuple(item.revision.revision_id for item in publications),
         outbox_ids=tuple(item.outbox_id for item in committed.outbox),
         outbox_count=len(committed.outbox),
+        outbox_delivery=delivery,
         replayed=replayed,
         fixture_inference_calls=fixture_inference_calls,
         network_call_count=0,
