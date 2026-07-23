@@ -1,0 +1,235 @@
+{
+  "$defs": {
+    "AuthorityBinding": {
+      "additionalProperties": false,
+      "description": "Authority and policy binding used by mapping or clock authorities.",
+      "properties": {
+        "authority_epoch": {
+          "minimum": 1,
+          "title": "Authority Epoch",
+          "type": "integer"
+        },
+        "authority_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Authority Id",
+          "type": "string"
+        },
+        "initial_binding_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Initial Binding Semantic Sha256",
+          "type": "string"
+        },
+        "policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Policy Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority_id",
+        "authority_epoch",
+        "policy_version",
+        "initial_binding_semantic_sha256"
+      ],
+      "title": "AuthorityBinding",
+      "type": "object"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "ChannelBinding": {
+      "additionalProperties": false,
+      "description": "One authority-issued camera/channel binding.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "channel_binding_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Channel Binding Semantic Sha256",
+          "type": "string"
+        },
+        "source_channel_epoch": {
+          "minimum": 1,
+          "title": "Source Channel Epoch",
+          "type": "integer"
+        },
+        "source_channel_id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Source Channel Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "camera_id",
+        "source_channel_id",
+        "source_channel_epoch",
+        "channel_binding_semantic_sha256"
+      ],
+      "title": "ChannelBinding",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/pre-eos-capture-subject.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable capture scope issued before the first stream segment.",
+  "properties": {
+    "acquisition_epoch": {
+      "minimum": 1,
+      "title": "Acquisition Epoch",
+      "type": "integer"
+    },
+    "acquisition_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Acquisition Id",
+      "type": "string"
+    },
+    "capture_assignment_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Capture Assignment Policy Version",
+      "type": "string"
+    },
+    "capture_authority_epoch": {
+      "minimum": 1,
+      "title": "Capture Authority Epoch",
+      "type": "integer"
+    },
+    "capture_authority_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Capture Authority Id",
+      "type": "string"
+    },
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "capture_scope_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Capture Scope Id",
+      "type": "string"
+    },
+    "capture_scope_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Capture Scope Key",
+      "type": "string"
+    },
+    "channel_bindings": {
+      "items": {
+        "$ref": "#/$defs/ChannelBinding"
+      },
+      "title": "Channel Bindings",
+      "type": "array"
+    },
+    "clock_authority": {
+      "$ref": "#/$defs/AuthorityBinding"
+    },
+    "identity_policy_version": {
+      "default": "pre-eos-capture-identity-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Identity Policy Version",
+      "type": "string"
+    },
+    "mapping_authority": {
+      "$ref": "#/$defs/AuthorityBinding"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_projection_version": {
+      "default": "pre-eos-capture-subject-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Semantic Projection Version",
+      "type": "string"
+    },
+    "subject_type": {
+      "const": "PRE_EOS_CAPTURE",
+      "default": "PRE_EOS_CAPTURE",
+      "title": "Subject Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "subject_type",
+    "capture_scope_id",
+    "capture_scope_key",
+    "capture_scope_digest",
+    "capture_authority_id",
+    "capture_authority_epoch",
+    "capture_assignment_policy_version",
+    "acquisition_id",
+    "acquisition_epoch",
+    "channel_bindings",
+    "mapping_authority",
+    "clock_authority",
+    "semantic_projection_version",
+    "identity_policy_version"
+  ],
+  "title": "PreEosCaptureSubject",
+  "type": "object"
+}

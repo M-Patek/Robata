@@ -1,0 +1,362 @@
+{
+  "$defs": {
+    "InferenceFailure": {
+      "additionalProperties": false,
+      "description": "Failure details for a non-success inference.",
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "detail": {
+          "minLength": 1,
+          "title": "Detail",
+          "type": "string"
+        },
+        "retryability": {
+          "$ref": "#/$defs/Retryability"
+        }
+      },
+      "required": [
+        "code",
+        "detail",
+        "retryability"
+      ],
+      "title": "InferenceFailure",
+      "type": "object"
+    },
+    "InferenceStatus": {
+      "description": "Terminal inference attempt status.",
+      "enum": [
+        "SUCCEEDED",
+        "FAILED",
+        "TIMEOUT",
+        "CANCELLED",
+        "INVALID_OUTPUT"
+      ],
+      "title": "InferenceStatus",
+      "type": "string"
+    },
+    "ModelInferenceUsage": {
+      "additionalProperties": false,
+      "description": "Resource usage for one inference attempt.",
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "input_frames": {
+          "minimum": 0,
+          "title": "Input Frames",
+          "type": "integer"
+        },
+        "input_images": {
+          "minimum": 0,
+          "title": "Input Images",
+          "type": "integer"
+        },
+        "input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Input Tokens"
+        },
+        "output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tokens"
+        }
+      },
+      "required": [
+        "input_frames",
+        "input_images",
+        "input_tokens",
+        "output_tokens",
+        "cost",
+        "currency"
+      ],
+      "title": "ModelInferenceUsage",
+      "type": "object"
+    },
+    "Retryability": {
+      "description": "Retry classification for failed inferences.",
+      "enum": [
+        "RETRYABLE",
+        "RATE_LIMITED",
+        "PERMANENT"
+      ],
+      "title": "Retryability",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "StreamInferenceIntentReference": {
+      "additionalProperties": false,
+      "description": "Exact stored intent reference with the identity fields needed for joins.",
+      "properties": {
+        "artifact_ref": {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        "inference_attempt_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Inference Attempt Id",
+          "type": "string"
+        },
+        "input_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Plan Semantic Sha256",
+          "type": "string"
+        },
+        "intent_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Intent Semantic Sha256",
+          "type": "string"
+        },
+        "stream_inference_logical_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Stream Inference Logical Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intent_semantic_sha256",
+        "stream_inference_logical_id",
+        "inference_attempt_id",
+        "input_plan_semantic_sha256",
+        "artifact_ref"
+      ],
+      "title": "StreamInferenceIntentReference",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/stream-accepted-call-evidence.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Complete accepted provider-call closure for one exact dispatch attempt.",
+  "properties": {
+    "accepted_call_projection_version": {
+      "default": "stream-accepted-call-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Accepted Call Projection Version",
+      "type": "string"
+    },
+    "accepted_call_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Accepted Call Semantic Sha256",
+      "type": "string"
+    },
+    "completed_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InferenceFailure"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "intent_ref": {
+      "$ref": "#/$defs/StreamInferenceIntentReference"
+    },
+    "latency_ms": {
+      "minimum": 0,
+      "title": "Latency Ms",
+      "type": "integer"
+    },
+    "normalized_output_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "output_semantic_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Output Semantic Sha256"
+    },
+    "output_valid": {
+      "title": "Output Valid",
+      "type": "boolean"
+    },
+    "provider_exchange_ref": {
+      "$ref": "#/$defs/StreamArtifactRef"
+    },
+    "provider_request_id": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider Request Id"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/InferenceStatus"
+    },
+    "usage": {
+      "$ref": "#/$defs/ModelInferenceUsage"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "intent_ref",
+    "status",
+    "provider_request_id",
+    "provider_exchange_ref",
+    "output_semantic_sha256",
+    "normalized_output_ref",
+    "output_valid",
+    "usage",
+    "latency_ms",
+    "failure",
+    "accepted_call_projection_version",
+    "accepted_call_semantic_sha256",
+    "completed_at"
+  ],
+  "title": "StreamAcceptedCallEvidence",
+  "type": "object"
+}

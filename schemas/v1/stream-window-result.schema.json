@@ -1,0 +1,356 @@
+{
+  "$defs": {
+    "InferenceStatus": {
+      "description": "Terminal inference attempt status.",
+      "enum": [
+        "SUCCEEDED",
+        "FAILED",
+        "TIMEOUT",
+        "CANCELLED",
+        "INVALID_OUTPUT"
+      ],
+      "title": "InferenceStatus",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "StreamInferenceTerminalReference": {
+      "additionalProperties": false,
+      "description": "Selected terminal lineage retained by an incremental window result.",
+      "properties": {
+        "artifact_ref": {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        "inference_attempt_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Inference Attempt Id",
+          "type": "string"
+        },
+        "inference_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Inference Semantic Sha256",
+          "type": "string"
+        },
+        "input_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Plan Semantic Sha256",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/StreamPurpose"
+        },
+        "status": {
+          "$ref": "#/$defs/InferenceStatus"
+        },
+        "stream_inference_logical_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Stream Inference Logical Id",
+          "type": "string"
+        },
+        "terminal_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Terminal Semantic Sha256",
+          "type": "string"
+        },
+        "window_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Window Key",
+          "type": "string"
+        },
+        "window_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Window Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "window_key",
+        "window_semantic_sha256",
+        "purpose",
+        "inference_semantic_sha256",
+        "stream_inference_logical_id",
+        "inference_attempt_id",
+        "input_plan_semantic_sha256",
+        "status",
+        "terminal_semantic_sha256",
+        "artifact_ref"
+      ],
+      "title": "StreamInferenceTerminalReference",
+      "type": "object"
+    },
+    "StreamPurpose": {
+      "description": "Provider-neutral purposes used in window and inference identity.",
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT"
+      ],
+      "title": "StreamPurpose",
+      "type": "string"
+    },
+    "StreamSubjectRef": {
+      "additionalProperties": false,
+      "description": "Exact typed reference shared by stream work and lineage records.",
+      "properties": {
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "identity_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Identity Policy Version",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        "subject_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Subject Key",
+          "type": "string"
+        },
+        "subject_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Subject Semantic Sha256",
+          "type": "string"
+        },
+        "subject_type": {
+          "$ref": "#/$defs/StreamSubjectType"
+        }
+      },
+      "required": [
+        "subject_type",
+        "subject_key",
+        "subject_semantic_sha256",
+        "capture_scope_digest",
+        "identity_policy_version",
+        "schema_ref"
+      ],
+      "title": "StreamSubjectRef",
+      "type": "object"
+    },
+    "StreamSubjectType": {
+      "description": "Typed semantic subjects that can appear in the pre-EOS graph.",
+      "enum": [
+        "PRE_EOS_CAPTURE",
+        "STREAM_SEGMENT",
+        "INCREMENTAL_WINDOW",
+        "STREAM_INFERENCE",
+        "WINDOW_RESULT",
+        "STREAM_WORK",
+        "EXPECTED_WINDOW_PLAN",
+        "EXPECTED_WINDOW_DECLARATION",
+        "EXPECTED_WINDOW_PLAN_SEAL",
+        "WINDOW_TERMINAL_CLOSURE",
+        "RECORDING_FINALIZATION"
+      ],
+      "title": "StreamSubjectType",
+      "type": "string"
+    },
+    "TerminalOutcome": {
+      "description": "Terminal outcomes retained by stream closure, including failures.",
+      "enum": [
+        "SUCCEEDED",
+        "SKIPPED_POLICY",
+        "SKIPPED_NOT_NEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+        "QUARANTINED",
+        "LATE_INPUT",
+        "INCOMPLETE",
+        "ABSTAINED",
+        "NO_EVENTS",
+        "INVALIDATED"
+      ],
+      "title": "TerminalOutcome",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/stream-window-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One immutable, non-final result for an incremental window subject.",
+  "properties": {
+    "accepted_terminals": {
+      "items": {
+        "$ref": "#/$defs/StreamInferenceTerminalReference"
+      },
+      "title": "Accepted Terminals",
+      "type": "array"
+    },
+    "created_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Created At",
+      "type": "string"
+    },
+    "purpose": {
+      "$ref": "#/$defs/StreamPurpose"
+    },
+    "reduction_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Reduction Policy Version",
+      "type": "string"
+    },
+    "result_evidence_ref": {
+      "$ref": "#/$defs/StreamArtifactRef"
+    },
+    "result_identity_policy_version": {
+      "default": "stream-window-result-identity-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Result Identity Policy Version",
+      "type": "string"
+    },
+    "result_projection_version": {
+      "default": "stream-window-result-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Result Projection Version",
+      "type": "string"
+    },
+    "result_semantic_evidence_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Result Semantic Evidence Sha256",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "subject_type": {
+      "const": "WINDOW_RESULT",
+      "default": "WINDOW_RESULT",
+      "title": "Subject Type",
+      "type": "string"
+    },
+    "terminal_outcome": {
+      "$ref": "#/$defs/TerminalOutcome"
+    },
+    "window_result_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Window Result Id",
+      "type": "string"
+    },
+    "window_result_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Window Result Key",
+      "type": "string"
+    },
+    "window_result_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Result Semantic Sha256",
+      "type": "string"
+    },
+    "window_subject": {
+      "$ref": "#/$defs/StreamSubjectRef"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "subject_type",
+    "window_result_id",
+    "window_result_key",
+    "window_result_semantic_sha256",
+    "window_subject",
+    "purpose",
+    "terminal_outcome",
+    "accepted_terminals",
+    "result_semantic_evidence_sha256",
+    "result_evidence_ref",
+    "reduction_policy_version",
+    "result_projection_version",
+    "result_identity_policy_version",
+    "created_at"
+  ],
+  "title": "StreamWindowResult",
+  "type": "object"
+}

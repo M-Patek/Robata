@@ -1,0 +1,382 @@
+{
+  "$defs": {
+    "DependencyCriticality": {
+      "description": "How strongly a downstream work item depends on an upstream one.",
+      "enum": [
+        "REQUIRED",
+        "DEGRADABLE",
+        "OPTIONAL"
+      ],
+      "title": "DependencyCriticality",
+      "type": "string"
+    },
+    "PreEosCaptureSubjectRef": {
+      "additionalProperties": false,
+      "description": "Compact reference to an authority-issued capture subject.",
+      "properties": {
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "capture_scope_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Capture Scope Id",
+          "type": "string"
+        },
+        "capture_scope_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Capture Scope Key",
+          "type": "string"
+        },
+        "identity_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Identity Policy Version",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        "subject_type": {
+          "const": "PRE_EOS_CAPTURE",
+          "default": "PRE_EOS_CAPTURE",
+          "title": "Subject Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_type",
+        "capture_scope_id",
+        "capture_scope_key",
+        "capture_scope_digest",
+        "identity_policy_version",
+        "schema_ref"
+      ],
+      "title": "PreEosCaptureSubjectRef",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamStage": {
+      "description": "Execution stages for stream work, independent of provider names.",
+      "enum": [
+        "SEGMENT",
+        "WINDOW",
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT",
+        "WINDOW_REDUCTION",
+        "FINALIZATION"
+      ],
+      "title": "StreamStage",
+      "type": "string"
+    },
+    "StreamSubjectRef": {
+      "additionalProperties": false,
+      "description": "Exact typed reference shared by stream work and lineage records.",
+      "properties": {
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "identity_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Identity Policy Version",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        "subject_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Subject Key",
+          "type": "string"
+        },
+        "subject_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Subject Semantic Sha256",
+          "type": "string"
+        },
+        "subject_type": {
+          "$ref": "#/$defs/StreamSubjectType"
+        }
+      },
+      "required": [
+        "subject_type",
+        "subject_key",
+        "subject_semantic_sha256",
+        "capture_scope_digest",
+        "identity_policy_version",
+        "schema_ref"
+      ],
+      "title": "StreamSubjectRef",
+      "type": "object"
+    },
+    "StreamSubjectType": {
+      "description": "Typed semantic subjects that can appear in the pre-EOS graph.",
+      "enum": [
+        "PRE_EOS_CAPTURE",
+        "STREAM_SEGMENT",
+        "INCREMENTAL_WINDOW",
+        "STREAM_INFERENCE",
+        "WINDOW_RESULT",
+        "STREAM_WORK",
+        "EXPECTED_WINDOW_PLAN",
+        "EXPECTED_WINDOW_DECLARATION",
+        "EXPECTED_WINDOW_PLAN_SEAL",
+        "WINDOW_TERMINAL_CLOSURE",
+        "RECORDING_FINALIZATION"
+      ],
+      "title": "StreamSubjectType",
+      "type": "string"
+    },
+    "StreamWorkMessageDependency": {
+      "additionalProperties": false,
+      "description": "Canonical dependency projection carried by a stream work message.",
+      "properties": {
+        "criticality": {
+          "$ref": "#/$defs/DependencyCriticality"
+        },
+        "upstream_work_logical_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Upstream Work Logical Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "upstream_work_logical_key",
+        "criticality"
+      ],
+      "title": "StreamWorkMessageDependency",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/stream-work-message.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable broker projection issued only from an active stream lease.",
+  "properties": {
+    "attempt": {
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "cancel_requested": {
+      "title": "Cancel Requested",
+      "type": "boolean"
+    },
+    "config_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Semantic Sha256",
+      "type": "string"
+    },
+    "created_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Created At",
+      "type": "string"
+    },
+    "execution_expiry_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Execution Expiry At"
+    },
+    "fencing_token": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Fencing Token",
+      "type": "string"
+    },
+    "input_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Semantic Sha256",
+      "type": "string"
+    },
+    "lease_epoch": {
+      "minimum": 1,
+      "title": "Lease Epoch",
+      "type": "integer"
+    },
+    "lease_expires_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Lease Expires At",
+      "type": "string"
+    },
+    "leased_by": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Leased By",
+      "type": "string"
+    },
+    "max_attempts": {
+      "minimum": 1,
+      "title": "Max Attempts",
+      "type": "integer"
+    },
+    "ordered_dependencies": {
+      "items": {
+        "$ref": "#/$defs/StreamWorkMessageDependency"
+      },
+      "title": "Ordered Dependencies",
+      "type": "array"
+    },
+    "plan_schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "priority": {
+      "minimum": 0,
+      "title": "Priority",
+      "type": "integer"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sla_deadline_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Sla Deadline At"
+    },
+    "source_subject": {
+      "$ref": "#/$defs/PreEosCaptureSubjectRef"
+    },
+    "stage": {
+      "$ref": "#/$defs/StreamStage"
+    },
+    "stream_run_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Stream Run Id",
+      "type": "string"
+    },
+    "subject": {
+      "$ref": "#/$defs/StreamSubjectRef"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Trace Id"
+    },
+    "work_item_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Work Item Id",
+      "type": "string"
+    },
+    "work_key_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Work Key Policy Version",
+      "type": "string"
+    },
+    "work_logical_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Work Logical Key",
+      "type": "string"
+    },
+    "work_projection_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Work Projection Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "plan_schema_ref",
+    "work_item_id",
+    "work_logical_key",
+    "stream_run_id",
+    "source_subject",
+    "stage",
+    "subject",
+    "ordered_dependencies",
+    "input_semantic_sha256",
+    "config_semantic_sha256",
+    "work_projection_version",
+    "work_key_policy_version",
+    "priority",
+    "sla_deadline_at",
+    "execution_expiry_at",
+    "max_attempts",
+    "trace_id",
+    "created_at",
+    "cancel_requested",
+    "lease_epoch",
+    "fencing_token",
+    "leased_by",
+    "lease_expires_at",
+    "attempt"
+  ],
+  "title": "StreamWorkMessage",
+  "type": "object"
+}

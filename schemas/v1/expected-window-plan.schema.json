@@ -1,0 +1,193 @@
+{
+  "$defs": {
+    "ExpectedWindowPlanState": {
+      "enum": [
+        "OPEN",
+        "SEALED"
+      ],
+      "title": "ExpectedWindowPlanState",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/expected-window-plan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Source/policy-derived expected set, independent of execution outcomes.",
+  "properties": {
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "idle_source_policy_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Idle Source Policy Semantic Sha256",
+      "type": "string"
+    },
+    "idle_source_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Idle Source Policy Version",
+      "type": "string"
+    },
+    "lateness_policy_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Lateness Policy Semantic Sha256",
+      "type": "string"
+    },
+    "lateness_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Lateness Policy Version",
+      "type": "string"
+    },
+    "plan_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Digest",
+      "type": "string"
+    },
+    "plan_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Plan Id",
+      "type": "string"
+    },
+    "plan_identity_policy_version": {
+      "default": "expected-window-plan-identity-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Plan Identity Policy Version",
+      "type": "string"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "plan_projection_version": {
+      "default": "expected-window-plan-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Plan Projection Version",
+      "type": "string"
+    },
+    "planner_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Planner Version",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "segmentation_policy_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Segmentation Policy Semantic Sha256",
+      "type": "string"
+    },
+    "segmentation_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Segmentation Policy Version",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/ExpectedWindowPlanState",
+      "default": "OPEN"
+    },
+    "watermark_policy_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Watermark Policy Semantic Sha256",
+      "type": "string"
+    },
+    "watermark_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Watermark Policy Version",
+      "type": "string"
+    },
+    "window_policy_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Policy Semantic Sha256",
+      "type": "string"
+    },
+    "window_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Window Policy Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "plan_id",
+    "plan_key",
+    "plan_digest",
+    "capture_scope_digest",
+    "segmentation_policy_version",
+    "segmentation_policy_semantic_sha256",
+    "window_policy_version",
+    "window_policy_semantic_sha256",
+    "watermark_policy_version",
+    "watermark_policy_semantic_sha256",
+    "lateness_policy_version",
+    "lateness_policy_semantic_sha256",
+    "idle_source_policy_version",
+    "idle_source_policy_semantic_sha256",
+    "planner_version",
+    "plan_projection_version",
+    "plan_identity_policy_version",
+    "state"
+  ],
+  "title": "ExpectedWindowPlan",
+  "type": "object"
+}

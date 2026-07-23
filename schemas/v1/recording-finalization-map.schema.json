@@ -1,0 +1,234 @@
+{
+  "$defs": {
+    "FinalizationSubjectMapping": {
+      "additionalProperties": false,
+      "description": "One immutable incremental-to-final subject link.",
+      "properties": {
+        "final_subject_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Final Subject Key",
+          "type": "string"
+        },
+        "final_subject_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Final Subject Semantic Sha256",
+          "type": "string"
+        },
+        "final_subject_type": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Final Subject Type",
+          "type": "string"
+        },
+        "incremental_subject_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Incremental Subject Key",
+          "type": "string"
+        },
+        "incremental_subject_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Incremental Subject Semantic Sha256",
+          "type": "string"
+        },
+        "incremental_subject_type": {
+          "$ref": "#/$defs/StreamSubjectType"
+        }
+      },
+      "required": [
+        "incremental_subject_type",
+        "incremental_subject_key",
+        "incremental_subject_semantic_sha256",
+        "final_subject_type",
+        "final_subject_key",
+        "final_subject_semantic_sha256"
+      ],
+      "title": "FinalizationSubjectMapping",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamSubjectType": {
+      "description": "Typed semantic subjects that can appear in the pre-EOS graph.",
+      "enum": [
+        "PRE_EOS_CAPTURE",
+        "STREAM_SEGMENT",
+        "INCREMENTAL_WINDOW",
+        "STREAM_INFERENCE",
+        "WINDOW_RESULT",
+        "STREAM_WORK",
+        "EXPECTED_WINDOW_PLAN",
+        "EXPECTED_WINDOW_DECLARATION",
+        "EXPECTED_WINDOW_PLAN_SEAL",
+        "WINDOW_TERMINAL_CLOSURE",
+        "RECORDING_FINALIZATION"
+      ],
+      "title": "StreamSubjectType",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/recording-finalization-map.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "EOS link from incremental history to final recording identities.",
+  "properties": {
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "capture_scope_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Capture Scope Key",
+      "type": "string"
+    },
+    "expected_plan_seal_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Expected Plan Seal Semantic Sha256",
+      "type": "string"
+    },
+    "export_manifest_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Export Manifest Semantic Sha256",
+      "type": "string"
+    },
+    "final_alignment_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Alignment Semantic Sha256",
+      "type": "string"
+    },
+    "final_duration_ns": {
+      "title": "Final Duration Ns",
+      "type": "integer"
+    },
+    "final_mapping_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Mapping Semantic Sha256",
+      "type": "string"
+    },
+    "final_recording_identity": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Recording Identity",
+      "type": "string"
+    },
+    "final_source_exact_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Source Exact Sha256",
+      "type": "string"
+    },
+    "final_source_subject_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Final Source Subject Id",
+      "type": "string"
+    },
+    "final_source_subject_type": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Final Source Subject Type",
+      "type": "string"
+    },
+    "finalization_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Finalization Key",
+      "type": "string"
+    },
+    "finalization_policy_version": {
+      "default": "recording-finalization-policy-v1",
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Finalization Policy Version",
+      "type": "string"
+    },
+    "finalization_projection_version": {
+      "default": "recording-finalization-map-semantic-v1",
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Finalization Projection Version",
+      "type": "string"
+    },
+    "finalization_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalization Semantic Sha256",
+      "type": "string"
+    },
+    "ordered_subject_mappings": {
+      "items": {
+        "$ref": "#/$defs/FinalizationSubjectMapping"
+      },
+      "title": "Ordered Subject Mappings",
+      "type": "array"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "window_terminal_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Terminal Closure Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "capture_scope_key",
+    "capture_scope_digest",
+    "final_source_subject_type",
+    "final_source_subject_id",
+    "final_source_exact_sha256",
+    "final_recording_identity",
+    "final_duration_ns",
+    "final_mapping_semantic_sha256",
+    "final_alignment_semantic_sha256",
+    "expected_plan_seal_semantic_sha256",
+    "window_terminal_closure_semantic_sha256",
+    "export_manifest_semantic_sha256",
+    "ordered_subject_mappings",
+    "finalization_projection_version",
+    "finalization_policy_version",
+    "finalization_key",
+    "finalization_semantic_sha256"
+  ],
+  "title": "RecordingFinalizationMap",
+  "type": "object"
+}

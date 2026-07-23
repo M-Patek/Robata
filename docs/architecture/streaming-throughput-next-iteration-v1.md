@@ -64,31 +64,153 @@ The durable scheduler currently owns `ACTION_PUBLISH`, not the full inference DA
 and Section 25 status remain owned by the
 [current implementation status](../current-implementation-status.md).
 
-The candidate-local baseline used one 40.890455-second six-camera MCAP with 7,350 observations and
-130,303,923 input bytes. The documented fresh run was 853.8 seconds with 16 deterministic
-fixture-backed inference calls and no network calls. The documented exact replay was 26 seconds
-with no redispatch. The current state tree is approximately 452.9 MB; the state tree plus the
-original source is approximately 583.2 MB.
+### 3.1 Exact clean-run evidence
 
-| Baseline quantity | Value | Interpretation |
-|---|---:|---|
-| Aggregate input frame rate | 179.75 frames/s | Approximately six cameras at 30 frames/s |
-| Aggregate compressed input | 25.49 Mbit/s | 10.68 GiB per recording hour |
-| Fresh end-to-end effective rate | 8.61 observations/s | 20.88 times slower than source time |
-| Fresh capacity | 0.04789 recording-h/wall-h | Local fixture-backed conformance only |
-| Current equivalent workers at 70% utilization | 29.83 per live six-camera group | Linear projection, not deployment sizing |
-| Materialized state footprint | 37.13 GiB per recording hour | About 3.48 times the external source bytes; not measured disk write I/O |
-| Source plus materialized state | 47.82 GiB per recording hour | About 1.12 TiB for one continuously active day |
+WP0 replaced the earlier timestamp estimate with two independent clean `FRESH` runs. Both runs use
+commit `bb348e758e11f76cd5b1d75acee88df819352f84`, source SHA-256
+`9fd5094bf29cd4ee50cd8c7d8c053e89d1c93660a0f4e57daaa726bae2b6156c`, lockfile SHA-256
+`3db137d7547f9542660942a6ed2eda0a8a0463dff5926bf28c5378b80690888a`, and Schema catalog
+SHA-256 `136108148a4fe1a0a094d1a84d21777b14da2358c49a11d750f893093769785e`.
+The source is 130,303,923 bytes with a 40.890455-second observed source span. The registered
+capacity denominator is the 40.833513001-second canonical requested camera interval. There are
+7,350 frame observations and 16 deterministic fixture calls; neither run makes a network call.
 
-File timestamps provide only a preliminary decomposition: source preparation was about 151
-seconds, the 16-call inference/evidence/persistence/validation interval was about 672 seconds, and
-finalization was about 17 seconds. These are not instrumented spans. In particular, the 672-second
-interval must not be described as pure SQLite time: it includes mock inference orchestration,
-canonical serialization, hashing, model validation, Schema validation, and durable evidence work.
+The machine-readable reports are workspace-local at
+`tmp/profiles/wp0-baseline-bb348e7-a.json` and
+`tmp/profiles/wp0-baseline-bb348e7-b.json`. Their exact identities and primary observations are:
 
-Even deleting that entire 672-second interval would leave about 181.8 seconds, or 4.45 times source
-time. The problem is structural as well as hardware-dependent. The next iteration must measure and
-change both the media path and the evidence/inference path.
+| Signal | Run A | Run B |
+|---|---:|---:|
+| Report SHA-256 | `b5827f7a793012791d75395d7bae67dad109aa470ad3adf6e4370a3361d7f4f0` | `fb1ece8db084af5766a5bb480c633c288417a62fc20ce71e4ebc576b6613d8ef` |
+| Manifest SHA-256 | `98a55c5bde2c1153875c1089bc3ea7d5660bc49d433938c60ed13ca21e764a25` | `7e61261ecae9326e1eb5cac97db98797280ba54460f60ebb3f1d3d686473633b` |
+| Observer wall time | 746.973059 s | 762.875233 s |
+| Process CPU time | 754.265625 s | 767.531250 s |
+| Real-time factor | 18.2931x | 18.6826x |
+| Recording-seconds/wall-second | 0.0546653 | 0.0535258 |
+| Process read bytes | 5,571,027,518 | 5,571,042,243 |
+| Process write bytes | 613,517,721 | 613,838,145 |
+| Reported RSS | 303,423,488 bytes | 300,736,512 bytes |
+| State tree | 452,819,551 bytes / 537 files | 452,823,647 bytes / 537 files |
+| Completion | `SUCCEEDED` | `SUCCEEDED` |
+
+Both reports have `error=null`, `evidence_class=LOCAL_CONFORMANCE`,
+`production_eligible=false`, and a clean Git manifest. Span, ledger, and artifact-byte
+reconciliations are all `RECONCILED`; each report contains 2,205 spans, three roots, no structural
+errors, 16 fixture calls matched to 16 terminals, one primary completion matched to one outbox row,
+and one review route matched to one review task. Run A has 1.312103 seconds and Run B has 1.347821
+seconds of wall time outside top-level spans.
+
+With only two repetitions, variance is descriptive rather than a stable performance distribution.
+The table reports population variance across A and B and sample standard deviation so later runs
+can use the same formulas. Inclusive child spans overlap their parents and must not be added.
+
+| Instrumented span | Run A (s) | Run B (s) | Mean (s) | Population variance (s2) | Sample SD (s) |
+|---|---:|---:|---:|---:|---:|
+| Observer wall | 746.973059 | 762.875233 | 754.924146 | 63.219783 | 11.244535 |
+| `source.prepare` | 138.112809 | 144.184080 | 141.148445 | 9.215082 | 4.293037 |
+| `source.export` | 69.740777 | 71.591014 | 70.665895 | 0.855844 | 1.308315 |
+| `source.materialize` | 66.148281 | 70.291728 | 68.220005 | 4.292038 | 2.929859 |
+| `inference.pipeline` | 586.545634 | 595.533674 | 591.039654 | 20.196212 | 6.355503 |
+| `inference.call_plan` | 489.813836 | 498.369006 | 494.091421 | 18.297732 | 6.049419 |
+| `inference.parse_validate_enrich` | 411.106732 | 417.244364 | 414.175548 | 9.417632 | 4.339961 |
+| `completion.commit` | 7.888391 | 8.264571 | 8.076481 | 0.035378 | 0.265999 |
+
+The mean fresh path is therefore 18.4879 times the canonical recording duration, processes 9.736
+observations per wall-second, and supplies 0.05409 recording-seconds per wall-second. A linear
+70%-utilization illustration is 26.41 equivalent current workers per continuously active
+six-camera group; this is not deployment sizing. Mean process CPU is 760.898 seconds, approximately
+one CPU-second per wall-second despite 32 logical CPUs. The observed shape is predominantly serial
+or single-worker work, not evidence that the host lacks enough installed CPU or media support.
+
+### 3.2 Measured evidence-path bottleneck
+
+The inference evidence adapter records 275 transactions in each run. Its inclusive transaction
+spans total 576.365 and 585.019 seconds, but the explicit SQLite `commit` spans total only 0.262099
+and 0.258026 seconds. Connection setup averages 0.487477 seconds in total per run, and 274
+per-operation integrity checks average 1.590344 seconds in total per run. WAL is already an
+enforced database invariant.
+The evidence does not support the earlier hypothesis that `fsync` or missing WAL configuration is
+the dominant cost.
+
+The measured cost is inside the operation bodies. The five largest append groups account for a
+mean 517.098 seconds, 89.34% of all measured evidence-operation time:
+
+| Evidence operation, 16 calls each | Run A (s) | Run B (s) | Mean (s) |
+|---|---:|---:|---:|
+| `append_enriched_output` | 214.002730 | 219.221026 | 216.611878 |
+| `append_selected_output` | 104.655101 | 105.384926 | 105.020014 |
+| `append_parsed_claim` | 87.790249 | 87.947547 | 87.868898 |
+| `append_terminal` | 60.173684 | 61.522088 | 60.847886 |
+| `append_selection` | 46.428443 | 47.070867 | 46.749655 |
+
+The separately instrumented pre-append `serialize_validate` work averages only 3.299591 seconds.
+Inspection of the measured operation bodies in
+[sqlite_inference_evidence.py](../../src/robata/adapters/sqlite_inference_evidence.py) shows the
+larger repeated work: persisted nested models are reconstructed, canonical bytes and digests are
+checked, lineage is validated, and rows are read back into full models after each append. These
+checks are valuable at authority boundaries, but repeating the entire growing object graph at each
+intermediate append is not a useful throughput defense. Transaction batching helps only if it also
+removes that repeated reconstruction and read-back work; batching commits alone cannot explain a
+material speedup when commits are 0.034% of mean wall time.
+
+### 3.3 Exact state and I/O shape
+
+Both runs reconcile every state byte to one file class. Only the SQLite file allocation differs,
+by one 4,096-byte page:
+
+| State class | Run A bytes / files | Run B bytes / files |
+|---|---:|---:|
+| `CONTENT_ADDRESSED_BLOB` | 259,983,158 / 20 | 259,983,158 / 20 |
+| `EXPORTED_VIDEO` | 125,906,130 / 6 | 125,906,130 / 6 |
+| `FRAME_PNG` | 42,472,077 / 495 | 42,472,077 / 495 |
+| `SQLITE` | 18,235,392 / 8 | 18,239,488 / 8 |
+| `JSON` | 6,222,794 / 8 | 6,222,794 / 8 |
+| `OTHER` | 0 / 0 | 0 / 0 |
+| **Total** | **452,819,551 / 537** | **452,823,647 / 537** |
+
+The mean state tree is 452,821,599 bytes, 3.47512 times raw input. Source plus state is
+583,125,522 bytes, 4.47512 times raw input. Under the report's canonical duration denominator this
+projects to 37.18 GiB of state and 47.88 GiB of source plus state per recording hour. Mean process
+I/O is 5.571 GB read and 613.678 MB written, respectively 42.75 and 4.71 times source bytes. These
+process-level counters cover all media, JSON, and database work; they must not be attributed solely
+to SQLite. Physical duplicate-byte accounting is still `NOT_AVAILABLE`, so the logical class
+totals do not prove how many hard-linked bytes are physically duplicated.
+
+### 3.4 PyAV environment finding
+
+PyAV is installed and active, not missing. The locked environment contains `av==18.0.0`, and
+`.venv\Scripts\python.exe -c "import av; print(av.__version__)"` returns `18.0.0`. Both clean
+runs completed the PyAV-backed export and materialization spans, produced six exported MP4 files
+and 495 PNG files, and ended in `SUCCEEDED`. The relevant adapters are
+[pyav_mp4_exporter.py](../../src/robata/adapters/pyav_mp4_exporter.py) and
+[pyav_frame_materializer.py](../../src/robata/adapters/pyav_frame_materializer.py). Missing PyAV is
+therefore not the explanation for the measured throughput.
+
+### 3.5 Adjusted optimization priorities
+
+The exact evidence changes the implementation order:
+
+1. Make one accepted inference-call persistence boundary write compact, content-addressed
+   references; reconstruct and fully audit the graph at checkpoint/completion rather than after
+   every intermediate row. Preserve strict validation at ingress, accepted-call commit, and final
+   publication boundaries.
+2. Replace repeated source traversal with one ordered MCAP traversal and remove full MP4 export and
+   PNG materialization from the incremental-analysis prerequisite path. `source.prepare` still
+   averages 141.148 seconds, including 70.666 seconds of export and 68.220 seconds of
+   materialization.
+3. Add bounded stage concurrency and provider-compatible microbatching after the persistence shape
+   is compact. Fixture provider dispatch averages only about 6.27 seconds across all 16 calls, so
+   `asyncio.gather` alone cannot solve the current baseline.
+4. Measure physical file identity, then remove physical source/export/view duplication and keep PNG
+   materialization lazy. Do not claim CAS savings while physical duplication remains
+   `NOT_AVAILABLE`.
+5. Re-measure before introducing a process pool, asynchronous database writer, or new media stack.
+   WAL-only tuning is not a priority, PyAV is functioning, and authority-changing async writes need
+   a demonstrated benefit before adding recovery complexity.
+
+This order keeps the small set of correctness defenses that protect identity, authoritative
+transactions, and publication, while removing repeated internal work that does not add a new
+trust boundary.
 
 ## 4. Enterprise pattern findings
 
@@ -633,6 +755,11 @@ Work proceeds in this order. Later work may be prototyped behind a port, but a p
 claim completion until its acceptance gate passes.
 
 ### WP0: Instrument the current fresh path
+
+Status on commit `bb348e758e11f76cd5b1d75acee88df819352f84`: completed for the stated clean
+local fixture scope. Runs A and B in Section 3.1 independently satisfy span, byte, and authoritative
+ledger reconciliation. Any change to the measured path, source, runtime lock, policies, or Schema
+catalog requires a new pinned baseline; this status is not production qualification.
 
 Deliver:
 

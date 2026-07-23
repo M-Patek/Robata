@@ -1,0 +1,281 @@
+{
+  "$defs": {
+    "ArtifactLifecycle": {
+      "additionalProperties": false,
+      "description": "Publication state and immutable retention-policy identity.",
+      "properties": {
+        "policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "state": {
+          "const": "ACTIVE",
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "policy_version"
+      ],
+      "title": "ArtifactLifecycle",
+      "type": "object"
+    },
+    "ArtifactLocator": {
+      "additionalProperties": false,
+      "description": "Versioned storage locator; neither field is an artifact identity.",
+      "properties": {
+        "object_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Object Version",
+          "type": "string"
+        },
+        "uri": {
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$",
+          "title": "Uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "object_version"
+      ],
+      "title": "ArtifactLocator",
+      "type": "object"
+    },
+    "ArtifactParentRelationV3": {
+      "description": "Typed direct lineage edges understood by the V3 registry.",
+      "enum": [
+        "EXPORT_CONFIG",
+        "MAPPING_PROFILE",
+        "SOURCE_CONTENT",
+        "TIMESTAMP_OUTPUT",
+        "VIDEO_OUTPUT",
+        "CAPTURE_SCOPE",
+        "ENCODED_SPOOL",
+        "SEGMENT_INPUT",
+        "WINDOW_INPUT",
+        "INPUT_PLAN",
+        "INFERENCE_INTENT",
+        "ACCEPTED_CALL",
+        "INFERENCE_TERMINAL",
+        "EXPECTED_PLAN",
+        "EXPECTED_DECLARATION",
+        "PLAN_SEAL",
+        "WINDOW_RESULT",
+        "TERMINAL_CLOSURE",
+        "EXPORT_MANIFEST"
+      ],
+      "title": "ArtifactParentRelationV3",
+      "type": "string"
+    },
+    "ArtifactParentV3": {
+      "additionalProperties": false,
+      "description": "One typed direct V3 lineage edge.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/ArtifactParentRelationV3"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relation"
+      ],
+      "title": "ArtifactParentV3",
+      "type": "object"
+    },
+    "ArtifactProducer": {
+      "additionalProperties": false,
+      "description": "Producer implementation and its canonicalized effective configuration.",
+      "properties": {
+        "canonical_config_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Canonical Config Sha256",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "canonical_config_sha256"
+      ],
+      "title": "ArtifactProducer",
+      "type": "object"
+    },
+    "ArtifactTypeV3": {
+      "description": "Closed V3 vocabulary, including the unchanged V2 artifact kinds.",
+      "enum": [
+        "CAMERA_VIDEO_EXPORT_MANIFEST",
+        "CAMERA_VIDEO_MP4",
+        "CAMERA_VIDEO_TIMESTAMP_MAP",
+        "EXPORT_CONFIG",
+        "JSON_SCHEMA",
+        "MAPPING_PROFILE",
+        "RAW_MCAP",
+        "PRE_EOS_CAPTURE",
+        "STREAM_ENCODED_SPOOL",
+        "STREAM_SEGMENT_MANIFEST",
+        "INCREMENTAL_WINDOW",
+        "INFERENCE_INPUT_PLAN",
+        "STREAM_INFERENCE_INTENT",
+        "STREAM_ACCEPTED_CALL_EVIDENCE",
+        "STREAM_INFERENCE_TERMINAL",
+        "STREAM_WINDOW_RESULT",
+        "EXPECTED_WINDOW_PLAN",
+        "EXPECTED_WINDOW_DECLARATION",
+        "EXPECTED_WINDOW_PLAN_SEAL",
+        "WINDOW_TERMINAL_CLOSURE",
+        "RECORDING_FINALIZATION_MAP"
+      ],
+      "title": "ArtifactTypeV3",
+      "type": "string"
+    },
+    "SchemaArtifactReference": {
+      "additionalProperties": false,
+      "description": "Exact registry identity of the schema governing an artifact payload.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "minLength": 4,
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://\\S+$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaArtifactReference",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v3/artifact-registry-entry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One immutable V3 artifact, preserving semantic and exact identities.",
+  "properties": {
+    "artifact_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Artifact Id",
+      "type": "string"
+    },
+    "artifact_type": {
+      "$ref": "#/$defs/ArtifactTypeV3"
+    },
+    "bytes": {
+      "minimum": 1,
+      "title": "Bytes",
+      "type": "integer"
+    },
+    "created_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Created At",
+      "type": "string"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/ArtifactLifecycle"
+    },
+    "locator": {
+      "$ref": "#/$defs/ArtifactLocator"
+    },
+    "media_type": {
+      "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+      "title": "Media Type",
+      "type": "string"
+    },
+    "parents": {
+      "items": {
+        "$ref": "#/$defs/ArtifactParentV3"
+      },
+      "title": "Parents",
+      "type": "array"
+    },
+    "payload_schema_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SchemaArtifactReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "producer": {
+      "$ref": "#/$defs/ArtifactProducer"
+    },
+    "schema_version": {
+      "const": "3.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Semantic Sha256",
+      "type": "string"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "artifact_type",
+    "semantic_sha256",
+    "locator",
+    "sha256",
+    "bytes",
+    "media_type",
+    "producer",
+    "lifecycle",
+    "parents",
+    "payload_schema_ref",
+    "created_at"
+  ],
+  "title": "ArtifactRegistryEntryV3",
+  "type": "object"
+}

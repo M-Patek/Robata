@@ -1,0 +1,444 @@
+{
+  "$defs": {
+    "CameraAbsenceReason": {
+      "description": "Explicit source-health facts for a missing six-slot member.",
+      "enum": [
+        "ABSENT",
+        "LATE",
+        "BLACK",
+        "FROZEN",
+        "DEGRADED",
+        "CORRUPT",
+        "UNAVAILABLE",
+        "GAP",
+        "UNKNOWN"
+      ],
+      "title": "CameraAbsenceReason",
+      "type": "string"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "CameraSlotClosure": {
+      "discriminator": {
+        "mapping": {
+          "ABSENCE": "#/$defs/StreamCameraAbsence",
+          "SEGMENT": "#/$defs/StreamSegmentRef",
+          "SEGMENT_SEQUENCE": "#/$defs/StreamSegmentSequence"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StreamSegmentRef"
+        },
+        {
+          "$ref": "#/$defs/StreamSegmentSequence"
+        },
+        {
+          "$ref": "#/$defs/StreamCameraAbsence"
+        }
+      ]
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "RefinementRole": {
+      "description": "Role of a derived boundary window.",
+      "enum": [
+        "ONSET",
+        "OFFSET"
+      ],
+      "title": "RefinementRole",
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamCameraAbsence": {
+      "additionalProperties": false,
+      "description": "Typed absence/degradation fact; omission is never used for a slot.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "evidence_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence Sha256"
+        },
+        "kind": {
+          "const": "ABSENCE",
+          "default": "ABSENCE",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/CameraAbsenceReason"
+        }
+      },
+      "required": [
+        "kind",
+        "camera_id",
+        "reason",
+        "evidence_sha256"
+      ],
+      "title": "StreamCameraAbsence",
+      "type": "object"
+    },
+    "StreamIntervalAbsence": {
+      "additionalProperties": false,
+      "description": "One evidenced missing or unusable interval inside a camera slot.\n\nThis is deliberately distinct from :class:`StreamCameraAbsence`, which\ncloses an entire camera slot. Partial gaps must remain explicit members\nof the ordered segment sequence so downstream planners cannot silently\ncollapse missing, late, black, frozen, or corrupt input.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "kind": {
+          "const": "INTERVAL_ABSENCE",
+          "default": "INTERVAL_ABSENCE",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/CameraAbsenceReason"
+        }
+      },
+      "required": [
+        "kind",
+        "camera_id",
+        "capture_scope_digest",
+        "interval",
+        "reason",
+        "evidence_sha256"
+      ],
+      "title": "StreamIntervalAbsence",
+      "type": "object"
+    },
+    "StreamPurpose": {
+      "description": "Provider-neutral purposes used in window and inference identity.",
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT"
+      ],
+      "title": "StreamPurpose",
+      "type": "string"
+    },
+    "StreamSegmentRef": {
+      "additionalProperties": false,
+      "description": "One immutable segment member in a camera slot.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "kind": {
+          "const": "SEGMENT",
+          "default": "SEGMENT",
+          "title": "Kind",
+          "type": "string"
+        },
+        "segment_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Segment Key",
+          "type": "string"
+        },
+        "segment_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Segment Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "camera_id",
+        "capture_scope_digest",
+        "segment_key",
+        "segment_semantic_sha256"
+      ],
+      "title": "StreamSegmentRef",
+      "type": "object"
+    },
+    "StreamSegmentSequence": {
+      "additionalProperties": false,
+      "description": "Ordered non-empty segment or evidenced-gap members for one camera slot.\n\nA sequence preserves the planner's temporal order without assuming a fixed\nsegment duration in the wire contract. Continuity and coverage against the\nwindow policy are planner responsibilities; this primitive still rejects\ncross-camera, cross-capture, empty, and repeated members.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "capture_scope_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Capture Scope Digest",
+          "type": "string"
+        },
+        "kind": {
+          "const": "SEGMENT_SEQUENCE",
+          "default": "SEGMENT_SEQUENCE",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ordered_members": {
+          "items": {
+            "$ref": "#/$defs/StreamSequenceMember"
+          },
+          "title": "Ordered Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "camera_id",
+        "capture_scope_digest",
+        "ordered_members"
+      ],
+      "title": "StreamSegmentSequence",
+      "type": "object"
+    },
+    "StreamSequenceMember": {
+      "discriminator": {
+        "mapping": {
+          "INTERVAL_ABSENCE": "#/$defs/StreamIntervalAbsence",
+          "SEGMENT": "#/$defs/StreamSegmentRef"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StreamSegmentRef"
+        },
+        {
+          "$ref": "#/$defs/StreamIntervalAbsence"
+        }
+      ]
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/incremental-window.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable non-final window subject under a pre-EOS capture scope.",
+  "properties": {
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "clock_or_alignment_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Clock Or Alignment Semantic Sha256",
+      "type": "string"
+    },
+    "effective_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "identity_policy_version": {
+      "default": "incremental-window-identity-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Identity Policy Version",
+      "type": "string"
+    },
+    "mapping_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Mapping Semantic Sha256",
+      "type": "string"
+    },
+    "ordered_six_slot_segment_or_explicit_absence_closure": {
+      "items": {
+        "$ref": "#/$defs/CameraSlotClosure"
+      },
+      "title": "Ordered Six Slot Segment Or Explicit Absence Closure",
+      "type": "array"
+    },
+    "parent_subject_key_or_none": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Subject Key Or None"
+    },
+    "purpose": {
+      "$ref": "#/$defs/StreamPurpose"
+    },
+    "refinement_generation": {
+      "default": 0,
+      "title": "Refinement Generation",
+      "type": "integer"
+    },
+    "refinement_role_or_none": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RefinementRole"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "requested_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_projection_version": {
+      "default": "incremental-window-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Semantic Projection Version",
+      "type": "string"
+    },
+    "subject_type": {
+      "const": "INCREMENTAL_WINDOW",
+      "default": "INCREMENTAL_WINDOW",
+      "title": "Subject Type",
+      "type": "string"
+    },
+    "window_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Window Id",
+      "type": "string"
+    },
+    "window_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Window Key",
+      "type": "string"
+    },
+    "window_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Window Policy Version",
+      "type": "string"
+    },
+    "window_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "subject_type",
+    "window_id",
+    "window_key",
+    "window_semantic_sha256",
+    "capture_scope_digest",
+    "purpose",
+    "requested_interval",
+    "effective_interval",
+    "ordered_six_slot_segment_or_explicit_absence_closure",
+    "mapping_semantic_sha256",
+    "clock_or_alignment_semantic_sha256",
+    "parent_subject_key_or_none",
+    "refinement_role_or_none",
+    "refinement_generation",
+    "window_policy_version",
+    "semantic_projection_version",
+    "identity_policy_version"
+  ],
+  "title": "IncrementalWindow",
+  "type": "object"
+}

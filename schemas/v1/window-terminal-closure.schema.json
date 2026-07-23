@@ -1,0 +1,252 @@
+{
+  "$defs": {
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "TerminalOutcome": {
+      "description": "Terminal outcomes retained by stream closure, including failures.",
+      "enum": [
+        "SUCCEEDED",
+        "SKIPPED_POLICY",
+        "SKIPPED_NOT_NEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+        "QUARANTINED",
+        "LATE_INPUT",
+        "INCOMPLETE",
+        "ABSTAINED",
+        "NO_EVENTS",
+        "INVALIDATED"
+      ],
+      "title": "TerminalOutcome",
+      "type": "string"
+    },
+    "WindowTerminalMember": {
+      "additionalProperties": false,
+      "description": "One exact terminal outcome for one sealed expected ordinal.",
+      "properties": {
+        "expected_ordinal": {
+          "minimum": 0,
+          "title": "Expected Ordinal",
+          "type": "integer"
+        },
+        "member_projection_version": {
+          "default": "window-terminal-member-semantic-v1",
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Member Projection Version",
+          "type": "string"
+        },
+        "member_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Member Semantic Sha256",
+          "type": "string"
+        },
+        "plan_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Plan Key",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "terminal_evidence_ref": {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        "terminal_outcome": {
+          "$ref": "#/$defs/TerminalOutcome"
+        },
+        "terminal_policy_version": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Terminal Policy Version",
+          "type": "string"
+        },
+        "terminal_work_item_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Terminal Work Item Id",
+          "type": "string"
+        },
+        "terminal_work_logical_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Terminal Work Logical Key",
+          "type": "string"
+        },
+        "window_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Window Key",
+          "type": "string"
+        },
+        "window_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Window Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "schema_ref",
+        "plan_key",
+        "expected_ordinal",
+        "window_key",
+        "window_semantic_sha256",
+        "terminal_outcome",
+        "terminal_work_item_id",
+        "terminal_work_logical_key",
+        "terminal_evidence_ref",
+        "terminal_policy_version",
+        "member_projection_version",
+        "member_semantic_sha256"
+      ],
+      "title": "WindowTerminalMember",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/window-terminal-closure.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Execution reconciliation over the already sealed expected set.",
+  "properties": {
+    "expected_member_count": {
+      "minimum": 0,
+      "title": "Expected Member Count",
+      "type": "integer"
+    },
+    "members": {
+      "items": {
+        "$ref": "#/$defs/WindowTerminalMember"
+      },
+      "title": "Members",
+      "type": "array"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "plan_seal_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Seal Semantic Sha256",
+      "type": "string"
+    },
+    "projection_version": {
+      "default": "window-terminal-closure-semantic-v1",
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "terminal_closure_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Terminal Closure Digest",
+      "type": "string"
+    },
+    "terminal_member_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Terminal Member Root",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "plan_key",
+    "plan_seal_semantic_sha256",
+    "expected_member_count",
+    "members",
+    "terminal_member_root",
+    "terminal_closure_digest",
+    "projection_version"
+  ],
+  "title": "WindowTerminalClosure",
+  "type": "object"
+}

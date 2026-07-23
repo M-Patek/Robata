@@ -27,6 +27,108 @@ class WireSchemaSpec:
 
 
 WIRE_SCHEMAS = {
+    "pre-eos-capture-subject": WireSchemaSpec(
+        module="robata.contracts.stream_source",
+        model="PreEosCaptureSubject",
+        document_id="https://schemas.robata.dev/v1/pre-eos-capture-subject.schema.json",
+        title="PreEosCaptureSubject",
+    ),
+    "stream-segment": WireSchemaSpec(
+        module="robata.contracts.stream_source",
+        model="StreamSegmentManifest",
+        document_id="https://schemas.robata.dev/v1/stream-segment.schema.json",
+        title="StreamSegmentManifest",
+    ),
+    "incremental-window": WireSchemaSpec(
+        module="robata.contracts.stream_window",
+        model="IncrementalWindow",
+        document_id="https://schemas.robata.dev/v1/incremental-window.schema.json",
+        title="IncrementalWindow",
+    ),
+    "stream-inference-intent": WireSchemaSpec(
+        module="robata.contracts.stream_inference",
+        model="StreamInferenceIntent",
+        document_id="https://schemas.robata.dev/v1/stream-inference-intent.schema.json",
+        title="StreamInferenceIntent",
+    ),
+    "stream-accepted-call-evidence": WireSchemaSpec(
+        module="robata.contracts.stream_inference",
+        model="StreamAcceptedCallEvidence",
+        document_id=("https://schemas.robata.dev/v1/stream-accepted-call-evidence.schema.json"),
+        title="StreamAcceptedCallEvidence",
+    ),
+    "stream-inference-terminal": WireSchemaSpec(
+        module="robata.contracts.stream_inference",
+        model="StreamInferenceTerminal",
+        document_id="https://schemas.robata.dev/v1/stream-inference-terminal.schema.json",
+        title="StreamInferenceTerminal",
+    ),
+    "stream-window-result": WireSchemaSpec(
+        module="robata.contracts.stream_inference",
+        model="StreamWindowResult",
+        document_id="https://schemas.robata.dev/v1/stream-window-result.schema.json",
+        title="StreamWindowResult",
+    ),
+    "stream-work-plan": WireSchemaSpec(
+        module="robata.contracts.stream_planning",
+        model="StreamWorkItemPlan",
+        document_id="https://schemas.robata.dev/v1/stream-work-plan.schema.json",
+        title="StreamWorkItemPlan",
+    ),
+    "stream-work-message": WireSchemaSpec(
+        module="robata.queue.stream_wire",
+        model="StreamWorkMessage",
+        document_id="https://schemas.robata.dev/v1/stream-work-message.schema.json",
+        title="StreamWorkMessage",
+    ),
+    "expected-window-plan": WireSchemaSpec(
+        module="robata.contracts.stream_planning",
+        model="ExpectedWindowPlan",
+        document_id="https://schemas.robata.dev/v1/expected-window-plan.schema.json",
+        title="ExpectedWindowPlan",
+    ),
+    "expected-window-declaration": WireSchemaSpec(
+        module="robata.contracts.stream_planning",
+        model="ExpectedWindowDeclaration",
+        document_id=("https://schemas.robata.dev/v1/expected-window-declaration.schema.json"),
+        title="ExpectedWindowDeclaration",
+    ),
+    "expected-window-plan-seal": WireSchemaSpec(
+        module="robata.contracts.stream_planning",
+        model="ExpectedWindowPlanSeal",
+        document_id="https://schemas.robata.dev/v1/expected-window-plan-seal.schema.json",
+        title="ExpectedWindowPlanSeal",
+    ),
+    "window-terminal-member": WireSchemaSpec(
+        module="robata.contracts.stream_finalization",
+        model="WindowTerminalMember",
+        document_id="https://schemas.robata.dev/v1/window-terminal-member.schema.json",
+        title="WindowTerminalMember",
+    ),
+    "window-terminal-closure": WireSchemaSpec(
+        module="robata.contracts.stream_finalization",
+        model="WindowTerminalClosure",
+        document_id="https://schemas.robata.dev/v1/window-terminal-closure.schema.json",
+        title="WindowTerminalClosure",
+    ),
+    "recording-finalization-map": WireSchemaSpec(
+        module="robata.contracts.stream_finalization",
+        model="RecordingFinalizationMap",
+        document_id="https://schemas.robata.dev/v1/recording-finalization-map.schema.json",
+        title="RecordingFinalizationMap",
+    ),
+    "artifact-registry-entry-v3": WireSchemaSpec(
+        module="robata.contracts.artifacts_v3",
+        model="ArtifactRegistryEntryV3",
+        document_id="https://schemas.robata.dev/v3/artifact-registry-entry.schema.json",
+        title="ArtifactRegistryEntryV3",
+    ),
+    "artifact-registry-snapshot-v3": WireSchemaSpec(
+        module="robata.contracts.artifacts_v3",
+        model="ArtifactRegistrySnapshotV3",
+        document_id="https://schemas.robata.dev/v3/artifact-registry-snapshot.schema.json",
+        title="ArtifactRegistrySnapshotV3",
+    ),
     "local-supplemental-qa-evidence": WireSchemaSpec(
         module="robata.qa_pipeline.supplemental_wire",
         model="LocalSupplementalQaEvidence",

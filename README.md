@@ -197,12 +197,13 @@ decision. An unapproved mapping may be exercised only with the CLI's explicit lo
 override. That mode may derive local V2 evidence, but never publishes a governed READY decision,
 makes a provider call, or sets `production_eligible=true`.
 
-Schema publication has two repository commands. `register_schema.py` publishes one new
-`compatibility_mode=NONE` schema. `register_schema_evolution.py` publishes one new `BACKWARD`
-target plus one or more direct incoming upcasters and their exact code, runtime, and paired golden
-artifacts as one bundle. Both normalize candidates to deterministic UTF-8/LF bytes, derive exact
-digests and artifact IDs, validate a complete temporary registry snapshot, and replace the catalog
-last as the publication commit point. Evolution publication additionally constructs the full
+Schema publication has three repository commands. `register_schema.py` publishes one new
+`compatibility_mode=NONE` schema. `register_schema_bundle.py` atomically publishes one or more
+independent `NONE` schemas. `register_schema_evolution.py` publishes one new `BACKWARD` target
+plus one or more direct incoming upcasters and their exact code, runtime, and paired golden
+artifacts as one bundle. All three normalize candidates to deterministic UTF-8/LF bytes, derive
+exact digests and artifact IDs, validate a complete temporary registry snapshot, and replace the
+catalog last as the publication commit point. Evolution publication additionally constructs the full
 upcaster graph and executes its golden validation before commit. Readers share the publication
 lock and therefore cannot observe the artifact/catalog replacement window. A digest-bound
 transaction marker covers every staged bundle artifact and supports exact recovery after an
@@ -212,16 +213,19 @@ stale marker left after the catalog commit:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\register_schema.py --help
+.\.venv\Scripts\python.exe scripts\register_schema_bundle.py --help
 .\.venv\Scripts\python.exe scripts\register_schema_evolution.py --help
 .\.venv\Scripts\python.exe scripts\verify_schema_registry.py
 .\.venv\Scripts\python.exe scripts\check_schema_immutability.py --baseline-ref $env:SCHEMA_BASELINE_REF
 ```
 
 The evolution command deliberately does not edit an existing target or edge: its bundle must name
-one previously unknown target and at least one direct predecessor. The 47-entry live catalog now
-includes `media-quality-report@1.0.0`, the frozen
-`local-supplemental-qa-evidence@1.0.0`, and its corrected separately published `2.0.0` version. It
-still has `upcasters=[]` because these targets declare `compatibility_mode=NONE`; the command is
+one previously unknown target and at least one direct predecessor. The 64-entry live catalog now
+includes the pre-EOS capture/segment/window, stream inference evidence, stream work,
+expected-window closure, finalization, and Artifact Registry V3 families in addition to
+`media-quality-report@1.0.0`, the frozen `local-supplemental-qa-evidence@1.0.0`, and its corrected
+separately published `2.0.0` version. It still has `upcasters=[]` because these targets declare
+`compatibility_mode=NONE`; the command is
 executable publication infrastructure, not evidence that a business migration has been approved
 or published. On Windows these tools guarantee atomic catalog
 visibility and retry after normal process interruption, but do not claim power-loss durability for
