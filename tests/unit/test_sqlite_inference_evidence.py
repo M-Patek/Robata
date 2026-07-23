@@ -1117,6 +1117,62 @@ def test_crud_uses_targeted_validation_until_explicit_full_audit(
     ledger.verify_integrity()
 
 
+def test_hot_reads_defer_registered_schema_validation_to_full_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = SQLiteInferenceEvidenceLedger(_database(tmp_path), SchemaRegistry())
+    evidence = _persist_chain(ledger)
+    validate_pinned = ledger.schema_registry.validate_pinned
+    validated_schema_ids: list[str] = []
+
+    def counted_validate_pinned(ref: object, instance: object) -> None:
+        schema_id = getattr(ref, "schema_id", None)
+        assert isinstance(schema_id, str)
+        validated_schema_ids.append(schema_id)
+        validate_pinned(ref, instance)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        ledger.schema_registry,
+        "validate_pinned",
+        counted_validate_pinned,
+    )
+
+    assert ledger.append_terminal(evidence.terminal) == evidence.terminal
+    assert evidence.intent.request.output_schema.schema_id in validated_schema_ids
+    validated_schema_ids.clear()
+
+    assert ledger.get_intent(evidence.intent.inference_id) == evidence.intent
+    assert ledger.get_terminal(evidence.terminal.inference_id) == evidence.terminal
+    assert (
+        ledger.get_raw_artifact(evidence.parsed.raw_response.artifact_id)
+        == evidence.parsed.raw_response
+    )
+    assert ledger.get_selection(
+        evidence.selection.logical_invocation_id,
+        evidence.selection.policy_version,
+    ) == evidence.selection
+    assert ledger.get_parsed_claim(evidence.parsed.artifact_id) == evidence.parsed
+    assert ledger.get_selected_output(evidence.selected.selection_id) == evidence.selected
+    assert ledger.get_enriched_output(evidence.enriched.artifact_id) == evidence.enriched
+    assert validated_schema_ids == []
+
+    ledger.verify_integrity()
+
+    assert INFERENCE_INTENT_SCHEMA_ID in validated_schema_ids
+    assert RAW_PROVIDER_RESPONSE_SCHEMA_ID in validated_schema_ids
+    validated_schema_ids.clear()
+
+    restarted = SQLiteInferenceEvidenceLedger(
+        _database(tmp_path),
+        ledger.schema_registry,
+    )
+
+    assert restarted.get_enriched_output(evidence.enriched.artifact_id) == evidence.enriched
+    assert INFERENCE_INTENT_SCHEMA_ID in validated_schema_ids
+    assert RAW_PROVIDER_RESPONSE_SCHEMA_ID in validated_schema_ids
+
+
 def test_explicit_full_audit_and_reopen_detect_unrelated_row_tampering(
     tmp_path: Path,
 ) -> None:

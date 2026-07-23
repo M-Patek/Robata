@@ -397,7 +397,7 @@ class SQLiteInferenceEvidenceLedger:
                 (checked.inference_id, checked.request_id),
             ).fetchall()
             existing = _exact_existing(
-                tuple(self._intent_from_row(row) for row in rows),
+                tuple(self._intent_from_row(row, audit_schema=False) for row in rows),
                 checked,
                 conflict=f"conflicting intent: {checked.inference_id}",
             )
@@ -485,6 +485,7 @@ class SQLiteInferenceEvidenceLedger:
                     intent,
                     terminal_raw,
                     candidate,
+                    audit_schema=False,
                 )
             rows = connection.execute(
                 """
@@ -562,12 +563,10 @@ class SQLiteInferenceEvidenceLedger:
 
         def append(connection: sqlite3.Connection) -> ModelInference:
             existing = self._terminal_by_inference_id(connection, checked.inference_id)
-            if existing is not None:
-                if existing != checked:
-                    raise SQLiteInferenceEvidenceLedgerError(
-                        f"conflicting terminal attempt: {checked.inference_id}"
-                    )
-                return existing
+            if existing is not None and existing != checked:
+                raise SQLiteInferenceEvidenceLedgerError(
+                    f"conflicting terminal attempt: {checked.inference_id}"
+                )
             intent = self._intent_by_inference_id(connection, checked.inference_id)
             if intent is None:
                 raise SQLiteInferenceEvidenceLedgerError(
@@ -580,7 +579,15 @@ class SQLiteInferenceEvidenceLedger:
                 else None
             )
             request_raw = self._raw_by_request_id(connection, checked.request_id)
-            self._validate_terminal(checked, intent, stored_raw, request_raw)
+            self._validate_terminal(
+                checked,
+                intent,
+                stored_raw,
+                request_raw,
+                audit_schema=True,
+            )
+            if existing is not None:
+                return existing
             pin = self._pins["terminal"]
             connection.execute(
                 """
@@ -1378,7 +1385,7 @@ class SQLiteInferenceEvidenceLedger:
         intents = {
             item.inference_id: item
             for item in (
-                self._intent_from_row(row)
+                self._intent_from_row(row, audit_schema=True)
                 for row in connection.execute(
                     "SELECT * FROM inference_intents ORDER BY inference_id"
                 ).fetchall()
@@ -1395,7 +1402,13 @@ class SQLiteInferenceEvidenceLedger:
         terminals = {
             item.inference_id: item
             for item in (
-                self._terminal_from_row(row, intents, raw, raw_inference)
+                self._terminal_from_row(
+                    row,
+                    intents,
+                    raw,
+                    raw_inference,
+                    audit_schema=True,
+                )
                 for row in connection.execute(
                     "SELECT * FROM model_inference_terminals ORDER BY inference_id"
                 ).fetchall()
@@ -1404,7 +1417,7 @@ class SQLiteInferenceEvidenceLedger:
         selections = {
             (item.logical_invocation_id, item.policy_version): item
             for item in (
-                self._selection_from_row(row, terminals)
+                self._selection_from_row(row, terminals, audit_schema=True)
                 for row in connection.execute(
                     """
                     SELECT * FROM inference_attempt_selections
@@ -1426,7 +1439,7 @@ class SQLiteInferenceEvidenceLedger:
         raw_artifacts = {
             item.artifact_id: item
             for item in (
-                self._raw_artifact_from_row(row, state)
+                self._raw_artifact_from_row(row, state, audit_schema=True)
                 for row in connection.execute(
                     "SELECT * FROM raw_provider_artifacts ORDER BY artifact_id"
                 ).fetchall()
@@ -1442,7 +1455,7 @@ class SQLiteInferenceEvidenceLedger:
         parsed = {
             item.artifact_id: item
             for item in (
-                self._parsed_from_row(row, state)
+                self._parsed_from_row(row, state, audit_schema=True)
                 for row in connection.execute(
                     "SELECT * FROM parsed_provider_claims ORDER BY artifact_id"
                 ).fetchall()
@@ -1452,7 +1465,7 @@ class SQLiteInferenceEvidenceLedger:
         selected = {
             item.selection_id: item
             for item in (
-                self._selected_from_row(row, state)
+                self._selected_from_row(row, state, audit_schema=True)
                 for row in connection.execute(
                     "SELECT * FROM selected_attempt_outputs ORDER BY selection_id"
                 ).fetchall()
@@ -1462,7 +1475,7 @@ class SQLiteInferenceEvidenceLedger:
         enriched = {
             item.artifact_id: item
             for item in (
-                self._enriched_from_row(row, state)
+                self._enriched_from_row(row, state, audit_schema=True)
                 for row in connection.execute(
                     "SELECT * FROM enriched_provider_outputs ORDER BY artifact_id"
                 ).fetchall()
@@ -1474,31 +1487,49 @@ class SQLiteInferenceEvidenceLedger:
         self,
         connection: sqlite3.Connection,
         inference_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> InferenceIntent | None:
         row = connection.execute(
             "SELECT * FROM inference_intents WHERE inference_id = ?",
             (inference_id,),
         ).fetchone()
-        return None if row is None else self._intent_from_row(row)
+        return (
+            None
+            if row is None
+            else self._intent_from_row(row, audit_schema=audit_schema)
+        )
 
     def _intent_by_request_id(
         self,
         connection: sqlite3.Connection,
         request_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> InferenceIntent | None:
         row = connection.execute(
             "SELECT * FROM inference_intents WHERE request_id = ?",
             (request_id,),
         ).fetchone()
-        return None if row is None else self._intent_from_row(row)
+        return (
+            None
+            if row is None
+            else self._intent_from_row(row, audit_schema=audit_schema)
+        )
 
     def _raw_from_database_row(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
+        *,
+        audit_schema: bool = False,
     ) -> StoredRawProviderBytes:
         inference_id = _row_text(row, "inference_id")
-        intent = self._intent_by_inference_id(connection, inference_id)
+        intent = self._intent_by_inference_id(
+            connection,
+            inference_id,
+            audit_schema=audit_schema,
+        )
         intents = {} if intent is None else {intent.inference_id: intent}
         record, _inference_id = self._raw_from_row(row, intents)
         return record
@@ -1507,23 +1538,43 @@ class SQLiteInferenceEvidenceLedger:
         self,
         connection: sqlite3.Connection,
         artifact_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> StoredRawProviderBytes | None:
         row = connection.execute(
             "SELECT * FROM raw_provider_responses WHERE artifact_id = ?",
             (artifact_id,),
         ).fetchone()
-        return None if row is None else self._raw_from_database_row(connection, row)
+        return (
+            None
+            if row is None
+            else self._raw_from_database_row(
+                connection,
+                row,
+                audit_schema=audit_schema,
+            )
+        )
 
     def _raw_by_request_id(
         self,
         connection: sqlite3.Connection,
         request_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> StoredRawProviderBytes | None:
         row = connection.execute(
             "SELECT * FROM raw_provider_responses WHERE request_id = ?",
             (request_id,),
         ).fetchone()
-        return None if row is None else self._raw_from_database_row(connection, row)
+        return (
+            None
+            if row is None
+            else self._raw_from_database_row(
+                connection,
+                row,
+                audit_schema=audit_schema,
+            )
+        )
 
     def _terminal_from_database_row(
         self,
@@ -1531,7 +1582,24 @@ class SQLiteInferenceEvidenceLedger:
         row: sqlite3.Row,
         *,
         require_typed_artifact: bool,
+        audit_schema: bool = False,
     ) -> ModelInference:
+        terminal, _state = self._terminal_and_state_from_database_row(
+            connection,
+            row,
+            require_typed_artifact=require_typed_artifact,
+            audit_schema=audit_schema,
+        )
+        return terminal
+
+    def _terminal_and_state_from_database_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        require_typed_artifact: bool,
+        audit_schema: bool,
+    ) -> tuple[ModelInference, _LedgerState]:
         inference_id = _row_text(row, "inference_id")
         request_id = _row_text(row, "request_id")
         raw_artifact_value: object = row["raw_artifact_id"]
@@ -1540,38 +1608,66 @@ class SQLiteInferenceEvidenceLedger:
                 "SQLite column 'raw_artifact_id' is neither text nor null"
             )
         raw_artifact_id = raw_artifact_value
-        intent = self._intent_by_inference_id(connection, inference_id)
+        intent_row = connection.execute(
+            "SELECT * FROM inference_intents WHERE inference_id = ?",
+            (inference_id,),
+        ).fetchone()
+        intent = (
+            None
+            if intent_row is None
+            else self._intent_from_row(intent_row, audit_schema=audit_schema)
+        )
         intents = {} if intent is None else {intent.inference_id: intent}
-        stored_raw = (
-            self._raw_by_artifact_id(connection, raw_artifact_id)
-            if raw_artifact_id is not None
-            else None
-        )
-        request_raw = self._raw_by_request_id(connection, request_id)
-        raw_values = tuple(
-            {
-                item.artifact_id: item for item in (stored_raw, request_raw) if item is not None
-            }.values()
-        )
-        raw = {item.artifact_id: item for item in raw_values}
-        raw_inference = {item.artifact_id: inference_id for item in raw_values}
+        raw: dict[str, StoredRawProviderBytes] = {}
+        raw_inference: dict[str, str] = {}
+        for raw_row in connection.execute(
+            """
+            SELECT * FROM raw_provider_responses
+            WHERE inference_id = ?
+              AND (artifact_id = ? OR request_id = ?)
+            ORDER BY artifact_id
+            """,
+            (inference_id, raw_artifact_id, request_id),
+        ).fetchall():
+            stored, stored_inference_id = self._raw_from_row(raw_row, intents)
+            raw[stored.artifact_id] = stored
+            raw_inference[stored.artifact_id] = stored_inference_id
         terminal = self._terminal_from_row(
             row,
             intents,
             raw,
             raw_inference,
+            audit_schema=audit_schema,
+        )
+        state = _LedgerState(
+            intents=intents,
+            raw=raw,
+            terminals={terminal.inference_id: terminal},
+            raw_artifacts={},
+            selections={},
+            parsed={},
+            selected={},
+            enriched={},
         )
         if require_typed_artifact and raw_artifact_id is not None:
-            typed = self._raw_artifact_by_id(
-                connection,
-                raw_artifact_id,
-                terminal=terminal,
-            )
-            if typed is None:
+            typed_row = connection.execute(
+                "SELECT * FROM raw_provider_artifacts WHERE artifact_id = ?",
+                (raw_artifact_id,),
+            ).fetchone()
+            if typed_row is None:
                 raise SQLiteInferenceEvidenceLedgerError(
                     "terminal raw bytes are missing their typed raw provider artifact"
                 )
-        return terminal
+            typed = self._raw_artifact_from_row(
+                typed_row,
+                state,
+                audit_schema=audit_schema,
+            )
+            state = replace(
+                state,
+                raw_artifacts={typed.artifact_id: typed},
+            )
+        return terminal, state
 
     def _terminal_by_inference_id(
         self,
@@ -1579,6 +1675,7 @@ class SQLiteInferenceEvidenceLedger:
         inference_id: str,
         *,
         require_typed_artifact: bool = True,
+        audit_schema: bool = False,
     ) -> ModelInference | None:
         row = connection.execute(
             "SELECT * FROM model_inference_terminals WHERE inference_id = ?",
@@ -1590,23 +1687,36 @@ class SQLiteInferenceEvidenceLedger:
             connection,
             row,
             require_typed_artifact=require_typed_artifact,
+            audit_schema=audit_schema,
         )
 
     def _selection_from_database_row(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
+        *,
+        audit_schema: bool = False,
     ) -> InferenceAttemptSelection:
         inference_id = _row_text(row, "inference_id")
-        terminal = self._terminal_by_inference_id(connection, inference_id)
+        terminal = self._terminal_by_inference_id(
+            connection,
+            inference_id,
+            audit_schema=audit_schema,
+        )
         terminals = {} if terminal is None else {terminal.inference_id: terminal}
-        return self._selection_from_row(row, terminals)
+        return self._selection_from_row(
+            row,
+            terminals,
+            audit_schema=audit_schema,
+        )
 
     def _selection_by_logical_key(
         self,
         connection: sqlite3.Connection,
         logical_invocation_id: str,
         policy_version: str,
+        *,
+        audit_schema: bool = False,
     ) -> InferenceAttemptSelection | None:
         row = connection.execute(
             """
@@ -1615,18 +1725,36 @@ class SQLiteInferenceEvidenceLedger:
             """,
             (logical_invocation_id, policy_version),
         ).fetchone()
-        return None if row is None else self._selection_from_database_row(connection, row)
+        return (
+            None
+            if row is None
+            else self._selection_from_database_row(
+                connection,
+                row,
+                audit_schema=audit_schema,
+            )
+        )
 
     def _selection_by_id(
         self,
         connection: sqlite3.Connection,
         selection_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> InferenceAttemptSelection | None:
         row = connection.execute(
             "SELECT * FROM inference_attempt_selections WHERE selection_id = ?",
             (selection_id,),
         ).fetchone()
-        return None if row is None else self._selection_from_database_row(connection, row)
+        return (
+            None
+            if row is None
+            else self._selection_from_database_row(
+                connection,
+                row,
+                audit_schema=audit_schema,
+            )
+        )
 
     def _raw_artifact_dependencies_state(
         self,
@@ -1634,18 +1762,34 @@ class SQLiteInferenceEvidenceLedger:
         *,
         artifact_id: str,
         inference_id: str,
+        audit_schema: bool = False,
     ) -> _LedgerState:
-        intent = self._intent_by_inference_id(connection, inference_id)
-        raw = self._raw_by_artifact_id(connection, artifact_id)
-        terminal = self._terminal_by_inference_id(
+        terminal_row = connection.execute(
+            "SELECT * FROM model_inference_terminals WHERE inference_id = ?",
+            (inference_id,),
+        ).fetchone()
+        if terminal_row is not None:
+            _terminal, state = self._terminal_and_state_from_database_row(
+                connection,
+                terminal_row,
+                require_typed_artifact=False,
+                audit_schema=audit_schema,
+            )
+            return state
+        intent = self._intent_by_inference_id(
             connection,
             inference_id,
-            require_typed_artifact=False,
+            audit_schema=audit_schema,
+        )
+        raw = self._raw_by_artifact_id(
+            connection,
+            artifact_id,
+            audit_schema=audit_schema,
         )
         return _LedgerState(
             intents={} if intent is None else {intent.inference_id: intent},
             raw={} if raw is None else {raw.artifact_id: raw},
-            terminals={} if terminal is None else {terminal.inference_id: terminal},
+            terminals={},
             raw_artifacts={},
             selections={},
             parsed={},
@@ -1659,6 +1803,7 @@ class SQLiteInferenceEvidenceLedger:
         row: sqlite3.Row,
         *,
         terminal: ModelInference | None = None,
+        audit_schema: bool = False,
     ) -> RawProviderResponseArtifact:
         artifact_id = _row_text(row, "artifact_id")
         inference_id = _row_text(row, "inference_id")
@@ -1666,13 +1811,18 @@ class SQLiteInferenceEvidenceLedger:
             connection,
             artifact_id=artifact_id,
             inference_id=inference_id,
+            audit_schema=audit_schema,
         )
         if terminal is not None:
             state = replace(
                 state,
                 terminals={terminal.inference_id: terminal},
             )
-        return self._raw_artifact_from_row(row, state)
+        return self._raw_artifact_from_row(
+            row,
+            state,
+            audit_schema=audit_schema,
+        )
 
     def _raw_artifact_by_id(
         self,
@@ -1680,6 +1830,7 @@ class SQLiteInferenceEvidenceLedger:
         artifact_id: str,
         *,
         terminal: ModelInference | None = None,
+        audit_schema: bool = False,
     ) -> RawProviderResponseArtifact | None:
         row = connection.execute(
             "SELECT * FROM raw_provider_artifacts WHERE artifact_id = ?",
@@ -1691,6 +1842,7 @@ class SQLiteInferenceEvidenceLedger:
             connection,
             row,
             terminal=terminal,
+            audit_schema=audit_schema,
         )
 
     def _append_raw_artifact_row(
@@ -1705,7 +1857,10 @@ class SQLiteInferenceEvidenceLedger:
             connection,
             artifact_id=artifact.artifact_id,
             inference_id=artifact.inference_id,
+            audit_schema=False,
         )
+        if payload is None:
+            self._validate_contract_payload("raw_artifact", artifact)
         self._validate_raw_artifact(artifact, state)
         existing = self._raw_artifact_by_id(connection, artifact.artifact_id)
         if existing is not None:
@@ -1767,140 +1922,285 @@ class SQLiteInferenceEvidenceLedger:
         self,
         connection: sqlite3.Connection,
         artifact_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> _LedgerState:
-        artifact = self._raw_artifact_by_id(connection, artifact_id)
-        if artifact is None:
+        row = connection.execute(
+            "SELECT * FROM raw_provider_artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
             return _LedgerState({}, {}, {}, {}, {}, {}, {}, {})
         state = self._raw_artifact_dependencies_state(
             connection,
-            artifact_id=artifact.artifact_id,
-            inference_id=artifact.inference_id,
+            artifact_id=artifact_id,
+            inference_id=_row_text(row, "inference_id"),
+            audit_schema=audit_schema,
+        )
+        artifact = self._raw_artifact_from_row(
+            row,
+            state,
+            audit_schema=audit_schema,
         )
         return replace(
             state,
             raw_artifacts={artifact.artifact_id: artifact},
         )
 
+    def _parsed_and_state_from_database_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        audit_schema: bool,
+    ) -> tuple[ParsedProviderClaimArtifact, _LedgerState]:
+        state = self._state_for_raw_artifact(
+            connection,
+            _row_text(row, "raw_artifact_id"),
+            audit_schema=audit_schema,
+        )
+        parsed = self._parsed_from_row(
+            row,
+            state,
+            audit_schema=audit_schema,
+        )
+        return parsed, replace(
+            state,
+            parsed={parsed.artifact_id: parsed},
+        )
+
     def _parsed_from_database_row(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
+        *,
+        audit_schema: bool = False,
     ) -> ParsedProviderClaimArtifact:
-        state = self._state_for_raw_artifact(
+        parsed, _state = self._parsed_and_state_from_database_row(
             connection,
-            _row_text(row, "raw_artifact_id"),
+            row,
+            audit_schema=audit_schema,
         )
-        return self._parsed_from_row(row, state)
+        return parsed
+
+    def _parsed_and_state_by_artifact_id(
+        self,
+        connection: sqlite3.Connection,
+        artifact_id: str,
+        *,
+        audit_schema: bool,
+    ) -> tuple[ParsedProviderClaimArtifact, _LedgerState] | None:
+        row = connection.execute(
+            "SELECT * FROM parsed_provider_claims WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._parsed_and_state_from_database_row(
+            connection,
+            row,
+            audit_schema=audit_schema,
+        )
 
     def _parsed_by_artifact_id(
         self,
         connection: sqlite3.Connection,
         artifact_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> ParsedProviderClaimArtifact | None:
-        row = connection.execute(
-            "SELECT * FROM parsed_provider_claims WHERE artifact_id = ?",
-            (artifact_id,),
-        ).fetchone()
-        return None if row is None else self._parsed_from_database_row(connection, row)
+        parsed_and_state = self._parsed_and_state_by_artifact_id(
+            connection,
+            artifact_id,
+            audit_schema=audit_schema,
+        )
+        return None if parsed_and_state is None else parsed_and_state[0]
 
     def _state_for_selected_output(
         self,
         connection: sqlite3.Connection,
         selection_id: str,
         parsed_artifact_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> _LedgerState:
-        selection = self._selection_by_id(connection, selection_id)
-        parsed = self._parsed_by_artifact_id(connection, parsed_artifact_id)
-        selections = (
-            {}
-            if selection is None
-            else {(selection.logical_invocation_id, selection.policy_version): selection}
+        parsed_and_state = self._parsed_and_state_by_artifact_id(
+            connection,
+            parsed_artifact_id,
+            audit_schema=audit_schema,
         )
-        return _LedgerState(
-            intents={},
-            raw={},
-            terminals={},
-            raw_artifacts={},
-            selections=selections,
-            parsed={} if parsed is None else {parsed.artifact_id: parsed},
-            selected={},
-            enriched={},
+        state = (
+            _LedgerState({}, {}, {}, {}, {}, {}, {}, {})
+            if parsed_and_state is None
+            else parsed_and_state[1]
+        )
+        selection_row = connection.execute(
+            "SELECT * FROM inference_attempt_selections WHERE selection_id = ?",
+            (selection_id,),
+        ).fetchone()
+        if selection_row is None:
+            selection = None
+        else:
+            selection_inference_id = _row_text(selection_row, "inference_id")
+            terminal = state.terminals.get(selection_inference_id)
+            if terminal is None:
+                selection = self._selection_from_database_row(
+                    connection,
+                    selection_row,
+                    audit_schema=audit_schema,
+                )
+            else:
+                selection = self._selection_from_row(
+                    selection_row,
+                    {terminal.inference_id: terminal},
+                    audit_schema=audit_schema,
+                )
+        return replace(
+            state,
+            selections=(
+                {}
+                if selection is None
+                else {(selection.logical_invocation_id, selection.policy_version): selection}
+            ),
+        )
+
+    def _selected_and_state_from_database_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        audit_schema: bool,
+    ) -> tuple[SelectedAttemptOutput, _LedgerState]:
+        state = self._state_for_selected_output(
+            connection,
+            _row_text(row, "selection_id"),
+            _row_text(row, "parsed_artifact_id"),
+            audit_schema=audit_schema,
+        )
+        selected = self._selected_from_row(
+            row,
+            state,
+            audit_schema=audit_schema,
+        )
+        return selected, replace(
+            state,
+            selected={selected.selection_id: selected},
         )
 
     def _selected_from_database_row(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
+        *,
+        audit_schema: bool = False,
     ) -> SelectedAttemptOutput:
-        state = self._state_for_selected_output(
+        selected, _state = self._selected_and_state_from_database_row(
             connection,
-            _row_text(row, "selection_id"),
-            _row_text(row, "parsed_artifact_id"),
+            row,
+            audit_schema=audit_schema,
         )
-        return self._selected_from_row(row, state)
+        return selected
+
+    def _selected_and_state_by_selection_id(
+        self,
+        connection: sqlite3.Connection,
+        selection_id: str,
+        *,
+        audit_schema: bool,
+    ) -> tuple[SelectedAttemptOutput, _LedgerState] | None:
+        row = connection.execute(
+            "SELECT * FROM selected_attempt_outputs WHERE selection_id = ?",
+            (selection_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._selected_and_state_from_database_row(
+            connection,
+            row,
+            audit_schema=audit_schema,
+        )
 
     def _selected_by_selection_id(
         self,
         connection: sqlite3.Connection,
         selection_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> SelectedAttemptOutput | None:
-        row = connection.execute(
-            "SELECT * FROM selected_attempt_outputs WHERE selection_id = ?",
-            (selection_id,),
-        ).fetchone()
-        return None if row is None else self._selected_from_database_row(connection, row)
+        selected_and_state = self._selected_and_state_by_selection_id(
+            connection,
+            selection_id,
+            audit_schema=audit_schema,
+        )
+        return None if selected_and_state is None else selected_and_state[0]
 
     def _state_for_enriched_output(
         self,
         connection: sqlite3.Connection,
         selection_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> _LedgerState:
-        selected = self._selected_by_selection_id(connection, selection_id)
-        if selected is None:
+        selected_and_state = self._selected_and_state_by_selection_id(
+            connection,
+            selection_id,
+            audit_schema=audit_schema,
+        )
+        if selected_and_state is None:
             return _LedgerState({}, {}, {}, {}, {}, {}, {}, {})
-        parsed = self._parsed_by_artifact_id(connection, selected.parsed_claim_artifact_id)
-        intent = self._intent_by_inference_id(connection, selected.inference_id)
-        selection = self._selection_by_id(connection, selected.selection_id)
-        selections = (
-            {}
-            if selection is None
-            else {(selection.logical_invocation_id, selection.policy_version): selection}
-        )
-        return _LedgerState(
-            intents={} if intent is None else {intent.inference_id: intent},
-            raw={},
-            terminals={},
-            raw_artifacts={},
-            selections=selections,
-            parsed={} if parsed is None else {parsed.artifact_id: parsed},
-            selected={selected.selection_id: selected},
-            enriched={},
-        )
+        return selected_and_state[1]
 
     def _enriched_from_database_row(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
+        *,
+        audit_schema: bool = False,
     ) -> OrchestratorEnrichedOutput:
         state = self._state_for_enriched_output(
             connection,
             _row_text(row, "selection_id"),
+            audit_schema=audit_schema,
         )
-        return self._enriched_from_row(row, state)
+        return self._enriched_from_row(
+            row,
+            state,
+            audit_schema=audit_schema,
+        )
 
     def _enriched_by_artifact_id(
         self,
         connection: sqlite3.Connection,
         artifact_id: str,
+        *,
+        audit_schema: bool = False,
     ) -> OrchestratorEnrichedOutput | None:
         row = connection.execute(
             "SELECT * FROM enriched_provider_outputs WHERE artifact_id = ?",
             (artifact_id,),
         ).fetchone()
-        return None if row is None else self._enriched_from_database_row(connection, row)
+        return (
+            None
+            if row is None
+            else self._enriched_from_database_row(
+                connection,
+                row,
+                audit_schema=audit_schema,
+            )
+        )
 
-    def _intent_from_row(self, row: sqlite3.Row) -> InferenceIntent:
-        intent = self._model_from_row(row, InferenceIntent, "intent")
+    def _intent_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        audit_schema: bool,
+    ) -> InferenceIntent:
+        intent = self._model_from_row(
+            row,
+            InferenceIntent,
+            "intent",
+            audit_schema=audit_schema,
+        )
         _require_columns(
             row,
             (
@@ -1955,8 +2255,15 @@ class SQLiteInferenceEvidenceLedger:
         intents: dict[str, InferenceIntent],
         raw: dict[str, StoredRawProviderBytes],
         raw_inference: dict[str, str],
+        *,
+        audit_schema: bool,
     ) -> ModelInference:
-        terminal = self._model_from_row(row, ModelInference, "terminal")
+        terminal = self._model_from_row(
+            row,
+            ModelInference,
+            "terminal",
+            audit_schema=audit_schema,
+        )
         raw_artifact_id = _terminal_raw_artifact_id(terminal)
         _require_columns(
             row,
@@ -1991,13 +2298,28 @@ class SQLiteInferenceEvidenceLedger:
             raise SQLiteInferenceEvidenceLedgerError(
                 "terminal raw artifact belongs to a different inference"
             )
-        self._validate_terminal(terminal, intent, stored_raw, request_raw)
+        self._validate_terminal(
+            terminal,
+            intent,
+            stored_raw,
+            request_raw,
+            audit_schema=audit_schema,
+        )
         return terminal
 
     def _selection_from_row(
-        self, row: sqlite3.Row, terminals: dict[str, ModelInference]
+        self,
+        row: sqlite3.Row,
+        terminals: dict[str, ModelInference],
+        *,
+        audit_schema: bool,
     ) -> InferenceAttemptSelection:
-        selection = self._model_from_row(row, InferenceAttemptSelection, "selection")
+        selection = self._model_from_row(
+            row,
+            InferenceAttemptSelection,
+            "selection",
+            audit_schema=audit_schema,
+        )
         _require_columns(
             row,
             (
@@ -2013,9 +2335,18 @@ class SQLiteInferenceEvidenceLedger:
         return selection
 
     def _raw_artifact_from_row(
-        self, row: sqlite3.Row, state: _LedgerState
+        self,
+        row: sqlite3.Row,
+        state: _LedgerState,
+        *,
+        audit_schema: bool,
     ) -> RawProviderResponseArtifact:
-        artifact = self._model_from_row(row, RawProviderResponseArtifact, "raw_artifact")
+        artifact = self._model_from_row(
+            row,
+            RawProviderResponseArtifact,
+            "raw_artifact",
+            audit_schema=audit_schema,
+        )
         intent = state.intents.get(artifact.inference_id)
         _require_columns(
             row,
@@ -2038,9 +2369,18 @@ class SQLiteInferenceEvidenceLedger:
         return artifact
 
     def _parsed_from_row(
-        self, row: sqlite3.Row, state: _LedgerState
+        self,
+        row: sqlite3.Row,
+        state: _LedgerState,
+        *,
+        audit_schema: bool,
     ) -> ParsedProviderClaimArtifact:
-        parsed = self._model_from_row(row, ParsedProviderClaimArtifact, "parsed")
+        parsed = self._model_from_row(
+            row,
+            ParsedProviderClaimArtifact,
+            "parsed",
+            audit_schema=audit_schema,
+        )
         raw = parsed.raw_response
         _require_columns(
             row,
@@ -2057,8 +2397,19 @@ class SQLiteInferenceEvidenceLedger:
         self._validate_parsed(parsed, state)
         return parsed
 
-    def _selected_from_row(self, row: sqlite3.Row, state: _LedgerState) -> SelectedAttemptOutput:
-        selected = self._model_from_row(row, SelectedAttemptOutput, "selected")
+    def _selected_from_row(
+        self,
+        row: sqlite3.Row,
+        state: _LedgerState,
+        *,
+        audit_schema: bool,
+    ) -> SelectedAttemptOutput:
+        selected = self._model_from_row(
+            row,
+            SelectedAttemptOutput,
+            "selected",
+            audit_schema=audit_schema,
+        )
         _require_columns(
             row,
             (
@@ -2074,9 +2425,18 @@ class SQLiteInferenceEvidenceLedger:
         return selected
 
     def _enriched_from_row(
-        self, row: sqlite3.Row, state: _LedgerState
+        self,
+        row: sqlite3.Row,
+        state: _LedgerState,
+        *,
+        audit_schema: bool,
     ) -> OrchestratorEnrichedOutput:
-        enriched = self._model_from_row(row, OrchestratorEnrichedOutput, "enriched")
+        enriched = self._model_from_row(
+            row,
+            OrchestratorEnrichedOutput,
+            "enriched",
+            audit_schema=audit_schema,
+        )
         selected = enriched.selected_attempt
         _require_columns(
             row,
@@ -2094,7 +2454,12 @@ class SQLiteInferenceEvidenceLedger:
         return enriched
 
     def _model_from_row(
-        self, row: sqlite3.Row, model_type: type[_ModelT], contract: str
+        self,
+        row: sqlite3.Row,
+        model_type: type[_ModelT],
+        contract: str,
+        *,
+        audit_schema: bool,
     ) -> _ModelT:
         pin = self._pins[contract]
         _require_columns(
@@ -2118,7 +2483,8 @@ class SQLiteInferenceEvidenceLedger:
                 raise SQLiteInferenceEvidenceLedgerError(
                     f"persisted {contract} is not canonical JSON"
                 )
-            self._validate_contract_payload(contract, value)
+            if audit_schema:
+                self._validate_contract_payload(contract, value)
             return value
         except SQLiteInferenceEvidenceLedgerError:
             raise
@@ -2133,6 +2499,8 @@ class SQLiteInferenceEvidenceLedger:
         intent: InferenceIntent,
         raw: StoredRawProviderBytes | None,
         request_raw: StoredRawProviderBytes | None,
+        *,
+        audit_schema: bool,
     ) -> None:
         _validate_terminal_binding(terminal, intent)
         raw_artifact_id = _terminal_raw_artifact_id(terminal)
@@ -2167,13 +2535,14 @@ class SQLiteInferenceEvidenceLedger:
                 raise SQLiteInferenceEvidenceLedgerError(
                     "successful terminal has inconsistent selection semantics"
                 )
-            try:
-                ref = _schema_ref(intent.request.output_schema)
-                self._schema_registry.validate_pinned(ref, terminal.normalized_output)
-            except (SchemaRegistryError, ValueError) as exc:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "successful terminal normalized output is not schema-valid"
-                ) from exc
+            if audit_schema:
+                try:
+                    ref = _schema_ref(intent.request.output_schema)
+                    self._schema_registry.validate_pinned(ref, terminal.normalized_output)
+                except (SchemaRegistryError, ValueError) as exc:
+                    raise SQLiteInferenceEvidenceLedgerError(
+                        "successful terminal normalized output is not schema-valid"
+                    ) from exc
         elif terminal.output_valid or terminal.failure is None:
             raise SQLiteInferenceEvidenceLedgerError(
                 "failed terminal must be invalid and retain failure evidence"
@@ -2209,7 +2578,6 @@ class SQLiteInferenceEvidenceLedger:
     def _validate_raw_artifact(
         self, artifact: RawProviderResponseArtifact, state: _LedgerState
     ) -> None:
-        self._validate_contract_payload("raw_artifact", artifact)
         stored = state.raw.get(artifact.artifact_id)
         terminal = state.terminals.get(artifact.inference_id)
         intent = state.intents.get(artifact.inference_id)
