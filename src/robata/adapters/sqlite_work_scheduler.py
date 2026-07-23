@@ -157,6 +157,26 @@ class SQLiteWorkScheduler:
     def database_path(self) -> Path:
         return self._database_path
 
+    def run_authority_transaction[T](
+        self,
+        *,
+        write: bool,
+        operation_name: str,
+        operation: Callable[[sqlite3.Connection], T],
+    ) -> T:
+        """Run one extension callback under the scheduler-owned transaction."""
+
+        if not isinstance(write, bool):
+            raise TypeError("write must be a boolean")
+        checked_name = _nonempty(operation_name, "operation_name")
+        if not callable(operation):
+            raise TypeError("operation must be callable")
+        return self._transaction(
+            write=write,
+            operation_name=f"authority.{checked_name}",
+            operation=operation,
+        )
+
     def plan(
         self,
         plan: WorkItemPlan,
