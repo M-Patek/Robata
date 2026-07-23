@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import struct
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +18,11 @@ import av
 from mcap.reader import make_reader
 from mcap_protobuf.decoder import DecoderFactory
 
+from robata.adapters.mcap_single_pass import H264PacketEnvelope
+from robata.application.canonical.bounded_media import (
+    ACCESS_UNIT_FRAMING_VERSION,
+    PacketReference,
+)
 from robata.contracts import CameraId, Sha256Digest, canonical_json_bytes
 from robata.ports import (
     COMPRESSED_IMAGE_SCHEMA,
@@ -30,6 +37,8 @@ _NANOSECOND_TIME_BASE = Fraction(1, 1_000_000_000)
 _TAIL_DURATION_POLICY = "MEDIAN_POSITIVE_INTERVAL"
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+_INTERVAL_RECORD = struct.Struct("<q")
+_INTERVAL_SCAN_SIZE = 64 * 1024
 
 EXPORTER_NAME: Final = "robata.pyav_h264_mp4_exporter"
 EXPORTER_VERSION: Final = "0.1.0"
@@ -84,9 +93,94 @@ class _TemporaryExportFacts:
     last_pts_ns: int
     duration_ns: int
     tail_duration_ns: int
-    expected_pts_ns: tuple[int, ...]
-    expected_duration_ns: tuple[int, ...]
-    expected_keyframes: tuple[bool, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SidecarExpectation:
+    pts_ns: int
+    duration_ns: int
+    is_keyframe: bool
+
+
+class _Int64IntervalSpool:
+    """Fixed-width interval ledger with exact bounded-memory median selection."""
+
+    __slots__ = ("_count", "_maximum", "_minimum", "_stream")
+
+    def __init__(self, path: Path) -> None:
+        self._stream: BinaryIO | None = path.open("r+b")
+        self._count = 0
+        self._minimum: int | None = None
+        self._maximum: int | None = None
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def minimum(self) -> int | None:
+        return self._minimum
+
+    @property
+    def maximum(self) -> int | None:
+        return self._maximum
+
+    def append(self, value: int) -> None:
+        if type(value) is not int or not 0 < value <= _INT64_MAX:
+            raise ValueError("packet interval must be a positive signed int64")
+        stream = self._require_open()
+        if stream.write(_INTERVAL_RECORD.pack(value)) != _INTERVAL_RECORD.size:
+            raise OSError("could not write the complete packet interval")
+        self._count += 1
+        self._minimum = value if self._minimum is None else min(self._minimum, value)
+        self._maximum = value if self._maximum is None else max(self._maximum, value)
+
+    def median_half_even(self) -> int:
+        if self._count == 0 or self._minimum is None or self._maximum is None:
+            raise ValueError("cannot compute a median without packet intervals")
+        self._require_open().flush()
+        upper_rank = self._count // 2
+        upper = self._select_rank(upper_rank, self._minimum, self._maximum)
+        if self._count % 2:
+            return upper
+        lower = self._select_rank(upper_rank - 1, self._minimum, upper)
+        total = lower + upper
+        quotient, remainder = divmod(total, 2)
+        return quotient + int(remainder == 1 and quotient % 2 == 1)
+
+    def close(self) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            stream.close()
+
+    def _select_rank(self, rank: int, lower: int, upper: int) -> int:
+        while lower < upper:
+            midpoint = lower + (upper - lower) // 2
+            if self._count_less_equal(midpoint) > rank:
+                upper = midpoint
+            else:
+                lower = midpoint + 1
+        return lower
+
+    def _count_less_equal(self, threshold: int) -> int:
+        stream = self._require_open()
+        stream.seek(0)
+        seen = 0
+        count = 0
+        while chunk := stream.read(_INTERVAL_SCAN_SIZE):
+            if len(chunk) % _INTERVAL_RECORD.size:
+                raise OSError("packet interval spool contains a truncated record")
+            seen += len(chunk) // _INTERVAL_RECORD.size
+            count += sum(value <= threshold for (value,) in _INTERVAL_RECORD.iter_unpack(chunk))
+        if seen != self._count:
+            raise OSError("packet interval spool record count changed unexpectedly")
+        return count
+
+    def _require_open(self) -> BinaryIO:
+        if self._stream is None:
+            raise RuntimeError("packet interval spool is closed")
+        return self._stream
 
 
 def _annex_b_nal_types(payload: bytes) -> tuple[int, ...]:
@@ -169,69 +263,18 @@ class PyAvH264Mp4Exporter:
         source = Path(source)
         video_path = Path(video_path)
         sidecar_path = Path(sidecar_path)
-        self._validate_request(source, camera_id, channel, video_path, sidecar_path)
-
-        video_temp: Path | None = None
-        sidecar_temp: Path | None = None
+        session: PyAvH264RemuxSession | None = None
         try:
-            video_temp = self._make_sibling_temp(video_path)
-            sidecar_temp = self._make_sibling_temp(sidecar_path)
-            temporary = self._write_temporary_outputs(
-                source,
+            self._validate_source(source)
+            session = self.begin_incremental(
                 camera_id,
                 channel,
-                video_temp,
-                sidecar_temp,
+                video_path,
+                sidecar_path,
             )
-            decoded_frames = self._validate_exported_mp4(video_temp, temporary)
-            if decoded_frames != temporary.decoded_frame_count:
-                raise VideoExportError(
-                    VideoExportErrorCode.DECODE_VALIDATION_FAILED,
-                    "source and exported MP4 decoded-frame counts differ",
-                )
-
-            video_size_bytes, video_sha256 = self._hash_file(video_temp)
-            sidecar_size_bytes, sidecar_sha256 = self._hash_file(sidecar_temp)
-            self._publish_pair_non_overwriting(
-                ((video_temp, video_path), (sidecar_temp, sidecar_path))
-            )
-
-            return ExportedCameraVideoFacts(
-                camera_id=camera_id,
-                channel_id=channel.channel_id,
-                topic=channel.topic,
-                video_path=video_path,
-                sidecar_path=sidecar_path,
-                source_message_count=temporary.source_message_count,
-                leading_access_unit_count=temporary.leading_access_unit_count,
-                trailing_access_unit_count=0,
-                exported_packet_count=temporary.exported_packet_count,
-                decoded_frame_count=decoded_frames,
-                keyframe_count=temporary.keyframe_count,
-                width=temporary.width,
-                height=temporary.height,
-                source_first_log_time_ns=temporary.source_first_log_time_ns,
-                source_last_log_time_ns=temporary.source_last_log_time_ns,
-                leading_first_log_time_ns=temporary.leading_first_log_time_ns,
-                leading_last_log_time_ns=temporary.leading_last_log_time_ns,
-                trailing_first_log_time_ns=None,
-                trailing_last_log_time_ns=None,
-                export_first_source_log_time_ns=temporary.export_first_source_log_time_ns,
-                export_last_source_log_time_ns=temporary.export_last_source_log_time_ns,
-                first_pts_ns=temporary.first_pts_ns,
-                last_pts_ns=temporary.last_pts_ns,
-                duration_ns=temporary.duration_ns,
-                time_base_numerator=_NANOSECOND_TIME_BASE.numerator,
-                time_base_denominator=_NANOSECOND_TIME_BASE.denominator,
-                tail_duration_ns=temporary.tail_duration_ns,
-                tail_duration_policy=_TAIL_DURATION_POLICY,
-                max_timestamp_mapping_error_ns=0,
-                video_size_bytes=video_size_bytes,
-                video_sha256=video_sha256,
-                sidecar_row_count=temporary.exported_packet_count,
-                sidecar_size_bytes=sidecar_size_bytes,
-                sidecar_sha256=sidecar_sha256,
-            )
+            self._stream_source_into_session(source, channel, session)
+            session.seal()
+            return session.facts
         except VideoExportError:
             raise
         except OSError as exc:
@@ -245,22 +288,62 @@ class PyAvH264Mp4Exporter:
                 f"camera-video remux failed: {type(exc).__name__}: {exc}",
             ) from exc
         finally:
-            self._safe_unlink(video_temp)
-            self._safe_unlink(sidecar_temp)
+            if session is not None:
+                session.abort()
 
-    @staticmethod
-    def _validate_request(
-        source: Path,
+    def begin_incremental(
+        self,
         camera_id: CameraId,
         channel: ChannelInspection,
         video_path: Path,
         sidecar_path: Path,
-    ) -> None:
-        if not isinstance(camera_id, CameraId):
-            raise VideoExportError(
-                VideoExportErrorCode.INVALID_CHANNEL,
-                "camera_id must be a canonical CameraId",
+    ) -> PyAvH264RemuxSession:
+        """Create one branch-compatible remux session for an ordered camera stream."""
+
+        video_path = Path(video_path)
+        sidecar_path = Path(sidecar_path)
+        self._validate_incremental_request(camera_id, channel, video_path, sidecar_path)
+        video_temp: Path | None = None
+        sidecar_temp: Path | None = None
+        interval_temp: Path | None = None
+        session: PyAvH264RemuxSession | None = None
+        try:
+            video_temp = self._make_sibling_temp(video_path)
+            sidecar_temp = self._make_sibling_temp(sidecar_path)
+            interval_temp = self._make_sibling_temp(sidecar_path)
+            session = PyAvH264RemuxSession(
+                exporter=self,
+                camera_id=camera_id,
+                channel=channel,
+                video_path=video_path,
+                sidecar_path=sidecar_path,
+                video_temp=video_temp,
+                sidecar_temp=sidecar_temp,
+                interval_temp=interval_temp,
             )
+            return session
+        except VideoExportError:
+            raise
+        except OSError as exc:
+            raise VideoExportError(
+                VideoExportErrorCode.SOURCE_IO_ERROR,
+                f"camera-video export I/O failed: {exc}",
+            ) from exc
+        except Exception as exc:
+            raise VideoExportError(
+                VideoExportErrorCode.REMUX_FAILED,
+                f"camera-video remux initialization failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        finally:
+            if video_temp is not None and session is None:
+                self._safe_unlink(video_temp)
+            if sidecar_temp is not None and session is None:
+                self._safe_unlink(sidecar_temp)
+            if interval_temp is not None and session is None:
+                self._safe_unlink(interval_temp)
+
+    @staticmethod
+    def _validate_source(source: Path) -> None:
         if not source.exists():
             raise VideoExportError(
                 VideoExportErrorCode.SOURCE_NOT_FOUND,
@@ -270,6 +353,19 @@ class PyAvH264Mp4Exporter:
             raise VideoExportError(
                 VideoExportErrorCode.SOURCE_IO_ERROR,
                 f"MCAP source is not a file: {source}",
+            )
+
+    @staticmethod
+    def _validate_incremental_request(
+        camera_id: CameraId,
+        channel: ChannelInspection,
+        video_path: Path,
+        sidecar_path: Path,
+    ) -> None:
+        if not isinstance(camera_id, CameraId):
+            raise VideoExportError(
+                VideoExportErrorCode.INVALID_CHANNEL,
+                "camera_id must be a canonical CameraId",
             )
         if channel.schema_name != COMPRESSED_IMAGE_SCHEMA:
             raise VideoExportError(
@@ -303,38 +399,14 @@ class PyAvH264Mp4Exporter:
                     f"destination parent is not an existing directory: {destination.parent}",
                 )
 
-    def _write_temporary_outputs(
+    def _stream_source_into_session(
         self,
         source: Path,
-        camera_id: CameraId,
         channel: ChannelInspection,
-        video_temp: Path,
-        sidecar_temp: Path,
-    ) -> _TemporaryExportFacts:
-        decoder = av.CodecContext.create("h264", "r")
-        output: Any | None = None
-        output_stream: Any | None = None
-        previous: _AccessUnit | None = None
-        bootstrap_time_ns: int | None = None
-        width: int | None = None
-        height: int | None = None
-        source_count = 0
-        leading_count = 0
-        keyframe_count = 0
-        source_first_ns: int | None = None
-        source_last_ns: int | None = None
-        leading_first_ns: int | None = None
-        leading_last_ns: int | None = None
-        previous_source_time_ns: int | None = None
-        intervals: list[int] = []
-        expected_pts: list[int] = []
-        expected_durations: list[int] = []
-        expected_keyframes: list[bool] = []
-        decoded_frame_count = 0
-        write_completed = False
-
+        session: PyAvH264RemuxSession,
+    ) -> None:
         try:
-            with source.open("rb") as source_stream, sidecar_temp.open("wb") as sidecar_stream:
+            with source.open("rb") as source_stream:
                 reader = make_reader(
                     source_stream,
                     validate_crcs=self._validate_crcs,
@@ -352,126 +424,7 @@ class PyAvH264Mp4Exporter:
                             VideoExportErrorCode.UNSUPPORTED_SCHEMA,
                             "mapped camera schema changed while reading the MCAP",
                         )
-                    source_count += 1
-                    log_time_ns = self._exact_int(message.log_time, "source log time")
-                    if (
-                        previous_source_time_ns is not None
-                        and log_time_ns <= previous_source_time_ns
-                    ):
-                        raise VideoExportError(
-                            VideoExportErrorCode.NONMONOTONIC_LOG_TIME,
-                            "camera source log times must be strictly increasing",
-                        )
-                    previous_source_time_ns = log_time_ns
-                    source_first_ns = (
-                        source_first_ns if source_first_ns is not None else log_time_ns
-                    )
-                    source_last_ns = log_time_ns
-                    unit = self._access_unit(decoded, message)
-
-                    if bootstrap_time_ns is None:
-                        if not _is_independent_bootstrap(unit.nal_types):
-                            leading_count += 1
-                            leading_first_ns = (
-                                leading_first_ns if leading_first_ns is not None else log_time_ns
-                            )
-                            leading_last_ns = log_time_ns
-                            continue
-                        bootstrap_time_ns = log_time_ns
-
-                    relative_pts_ns = log_time_ns - bootstrap_time_ns
-                    frame_width, frame_height = self._decode_without_reordering(
-                        decoder,
-                        unit,
-                        relative_pts_ns,
-                    )
-                    decoded_frame_count += 1
-                    if width is None:
-                        width, height = frame_width, frame_height
-                    elif (frame_width, frame_height) != (width, height):
-                        raise VideoExportError(
-                            VideoExportErrorCode.DECODE_VALIDATION_FAILED,
-                            "decoded camera dimensions change within one export",
-                        )
-
-                    if previous is not None:
-                        duration_ns = unit.log_time_ns - previous.log_time_ns
-                        intervals.append(duration_ns)
-                        if output is None:
-                            if width is None or height is None:
-                                raise VideoExportError(
-                                    VideoExportErrorCode.DECODE_VALIDATION_FAILED,
-                                    "decoder did not establish video dimensions",
-                                )
-                            output = av.open(str(video_temp), mode="w", format="mp4")
-                            output_stream = output.add_stream(
-                                "h264",
-                                rate=Fraction(1_000_000_000, duration_ns),
-                            )
-                            output_stream.width = width
-                            output_stream.height = height
-                            output_stream.time_base = _NANOSECOND_TIME_BASE
-                        self._mux_and_record(
-                            output,
-                            output_stream,
-                            sidecar_stream,
-                            camera_id,
-                            previous,
-                            bootstrap_time_ns,
-                            duration_ns,
-                            len(expected_pts),
-                            duration_is_estimated=False,
-                        )
-                        expected_pts.append(previous.log_time_ns - bootstrap_time_ns)
-                        expected_durations.append(duration_ns)
-                        expected_keyframes.append(previous.is_keyframe)
-                        keyframe_count += int(previous.is_keyframe)
-                    previous = unit
-
-                if source_count == 0:
-                    raise VideoExportError(
-                        VideoExportErrorCode.NO_CAMERA_MESSAGES,
-                        f"no messages found for exact channel {channel.channel_id}",
-                    )
-                if source_count != channel.message_count:
-                    raise VideoExportError(
-                        VideoExportErrorCode.INVALID_CHANNEL,
-                        "mapped channel message count differs from the inspected count",
-                    )
-                if bootstrap_time_ns is None or previous is None:
-                    raise VideoExportError(
-                        VideoExportErrorCode.BOOTSTRAP_NOT_FOUND,
-                        "no Annex-B SPS+PPS+IDR bootstrap was found",
-                    )
-                if not intervals or output is None or output_stream is None:
-                    raise VideoExportError(
-                        VideoExportErrorCode.INVALID_ACCESS_UNIT,
-                        "at least two exportable access units are required for packet duration",
-                    )
-                delayed_frames = decoder.decode(None)
-                if delayed_frames or decoder.has_b_frames:
-                    raise VideoExportError(
-                        VideoExportErrorCode.FRAME_REORDERING_UNSUPPORTED,
-                        "decoder flush exposed delayed or reordered frames",
-                    )
-
-                tail_duration_ns = self._median_half_even(intervals)
-                self._mux_and_record(
-                    output,
-                    output_stream,
-                    sidecar_stream,
-                    camera_id,
-                    previous,
-                    bootstrap_time_ns,
-                    tail_duration_ns,
-                    len(expected_pts),
-                    duration_is_estimated=True,
-                )
-                expected_pts.append(previous.log_time_ns - bootstrap_time_ns)
-                expected_durations.append(tail_duration_ns)
-                expected_keyframes.append(previous.is_keyframe)
-                keyframe_count += int(previous.is_keyframe)
-                write_completed = True
+                    session._append_unit(self._access_unit(decoded, message))
         except VideoExportError:
             raise
         except OSError:
@@ -481,45 +434,6 @@ class PyAvH264Mp4Exporter:
                 VideoExportErrorCode.MCAP_READ_ERROR,
                 f"could not read mapped camera messages: {type(exc).__name__}: {exc}",
             ) from exc
-        finally:
-            if output is not None:
-                try:
-                    output.close()
-                except Exception as exc:
-                    if write_completed:
-                        raise VideoExportError(
-                            VideoExportErrorCode.REMUX_FAILED,
-                            f"MP4 trailer write failed: {type(exc).__name__}: {exc}",
-                        ) from exc
-
-        assert width is not None
-        assert height is not None
-        assert source_first_ns is not None
-        assert source_last_ns is not None
-        assert bootstrap_time_ns is not None
-        assert previous is not None
-        return _TemporaryExportFacts(
-            source_message_count=source_count,
-            leading_access_unit_count=leading_count,
-            exported_packet_count=len(expected_pts),
-            decoded_frame_count=decoded_frame_count,
-            keyframe_count=keyframe_count,
-            width=width,
-            height=height,
-            source_first_log_time_ns=source_first_ns,
-            source_last_log_time_ns=source_last_ns,
-            leading_first_log_time_ns=leading_first_ns,
-            leading_last_log_time_ns=leading_last_ns,
-            export_first_source_log_time_ns=bootstrap_time_ns,
-            export_last_source_log_time_ns=previous.log_time_ns,
-            first_pts_ns=expected_pts[0],
-            last_pts_ns=expected_pts[-1],
-            duration_ns=expected_pts[-1] + expected_durations[-1],
-            tail_duration_ns=expected_durations[-1],
-            expected_pts_ns=tuple(expected_pts),
-            expected_duration_ns=tuple(expected_durations),
-            expected_keyframes=tuple(expected_keyframes),
-        )
 
     @classmethod
     def _access_unit(cls, decoded: Any, message: Any) -> _AccessUnit:
@@ -652,9 +566,16 @@ class PyAvH264Mp4Exporter:
         )
 
     @staticmethod
-    def _validate_exported_mp4(path: Path, facts: _TemporaryExportFacts) -> int:
+    def _validate_exported_mp4(
+        path: Path,
+        sidecar_path: Path,
+        facts: _TemporaryExportFacts,
+    ) -> int:
         try:
-            with av.open(str(path), mode="r") as container:
+            with (
+                av.open(str(path), mode="r") as container,
+                sidecar_path.open("rb") as sidecar_stream,
+            ):
                 if len(container.streams.video) != 1:
                     raise VideoExportError(
                         VideoExportErrorCode.DECODE_VALIDATION_FAILED,
@@ -666,13 +587,19 @@ class PyAvH264Mp4Exporter:
                         VideoExportErrorCode.DECODE_VALIDATION_FAILED,
                         f"exported MP4 time base changed to {stream.time_base}",
                     )
-                packets = [packet for packet in container.demux(stream) if packet.dts is not None]
-                if len(packets) != facts.exported_packet_count:
-                    raise VideoExportError(
-                        VideoExportErrorCode.DECODE_VALIDATION_FAILED,
-                        "exported MP4 packet count differs from the timestamp ledger",
+                packet_count = 0
+                for packet in container.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    if packet_count >= facts.exported_packet_count:
+                        raise VideoExportError(
+                            VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                            "exported MP4 contains more packets than the timestamp ledger",
+                        )
+                    expected = PyAvH264Mp4Exporter._read_sidecar_expectation(
+                        sidecar_stream,
+                        packet_count,
                     )
-                for index, packet in enumerate(packets):
                     if packet.pts is None or packet.dts is None or packet.time_base is None:
                         raise VideoExportError(
                             VideoExportErrorCode.DECODE_VALIDATION_FAILED,
@@ -683,18 +610,27 @@ class PyAvH264Mp4Exporter:
                     if (
                         pts_ns.denominator != 1
                         or dts_ns.denominator != 1
-                        or pts_ns.numerator != facts.expected_pts_ns[index]
-                        or dts_ns.numerator != facts.expected_pts_ns[index]
-                        or packet.duration != facts.expected_duration_ns[index]
-                        or packet.is_keyframe != facts.expected_keyframes[index]
+                        or pts_ns.numerator != expected.pts_ns
+                        or dts_ns.numerator != expected.pts_ns
+                        or packet.duration != expected.duration_ns
+                        or packet.is_keyframe != expected.is_keyframe
                     ):
                         raise VideoExportError(
                             VideoExportErrorCode.DECODE_VALIDATION_FAILED,
-                            f"exported packet {index} differs from its timestamp ledger",
+                            f"exported packet {packet_count} differs from its timestamp ledger",
                         )
+                    packet_count += 1
+                if packet_count != facts.exported_packet_count or sidecar_stream.readline():
+                    raise VideoExportError(
+                        VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                        "exported MP4 packet count differs from the timestamp ledger",
+                    )
 
             decoded_count = 0
-            with av.open(str(path), mode="r") as container:
+            with (
+                av.open(str(path), mode="r") as container,
+                sidecar_path.open("rb") as sidecar_stream,
+            ):
                 stream = container.streams.video[0]
                 if stream.codec_context.has_b_frames:
                     raise VideoExportError(
@@ -702,11 +638,15 @@ class PyAvH264Mp4Exporter:
                         "exported MP4 declares reordered frames",
                     )
                 for index, frame in enumerate(container.decode(stream)):
-                    if index >= len(facts.expected_pts_ns):
+                    if index >= facts.exported_packet_count:
                         raise VideoExportError(
                             VideoExportErrorCode.DECODE_VALIDATION_FAILED,
                             "exported MP4 decoded more frames than source access units",
                         )
+                    expected = PyAvH264Mp4Exporter._read_sidecar_expectation(
+                        sidecar_stream,
+                        index,
+                    )
                     picture_type = getattr(frame.pict_type, "name", str(frame.pict_type))
                     if picture_type == "B" or frame.pts is None or frame.time_base is None:
                         raise VideoExportError(
@@ -714,7 +654,7 @@ class PyAvH264Mp4Exporter:
                             "exported MP4 contains unattributable or reordered frames",
                         )
                     pts_ns = Fraction(frame.pts) * frame.time_base * 1_000_000_000
-                    if pts_ns.denominator != 1 or pts_ns.numerator != facts.expected_pts_ns[index]:
+                    if pts_ns.denominator != 1 or pts_ns.numerator != expected.pts_ns:
                         raise VideoExportError(
                             VideoExportErrorCode.FRAME_REORDERING_UNSUPPORTED,
                             "exported frame order differs from source access-unit order",
@@ -732,6 +672,45 @@ class PyAvH264Mp4Exporter:
             raise VideoExportError(
                 VideoExportErrorCode.DECODE_VALIDATION_FAILED,
                 f"exported MP4 cannot be independently decoded: {type(exc).__name__}: {exc}",
+            ) from exc
+
+    @staticmethod
+    def _read_sidecar_expectation(
+        sidecar_stream: BinaryIO,
+        expected_index: int,
+    ) -> _SidecarExpectation:
+        line = sidecar_stream.readline()
+        if not line:
+            raise VideoExportError(
+                VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                "timestamp ledger ended before the exported MP4",
+            )
+        try:
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise TypeError("row is not an object")
+            packet_index = row["packet_index"]
+            pts_ns = int(row["relative_pts_ns"])
+            dts_ns = int(row["relative_dts_ns"])
+            duration_ns = int(row["duration_ns"])
+            is_keyframe = row["is_keyframe"]
+            if (
+                type(packet_index) is not int
+                or packet_index != expected_index
+                or pts_ns != dts_ns
+                or duration_ns <= 0
+                or type(is_keyframe) is not bool
+            ):
+                raise ValueError("row fields are inconsistent")
+            return _SidecarExpectation(
+                pts_ns=pts_ns,
+                duration_ns=duration_ns,
+                is_keyframe=is_keyframe,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VideoExportError(
+                VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                f"timestamp ledger row {expected_index} is invalid: {exc}",
             ) from exc
 
     @staticmethod
@@ -811,3 +790,423 @@ class PyAvH264Mp4Exporter:
             return
         with suppress(OSError):
             path.unlink(missing_ok=True)
+
+
+class PyAvH264RemuxSession:
+    """Incremental H.264 remux branch sharing the offline export state machine."""
+
+    def __init__(
+        self,
+        *,
+        exporter: PyAvH264Mp4Exporter,
+        camera_id: CameraId,
+        channel: ChannelInspection,
+        video_path: Path,
+        sidecar_path: Path,
+        video_temp: Path,
+        sidecar_temp: Path,
+        interval_temp: Path,
+    ) -> None:
+        self._exporter = exporter
+        self.camera_id = camera_id
+        self._channel = channel
+        self._video_path = video_path
+        self._sidecar_path = sidecar_path
+        self._video_temp = video_temp
+        self._sidecar_temp = sidecar_temp
+        self._interval_temp = interval_temp
+        self._decoder = av.CodecContext.create("h264", "r")
+        self._sidecar_stream: BinaryIO | None = sidecar_temp.open("wb")
+        self._interval_spool: _Int64IntervalSpool | None = _Int64IntervalSpool(interval_temp)
+        self._output: Any | None = None
+        self._output_stream: Any | None = None
+        self._previous: _AccessUnit | None = None
+        self._bootstrap_time_ns: int | None = None
+        self._width: int | None = None
+        self._height: int | None = None
+        self._source_count = 0
+        self._leading_count = 0
+        self._keyframe_count = 0
+        self._source_first_ns: int | None = None
+        self._source_last_ns: int | None = None
+        self._leading_first_ns: int | None = None
+        self._leading_last_ns: int | None = None
+        self._previous_source_time_ns: int | None = None
+        self._exported_packet_count = 0
+        self._decoded_frame_count = 0
+        self._facts: ExportedCameraVideoFacts | None = None
+        self._aborted = False
+
+    def append_access_unit(
+        self,
+        envelope: H264PacketEnvelope,
+        reference: PacketReference,
+        *,
+        framing_version: str,
+    ) -> None:
+        """Append one envelope from the single-pass MCAP tee."""
+
+        try:
+            packet = envelope.packet
+            if framing_version != ACCESS_UNIT_FRAMING_VERSION:
+                raise VideoExportError(
+                    VideoExportErrorCode.INVALID_ACCESS_UNIT,
+                    "incremental remux framing version is unsupported",
+                )
+            if packet.camera_id is not self.camera_id:
+                raise VideoExportError(
+                    VideoExportErrorCode.INVALID_CHANNEL,
+                    "incremental remux packet belongs to another camera",
+                )
+            if packet.source_order != self._source_count:
+                raise VideoExportError(
+                    VideoExportErrorCode.INVALID_ACCESS_UNIT,
+                    "incremental remux source_order is not contiguous",
+                )
+            if reference != packet.reference():
+                raise VideoExportError(
+                    VideoExportErrorCode.INVALID_ACCESS_UNIT,
+                    "incremental remux packet reference differs from its envelope",
+                )
+            if packet.is_keyframe != (5 in envelope.nal_types):
+                raise VideoExportError(
+                    VideoExportErrorCode.INVALID_ACCESS_UNIT,
+                    "incremental remux keyframe flag differs from its NAL units",
+                )
+            self._append_unit(
+                _AccessUnit(
+                    log_time_ns=packet.source_timestamp_ns,
+                    publish_time_ns=envelope.source_publish_time_ns,
+                    embedded_header_time_ns=envelope.embedded_header_time_ns,
+                    source_sequence=packet.source_sequence,
+                    payload=packet.payload,
+                    nal_types=envelope.nal_types,
+                )
+            )
+        except VideoExportError:
+            self.abort()
+            raise
+        except OSError as exc:
+            self.abort()
+            raise VideoExportError(
+                VideoExportErrorCode.SOURCE_IO_ERROR,
+                f"camera-video export I/O failed: {exc}",
+            ) from exc
+        except Exception as exc:
+            self.abort()
+            raise VideoExportError(
+                VideoExportErrorCode.REMUX_FAILED,
+                f"incremental camera-video remux failed: {type(exc).__name__}: {exc}",
+            ) from exc
+
+    def _append_unit(self, unit: _AccessUnit) -> None:
+        self._ensure_open()
+        self._source_count += 1
+        log_time_ns = unit.log_time_ns
+        if (
+            self._previous_source_time_ns is not None
+            and log_time_ns <= self._previous_source_time_ns
+        ):
+            raise VideoExportError(
+                VideoExportErrorCode.NONMONOTONIC_LOG_TIME,
+                "camera source log times must be strictly increasing",
+            )
+        self._previous_source_time_ns = log_time_ns
+        self._source_first_ns = (
+            self._source_first_ns if self._source_first_ns is not None else log_time_ns
+        )
+        self._source_last_ns = log_time_ns
+
+        if self._bootstrap_time_ns is None:
+            if not _is_independent_bootstrap(unit.nal_types):
+                self._leading_count += 1
+                self._leading_first_ns = (
+                    self._leading_first_ns if self._leading_first_ns is not None else log_time_ns
+                )
+                self._leading_last_ns = log_time_ns
+                return
+            self._bootstrap_time_ns = log_time_ns
+
+        relative_pts_ns = log_time_ns - self._bootstrap_time_ns
+        frame_width, frame_height = self._exporter._decode_without_reordering(
+            self._decoder,
+            unit,
+            relative_pts_ns,
+        )
+        self._decoded_frame_count += 1
+        if self._width is None:
+            self._width, self._height = frame_width, frame_height
+        elif (frame_width, frame_height) != (self._width, self._height):
+            raise VideoExportError(
+                VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                "decoded camera dimensions change within one export",
+            )
+
+        if self._previous is not None:
+            duration_ns = unit.log_time_ns - self._previous.log_time_ns
+            assert self._interval_spool is not None
+            self._interval_spool.append(duration_ns)
+            if self._output is None:
+                assert self._width is not None
+                assert self._height is not None
+                self._output = av.open(str(self._video_temp), mode="w", format="mp4")
+                self._output_stream = self._output.add_stream(
+                    "h264",
+                    rate=Fraction(1_000_000_000, duration_ns),
+                )
+                self._output_stream.width = self._width
+                self._output_stream.height = self._height
+                self._output_stream.time_base = _NANOSECOND_TIME_BASE
+            assert self._output_stream is not None
+            assert self._sidecar_stream is not None
+            self._exporter._mux_and_record(
+                self._output,
+                self._output_stream,
+                self._sidecar_stream,
+                self.camera_id,
+                self._previous,
+                self._bootstrap_time_ns,
+                duration_ns,
+                self._exported_packet_count,
+                duration_is_estimated=False,
+            )
+            self._exported_packet_count += 1
+            self._keyframe_count += int(self._previous.is_keyframe)
+        self._previous = unit
+
+    def seal(self) -> None:
+        """Finalize, verify, and atomically publish the MP4/sidecar pair."""
+
+        if self._facts is not None:
+            return
+        try:
+            temporary = self._finish_temporary_outputs()
+            self._close_interval_spool()
+            self._exporter._safe_unlink(self._interval_temp)
+            self._close_sidecar()
+            self._close_output(trailer_required=True)
+            decoded_frames = self._exporter._validate_exported_mp4(
+                self._video_temp,
+                self._sidecar_temp,
+                temporary,
+            )
+            if decoded_frames != temporary.decoded_frame_count:
+                raise VideoExportError(
+                    VideoExportErrorCode.DECODE_VALIDATION_FAILED,
+                    "source and exported MP4 decoded-frame counts differ",
+                )
+            video_size_bytes, video_sha256 = self._exporter._hash_file(self._video_temp)
+            sidecar_size_bytes, sidecar_sha256 = self._exporter._hash_file(self._sidecar_temp)
+            facts = self._build_facts(
+                temporary,
+                decoded_frames=decoded_frames,
+                video_size_bytes=video_size_bytes,
+                video_sha256=video_sha256,
+                sidecar_size_bytes=sidecar_size_bytes,
+                sidecar_sha256=sidecar_sha256,
+            )
+            self._exporter._publish_pair_non_overwriting(
+                (
+                    (self._video_temp, self._video_path),
+                    (self._sidecar_temp, self._sidecar_path),
+                )
+            )
+            self._facts = facts
+        except VideoExportError:
+            self.abort()
+            raise
+        except OSError as exc:
+            self.abort()
+            raise VideoExportError(
+                VideoExportErrorCode.SOURCE_IO_ERROR,
+                f"camera-video export I/O failed: {exc}",
+            ) from exc
+        except Exception as exc:
+            self.abort()
+            raise VideoExportError(
+                VideoExportErrorCode.REMUX_FAILED,
+                f"incremental camera-video remux finalization failed: {type(exc).__name__}: {exc}",
+            ) from exc
+
+    def abort(self) -> None:
+        """Best-effort cleanup that never masks the initiating failure."""
+
+        if self._facts is not None or self._aborted:
+            return
+        self._aborted = True
+        with suppress(Exception):
+            self._close_sidecar()
+        with suppress(Exception):
+            self._close_output(trailer_required=False)
+        with suppress(Exception):
+            self._close_interval_spool()
+        self._exporter._safe_unlink(self._video_temp)
+        self._exporter._safe_unlink(self._sidecar_temp)
+        self._exporter._safe_unlink(self._interval_temp)
+
+    @property
+    def facts(self) -> ExportedCameraVideoFacts:
+        if self._facts is None:
+            raise RuntimeError("incremental remux facts are available only after seal")
+        return self._facts
+
+    def _ensure_open(self) -> None:
+        if self._facts is not None:
+            raise VideoExportError(
+                VideoExportErrorCode.REMUX_FAILED,
+                "incremental remux session is already sealed",
+            )
+        if self._aborted:
+            raise VideoExportError(
+                VideoExportErrorCode.REMUX_FAILED,
+                "incremental remux session is aborted",
+            )
+
+    def _finish_temporary_outputs(self) -> _TemporaryExportFacts:
+        self._ensure_open()
+        if self._source_count == 0:
+            raise VideoExportError(
+                VideoExportErrorCode.NO_CAMERA_MESSAGES,
+                f"no messages found for exact channel {self._channel.channel_id}",
+            )
+        if self._source_count != self._channel.message_count:
+            raise VideoExportError(
+                VideoExportErrorCode.INVALID_CHANNEL,
+                "mapped channel message count differs from the inspected count",
+            )
+        if self._bootstrap_time_ns is None or self._previous is None:
+            raise VideoExportError(
+                VideoExportErrorCode.BOOTSTRAP_NOT_FOUND,
+                "no Annex-B SPS+PPS+IDR bootstrap was found",
+            )
+        if (
+            self._interval_spool is None
+            or self._interval_spool.count == 0
+            or self._output is None
+            or self._output_stream is None
+        ):
+            raise VideoExportError(
+                VideoExportErrorCode.INVALID_ACCESS_UNIT,
+                "at least two exportable access units are required for packet duration",
+            )
+        delayed_frames = self._decoder.decode(None)
+        if delayed_frames or self._decoder.has_b_frames:
+            raise VideoExportError(
+                VideoExportErrorCode.FRAME_REORDERING_UNSUPPORTED,
+                "decoder flush exposed delayed or reordered frames",
+            )
+
+        tail_duration_ns = self._interval_spool.median_half_even()
+        assert self._sidecar_stream is not None
+        self._exporter._mux_and_record(
+            self._output,
+            self._output_stream,
+            self._sidecar_stream,
+            self.camera_id,
+            self._previous,
+            self._bootstrap_time_ns,
+            tail_duration_ns,
+            self._exported_packet_count,
+            duration_is_estimated=True,
+        )
+        self._exported_packet_count += 1
+        self._keyframe_count += int(self._previous.is_keyframe)
+
+        assert self._width is not None
+        assert self._height is not None
+        assert self._source_first_ns is not None
+        assert self._source_last_ns is not None
+        last_pts_ns = self._previous.log_time_ns - self._bootstrap_time_ns
+        return _TemporaryExportFacts(
+            source_message_count=self._source_count,
+            leading_access_unit_count=self._leading_count,
+            exported_packet_count=self._exported_packet_count,
+            decoded_frame_count=self._decoded_frame_count,
+            keyframe_count=self._keyframe_count,
+            width=self._width,
+            height=self._height,
+            source_first_log_time_ns=self._source_first_ns,
+            source_last_log_time_ns=self._source_last_ns,
+            leading_first_log_time_ns=self._leading_first_ns,
+            leading_last_log_time_ns=self._leading_last_ns,
+            export_first_source_log_time_ns=self._bootstrap_time_ns,
+            export_last_source_log_time_ns=self._previous.log_time_ns,
+            first_pts_ns=0,
+            last_pts_ns=last_pts_ns,
+            duration_ns=last_pts_ns + tail_duration_ns,
+            tail_duration_ns=tail_duration_ns,
+        )
+
+    def _close_sidecar(self) -> None:
+        stream = self._sidecar_stream
+        self._sidecar_stream = None
+        if stream is not None:
+            stream.close()
+
+    def _close_interval_spool(self) -> None:
+        spool = self._interval_spool
+        self._interval_spool = None
+        if spool is not None:
+            spool.close()
+
+    def _close_output(self, *, trailer_required: bool) -> None:
+        output = self._output
+        self._output = None
+        self._output_stream = None
+        if output is None:
+            return
+        try:
+            output.close()
+        except Exception as exc:
+            if trailer_required:
+                raise VideoExportError(
+                    VideoExportErrorCode.REMUX_FAILED,
+                    f"MP4 trailer write failed: {type(exc).__name__}: {exc}",
+                ) from exc
+
+    def _build_facts(
+        self,
+        temporary: _TemporaryExportFacts,
+        *,
+        decoded_frames: int,
+        video_size_bytes: int,
+        video_sha256: Sha256Digest,
+        sidecar_size_bytes: int,
+        sidecar_sha256: Sha256Digest,
+    ) -> ExportedCameraVideoFacts:
+        return ExportedCameraVideoFacts(
+            camera_id=self.camera_id,
+            channel_id=self._channel.channel_id,
+            topic=self._channel.topic,
+            video_path=self._video_path,
+            sidecar_path=self._sidecar_path,
+            source_message_count=temporary.source_message_count,
+            leading_access_unit_count=temporary.leading_access_unit_count,
+            trailing_access_unit_count=0,
+            exported_packet_count=temporary.exported_packet_count,
+            decoded_frame_count=decoded_frames,
+            keyframe_count=temporary.keyframe_count,
+            width=temporary.width,
+            height=temporary.height,
+            source_first_log_time_ns=temporary.source_first_log_time_ns,
+            source_last_log_time_ns=temporary.source_last_log_time_ns,
+            leading_first_log_time_ns=temporary.leading_first_log_time_ns,
+            leading_last_log_time_ns=temporary.leading_last_log_time_ns,
+            trailing_first_log_time_ns=None,
+            trailing_last_log_time_ns=None,
+            export_first_source_log_time_ns=temporary.export_first_source_log_time_ns,
+            export_last_source_log_time_ns=temporary.export_last_source_log_time_ns,
+            first_pts_ns=temporary.first_pts_ns,
+            last_pts_ns=temporary.last_pts_ns,
+            duration_ns=temporary.duration_ns,
+            time_base_numerator=_NANOSECOND_TIME_BASE.numerator,
+            time_base_denominator=_NANOSECOND_TIME_BASE.denominator,
+            tail_duration_ns=temporary.tail_duration_ns,
+            tail_duration_policy=_TAIL_DURATION_POLICY,
+            max_timestamp_mapping_error_ns=0,
+            video_size_bytes=video_size_bytes,
+            video_sha256=video_sha256,
+            sidecar_row_count=temporary.exported_packet_count,
+            sidecar_size_bytes=sidecar_size_bytes,
+            sidecar_sha256=sidecar_sha256,
+        )
