@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import cache
 from pathlib import Path
+from threading import RLock
 from time import sleep
 from typing import Final, TypeVar
 from uuid import NAMESPACE_URL, uuid5
@@ -309,6 +310,25 @@ class _LedgerState:
     enriched: dict[str, OrchestratorEnrichedOutput]
 
 
+@dataclass(frozen=True, slots=True)
+class _LedgerCache:
+    """Process-local typed snapshot owned by one local composition root."""
+
+    state: _LedgerState
+    payloads: dict[tuple[str, str], bytes]
+    intents_by_request: dict[str, InferenceIntent]
+    raw_by_request: dict[str, StoredRawProviderBytes]
+    selections_by_id: dict[str, InferenceAttemptSelection]
+    parsed_by_identity: dict[tuple[str, str, str], ParsedProviderClaimArtifact]
+    selected_by_digest: dict[str, SelectedAttemptOutput]
+    enriched_by_logical_key: dict[str, OrchestratorEnrichedOutput]
+    enriched_by_semantic_sha256: dict[str, OrchestratorEnrichedOutput]
+
+
+class _CachedDependencyMissing(SQLiteInferenceEvidenceLedgerError):
+    """A second local ledger may have advanced the append-only database."""
+
+
 _ResultT = TypeVar("_ResultT")
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -326,12 +346,42 @@ def _exact_existing[EvidenceT](
     return values[0]
 
 
+def _build_ledger_cache(
+    state: _LedgerState,
+    payloads: dict[tuple[str, str], bytes],
+) -> _LedgerCache:
+    return _LedgerCache(
+        state=state,
+        payloads=payloads,
+        intents_by_request={item.request_id: item for item in state.intents.values()},
+        raw_by_request={item.request_id: item for item in state.raw.values()},
+        selections_by_id={item.selection_id: item for item in state.selections.values()},
+        parsed_by_identity={
+            (
+                item.raw_response.artifact_id,
+                item.provider_claim_schema.sha256,
+                item.parser_version,
+            ): item
+            for item in state.parsed.values()
+        },
+        selected_by_digest={item.output_sha256: item for item in state.selected.values()},
+        enriched_by_logical_key={
+            item.enrichment_logical_key: item for item in state.enriched.values()
+        },
+        enriched_by_semantic_sha256={
+            item.semantic_sha256: item for item in state.enriched.values()
+        },
+    )
+
+
 class SQLiteInferenceEvidenceLedger:
     """Append-only local conformance ledger for one inference evidence graph.
 
-    CRUD validates the addressed row and its dependency closure. Call
-    `verify_integrity()` at every authoritative commit boundary to audit unrelated
-    rows; construction also performs this complete audit before the ledger is used.
+    One local composition root owns an instance as its single writer. Construction
+    performs a complete audit and caches the typed graph; append operations validate
+    candidates against that snapshot and publish copy-on-write cache updates only
+    after SQLite commits. Call `verify_integrity()` at every authoritative commit
+    boundary to audit and refresh the complete graph.
     """
 
     def __init__(
@@ -345,6 +395,7 @@ class SQLiteInferenceEvidenceLedger:
             raise TypeError("database_path must be a pathlib.Path")
         if not isinstance(schema_registry, SchemaRegistry):
             raise TypeError("schema_registry must be a SchemaRegistry")
+        self._state_lock = RLock()
         self._runtime_observer = runtime_observer
         self._schema_registry = schema_registry
         self._pins = {
@@ -362,6 +413,7 @@ class SQLiteInferenceEvidenceLedger:
         }
         self._prepare_path(database_path)
         self._database_path = database_path.resolve()
+        self._cache: _LedgerCache
         self._initialize_database()
 
     @property
@@ -373,36 +425,603 @@ class SQLiteInferenceEvidenceLedger:
         return self._schema_registry
 
     def verify_integrity(self) -> None:
-        """Audit the complete immutable evidence graph and all registered contracts."""
+        """Audit and refresh the complete immutable evidence graph."""
 
-        def audit(connection: sqlite3.Connection) -> None:
-            self._load_state(connection)
+        def audit(connection: sqlite3.Connection) -> _LedgerCache:
+            self._verify_database(connection)
+            state = self._load_state(connection)
+            return self._cache_from_database(connection, state)
 
-        self._transaction(
-            write=False,
-            operation_name="verify_integrity",
-            operation=audit,
+        with self._state_lock:
+            refreshed = self._transaction(
+                write=False,
+                operation_name="verify_integrity",
+                operation=audit,
+            )
+            self._cache = refreshed
+
+    def _cache_from_database(
+        self,
+        connection: sqlite3.Connection,
+        state: _LedgerState,
+    ) -> _LedgerCache:
+        payloads: dict[tuple[str, str], bytes] = {}
+        for contract, table, key_column in (
+            ("intent", "inference_intents", "inference_id"),
+            ("terminal", "model_inference_terminals", "inference_id"),
+            ("selection", "inference_attempt_selections", "selection_id"),
+            ("raw_artifact", "raw_provider_artifacts", "artifact_id"),
+            ("parsed", "parsed_provider_claims", "artifact_id"),
+            ("selected", "selected_attempt_outputs", "selection_id"),
+            ("enriched", "enriched_provider_outputs", "artifact_id"),
+        ):
+            for row in connection.execute(
+                f"SELECT {key_column}, payload_json FROM {table}"
+            ).fetchall():
+                key = _row_text(row, key_column)
+                payloads[(contract, key)] = _row_bytes(row, "payload_json")
+        return _build_ledger_cache(state, payloads)
+
+    @staticmethod
+    def _updated_cache(
+        cache: _LedgerCache,
+        state: _LedgerState,
+        *payload_updates: tuple[str, str, bytes],
+    ) -> _LedgerCache:
+        payloads = dict(cache.payloads)
+        for contract, key, payload in payload_updates:
+            payloads[(contract, key)] = payload
+        return _build_ledger_cache(state, payloads)
+
+    def _assert_cached_model_row(
+        self,
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+        contract: str,
+        key: str,
+    ) -> None:
+        state = cache.state
+        cached_value: BaseModel | None
+        indexed: tuple[tuple[str, object], ...]
+        if contract == "intent":
+            intent_value = state.intents.get(key)
+            cached_value = intent_value
+            table, key_column, description = (
+                "inference_intents",
+                "inference_id",
+                "intent",
+            )
+            indexed = (
+                (
+                    "inference_id",
+                    None if intent_value is None else intent_value.inference_id,
+                ),
+                (
+                    "logical_invocation_id",
+                    (
+                        None
+                        if intent_value is None
+                        else intent_value.logical_invocation_id
+                    ),
+                ),
+                ("request_id", None if intent_value is None else intent_value.request_id),
+            )
+        elif contract == "terminal":
+            terminal_value = state.terminals.get(key)
+            cached_value = terminal_value
+            table, key_column, description = (
+                "model_inference_terminals",
+                "inference_id",
+                "terminal",
+            )
+            indexed = (
+                (
+                    "inference_id",
+                    None if terminal_value is None else terminal_value.inference_id,
+                ),
+                (
+                    "logical_invocation_id",
+                    (
+                        None
+                        if terminal_value is None
+                        else terminal_value.logical_invocation_id
+                    ),
+                ),
+                (
+                    "request_id",
+                    None if terminal_value is None else terminal_value.request_id,
+                ),
+                (
+                    "status",
+                    None if terminal_value is None else terminal_value.status.value,
+                ),
+                (
+                    "shadow",
+                    None if terminal_value is None else int(terminal_value.shadow),
+                ),
+                (
+                    "output_valid",
+                    (
+                        None
+                        if terminal_value is None
+                        else int(terminal_value.output_valid)
+                    ),
+                ),
+                (
+                    "raw_artifact_id",
+                    (
+                        None
+                        if terminal_value is None
+                        else _terminal_raw_artifact_id(terminal_value)
+                    ),
+                ),
+            )
+        elif contract == "selection":
+            selection_value = cache.selections_by_id.get(key)
+            cached_value = selection_value
+            table, key_column, description = (
+                "inference_attempt_selections",
+                "selection_id",
+                "selection",
+            )
+            indexed = (
+                (
+                    "logical_invocation_id",
+                    (
+                        None
+                        if selection_value is None
+                        else selection_value.logical_invocation_id
+                    ),
+                ),
+                (
+                    "policy_version",
+                    None if selection_value is None else selection_value.policy_version,
+                ),
+                (
+                    "selection_reason",
+                    None if selection_value is None else selection_value.selection_reason,
+                ),
+                (
+                    "selection_id",
+                    None if selection_value is None else selection_value.selection_id,
+                ),
+                (
+                    "inference_id",
+                    None if selection_value is None else selection_value.inference_id,
+                ),
+            )
+        elif contract == "raw_artifact":
+            raw_artifact_value = state.raw_artifacts.get(key)
+            cached_value = raw_artifact_value
+            table, key_column, description = (
+                "raw_provider_artifacts",
+                "artifact_id",
+                "raw provider artifact",
+            )
+            intent = (
+                None
+                if raw_artifact_value is None
+                else state.intents.get(raw_artifact_value.inference_id)
+            )
+            indexed = (
+                (
+                    "artifact_id",
+                    None if raw_artifact_value is None else raw_artifact_value.artifact_id,
+                ),
+                (
+                    "inference_id",
+                    None if raw_artifact_value is None else raw_artifact_value.inference_id,
+                ),
+                ("request_id", None if intent is None else intent.request_id),
+                (
+                    "exact_bytes_sha256",
+                    (
+                        None
+                        if raw_artifact_value is None
+                        else raw_artifact_value.exact_bytes_sha256
+                    ),
+                ),
+                (
+                    "byte_count",
+                    None if raw_artifact_value is None else raw_artifact_value.byte_count,
+                ),
+                (
+                    "media_type",
+                    None if raw_artifact_value is None else raw_artifact_value.media_type,
+                ),
+                (
+                    "provider_request_id",
+                    (
+                        None
+                        if raw_artifact_value is None
+                        else raw_artifact_value.provider_request_id
+                    ),
+                ),
+                (
+                    "provider",
+                    None if raw_artifact_value is None else raw_artifact_value.provider,
+                ),
+                (
+                    "model_name",
+                    None if raw_artifact_value is None else raw_artifact_value.model_name,
+                ),
+                (
+                    "model_version",
+                    None if raw_artifact_value is None else raw_artifact_value.model_version,
+                ),
+                (
+                    "created_at",
+                    None if raw_artifact_value is None else raw_artifact_value.created_at,
+                ),
+            )
+        elif contract == "parsed":
+            parsed_value = state.parsed.get(key)
+            cached_value = parsed_value
+            table, key_column, description = (
+                "parsed_provider_claims",
+                "artifact_id",
+                "parsed claim",
+            )
+            indexed = (
+                (
+                    "artifact_id",
+                    None if parsed_value is None else parsed_value.artifact_id,
+                ),
+                (
+                    "inference_id",
+                    (
+                        None
+                        if parsed_value is None
+                        else parsed_value.raw_response.inference_id
+                    ),
+                ),
+                (
+                    "raw_artifact_id",
+                    (
+                        None
+                        if parsed_value is None
+                        else parsed_value.raw_response.artifact_id
+                    ),
+                ),
+                (
+                    "semantic_sha256",
+                    None if parsed_value is None else parsed_value.semantic_sha256,
+                ),
+                (
+                    "provider_claim_schema_sha256",
+                    (
+                        None
+                        if parsed_value is None
+                        else parsed_value.provider_claim_schema.sha256
+                    ),
+                ),
+                (
+                    "parser_version",
+                    None if parsed_value is None else parsed_value.parser_version,
+                ),
+            )
+        elif contract == "selected":
+            selected_value = state.selected.get(key)
+            cached_value = selected_value
+            table, key_column, description = (
+                "selected_attempt_outputs",
+                "selection_id",
+                "selected output",
+            )
+            indexed = (
+                (
+                    "selection_id",
+                    None if selected_value is None else selected_value.selection_id,
+                ),
+                (
+                    "inference_id",
+                    None if selected_value is None else selected_value.inference_id,
+                ),
+                (
+                    "parsed_artifact_id",
+                    (
+                        None
+                        if selected_value is None
+                        else selected_value.parsed_claim_artifact_id
+                    ),
+                ),
+                (
+                    "raw_artifact_id",
+                    (
+                        None
+                        if selected_value is None
+                        else selected_value.raw_response_artifact_id
+                    ),
+                ),
+                (
+                    "output_sha256",
+                    None if selected_value is None else selected_value.output_sha256,
+                ),
+            )
+        elif contract == "enriched":
+            enriched_value = state.enriched.get(key)
+            cached_value = enriched_value
+            table, key_column, description = (
+                "enriched_provider_outputs",
+                "artifact_id",
+                "enriched output",
+            )
+            selected = None if enriched_value is None else enriched_value.selected_attempt
+            indexed = (
+                (
+                    "artifact_id",
+                    None if enriched_value is None else enriched_value.artifact_id,
+                ),
+                (
+                    "enrichment_logical_key",
+                    (
+                        None
+                        if enriched_value is None
+                        else enriched_value.enrichment_logical_key
+                    ),
+                ),
+                (
+                    "semantic_sha256",
+                    None if enriched_value is None else enriched_value.semantic_sha256,
+                ),
+                ("selection_id", None if selected is None else selected.selection_id),
+                ("inference_id", None if selected is None else selected.inference_id),
+                (
+                    "selected_output_sha256",
+                    None if selected is None else selected.output_sha256,
+                ),
+            )
+        else:
+            raise AssertionError(f"unsupported cached contract: {contract}")
+        if cached_value is None:
+            raise _CachedDependencyMissing(
+                f"cached {description} dependency is unavailable: {key}"
+            )
+        payload = cache.payloads.get((contract, key))
+        if payload is None:
+            raise _CachedDependencyMissing(
+                f"cached {description} payload is unavailable: {key}"
+            )
+        row = connection.execute(
+            f"SELECT * FROM {table} WHERE {key_column} = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            message = (
+                "terminal rows are missing their typed raw provider artifact"
+                if contract == "raw_artifact"
+                else f"persisted {description} dependency is unavailable"
+            )
+            raise _CachedDependencyMissing(message)
+        pin = self._pins[contract]
+        _require_columns(
+            row,
+            (
+                ("contract_schema_id", pin.schema_id),
+                ("contract_version", pin.version),
+                ("contract_artifact_id", pin.artifact_id),
+                ("contract_sha256", pin.sha256),
+                *indexed,
+            ),
+            description,
         )
+        stored_payload = _row_bytes(row, "payload_json")
+        if (
+            stored_payload != payload
+            or _row_text(row, "payload_sha256") != exact_bytes_sha256(stored_payload)
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"persisted {description} does not match its exact cached payload bytes"
+            )
+
+    @staticmethod
+    def _assert_cached_raw_row(
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+        raw: StoredRawProviderBytes,
+    ) -> None:
+        intent = cache.intents_by_request.get(raw.request_id)
+        if intent is None:
+            raise _CachedDependencyMissing(
+                "raw provider bytes require a cached inference intent"
+            )
+        row = connection.execute(
+            "SELECT * FROM raw_provider_responses WHERE artifact_id = ?",
+            (raw.artifact_id,),
+        ).fetchone()
+        if row is None:
+            raise _CachedDependencyMissing(
+                "persisted raw provider response dependency is unavailable"
+            )
+        _require_columns(
+            row,
+            (
+                ("artifact_id", raw.artifact_id),
+                ("inference_id", intent.inference_id),
+                ("request_id", raw.request_id),
+                ("provider_request_id", raw.provider_request_id),
+                ("exact_bytes_sha256", raw.exact_bytes_sha256),
+                ("media_type", raw.media_type),
+                ("byte_count", raw.byte_count),
+            ),
+            "raw provider response",
+        )
+        stored_bytes = _row_bytes(row, "raw_bytes")
+        if (
+            stored_bytes != raw.data
+            or exact_bytes_sha256(stored_bytes) != raw.exact_bytes_sha256
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "persisted raw provider response does not match exact cached bytes"
+            )
+
+    def _append_cached_raw_artifact(
+        self,
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+        artifact: RawProviderResponseArtifact,
+        payload: bytes,
+        *,
+        allow_terminal_materialization: bool,
+    ) -> _LedgerCache:
+        state = cache.state
+        self._validate_raw_artifact(artifact, state)
+        existing = state.raw_artifacts.get(artifact.artifact_id)
+        if existing is not None:
+            if existing != artifact:
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "raw provider artifact identity has conflicting metadata"
+                )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "raw_artifact",
+                existing.artifact_id,
+            )
+            return cache
+        if (
+            artifact.inference_id in state.terminals
+            and not allow_terminal_materialization
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "terminal rows are missing their typed raw provider artifact"
+            )
+        intent = state.intents[artifact.inference_id]
+        terminal = state.terminals[artifact.inference_id]
+        raw = state.raw[artifact.artifact_id]
+        self._assert_cached_model_row(
+            connection,
+            cache,
+            "intent",
+            intent.inference_id,
+        )
+        self._assert_cached_model_row(
+            connection,
+            cache,
+            "terminal",
+            terminal.inference_id,
+        )
+        self._assert_cached_raw_row(connection, cache, raw)
+        pin = self._pins["raw_artifact"]
+        connection.execute(
+            """
+            INSERT INTO raw_provider_artifacts (
+                artifact_id, inference_id, request_id, exact_bytes_sha256,
+                byte_count, media_type, provider_request_id, provider, model_name,
+                model_version, created_at,
+                contract_schema_id, contract_version, contract_artifact_id,
+                contract_sha256, payload_json, payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact.artifact_id,
+                artifact.inference_id,
+                intent.request_id,
+                artifact.exact_bytes_sha256,
+                artifact.byte_count,
+                artifact.media_type,
+                artifact.provider_request_id,
+                artifact.provider,
+                artifact.model_name,
+                artifact.model_version,
+                artifact.created_at,
+                pin.schema_id,
+                pin.version,
+                pin.artifact_id,
+                pin.sha256,
+                sqlite3.Binary(payload),
+                exact_bytes_sha256(payload),
+            ),
+        )
+        updated_state = replace(
+            state,
+            raw_artifacts={**state.raw_artifacts, artifact.artifact_id: artifact},
+        )
+        return self._updated_cache(
+            cache,
+            updated_state,
+            ("raw_artifact", artifact.artifact_id, payload),
+        )
+
+    def _reload_cache_locked(self) -> None:
+        def reload_cache(connection: sqlite3.Connection) -> _LedgerCache:
+            self._verify_database(connection)
+            state = self._load_state(connection)
+            return self._cache_from_database(connection, state)
+
+        self._cache = self._transaction(
+            write=False,
+            operation_name="reload_cache",
+            operation=reload_cache,
+        )
+
+    def _cached_write(
+        self,
+        *,
+        operation_name: str,
+        operation: Callable[
+            [sqlite3.Connection, _LedgerCache],
+            tuple[_ResultT, _LedgerCache],
+        ],
+    ) -> _ResultT:
+        with self._state_lock:
+            for attempt in range(2):
+                cache = self._cache
+                try:
+                    def execute_with_cache(
+                        connection: sqlite3.Connection,
+                        cached: _LedgerCache = cache,
+                    ) -> tuple[_ResultT, _LedgerCache]:
+                        return operation(connection, cached)
+
+                    result, committed_cache = self._transaction(
+                        write=True,
+                        operation_name=operation_name,
+                        operation=execute_with_cache,
+                    )
+                except _CachedDependencyMissing:
+                    if attempt != 0:
+                        raise
+                    self._reload_cache_locked()
+                    continue
+                except SQLiteInferenceEvidenceLedgerError as exc:
+                    if attempt != 0 or not isinstance(exc.__cause__, sqlite3.IntegrityError):
+                        raise
+                    self._reload_cache_locked()
+                    continue
+                self._cache = committed_cache
+                return result
+        raise AssertionError("cached write retry loop did not return")
 
     def append_intent(self, intent: InferenceIntent) -> InferenceIntent:
         checked, payload = self._prepare_model(intent, InferenceIntent, "intent")
 
-        def append(connection: sqlite3.Connection) -> InferenceIntent:
-            rows = connection.execute(
-                """
-                SELECT * FROM inference_intents
-                WHERE inference_id = ? OR request_id = ?
-                ORDER BY inference_id
-                """,
-                (checked.inference_id, checked.request_id),
-            ).fetchall()
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[InferenceIntent, _LedgerCache]:
+            state = cache.state
+            candidates = {
+                item.inference_id: item
+                for item in (
+                    state.intents.get(checked.inference_id),
+                    cache.intents_by_request.get(checked.request_id),
+                )
+                if item is not None
+            }
             existing = _exact_existing(
-                tuple(self._intent_from_row(row, audit_schema=False) for row in rows),
+                tuple(candidates.values()),
                 checked,
                 conflict=f"conflicting intent: {checked.inference_id}",
             )
             if existing is not None:
-                return existing
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "intent",
+                    existing.inference_id,
+                )
+                return existing, cache
             pin = self._pins["intent"]
             connection.execute(
                 """
@@ -424,15 +1043,17 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
-            stored = self._intent_by_inference_id(connection, checked.inference_id)
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted inference intent differs after append"
-                )
-            return stored
+            updated_state = replace(
+                state,
+                intents={**state.intents, checked.inference_id: checked},
+            )
+            return checked, self._updated_cache(
+                cache,
+                updated_state,
+                ("intent", checked.inference_id, payload),
+            )
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_intent",
             operation=append,
         )
@@ -456,25 +1077,45 @@ class SQLiteInferenceEvidenceLedger:
             raise ValueError("raw provider response must be nonempty bytes")
         digest = exact_bytes_sha256(data)
         artifact_id = _stable_uuid("raw-provider-response", request_id, digest)
+        candidate = StoredRawProviderBytes(
+            artifact_id=artifact_id,
+            request_id=request_id,
+            provider_request_id=provider_request_id,
+            exact_bytes_sha256=digest,
+            media_type=media_type,
+            data=data,
+        )
 
-        def append_raw(connection: sqlite3.Connection) -> StoredRawProviderBytes:
-            intent = self._intent_by_request_id(connection, request_id)
+        def append_raw(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[StoredRawProviderBytes, _LedgerCache]:
+            state = cache.state
+            intent = cache.intents_by_request.get(request_id)
             if intent is None:
-                raise SQLiteInferenceEvidenceLedgerError(
+                raise _CachedDependencyMissing(
                     "raw provider bytes require a persisted inference intent"
                 )
-            candidate = StoredRawProviderBytes(
-                artifact_id=artifact_id,
-                request_id=request_id,
-                provider_request_id=provider_request_id,
-                exact_bytes_sha256=digest,
-                media_type=media_type,
-                data=data,
+            candidates = {
+                item.artifact_id: item
+                for item in (
+                    state.raw.get(candidate.artifact_id),
+                    cache.raw_by_request.get(candidate.request_id),
+                )
+                if item is not None
+            }
+            existing = _exact_existing(
+                tuple(candidates.values()),
+                candidate,
+                conflict="one inference request cannot append different raw response bytes",
             )
-            terminal = self._terminal_by_inference_id(
+            self._assert_cached_model_row(
                 connection,
+                cache,
+                "intent",
                 intent.inference_id,
             )
+            terminal = state.terminals.get(intent.inference_id)
             if terminal is not None:
                 terminal_raw_artifact_id = _terminal_raw_artifact_id(terminal)
                 terminal_raw = (
@@ -487,21 +1128,20 @@ class SQLiteInferenceEvidenceLedger:
                     candidate,
                     audit_schema=False,
                 )
-            rows = connection.execute(
-                """
-                SELECT * FROM raw_provider_responses
-                WHERE artifact_id = ? OR request_id = ?
-                ORDER BY artifact_id
-                """,
-                (artifact_id, request_id),
-            ).fetchall()
-            existing = _exact_existing(
-                tuple(self._raw_from_database_row(connection, row) for row in rows),
-                candidate,
-                conflict="one inference request cannot append different raw response bytes",
-            )
+                typed_raw = state.raw_artifacts.get(candidate.artifact_id)
+                if typed_raw is None:
+                    raise _CachedDependencyMissing(
+                        "terminal rows are missing their typed raw provider artifact"
+                    )
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "raw_artifact",
+                    typed_raw.artifact_id,
+                )
             if existing is not None:
-                return existing
+                self._assert_cached_raw_row(connection, cache, existing)
+                return existing, cache
             connection.execute(
                 """
                 INSERT INTO raw_provider_responses (
@@ -520,15 +1160,13 @@ class SQLiteInferenceEvidenceLedger:
                     sqlite3.Binary(candidate.data),
                 ),
             )
-            stored = self._raw_by_artifact_id(connection, candidate.artifact_id)
-            if stored != candidate:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted raw provider bytes differ after append"
-                )
-            return stored
+            updated_state = replace(
+                state,
+                raw={**state.raw, candidate.artifact_id: candidate},
+            )
+            return candidate, self._updated_cache(cache, updated_state)
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_raw_provider_response",
             operation=append_raw,
         )
@@ -561,24 +1199,28 @@ class SQLiteInferenceEvidenceLedger:
     def append_terminal(self, inference: ModelInference) -> ModelInference:
         checked, payload = self._prepare_model(inference, ModelInference, "terminal")
 
-        def append(connection: sqlite3.Connection) -> ModelInference:
-            existing = self._terminal_by_inference_id(connection, checked.inference_id)
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[ModelInference, _LedgerCache]:
+            state = cache.state
+            existing = state.terminals.get(checked.inference_id)
             if existing is not None and existing != checked:
                 raise SQLiteInferenceEvidenceLedgerError(
                     f"conflicting terminal attempt: {checked.inference_id}"
                 )
-            intent = self._intent_by_inference_id(connection, checked.inference_id)
+            intent = state.intents.get(checked.inference_id)
             if intent is None:
-                raise SQLiteInferenceEvidenceLedgerError(
+                raise _CachedDependencyMissing(
                     "terminal attempt requires a persisted intent"
                 )
             raw_artifact_id = _terminal_raw_artifact_id(checked)
             stored_raw = (
-                self._raw_by_artifact_id(connection, raw_artifact_id)
+                state.raw.get(raw_artifact_id)
                 if raw_artifact_id is not None
                 else None
             )
-            request_raw = self._raw_by_request_id(connection, checked.request_id)
+            request_raw = cache.raw_by_request.get(checked.request_id)
             self._validate_terminal(
                 checked,
                 intent,
@@ -587,7 +1229,29 @@ class SQLiteInferenceEvidenceLedger:
                 audit_schema=True,
             )
             if existing is not None:
-                return existing
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "terminal",
+                    existing.inference_id,
+                )
+                if stored_raw is not None:
+                    self._assert_cached_raw_row(connection, cache, stored_raw)
+                    self._assert_cached_model_row(
+                        connection,
+                        cache,
+                        "raw_artifact",
+                        stored_raw.artifact_id,
+                    )
+                return existing, cache
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "intent",
+                intent.inference_id,
+            )
+            if stored_raw is not None:
+                self._assert_cached_raw_row(connection, cache, stored_raw)
             pin = self._pins["terminal"]
             connection.execute(
                 """
@@ -613,6 +1277,15 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
+            terminal_state = replace(
+                state,
+                terminals={**state.terminals, checked.inference_id: checked},
+            )
+            committed_cache = self._updated_cache(
+                cache,
+                terminal_state,
+                ("terminal", checked.inference_id, payload),
+            )
             if stored_raw is not None:
                 raw_artifact = RawProviderResponseArtifact.from_bytes(
                     data=stored_raw.data,
@@ -625,20 +1298,21 @@ class SQLiteInferenceEvidenceLedger:
                     model_version=checked.model_version,
                     created_at=checked.completed_at,
                 )
-                self._append_raw_artifact_row(
-                    connection,
+                checked_artifact, raw_payload = self._prepare_model_unobserved(
                     raw_artifact,
+                    RawProviderResponseArtifact,
+                    "raw_artifact",
+                )
+                committed_cache = self._append_cached_raw_artifact(
+                    connection,
+                    committed_cache,
+                    checked_artifact,
+                    raw_payload,
                     allow_terminal_materialization=True,
                 )
-            stored = self._terminal_by_inference_id(connection, checked.inference_id)
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted terminal attempt differs after append"
-                )
-            return stored
+            return checked, committed_cache
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_terminal",
             operation=append,
         )
@@ -653,29 +1327,46 @@ class SQLiteInferenceEvidenceLedger:
     def append_selection(self, selection: InferenceAttemptSelection) -> InferenceAttemptSelection:
         checked, payload = self._prepare_model(selection, InferenceAttemptSelection, "selection")
 
-        def append(connection: sqlite3.Connection) -> InferenceAttemptSelection:
-            rows = connection.execute(
-                """
-                SELECT * FROM inference_attempt_selections
-                WHERE (logical_invocation_id = ? AND policy_version = ?)
-                   OR selection_id = ?
-                ORDER BY logical_invocation_id, policy_version
-                """,
-                (
-                    checked.logical_invocation_id,
-                    checked.policy_version,
-                    checked.selection_id,
-                ),
-            ).fetchall()
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[InferenceAttemptSelection, _LedgerCache]:
+            state = cache.state
+            candidates = {
+                item.selection_id: item
+                for item in (
+                    state.selections.get(
+                        (checked.logical_invocation_id, checked.policy_version)
+                    ),
+                    cache.selections_by_id.get(checked.selection_id),
+                )
+                if item is not None
+            }
             existing = _exact_existing(
-                tuple(self._selection_from_database_row(connection, row) for row in rows),
+                tuple(candidates.values()),
                 checked,
                 conflict="logical invocation already has a different selected attempt",
             )
             if existing is not None:
-                return existing
-            terminal = self._terminal_by_inference_id(connection, checked.inference_id)
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "selection",
+                    existing.selection_id,
+                )
+                return existing, cache
+            terminal = state.terminals.get(checked.inference_id)
+            if terminal is None:
+                raise _CachedDependencyMissing(
+                    "selection requires a successful terminal attempt"
+                )
             self._validate_selection(checked, terminal)
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "terminal",
+                terminal.inference_id,
+            )
             pin = self._pins["selection"]
             connection.execute(
                 """
@@ -700,19 +1391,20 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
-            stored = self._selection_by_logical_key(
-                connection,
-                checked.logical_invocation_id,
-                checked.policy_version,
+            updated_state = replace(
+                state,
+                selections={
+                    **state.selections,
+                    (checked.logical_invocation_id, checked.policy_version): checked,
+                },
             )
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted attempt selection differs after append"
-                )
-            return stored
+            return checked, self._updated_cache(
+                cache,
+                updated_state,
+                ("selection", checked.selection_id, payload),
+            )
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_selection",
             operation=append,
         )
@@ -734,12 +1426,32 @@ class SQLiteInferenceEvidenceLedger:
         checked, payload = self._prepare_model(
             artifact, RawProviderResponseArtifact, "raw_artifact"
         )
-        return self._transaction(
-            write=True,
+
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[RawProviderResponseArtifact, _LedgerCache]:
+            state = cache.state
+            if (
+                state.intents.get(checked.inference_id) is None
+                or state.terminals.get(checked.inference_id) is None
+                or state.raw.get(checked.artifact_id) is None
+            ):
+                raise _CachedDependencyMissing(
+                    "raw provider artifact requires its intent, terminal, and exact bytes"
+                )
+            updated = self._append_cached_raw_artifact(
+                connection,
+                cache,
+                checked,
+                payload,
+                allow_terminal_materialization=False,
+            )
+            return checked, updated
+
+        return self._cached_write(
             operation_name="append_raw_artifact",
-            operation=lambda connection: self._append_raw_artifact_row(
-                connection, checked, payload=payload
-            ),
+            operation=append,
         )
 
     def get_raw_artifact(self, artifact_id: str) -> RawProviderResponseArtifact | None:
@@ -754,35 +1466,70 @@ class SQLiteInferenceEvidenceLedger:
     ) -> ParsedProviderClaimArtifact:
         checked, payload = self._prepare_model(artifact, ParsedProviderClaimArtifact, "parsed")
 
-        def append(connection: sqlite3.Connection) -> ParsedProviderClaimArtifact:
-            rows = connection.execute(
-                """
-                SELECT * FROM parsed_provider_claims
-                WHERE artifact_id = ?
-                   OR (
-                       raw_artifact_id = ?
-                       AND provider_claim_schema_sha256 = ?
-                       AND parser_version = ?
-                   )
-                ORDER BY artifact_id
-                """,
-                (
-                    checked.artifact_id,
-                    checked.raw_response.artifact_id,
-                    checked.provider_claim_schema.sha256,
-                    checked.parser_version,
-                ),
-            ).fetchall()
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[ParsedProviderClaimArtifact, _LedgerCache]:
+            state = cache.state
+            identity = (
+                checked.raw_response.artifact_id,
+                checked.provider_claim_schema.sha256,
+                checked.parser_version,
+            )
+            candidates = {
+                item.artifact_id: item
+                for item in (
+                    state.parsed.get(checked.artifact_id),
+                    cache.parsed_by_identity.get(identity),
+                )
+                if item is not None
+            }
             existing = _exact_existing(
-                tuple(self._parsed_from_database_row(connection, row) for row in rows),
+                tuple(candidates.values()),
                 checked,
                 conflict="parsed provider claim identity has conflicting content",
             )
             if existing is not None:
-                return existing
-            self._append_raw_artifact_row(connection, checked.raw_response)
-            state = self._state_for_raw_artifact(connection, checked.raw_response.artifact_id)
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "parsed",
+                    existing.artifact_id,
+                )
+                return existing, cache
+            raw_artifact = state.raw_artifacts.get(checked.raw_response.artifact_id)
+            terminal = state.terminals.get(checked.raw_response.inference_id)
+            intent = state.intents.get(checked.raw_response.inference_id)
+            stored_raw = state.raw.get(checked.raw_response.artifact_id)
+            if (
+                raw_artifact is None
+                or terminal is None
+                or intent is None
+                or stored_raw is None
+            ):
+                raise _CachedDependencyMissing(
+                    "parsed claim requires its intent, terminal, and exact raw artifact"
+                )
             self._validate_parsed(checked, state)
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "raw_artifact",
+                raw_artifact.artifact_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "terminal",
+                terminal.inference_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "intent",
+                intent.inference_id,
+            )
+            self._assert_cached_raw_row(connection, cache, stored_raw)
             pin = self._pins["parsed"]
             connection.execute(
                 """
@@ -808,15 +1555,17 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
-            stored = self._parsed_by_artifact_id(connection, checked.artifact_id)
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted parsed claim differs after append"
-                )
-            return stored
+            updated_state = replace(
+                state,
+                parsed={**state.parsed, checked.artifact_id: checked},
+            )
+            return checked, self._updated_cache(
+                cache,
+                updated_state,
+                ("parsed", checked.artifact_id, payload),
+            )
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_parsed_claim",
             operation=append,
         )
@@ -831,28 +1580,53 @@ class SQLiteInferenceEvidenceLedger:
     def append_selected_output(self, output: SelectedAttemptOutput) -> SelectedAttemptOutput:
         checked, payload = self._prepare_model(output, SelectedAttemptOutput, "selected")
 
-        def append(connection: sqlite3.Connection) -> SelectedAttemptOutput:
-            rows = connection.execute(
-                """
-                SELECT * FROM selected_attempt_outputs
-                WHERE selection_id = ? OR output_sha256 = ?
-                ORDER BY selection_id
-                """,
-                (checked.selection_id, checked.output_sha256),
-            ).fetchall()
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[SelectedAttemptOutput, _LedgerCache]:
+            state = cache.state
+            candidates = {
+                item.selection_id: item
+                for item in (
+                    state.selected.get(checked.selection_id),
+                    cache.selected_by_digest.get(checked.output_sha256),
+                )
+                if item is not None
+            }
             existing = _exact_existing(
-                tuple(self._selected_from_database_row(connection, row) for row in rows),
+                tuple(candidates.values()),
                 checked,
                 conflict="selected attempt output identity has conflicting content",
             )
             if existing is not None:
-                return existing
-            state = self._state_for_selected_output(
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "selected",
+                    existing.selection_id,
+                )
+                return existing, cache
+            if cache.selections_by_id.get(checked.selection_id) is None:
+                raise _CachedDependencyMissing(
+                    "selected output requires its selection and parsed claim"
+                )
+            if state.parsed.get(checked.parsed_claim_artifact_id) is None:
+                raise _CachedDependencyMissing(
+                    "selected output requires its selection and parsed claim"
+                )
+            self._validate_selected(checked, state)
+            self._assert_cached_model_row(
                 connection,
+                cache,
+                "selection",
                 checked.selection_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "parsed",
                 checked.parsed_claim_artifact_id,
             )
-            self._validate_selected(checked, state)
             pin = self._pins["selected"]
             connection.execute(
                 """
@@ -876,15 +1650,17 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
-            stored = self._selected_by_selection_id(connection, checked.selection_id)
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted selected output differs after append"
-                )
-            return stored
+            updated_state = replace(
+                state,
+                selected={**state.selected, checked.selection_id: checked},
+            )
+            return checked, self._updated_cache(
+                cache,
+                updated_state,
+                ("selected", checked.selection_id, payload),
+            )
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_selected_output",
             operation=append,
         )
@@ -901,34 +1677,72 @@ class SQLiteInferenceEvidenceLedger:
     ) -> OrchestratorEnrichedOutput:
         checked, payload = self._prepare_model(output, OrchestratorEnrichedOutput, "enriched")
 
-        def append(connection: sqlite3.Connection) -> OrchestratorEnrichedOutput:
-            rows = connection.execute(
-                """
-                SELECT * FROM enriched_provider_outputs
-                WHERE artifact_id = ?
-                   OR enrichment_logical_key = ?
-                   OR semantic_sha256 = ?
-                ORDER BY artifact_id
-                """,
-                (
-                    checked.artifact_id,
-                    checked.enrichment_logical_key,
-                    checked.semantic_sha256,
-                ),
-            ).fetchall()
+        def append(
+            connection: sqlite3.Connection,
+            cache: _LedgerCache,
+        ) -> tuple[OrchestratorEnrichedOutput, _LedgerCache]:
+            state = cache.state
+            candidates = {
+                item.artifact_id: item
+                for item in (
+                    state.enriched.get(checked.artifact_id),
+                    cache.enriched_by_logical_key.get(checked.enrichment_logical_key),
+                    cache.enriched_by_semantic_sha256.get(checked.semantic_sha256),
+                )
+                if item is not None
+            }
             existing = _exact_existing(
-                tuple(self._enriched_from_database_row(connection, row) for row in rows),
+                tuple(candidates.values()),
                 checked,
                 conflict="enriched output identity has conflicting content",
             )
             if existing is not None:
-                return existing
-            state = self._state_for_enriched_output(
-                connection, checked.selected_attempt.selection_id
-            )
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "enriched",
+                    existing.artifact_id,
+                )
+                return existing, cache
+            selected = state.selected.get(checked.selected_attempt.selection_id)
+            if selected is None:
+                raise _CachedDependencyMissing(
+                    "enriched output does not reference the exact selected attempt output"
+                )
             self._validate_enriched(checked, state)
+            parsed = state.parsed.get(selected.parsed_claim_artifact_id)
+            intent = state.intents.get(selected.inference_id)
+            selection = cache.selections_by_id.get(selected.selection_id)
+            if parsed is None or intent is None or selection is None:
+                raise _CachedDependencyMissing(
+                    "enriched output schema lineage is inconsistent"
+                )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "selected",
+                selected.selection_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "parsed",
+                parsed.artifact_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "intent",
+                intent.inference_id,
+            )
+            self._assert_cached_model_row(
+                connection,
+                cache,
+                "selection",
+                selection.selection_id,
+            )
             pin = self._pins["enriched"]
-            selected = checked.selected_attempt
+            selected_attempt = checked.selected_attempt
             connection.execute(
                 """
                 INSERT INTO enriched_provider_outputs (
@@ -942,9 +1756,9 @@ class SQLiteInferenceEvidenceLedger:
                     checked.artifact_id,
                     checked.enrichment_logical_key,
                     checked.semantic_sha256,
-                    selected.selection_id,
-                    selected.inference_id,
-                    selected.output_sha256,
+                    selected_attempt.selection_id,
+                    selected_attempt.inference_id,
+                    selected_attempt.output_sha256,
                     pin.schema_id,
                     pin.version,
                     pin.artifact_id,
@@ -953,15 +1767,17 @@ class SQLiteInferenceEvidenceLedger:
                     exact_bytes_sha256(payload),
                 ),
             )
-            stored = self._enriched_by_artifact_id(connection, checked.artifact_id)
-            if stored != checked:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "persisted enriched output differs after append"
-                )
-            return stored
+            updated_state = replace(
+                state,
+                enriched={**state.enriched, checked.artifact_id: checked},
+            )
+            return checked, self._updated_cache(
+                cache,
+                updated_state,
+                ("enriched", checked.artifact_id, payload),
+            )
 
-        return self._transaction(
-            write=True,
+        return self._cached_write(
             operation_name="append_enriched_output",
             operation=append,
         )
@@ -1061,6 +1877,7 @@ class SQLiteInferenceEvidenceLedger:
 
     def _initialize_database_unobserved(self) -> None:
         connection: sqlite3.Connection | None = None
+        initialized_cache: _LedgerCache | None = None
         try:
             connection = self._connect()
             with self._observed_transaction_scope(
@@ -1114,7 +1931,11 @@ class SQLiteInferenceEvidenceLedger:
                         "inference evidence database has an unexpected application identity"
                     )
                 self._verify_database(connection)
-                self._load_state(connection)
+                state = self._load_state(connection)
+                initialized_cache = self._cache_from_database(connection, state)
+            if initialized_cache is None:
+                raise AssertionError("database initialization did not build a typed cache")
+            self._cache = initialized_cache
         except SQLiteInferenceEvidenceLedgerError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -1207,7 +2028,7 @@ class SQLiteInferenceEvidenceLedger:
                 write=write,
                 operation_name=operation_name,
             ):
-                self._verify_database(connection)
+                self._verify_database_identity(connection)
                 with runtime_span(
                     self._runtime_observer,
                     "sqlite.inference_evidence.operation",
@@ -1354,19 +2175,7 @@ class SQLiteInferenceEvidenceLedger:
             self._verify_database_unobserved(connection)
 
     def _verify_database_unobserved(self, connection: sqlite3.Connection) -> None:
-        if _pragma_int(connection, "application_id") != _APPLICATION_ID:
-            raise SQLiteInferenceEvidenceLedgerError(
-                "inference evidence database application identity changed"
-            )
-        if _pragma_int(connection, "user_version") != _SCHEMA_VERSION:
-            raise SQLiteInferenceEvidenceLedgerError(
-                "inference evidence database schema version changed"
-            )
-        journal = connection.execute("PRAGMA journal_mode").fetchone()
-        if journal is None or not isinstance(journal[0], str) or journal[0].lower() != "wal":
-            raise SQLiteInferenceEvidenceLedgerError(
-                "inference evidence database is not in WAL mode"
-            )
+        self._verify_database_identity(connection)
         if _database_schema_fingerprint(connection) != _expected_schema_fingerprint():
             raise SQLiteInferenceEvidenceLedgerError(
                 "SQLite inference evidence DDL does not match the canonical schema"
@@ -1379,6 +2188,22 @@ class SQLiteInferenceEvidenceLedger:
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise SQLiteInferenceEvidenceLedgerError(
                 "SQLite foreign-key check found orphaned inference evidence"
+            )
+
+    @staticmethod
+    def _verify_database_identity(connection: sqlite3.Connection) -> None:
+        if _pragma_int(connection, "application_id") != _APPLICATION_ID:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "inference evidence database application identity changed"
+            )
+        if _pragma_int(connection, "user_version") != _SCHEMA_VERSION:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "inference evidence database schema version changed"
+            )
+        journal = connection.execute("PRAGMA journal_mode").fetchone()
+        if journal is None or not isinstance(journal[0], str) or journal[0].lower() != "wal":
+            raise SQLiteInferenceEvidenceLedgerError(
+                "inference evidence database is not in WAL mode"
             )
 
     def _load_state(self, connection: sqlite3.Connection) -> _LedgerState:
