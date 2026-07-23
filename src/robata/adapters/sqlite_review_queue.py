@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Final, TypeVar, cast
 
@@ -35,6 +35,12 @@ from robata.review.models import (
     validate_registered_review_annotation,
     validate_registered_review_reopen_command,
     validate_registered_review_task,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _APPLICATION_ID: Final = 0x52565257  # "RVRW"
@@ -161,6 +167,7 @@ class SQLiteReviewQueue(ReviewQueue):
         database_path: Path,
         *,
         registry: SchemaRegistry | None = None,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be a pathlib.Path")
@@ -173,6 +180,7 @@ class SQLiteReviewQueue(ReviewQueue):
                 f"cannot prepare review queue database path: {exc}",
             ) from exc
         self._registry = registry or default_schema_registry()
+        self._runtime_observer = runtime_observer
         self._initialize_database()
 
     @property
@@ -237,7 +245,7 @@ class SQLiteReviewQueue(ReviewQueue):
             )
             return EnqueuedReviewTask(task=task, inserted=True)
 
-        return self._transaction(write=True, operation=write)
+        return self._transaction(write=True, operation_name="enqueue", operation=write)
 
     def claim_next(
         self,
@@ -295,7 +303,7 @@ class SQLiteReviewQueue(ReviewQueue):
                 lease_expires_at_ns=expires_at,
             )
 
-        return self._transaction(write=True, operation=write)
+        return self._transaction(write=True, operation_name="claim_next", operation=write)
 
     def renew_lease(
         self,
@@ -332,7 +340,7 @@ class SQLiteReviewQueue(ReviewQueue):
                 lease_expires_at_ns=expires_at,
             )
 
-        return self._transaction(write=True, operation=write)
+        return self._transaction(write=True, operation_name="renew_lease", operation=write)
 
     def submit_annotation(
         self,
@@ -431,7 +439,11 @@ class SQLiteReviewQueue(ReviewQueue):
                 raise _integrity_error("annotation completion did not update one leased task")
             return SubmittedReviewAnnotation(annotation=annotation, inserted=True)
 
-        return self._transaction(write=True, operation=write)
+        return self._transaction(
+            write=True,
+            operation_name="submit_annotation",
+            operation=write,
+        )
 
     def reopen(self, command: ReviewReopenCommand) -> ReopenedReviewTask:
         """Return completed work to pending while preserving immutable history."""
@@ -508,7 +520,7 @@ class SQLiteReviewQueue(ReviewQueue):
                 applied=True,
             )
 
-        return self._transaction(write=True, operation=write)
+        return self._transaction(write=True, operation_name="reopen", operation=write)
 
     def get_task(self, review_task_id: str) -> ReviewTaskSnapshot | None:
         """Read one verified task snapshot."""
@@ -522,7 +534,7 @@ class SQLiteReviewQueue(ReviewQueue):
             ).fetchone()
             return None if row is None else self._snapshot_from_row(row)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_task", operation=read)
 
     def list_open(self) -> tuple[ReviewTaskSnapshot, ...]:
         """List pending and leased work in deterministic scheduling order."""
@@ -537,7 +549,7 @@ class SQLiteReviewQueue(ReviewQueue):
             ).fetchall()
             return tuple(self._snapshot_from_row(row) for row in rows)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="list_open", operation=read)
 
     def list_overdue(self, *, now_ns: int) -> tuple[ReviewTaskSnapshot, ...]:
         """List incomplete work strictly later than its SLA deadline."""
@@ -555,7 +567,7 @@ class SQLiteReviewQueue(ReviewQueue):
             ).fetchall()
             return tuple(self._snapshot_from_row(row) for row in rows)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="list_overdue", operation=read)
 
     def list_annotations(self, review_task_id: str) -> tuple[ReviewAnnotation, ...]:
         """Read verified append-only annotation history."""
@@ -574,7 +586,11 @@ class SQLiteReviewQueue(ReviewQueue):
             ).fetchall()
             return tuple(self._annotation_from_row(row) for row in rows)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(
+            write=False,
+            operation_name="list_annotations",
+            operation=read,
+        )
 
     def _require_matching_lease(
         self,
@@ -728,13 +744,11 @@ class SQLiteReviewQueue(ReviewQueue):
         try:
             tables = _user_tables(connection)
             if not tables:
-                connection.executescript(_SCHEMA_SQL)
+                self._initialize_schema(connection)
             self._verify_database(connection)
         except ReviewQueueError:
             raise
         except sqlite3.Error as exc:
-            with suppress(sqlite3.Error):
-                connection.execute("ROLLBACK")
             raise ReviewQueueError(
                 ReviewQueueErrorCode.STORAGE_IO_ERROR,
                 f"cannot initialize review queue database: {exc}",
@@ -773,32 +787,176 @@ class SQLiteReviewQueue(ReviewQueue):
         self,
         *,
         write: bool,
+        operation_name: str,
         operation: Callable[[sqlite3.Connection], ResultT],
     ) -> ResultT:
         connection = self._open()
         try:
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            self._verify_database(connection)
-            result = operation(connection)
-            connection.execute("COMMIT")
-            return result
+            with self._observed_transaction_scope(
+                connection,
+                write=write,
+                operation_name=operation_name,
+            ):
+                self._verify_database(connection)
+                return operation(connection)
         except ReviewQueueError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.IntegrityError as exc:
-            _rollback_quietly(connection)
             raise ReviewQueueError(
                 ReviewQueueErrorCode.INTEGRITY_ERROR,
                 f"review queue integrity failure: {exc}",
             ) from exc
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise ReviewQueueError(
                 ReviewQueueErrorCode.STORAGE_IO_ERROR,
                 f"review queue storage failure: {exc}",
             ) from exc
         finally:
             connection.close()
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": "initialize_schema",
+            "write": True,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.review_queue.transaction",
+            attributes,
+        ):
+            try:
+                connection.executescript(_SCHEMA_SQL)
+            except BaseException:
+                if connection.in_transaction:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.review_queue.transactions",
+                        attributes=attributes,
+                    )
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollbacks",
+                            attributes=attributes,
+                        )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.review_queue.transactions",
+                attributes=attributes,
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.review_queue.commits",
+                attributes=attributes,
+            )
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.review_queue.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.review_queue.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.review_queue.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            try:
+                connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.review_queue.commit_failures",
+                    attributes=attributes,
+                )
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.review_queue.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.review_queue.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.review_queue.commits",
+                attributes=attributes,
+            )
 
 
 def _encode_model(model: BaseModel) -> tuple[bytes, str]:
@@ -951,11 +1109,6 @@ def _row_bytes(row: sqlite3.Row, column: str) -> bytes:
     if not isinstance(value, bytes):
         raise _integrity_error(f"review database column {column} must be bytes")
     return value
-
-
-def _rollback_quietly(connection: sqlite3.Connection) -> None:
-    with suppress(sqlite3.Error):
-        connection.execute("ROLLBACK")
 
 
 __all__ = ["SQLiteReviewQueue"]

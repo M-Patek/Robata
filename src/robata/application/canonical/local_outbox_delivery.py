@@ -32,6 +32,7 @@ from robata.queue.outbox import (
     OutboxRelay,
     OutboxRetryPolicy,
 )
+from robata.runtime.observability import RuntimeObserver
 
 LOCAL_OUTBOX_DELIVERY_MODEL_VERSION: Final = "canonical-local-outbox-delivery-v1"
 LOCAL_OUTBOX_RETRY_POLICY_VERSION: Final = "canonical-local-outbox-retry-v1"
@@ -139,6 +140,7 @@ def reconcile_local_primary_outbox(
     outbox: tuple[EventIdentityOutboxRecord, ...],
     registry: SchemaRegistry,
     max_delivery_attempts: int = LOCAL_OUTBOX_MAX_DELIVERY_ATTEMPTS,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> LocalOutboxDeliverySummary:
     """Drain currently eligible rows and reconcile exact local sink bytes."""
 
@@ -175,12 +177,16 @@ def reconcile_local_primary_outbox(
                 max_delay_seconds=60.0,
             ),
             registry=registry,
+            runtime_observer=runtime_observer,
         )
         sink: IdempotentOutboxSink
         exact_sink: SQLiteIdempotentOutboxSink | None
         sink_initialization_error: OutboxDeliveryError | None = None
         try:
-            exact_sink = SQLiteIdempotentOutboxSink(sink_database_path)
+            exact_sink = SQLiteIdempotentOutboxSink(
+                sink_database_path,
+                runtime_observer=runtime_observer,
+            )
             sink = exact_sink
         except OutboxDeliveryError as error:
             exact_sink = None

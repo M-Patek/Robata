@@ -8,8 +8,8 @@ import re
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Final
 
@@ -27,6 +27,12 @@ from robata.ports.artifact_registry import (
     ArtifactRegistryError,
     ArtifactRegistryErrorCode,
     PublishedArtifactDerivation,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _ARTIFACT_ID_PATTERN: Final = re.compile(
@@ -127,12 +133,18 @@ allocate_local_artifact_id = deterministic_local_artifact_id
 class LocalArtifactRegistry:
     """Local durable registry whose SQLite commit is the publication boundary."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(root, Path):
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INVALID_REQUEST,
                 "registry root must be a pathlib.Path",
             )
+        self._runtime_observer = runtime_observer
         try:
             if root.is_symlink():
                 raise ArtifactRegistryError(
@@ -173,7 +185,11 @@ class LocalArtifactRegistry:
                 ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot initialize registry storage at {root}: {error}",
             ) from error
-        self._initialize_database()
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.artifact_registry.initialization",
+        ):
+            self._initialize_database()
 
     @property
     def root(self) -> Path:
@@ -270,83 +286,83 @@ class LocalArtifactRegistry:
         self._assert_storage_layout()
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            row = connection.execute(
-                """
-                SELECT artifact_id, entry_json
-                FROM artifacts
-                WHERE artifact_type = ? AND semantic_sha256 = ?
-                """,
-                (artifact_type.value, semantic_sha256),
-            ).fetchone()
-            if row is None:
-                connection.commit()
-                return None
-            artifact_id = _row_text(row, "artifact_id")
-            if artifact_id != expected_id:
-                raise ArtifactRegistryError(
-                    ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                    "semantic index points to a non-deterministic artifact ID",
-                )
-            entry_bytes = _row_bytes(row, "entry_json")
-            try:
-                entry = ArtifactRegistryEntry.model_validate_json(entry_bytes, strict=True)
-            except (ValidationError, ValueError) as error:
-                raise ArtifactRegistryError(
-                    ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                    f"stored artifact entry is invalid for {artifact_id}: {error}",
-                ) from error
-            if (
-                canonical_json_bytes(entry) != entry_bytes
-                or entry.artifact_id != artifact_id
-                or entry.artifact_type is not artifact_type
-                or entry.semantic_sha256 != semantic_sha256
+            with self._observed_transaction_scope(
+                connection,
+                operation="lookup_artifact",
+                write=False,
             ):
-                raise ArtifactRegistryError(
-                    ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                    f"stored artifact entry disagrees with semantic index: {artifact_id}",
-                )
-            self._verify_registered_entry(connection, entry)
-            anchor_rows = connection.execute(
-                """
-                SELECT d.logical_key, d.manifest_artifact_id,
-                       d.snapshot_json, d.snapshot_sha256
-                FROM derivation_artifacts AS da
-                JOIN derivations AS d ON d.logical_key = da.logical_key
-                WHERE da.artifact_id = ?
-                ORDER BY d.logical_key
-                """,
-                (artifact_id,),
-            ).fetchall()
-            if not anchor_rows:
-                raise ArtifactRegistryError(
-                    ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                    f"artifact has no committed derivation anchor: {artifact_id}",
-                )
-            for anchor_row in anchor_rows:
-                anchor_key = _row_text(anchor_row, "logical_key")
-                anchor_snapshot = self._snapshot_from_derivation_row(anchor_row, anchor_key)
-                self._verify_derivation_membership(connection, anchor_key, anchor_snapshot)
-                anchored_entry = next(
-                    (
-                        candidate
-                        for candidate in anchor_snapshot.entries
-                        if candidate.artifact_id == artifact_id
-                    ),
-                    None,
-                )
-                if anchored_entry != entry:
+                row = connection.execute(
+                    """
+                    SELECT artifact_id, entry_json
+                    FROM artifacts
+                    WHERE artifact_type = ? AND semantic_sha256 = ?
+                    """,
+                    (artifact_type.value, semantic_sha256),
+                ).fetchone()
+                if row is None:
+                    return None
+                artifact_id = _row_text(row, "artifact_id")
+                if artifact_id != expected_id:
                     raise ArtifactRegistryError(
                         ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                        f"artifact entry disagrees with derivation anchor: {artifact_id}",
+                        "semantic index points to a non-deterministic artifact ID",
                     )
-            self._verify_database_graph(connection)
-            connection.commit()
+                entry_bytes = _row_bytes(row, "entry_json")
+                try:
+                    entry = ArtifactRegistryEntry.model_validate_json(entry_bytes, strict=True)
+                except (ValidationError, ValueError) as error:
+                    raise ArtifactRegistryError(
+                        ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                        f"stored artifact entry is invalid for {artifact_id}: {error}",
+                    ) from error
+                if (
+                    canonical_json_bytes(entry) != entry_bytes
+                    or entry.artifact_id != artifact_id
+                    or entry.artifact_type is not artifact_type
+                    or entry.semantic_sha256 != semantic_sha256
+                ):
+                    raise ArtifactRegistryError(
+                        ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                        f"stored artifact entry disagrees with semantic index: {artifact_id}",
+                    )
+                self._verify_registered_entry(connection, entry)
+                anchor_rows = connection.execute(
+                    """
+                    SELECT d.logical_key, d.manifest_artifact_id,
+                           d.snapshot_json, d.snapshot_sha256
+                    FROM derivation_artifacts AS da
+                    JOIN derivations AS d ON d.logical_key = da.logical_key
+                    WHERE da.artifact_id = ?
+                    ORDER BY d.logical_key
+                    """,
+                    (artifact_id,),
+                ).fetchall()
+                if not anchor_rows:
+                    raise ArtifactRegistryError(
+                        ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                        f"artifact has no committed derivation anchor: {artifact_id}",
+                    )
+                for anchor_row in anchor_rows:
+                    anchor_key = _row_text(anchor_row, "logical_key")
+                    anchor_snapshot = self._snapshot_from_derivation_row(anchor_row, anchor_key)
+                    self._verify_derivation_membership(connection, anchor_key, anchor_snapshot)
+                    anchored_entry = next(
+                        (
+                            candidate
+                            for candidate in anchor_snapshot.entries
+                            if candidate.artifact_id == artifact_id
+                        ),
+                        None,
+                    )
+                    if anchored_entry != entry:
+                        raise ArtifactRegistryError(
+                            ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                            f"artifact entry disagrees with derivation anchor: {artifact_id}",
+                        )
+                self._verify_database_graph(connection)
         except ArtifactRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as error:
-            _rollback_quietly(connection)
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INTEGRITY_ERROR,
                 f"cannot look up artifact by semantic identity: {error}",
@@ -446,31 +462,32 @@ class LocalArtifactRegistry:
         self._assert_storage_layout()
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            row = connection.execute(
-                """
-                SELECT manifest_artifact_id, snapshot_json, snapshot_sha256
-                FROM derivations
-                WHERE logical_key = ?
-                """,
-                (checked_key,),
-            ).fetchone()
-            if row is None:
-                raise ArtifactRegistryError(
-                    ArtifactRegistryErrorCode.DERIVATION_NOT_FOUND,
-                    f"artifact derivation is not registered: {checked_key!r}",
-                )
-            snapshot = self._snapshot_from_derivation_row(row, checked_key)
-            self._verify_derivation_membership(connection, checked_key, snapshot)
-            for entry in snapshot.entries:
-                self._verify_registered_entry(connection, entry)
-            self._verify_database_graph(connection)
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                operation="verify_derivation",
+                write=False,
+            ):
+                row = connection.execute(
+                    """
+                    SELECT manifest_artifact_id, snapshot_json, snapshot_sha256
+                    FROM derivations
+                    WHERE logical_key = ?
+                    """,
+                    (checked_key,),
+                ).fetchone()
+                if row is None:
+                    raise ArtifactRegistryError(
+                        ArtifactRegistryErrorCode.DERIVATION_NOT_FOUND,
+                        f"artifact derivation is not registered: {checked_key!r}",
+                    )
+                snapshot = self._snapshot_from_derivation_row(row, checked_key)
+                self._verify_derivation_membership(connection, checked_key, snapshot)
+                for entry in snapshot.entries:
+                    self._verify_registered_entry(connection, entry)
+                self._verify_database_graph(connection)
         except ArtifactRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as error:
-            _rollback_quietly(connection)
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INTEGRITY_ERROR,
                 f"cannot verify derivation {checked_key!r}: {error}",
@@ -510,9 +527,24 @@ class LocalArtifactRegistry:
                     ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                     "SQLite foreign-key enforcement could not be enabled",
                 )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.transactions",
+                attributes={"operation": "initialize_schema", "write": True},
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.commits",
+                attributes={"operation": "initialize_schema", "write": True},
+            )
         except ArtifactRegistryError:
             raise
         except sqlite3.Error as error:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.transaction_outcomes_unknown",
+                attributes={"operation": "initialize_schema", "write": True},
+            )
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot initialize SQLite artifact registry: {error}",
@@ -548,6 +580,98 @@ class LocalArtifactRegistry:
                 ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot open SQLite artifact registry: {error}",
             ) from error
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        operation: str,
+        write: bool,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.artifact_registry.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                self._rollback_observed(
+                    connection,
+                    attributes=attributes,
+                    outcome_unknown_if_inactive=True,
+                    suppress_errors=True,
+                )
+                raise
+            try:
+                self._commit(connection)
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.artifact_registry.commit_failures",
+                    attributes=attributes,
+                )
+                self._rollback_observed(
+                    connection,
+                    attributes=attributes,
+                    outcome_unknown_if_inactive=True,
+                    suppress_errors=True,
+                )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.commits",
+                attributes=attributes,
+            )
+
+    def _rollback_observed(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        attributes: Mapping[str, RuntimeAttributeValue],
+        outcome_unknown_if_inactive: bool,
+        suppress_errors: bool,
+    ) -> None:
+        if not connection.in_transaction:
+            if outcome_unknown_if_inactive:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.artifact_registry.transaction_outcomes_unknown",
+                    attributes=attributes,
+                )
+            return
+        try:
+            self._rollback(connection)
+        except BaseException:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.rollback_failures",
+                attributes=attributes,
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.transaction_outcomes_unknown",
+                attributes=attributes,
+            )
+            if not suppress_errors:
+                raise
+        else:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.artifact_registry.rollbacks",
+                attributes=attributes,
+            )
 
     def _assert_storage_layout(self) -> None:
         try:
@@ -955,62 +1079,65 @@ class LocalArtifactRegistry:
     ) -> bool:
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            reused = self._check_existing_derivation(
+            with self._observed_transaction_scope(
                 connection,
-                logical_key=logical_key,
-                manifest_artifact_id=manifest_artifact_id,
-                snapshot_bytes=snapshot_bytes,
-                snapshot_sha256=snapshot_sha256,
-            )
-            inserted: dict[str, bool] = {}
-            for entry in snapshot.entries:
-                inserted[entry.artifact_id] = self._insert_or_verify_entry(connection, entry)
-            for entry in snapshot.entries:
-                self._insert_or_verify_edges(
+                operation="publish_derivation",
+                write=True,
+            ):
+                reused = self._check_existing_derivation(
                     connection,
-                    entry,
-                    newly_inserted=inserted[entry.artifact_id],
+                    logical_key=logical_key,
+                    manifest_artifact_id=manifest_artifact_id,
+                    snapshot_bytes=snapshot_bytes,
+                    snapshot_sha256=snapshot_sha256,
                 )
-            self._verify_database_graph(connection)
-            if reused:
-                self._verify_derivation_membership(connection, logical_key, snapshot)
-            else:
-                manifest = next(
-                    entry for entry in snapshot.entries if entry.artifact_id == manifest_artifact_id
-                )
-                connection.execute(
-                    """
-                    INSERT INTO derivations (
-                        logical_key, manifest_artifact_id, snapshot_json,
-                        snapshot_sha256, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        logical_key,
-                        manifest_artifact_id,
-                        sqlite3.Binary(snapshot_bytes),
-                        snapshot_sha256,
-                        manifest.created_at,
-                    ),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO derivation_artifacts (logical_key, ordinal, artifact_id)
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        (logical_key, ordinal, entry.artifact_id)
-                        for ordinal, entry in enumerate(snapshot.entries)
-                    ),
-                )
-            self._commit(connection)
+                inserted: dict[str, bool] = {}
+                for entry in snapshot.entries:
+                    inserted[entry.artifact_id] = self._insert_or_verify_entry(connection, entry)
+                for entry in snapshot.entries:
+                    self._insert_or_verify_edges(
+                        connection,
+                        entry,
+                        newly_inserted=inserted[entry.artifact_id],
+                    )
+                self._verify_database_graph(connection)
+                if reused:
+                    self._verify_derivation_membership(connection, logical_key, snapshot)
+                else:
+                    manifest = next(
+                        entry
+                        for entry in snapshot.entries
+                        if entry.artifact_id == manifest_artifact_id
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO derivations (
+                            logical_key, manifest_artifact_id, snapshot_json,
+                            snapshot_sha256, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            logical_key,
+                            manifest_artifact_id,
+                            sqlite3.Binary(snapshot_bytes),
+                            snapshot_sha256,
+                            manifest.created_at,
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO derivation_artifacts (logical_key, ordinal, artifact_id)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            (logical_key, ordinal, entry.artifact_id)
+                            for ordinal, entry in enumerate(snapshot.entries)
+                        ),
+                    )
             return reused
         except ArtifactRegistryError:
-            _rollback_quietly(connection)
             raise
         except (sqlite3.Error, OSError) as error:
-            _rollback_quietly(connection)
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.TRANSACTION_FAILED,
                 f"artifact derivation transaction failed for {logical_key!r}: {error}",
@@ -1022,6 +1149,11 @@ class LocalArtifactRegistry:
         """Commit hook kept narrow so commit failures can be fault-injected."""
 
         connection.commit()
+
+    def _rollback(self, connection: sqlite3.Connection) -> None:
+        """Rollback hook kept narrow so rollback failures can be fault-injected."""
+
+        connection.rollback()
 
     def _check_existing_derivation(
         self,
@@ -1415,14 +1547,6 @@ def _pragma_int(connection: sqlite3.Connection, name: str) -> int:
             f"SQLite PRAGMA {name} returned a non-integer value",
         )
     return value
-
-
-def _rollback_quietly(connection: sqlite3.Connection) -> None:
-    try:
-        if connection.in_transaction:
-            connection.rollback()
-    except sqlite3.Error:
-        pass
 
 
 def _fsync_file(path: Path) -> None:

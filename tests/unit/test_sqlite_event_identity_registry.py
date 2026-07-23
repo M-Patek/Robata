@@ -37,6 +37,11 @@ from robata.event_pipeline.identity_registry import (
     event_identity_assignment_semantic_projection,
     event_identity_relation_semantic_projection,
 )
+from robata.runtime.observability import (
+    RuntimeObserver,
+    RuntimeProfileRecorder,
+    RuntimeProfileSnapshot,
+)
 from tests.unit.test_event_identity_registry import (
     NOW,
     OUTPUT_ADMISSION_POLICY,
@@ -52,6 +57,61 @@ from tests.unit.test_event_identity_registry import (
 
 def _database(tmp_path: Path) -> Path:
     return tmp_path / "event-identities.sqlite3"
+
+
+def _operation_counter_value(
+    snapshot: RuntimeProfileSnapshot,
+    counter_name: str,
+    operation: str,
+) -> int:
+    return sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == counter_name
+        and any(
+            attribute.name == "operation" and attribute.value == operation
+            for attribute in counter.attributes
+        )
+    )
+
+
+def test_initialization_observes_exact_event_identity_transaction(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+
+    SQLiteEventIdentityRegistryRepository(
+        _database(tmp_path),
+        runtime_observer=recorder,
+    )
+
+    snapshot = recorder.snapshot()
+    domain = "sqlite.event_identity"
+    assert (
+        _operation_counter_value(
+            snapshot,
+            f"{domain}.transactions",
+            "initialize_schema",
+        )
+        == 1
+    )
+    assert (
+        _operation_counter_value(
+            snapshot,
+            f"{domain}.commits",
+            "initialize_schema",
+        )
+        == 1
+    )
+    assert (
+        _operation_counter_value(
+            snapshot,
+            f"{domain}.rollbacks",
+            "initialize_schema",
+        )
+        == 0
+    )
+    assert sum(span.name == f"{domain}.transaction" for span in snapshot.spans) == 1
 
 
 def _assign_one(
@@ -202,8 +262,13 @@ class _SynchronizedSQLiteRepository(SQLiteEventIdentityRegistryRepository):
 
 
 class _FailingCommitSQLiteRepository(SQLiteEventIdentityRegistryRepository):
-    def __init__(self, database_path: Path) -> None:
-        super().__init__(database_path)
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
+        super().__init__(database_path, runtime_observer=runtime_observer)
         self._inside_mutation = False
         self._fail_once = True
 
@@ -222,8 +287,13 @@ class _FailingCommitSQLiteRepository(SQLiteEventIdentityRegistryRepository):
 
 
 class _CommitThenFailSQLiteRepository(SQLiteEventIdentityRegistryRepository):
-    def __init__(self, database_path: Path) -> None:
-        super().__init__(database_path)
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
+        super().__init__(database_path, runtime_observer=runtime_observer)
         self._inside_mutation = False
         self._fail_once = True
 
@@ -618,6 +688,7 @@ def test_event_id_ownership_is_global_and_survives_restart(tmp_path: Path) -> No
 
 def test_failed_sqlite_commit_rolls_back_every_mutation_row(tmp_path: Path) -> None:
     database_path = _database(tmp_path)
+    recorder = RuntimeProfileRecorder()
     context = _context()
     output = _enriched_output(context)
     hypothesis = _hypothesis(
@@ -628,7 +699,10 @@ def test_failed_sqlite_commit_rolls_back_every_mutation_row(tmp_path: Path) -> N
         fingerprint="rolled-back-event",
         ordinal=0,
     )
-    repository = _FailingCommitSQLiteRepository(database_path)
+    repository = _FailingCommitSQLiteRepository(
+        database_path,
+        runtime_observer=recorder,
+    )
 
     with pytest.raises(
         SQLiteEventIdentityRegistryUncertainCommitError,
@@ -640,6 +714,28 @@ def test_failed_sqlite_commit_rolls_back_every_mutation_row(tmp_path: Path) -> N
             enriched_outputs=(output,),
             decided_at=NOW,
         )
+
+    observation = recorder.snapshot()
+    domain = "sqlite.event_identity"
+    assert _operation_counter_value(observation, f"{domain}.transactions", "commit") == 1
+    assert _operation_counter_value(observation, f"{domain}.commits", "commit") == 0
+    assert _operation_counter_value(observation, f"{domain}.rollbacks", "commit") == 1
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.transactions",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.commits",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
 
     reopened = SQLiteEventIdentityRegistryRepository(database_path)
     snapshot = reopened.snapshot(context.recording_identity)
@@ -653,7 +749,11 @@ def test_failed_sqlite_commit_rolls_back_every_mutation_row(tmp_path: Path) -> N
 
 def test_error_after_durable_commit_reconciles_the_exact_mutation(tmp_path: Path) -> None:
     database_path = _database(tmp_path)
-    repository = _CommitThenFailSQLiteRepository(database_path)
+    recorder = RuntimeProfileRecorder()
+    repository = _CommitThenFailSQLiteRepository(
+        database_path,
+        runtime_observer=recorder,
+    )
 
     context, result = _assign_one(repository, fingerprint="durably-committed-event")
 
@@ -663,6 +763,27 @@ def test_error_after_durable_commit_reconciles_the_exact_mutation(tmp_path: Path
     assert len(result.assignments) == 1
     assert len(result.new_identities) == 1
     assert len(result.outbox) == 1
+    observation = recorder.snapshot()
+    domain = "sqlite.event_identity"
+    assert _operation_counter_value(observation, f"{domain}.transactions", "commit") == 1
+    assert _operation_counter_value(observation, f"{domain}.commits", "commit") == 0
+    assert _operation_counter_value(observation, f"{domain}.rollbacks", "commit") == 0
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.transactions",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.commits",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
 
     reopened = SQLiteEventIdentityRegistryRepository(database_path)
     snapshot = reopened.snapshot(context.recording_identity)

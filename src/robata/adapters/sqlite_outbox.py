@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
@@ -37,12 +38,111 @@ from robata.queue.outbox import (
     OutboxMessage,
     OutboxRetryPolicy,
 )
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
+)
 
 _PRIMARY_APPLICATION_ID: Final = 0x52504341
 _PRIMARY_SCHEMA_VERSION: Final = 2
 _SINK_APPLICATION_ID: Final = 0x524F4258  # "ROBX"
 _SINK_SCHEMA_VERSION: Final = 1
 _BUSY_TIMEOUT_MS: Final = 30_000
+
+
+@contextmanager
+def _observed_transaction(
+    connection: sqlite3.Connection,
+    *,
+    runtime_observer: RuntimeObserver | None,
+    domain: str,
+    write: bool,
+    operation_name: str,
+) -> Iterator[None]:
+    attributes: dict[str, RuntimeAttributeValue] = {
+        "operation": operation_name,
+        "write": write,
+    }
+    with runtime_span(runtime_observer, f"{domain}.transaction", attributes):
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        runtime_increment(
+            runtime_observer,
+            f"{domain}.transactions",
+            attributes=attributes,
+        )
+        try:
+            yield
+        except BaseException:
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.rollback_failures",
+                        attributes=attributes,
+                    )
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                else:
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.rollbacks",
+                        attributes=attributes,
+                    )
+            else:
+                runtime_increment(
+                    runtime_observer,
+                    f"{domain}.transaction_outcomes_unknown",
+                    attributes=attributes,
+                )
+            raise
+        try:
+            connection.commit()
+        except BaseException:
+            runtime_increment(
+                runtime_observer,
+                f"{domain}.commit_failures",
+                attributes=attributes,
+            )
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.rollback_failures",
+                        attributes=attributes,
+                    )
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                else:
+                    runtime_increment(
+                        runtime_observer,
+                        f"{domain}.rollbacks",
+                        attributes=attributes,
+                    )
+            else:
+                runtime_increment(
+                    runtime_observer,
+                    f"{domain}.transaction_outcomes_unknown",
+                    attributes=attributes,
+                )
+            raise
+        runtime_increment(
+            runtime_observer,
+            f"{domain}.commits",
+            attributes=attributes,
+        )
+
 
 _SINK_SCHEMA_STATEMENTS: Final = (
     """
@@ -140,6 +240,7 @@ class SQLitePrimaryOutboxDeliveryStore:
         retry_policy: OutboxRetryPolicy,
         clock: Clock | None = None,
         registry: SchemaRegistry | None = None,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not isinstance(primary_database_path, Path):
             raise TypeError("primary_database_path must be pathlib.Path")
@@ -154,9 +255,14 @@ class SQLitePrimaryOutboxDeliveryStore:
             )
         self._retry_policy = retry_policy
         self._clock = clock if clock is not None else _default_clock
+        self._runtime_observer = runtime_observer
         try:
             self._registry = registry or default_schema_registry()
-            SQLitePrimaryCompletionRepository(self._path, registry=self._registry)
+            SQLitePrimaryCompletionRepository(
+                self._path,
+                registry=self._registry,
+                runtime_observer=self._runtime_observer,
+            )
         except (PrimaryCompletionError, SchemaRegistryError) as error:
             raise OutboxDeliveryError(
                 f"cannot resolve outbox relay schema governance: {error}"
@@ -182,69 +288,68 @@ class SQLitePrimaryOutboxDeliveryStore:
         expires_at = _rfc3339(now + lease_duration)
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._discover(connection, now_text)
-            self._expire_leases(connection, now_text)
-            row = connection.execute(
-                """
-                SELECT d.outbox_id, d.attempt_count, d.lease_epoch
-                FROM primary_outbox_deliveries AS d
-                JOIN primary_outbox AS o ON o.outbox_id = d.outbox_id
-                WHERE o.delivered_at IS NULL
-                  AND d.status IN ('PENDING', 'RETRY_WAIT')
-                  AND d.next_attempt_at <= ?
-                ORDER BY o.completion_run_id, o.outbox_ordinal, o.outbox_id
-                LIMIT 1
-                """,
-                (now_text,),
-            ).fetchone()
-            if row is None:
-                connection.commit()
-                return None
-            outbox_id = str(row["outbox_id"])
-            lease_epoch = int(row["lease_epoch"]) + 1
-            attempt_count = int(row["attempt_count"]) + 1
-            token = _fencing_token(outbox_id, lease_epoch)
-            cursor = connection.execute(
-                """
-                UPDATE primary_outbox_deliveries
-                SET status = 'LEASED',
-                    attempt_count = ?,
-                    lease_epoch = ?,
-                    fencing_token = ?,
-                    claimed_by = ?,
-                    lease_expires_at = ?,
-                    last_error = NULL
-                WHERE outbox_id = ?
-                  AND status IN ('PENDING', 'RETRY_WAIT')
-                  AND lease_epoch = ?
-                """,
-                (
-                    attempt_count,
-                    lease_epoch,
-                    token,
-                    worker_id,
-                    expires_at,
-                    outbox_id,
-                    int(row["lease_epoch"]),
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise OutboxDeliveryError("outbox claim lost its atomic state transition")
-            claimed = self._joined_row(connection, outbox_id)
-            claim = OutboxDeliveryClaim(
-                message=self._message_from_row(claimed),
-                delivery=self._snapshot_from_row(claimed),
-            )
-            connection.commit()
-            return claim
+            with _observed_transaction(
+                connection,
+                runtime_observer=self._runtime_observer,
+                domain="sqlite.outbox_delivery",
+                write=True,
+                operation_name="claim",
+            ):
+                self._discover(connection, now_text)
+                self._expire_leases(connection, now_text)
+                row = connection.execute(
+                    """
+                    SELECT d.outbox_id, d.attempt_count, d.lease_epoch
+                    FROM primary_outbox_deliveries AS d
+                    JOIN primary_outbox AS o ON o.outbox_id = d.outbox_id
+                    WHERE o.delivered_at IS NULL
+                      AND d.status IN ('PENDING', 'RETRY_WAIT')
+                      AND d.next_attempt_at <= ?
+                    ORDER BY o.completion_run_id, o.outbox_ordinal, o.outbox_id
+                    LIMIT 1
+                    """,
+                    (now_text,),
+                ).fetchone()
+                if row is None:
+                    return None
+                outbox_id = str(row["outbox_id"])
+                lease_epoch = int(row["lease_epoch"]) + 1
+                attempt_count = int(row["attempt_count"]) + 1
+                token = _fencing_token(outbox_id, lease_epoch)
+                cursor = connection.execute(
+                    """
+                    UPDATE primary_outbox_deliveries
+                    SET status = 'LEASED',
+                        attempt_count = ?,
+                        lease_epoch = ?,
+                        fencing_token = ?,
+                        claimed_by = ?,
+                        lease_expires_at = ?,
+                        last_error = NULL
+                    WHERE outbox_id = ?
+                      AND status IN ('PENDING', 'RETRY_WAIT')
+                      AND lease_epoch = ?
+                    """,
+                    (
+                        attempt_count,
+                        lease_epoch,
+                        token,
+                        worker_id,
+                        expires_at,
+                        outbox_id,
+                        int(row["lease_epoch"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise OutboxDeliveryError("outbox claim lost its atomic state transition")
+                claimed = self._joined_row(connection, outbox_id)
+                return OutboxDeliveryClaim(
+                    message=self._message_from_row(claimed),
+                    delivery=self._snapshot_from_row(claimed),
+                )
         except OutboxDeliveryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except (sqlite3.Error, ValidationError, TypeError, ValueError) as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise OutboxDeliveryError(f"cannot claim primary outbox row: {error}") from error
         finally:
             connection.close()
@@ -254,64 +359,63 @@ class SQLitePrimaryOutboxDeliveryStore:
         now_text = _rfc3339(_require_now(self._clock))
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._expire_leases(connection, now_text)
-            row = self._joined_row(connection, checked.message.outbox_id)
-            if (
-                str(row["delivery_status"]) == OutboxDeliveryStatus.DELIVERED
-                and str(row["fencing_token"]) == checked.delivery.fencing_token
+            with _observed_transaction(
+                connection,
+                runtime_observer=self._runtime_observer,
+                domain="sqlite.outbox_delivery",
+                write=True,
+                operation_name="acknowledge",
             ):
-                connection.commit()
-                return self._snapshot_from_row(row)
-            self._require_current_fence(row, checked)
-            cursor = connection.execute(
-                """
-                UPDATE primary_outbox_deliveries
-                SET status = 'DELIVERED',
-                    lease_expires_at = NULL,
-                    next_attempt_at = ?,
-                    delivered_at = ?,
-                    dead_lettered_at = NULL,
-                    last_error = NULL
-                WHERE outbox_id = ?
-                  AND status = 'LEASED'
-                  AND lease_epoch = ?
-                  AND fencing_token = ?
-                  AND claimed_by = ?
-                """,
-                (
-                    now_text,
-                    now_text,
-                    checked.message.outbox_id,
-                    checked.delivery.lease_epoch,
-                    checked.delivery.fencing_token,
-                    checked.delivery.claimed_by,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise OutboxFenceError("delivery acknowledgement fence is stale")
-            cursor = connection.execute(
-                """
-                UPDATE primary_outbox
-                SET delivered_at = ?
-                WHERE outbox_id = ? AND delivered_at IS NULL
-                """,
-                (now_text, checked.message.outbox_id),
-            )
-            if cursor.rowcount != 1:
-                raise OutboxDeliveryError("primary outbox acknowledgement is inconsistent")
-            result = self._snapshot_from_row(
-                self._joined_row(connection, checked.message.outbox_id)
-            )
-            connection.commit()
-            return result
+                self._expire_leases(connection, now_text)
+                row = self._joined_row(connection, checked.message.outbox_id)
+                if (
+                    str(row["delivery_status"]) == OutboxDeliveryStatus.DELIVERED
+                    and str(row["fencing_token"]) == checked.delivery.fencing_token
+                ):
+                    return self._snapshot_from_row(row)
+                self._require_current_fence(row, checked)
+                cursor = connection.execute(
+                    """
+                    UPDATE primary_outbox_deliveries
+                    SET status = 'DELIVERED',
+                        lease_expires_at = NULL,
+                        next_attempt_at = ?,
+                        delivered_at = ?,
+                        dead_lettered_at = NULL,
+                        last_error = NULL
+                    WHERE outbox_id = ?
+                      AND status = 'LEASED'
+                      AND lease_epoch = ?
+                      AND fencing_token = ?
+                      AND claimed_by = ?
+                    """,
+                    (
+                        now_text,
+                        now_text,
+                        checked.message.outbox_id,
+                        checked.delivery.lease_epoch,
+                        checked.delivery.fencing_token,
+                        checked.delivery.claimed_by,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise OutboxFenceError("delivery acknowledgement fence is stale")
+                cursor = connection.execute(
+                    """
+                    UPDATE primary_outbox
+                    SET delivered_at = ?
+                    WHERE outbox_id = ? AND delivered_at IS NULL
+                    """,
+                    (now_text, checked.message.outbox_id),
+                )
+                if cursor.rowcount != 1:
+                    raise OutboxDeliveryError("primary outbox acknowledgement is inconsistent")
+                return self._snapshot_from_row(
+                    self._joined_row(connection, checked.message.outbox_id)
+                )
         except OutboxDeliveryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except (sqlite3.Error, TypeError, ValueError) as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise OutboxDeliveryError(
                 f"cannot acknowledge primary outbox delivery: {error}"
             ) from error
@@ -331,68 +435,71 @@ class SQLitePrimaryOutboxDeliveryStore:
         now_text = _rfc3339(now)
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._expire_leases(connection, now_text)
-            row = self._joined_row(connection, checked.message.outbox_id)
-            status = OutboxDeliveryStatus(str(row["delivery_status"]))
-            if (
-                status in (OutboxDeliveryStatus.RETRY_WAIT, OutboxDeliveryStatus.DEAD_LETTER)
-                and str(row["fencing_token"]) == checked.delivery.fencing_token
-                and str(row["last_error"]) == error
+            with _observed_transaction(
+                connection,
+                runtime_observer=self._runtime_observer,
+                domain="sqlite.outbox_delivery",
+                write=True,
+                operation_name="record_failure",
             ):
-                connection.commit()
-                return self._snapshot_from_row(row)
-            self._require_current_fence(row, checked)
-            attempt_count = int(row["attempt_count"])
-            max_attempts = int(row["max_attempts"])
-            if attempt_count >= max_attempts:
-                next_status = OutboxDeliveryStatus.DEAD_LETTER
-                next_attempt_at = now_text
-                dead_lettered_at: str | None = now_text
-            else:
-                policy = self._policy_from_row(row)
-                next_status = OutboxDeliveryStatus.RETRY_WAIT
-                next_attempt_at = _rfc3339(now + policy.delay_after(attempt_count))
-                dead_lettered_at = None
-            cursor = connection.execute(
-                """
-                UPDATE primary_outbox_deliveries
-                SET status = ?,
-                    lease_expires_at = NULL,
-                    next_attempt_at = ?,
-                    last_error = ?,
-                    dead_lettered_at = ?
-                WHERE outbox_id = ?
-                  AND status = 'LEASED'
-                  AND lease_epoch = ?
-                  AND fencing_token = ?
-                  AND claimed_by = ?
-                """,
-                (
-                    next_status,
-                    next_attempt_at,
-                    error,
-                    dead_lettered_at,
-                    checked.message.outbox_id,
-                    checked.delivery.lease_epoch,
-                    checked.delivery.fencing_token,
-                    checked.delivery.claimed_by,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise OutboxFenceError("delivery failure fence is stale")
-            result = self._snapshot_from_row(
-                self._joined_row(connection, checked.message.outbox_id)
-            )
-            connection.commit()
-            return result
+                self._expire_leases(connection, now_text)
+                row = self._joined_row(connection, checked.message.outbox_id)
+                status = OutboxDeliveryStatus(str(row["delivery_status"]))
+                if (
+                    status
+                    in (
+                        OutboxDeliveryStatus.RETRY_WAIT,
+                        OutboxDeliveryStatus.DEAD_LETTER,
+                    )
+                    and str(row["fencing_token"]) == checked.delivery.fencing_token
+                    and str(row["last_error"]) == error
+                ):
+                    return self._snapshot_from_row(row)
+                self._require_current_fence(row, checked)
+                attempt_count = int(row["attempt_count"])
+                max_attempts = int(row["max_attempts"])
+                if attempt_count >= max_attempts:
+                    next_status = OutboxDeliveryStatus.DEAD_LETTER
+                    next_attempt_at = now_text
+                    dead_lettered_at: str | None = now_text
+                else:
+                    policy = self._policy_from_row(row)
+                    next_status = OutboxDeliveryStatus.RETRY_WAIT
+                    next_attempt_at = _rfc3339(now + policy.delay_after(attempt_count))
+                    dead_lettered_at = None
+                cursor = connection.execute(
+                    """
+                    UPDATE primary_outbox_deliveries
+                    SET status = ?,
+                        lease_expires_at = NULL,
+                        next_attempt_at = ?,
+                        last_error = ?,
+                        dead_lettered_at = ?
+                    WHERE outbox_id = ?
+                      AND status = 'LEASED'
+                      AND lease_epoch = ?
+                      AND fencing_token = ?
+                      AND claimed_by = ?
+                    """,
+                    (
+                        next_status,
+                        next_attempt_at,
+                        error,
+                        dead_lettered_at,
+                        checked.message.outbox_id,
+                        checked.delivery.lease_epoch,
+                        checked.delivery.fencing_token,
+                        checked.delivery.claimed_by,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise OutboxFenceError("delivery failure fence is stale")
+                return self._snapshot_from_row(
+                    self._joined_row(connection, checked.message.outbox_id)
+                )
         except OutboxDeliveryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except (sqlite3.Error, TypeError, ValueError) as caught:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise OutboxDeliveryError(
                 f"cannot record primary outbox delivery failure: {caught}"
             ) from caught
@@ -636,13 +743,20 @@ class SQLitePrimaryOutboxDeliveryStore:
 class SQLiteIdempotentOutboxSink:
     """Local broker substitute keyed by outbox ID and exact message bytes."""
 
-    def __init__(self, database_path: Path, *, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        clock: Clock | None = None,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be pathlib.Path")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._path = database_path.resolve()
         self._clock = clock if clock is not None else _default_clock
+        self._runtime_observer = runtime_observer
         self._path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._initialize()
@@ -661,53 +775,53 @@ class SQLiteIdempotentOutboxSink:
         published_at = _rfc3339(_require_now(self._clock))
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM delivered_outbox_messages WHERE outbox_id = ?",
-                (message.outbox_id,),
-            ).fetchone()
-            if row is not None:
-                stored = (
-                    str(row["topic"]),
-                    str(row["message_key"]),
-                    bytes(row["payload"]),
-                    str(row["payload_sha256"]),
-                )
-                candidate = (
-                    message.topic,
-                    message.key,
-                    message.payload,
-                    message.payload_sha256,
-                )
-                if stored != candidate:
-                    raise OutboxDeliveryError(
-                        "sink already contains different bytes for this outbox ID"
+            with _observed_transaction(
+                connection,
+                runtime_observer=self._runtime_observer,
+                domain="sqlite.outbox_sink",
+                write=True,
+                operation_name="publish",
+            ):
+                row = connection.execute(
+                    "SELECT * FROM delivered_outbox_messages WHERE outbox_id = ?",
+                    (message.outbox_id,),
+                ).fetchone()
+                if row is not None:
+                    stored = (
+                        str(row["topic"]),
+                        str(row["message_key"]),
+                        bytes(row["payload"]),
+                        str(row["payload_sha256"]),
                     )
-                connection.commit()
-                return
-            connection.execute(
-                """
-                INSERT INTO delivered_outbox_messages (
-                    outbox_id, topic, message_key, payload, payload_sha256, published_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message.outbox_id,
-                    message.topic,
-                    message.key,
-                    message.payload,
-                    message.payload_sha256,
-                    published_at,
-                ),
-            )
-            connection.commit()
+                    candidate = (
+                        message.topic,
+                        message.key,
+                        message.payload,
+                        message.payload_sha256,
+                    )
+                    if stored != candidate:
+                        raise OutboxDeliveryError(
+                            "sink already contains different bytes for this outbox ID"
+                        )
+                    return
+                connection.execute(
+                    """
+                    INSERT INTO delivered_outbox_messages (
+                        outbox_id, topic, message_key, payload, payload_sha256, published_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message.outbox_id,
+                        message.topic,
+                        message.key,
+                        message.payload,
+                        message.payload_sha256,
+                        published_at,
+                    ),
+                )
         except OutboxDeliveryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise OutboxDeliveryError(f"cannot publish to idempotent sink: {error}") from error
         finally:
             connection.close()
@@ -755,17 +869,20 @@ class SQLiteIdempotentOutboxSink:
                 raise OutboxDeliveryError(
                     "refusing to initialize sink over an existing SQLite schema"
                 )
-            connection.execute("BEGIN IMMEDIATE")
-            for statement in _SINK_SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            connection.execute(f"PRAGMA application_id = {_SINK_APPLICATION_ID}")
-            connection.execute(f"PRAGMA user_version = {_SINK_SCHEMA_VERSION}")
-            if not _sink_schema_is_current(connection):
-                raise OutboxDeliveryError("new sink DDL is not canonical")
-            connection.commit()
+            with _observed_transaction(
+                connection,
+                runtime_observer=self._runtime_observer,
+                domain="sqlite.outbox_sink",
+                write=True,
+                operation_name="initialize_schema",
+            ):
+                for statement in _SINK_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA application_id = {_SINK_APPLICATION_ID}")
+                connection.execute(f"PRAGMA user_version = {_SINK_SCHEMA_VERSION}")
+                if not _sink_schema_is_current(connection):
+                    raise OutboxDeliveryError("new sink DDL is not canonical")
         except Exception:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         finally:
             connection.close()

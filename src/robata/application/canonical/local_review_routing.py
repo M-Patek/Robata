@@ -24,6 +24,7 @@ from robata.review.routing import (
     NonBlockingReviewRouter,
     ReviewRoutingDisposition,
 )
+from robata.runtime.observability import RuntimeObserver
 
 LOCAL_CANONICAL_REVIEW_POLICY_VERSION = "canonical-local-nonblocking-review-v2"
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -47,6 +48,7 @@ def route_local_review_after_completion(
     registry: SchemaRegistry,
     queue: ReviewQueue | None = None,
     media_quality_binding: LocalMediaQualityBinding | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> LocalReviewRoutingSummary:
     """Route a committed result without changing or withholding primary truth."""
 
@@ -127,6 +129,7 @@ def route_local_review_after_completion(
     active_queue = queue or SQLiteReviewQueue(
         state_root / "review-queue.sqlite3",
         registry=registry,
+        runtime_observer=runtime_observer,
     )
     receipt = NonBlockingReviewRouter(policy=policy, queue=active_queue).route(request)
     return LocalReviewRoutingSummary(

@@ -35,6 +35,7 @@ from robata.event_pipeline.identity_registry import (
 )
 from robata.inference.adapter import VisionInferenceRequest
 from robata.inference.enrichment import OrchestratorEnrichedOutput, ProviderObservation
+from robata.runtime.observability import RuntimeProfileRecorder, RuntimeProfileSnapshot
 from tests.integration.test_canonical_offline import (
     _action_evidence_claim_bytes,
     _claim_bytes,
@@ -51,6 +52,22 @@ from tests.integration.test_canonical_offline import (
 
 def _uuid(value: int) -> str:
     return f"00000000-0000-5000-8000-{value:012x}"
+
+
+def _operation_counter_value(
+    snapshot: RuntimeProfileSnapshot,
+    counter_name: str,
+    operation: str,
+) -> int:
+    return sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == counter_name
+        and any(
+            attribute.name == "operation" and attribute.value == operation
+            for attribute in counter.attributes
+        )
+    )
 
 
 def _prepare_command(
@@ -118,6 +135,30 @@ def _run_case(
             result=result,
         ),
     )
+
+
+def test_runtime_observer_counts_exact_primary_transaction_transitions(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
+    repository = SQLitePrimaryCompletionRepository(
+        tmp_path / "completion.sqlite3",
+        runtime_observer=recorder,
+    )
+    processing_run = _processing_run(harness, run_id=_uuid(80_000))
+
+    assert repository.begin_run(processing_run) == processing_run.to_record()
+    assert repository.begin_run(processing_run) == processing_run.to_record()
+
+    snapshot = recorder.snapshot()
+    domain = "sqlite.primary_completion"
+    assert _operation_counter_value(snapshot, f"{domain}.transactions", "initialize_schema") == 1
+    assert _operation_counter_value(snapshot, f"{domain}.commits", "initialize_schema") == 1
+    assert _operation_counter_value(snapshot, f"{domain}.transactions", "begin_run") == 2
+    assert _operation_counter_value(snapshot, f"{domain}.commits", "begin_run") == 1
+    assert _operation_counter_value(snapshot, f"{domain}.rollbacks", "begin_run") == 1
+    assert sum(span.name == f"{domain}.transaction" for span in snapshot.spans) == 3
 
 
 def test_atomic_completion_survives_reopen_and_exact_replay(tmp_path: Path) -> None:
@@ -413,7 +454,11 @@ class _FailAfterStagedFactsRepository(SQLitePrimaryCompletionRepository):
 
 def test_lost_commit_response_recovers_without_duplicate_outbox(tmp_path: Path) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
-    repository = _CommitThenLoseResponseRepository(tmp_path / "completion.sqlite3")
+    recorder = RuntimeProfileRecorder()
+    repository = _CommitThenLoseResponseRepository(
+        tmp_path / "completion.sqlite3",
+        runtime_observer=recorder,
+    )
     processing_run = _processing_run(harness, run_id=_uuid(80_002))
     repository.begin_run(processing_run)
     result = _run(harness, processing_run=processing_run)
@@ -423,6 +468,27 @@ def test_lost_commit_response_recovers_without_duplicate_outbox(tmp_path: Path) 
 
     assert recovered.replayed is True
     assert recovered.committed.command_sha256 == command.command_sha256
+    observation = recorder.snapshot()
+    domain = "sqlite.primary_completion"
+    assert _operation_counter_value(observation, f"{domain}.transactions", "commit") == 1
+    assert _operation_counter_value(observation, f"{domain}.commits", "commit") == 0
+    assert _operation_counter_value(observation, f"{domain}.rollbacks", "commit") == 0
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.transactions",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
+    assert (
+        _operation_counter_value(
+            observation,
+            f"{domain}.commits",
+            "recover_uncertain_commit",
+        )
+        == 1
+    )
     assert len(repository.list_outbox(harness.context.recording_identity)) == 1
     reopened = SQLitePrimaryCompletionRepository(repository.path)
     replay = reopened.commit(command)
@@ -644,7 +710,11 @@ def test_repository_rejects_compact_record_that_disagrees_with_detail(tmp_path: 
 
 def test_failure_after_staging_rolls_back_every_aggregate_fact(tmp_path: Path) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
-    repository = _FailAfterStagedFactsRepository(tmp_path / "completion.sqlite3")
+    recorder = RuntimeProfileRecorder()
+    repository = _FailAfterStagedFactsRepository(
+        tmp_path / "completion.sqlite3",
+        runtime_observer=recorder,
+    )
     processing_run = _processing_run(harness, run_id=_uuid(80_007))
     repository.begin_run(processing_run)
     result = _run(harness, processing_run=processing_run)
@@ -654,6 +724,11 @@ def test_failure_after_staging_rolls_back_every_aggregate_fact(tmp_path: Path) -
         repository.commit(command)
 
     assert caught.value.code is PrimaryCompletionErrorCode.TRANSACTION_FAILED
+    observation = recorder.snapshot()
+    domain = "sqlite.primary_completion"
+    assert _operation_counter_value(observation, f"{domain}.transactions", "commit") == 1
+    assert _operation_counter_value(observation, f"{domain}.commits", "commit") == 0
+    assert _operation_counter_value(observation, f"{domain}.rollbacks", "commit") == 1
     reopened = SQLitePrimaryCompletionRepository(repository.path)
     assert reopened.get(processing_run.run_id) is None
     assert reopened.begin_run(processing_run).primary_status.value == "RUNNING"

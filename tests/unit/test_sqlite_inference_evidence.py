@@ -37,6 +37,7 @@ from robata.inference.models import (
     inference_attempt_selection_logical_key,
 )
 from robata.inference.orchestrator import InferenceIntent
+from robata.runtime.observability import RuntimeProfileRecorder
 from tests.unit.test_inference_enrichment import _Fixture as _EnrichmentFixture
 from tests.unit.test_inference_enrichment import _fixture as _enrichment_fixture
 
@@ -59,6 +60,45 @@ def _stable_uuid(namespace: str, *parts: object) -> str:
 
 def _database(tmp_path: Path) -> Path:
     return tmp_path / "inference-evidence.sqlite3"
+
+
+def test_initialization_observes_exact_transaction_boundaries(tmp_path: Path) -> None:
+    recorder = RuntimeProfileRecorder()
+
+    SQLiteInferenceEvidenceLedger(
+        _database(tmp_path),
+        SchemaRegistry(),
+        runtime_observer=recorder,
+    )
+
+    snapshot = recorder.snapshot()
+    transaction_counters = tuple(
+        counter
+        for counter in snapshot.counters
+        if counter.name == "sqlite.inference_evidence.transactions"
+    )
+    commit_count = sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == "sqlite.inference_evidence.commits"
+    )
+    rollback_count = sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == "sqlite.inference_evidence.rollbacks"
+    )
+    operations = {
+        attribute.value
+        for counter in transaction_counters
+        for attribute in counter.attributes
+        if attribute.name == "operation"
+    }
+
+    assert sum(counter.value for counter in transaction_counters) == 2
+    assert commit_count == 2
+    assert rollback_count == 0
+    assert operations == {"initialize_preflight", "initialize_schema"}
+    assert sum(span.name == "sqlite.inference_evidence.transaction" for span in snapshot.spans) == 2
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,7 @@ from robata.review.models import (
     create_review_reopen_command,
     create_review_task,
 )
+from robata.runtime.observability import RuntimeProfileRecorder
 
 
 def _uuid(value: int) -> str:
@@ -162,6 +163,33 @@ def _persist_review_history(
     )
     assert queue.reopen(command).applied is True
     return queue, task, annotation, command
+
+
+def test_runtime_observation_counts_exact_review_transaction_outcomes(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    queue = SQLiteReviewQueue(
+        tmp_path / "observed-review.sqlite3",
+        runtime_observer=recorder,
+    )
+    task = _task(1)
+    assert queue.enqueue(task).inserted is True
+
+    with pytest.raises(ReviewQueueError) as conflict:
+        queue.enqueue(_task(1, requested_at_ns=1_001))
+    assert conflict.value.code is ReviewQueueErrorCode.TASK_CONFLICT
+    assert queue.get_task(task.review_task_id) is not None
+
+    snapshot = recorder.snapshot()
+
+    def total(name: str) -> int:
+        return sum(counter.value for counter in snapshot.counters if counter.name == name)
+
+    assert total("sqlite.review_queue.transactions") == 4
+    assert total("sqlite.review_queue.commits") == 3
+    assert total("sqlite.review_queue.rollbacks") == 1
+    assert sum(span.name == "sqlite.review_queue.transaction" for span in snapshot.spans) == 4
 
 
 def test_priority_claim_submit_and_exact_replay(tmp_path: Path) -> None:

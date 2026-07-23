@@ -10,6 +10,7 @@ import pytest
 from robata.adapters.sqlite_work_scheduler import (
     SQLiteWorkScheduler,
     WorkFenceError,
+    WorkNotFoundError,
 )
 from robata.queue.models import (
     WorkAttemptOutcome,
@@ -19,6 +20,7 @@ from robata.queue.models import (
     WorkItemSubjectType,
 )
 from robata.queue.stage import DependencyCriticality, Stage
+from robata.runtime.observability import RuntimeProfileRecorder
 
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 _RUN_ID = "00000000-0000-4000-8000-000000000001"
@@ -63,6 +65,48 @@ def _plan(
 
 def _scheduler(tmp_path: Path) -> SQLiteWorkScheduler:
     return SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+
+
+def test_observes_exact_transaction_boundaries_and_actual_rollback(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    scheduler = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+
+    with pytest.raises(WorkNotFoundError, match="not registered"):
+        scheduler.get(_uuid(999))
+
+    snapshot = recorder.snapshot()
+    transactions = tuple(
+        counter
+        for counter in snapshot.counters
+        if counter.name == "sqlite.work_scheduler.transactions"
+    )
+    commits = sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == "sqlite.work_scheduler.commits"
+    )
+    rollbacks = sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == "sqlite.work_scheduler.rollbacks"
+    )
+    writes = {
+        attribute.value
+        for counter in transactions
+        for attribute in counter.attributes
+        if attribute.name == "write"
+    }
+
+    assert sum(counter.value for counter in transactions) == 2
+    assert commits == 1
+    assert rollbacks == 1
+    assert writes == {False, True}
+    assert sum(span.name == "sqlite.work_scheduler.transaction" for span in snapshot.spans) == 2
 
 
 def test_dependency_stays_planned_until_required_upstream_succeeds(

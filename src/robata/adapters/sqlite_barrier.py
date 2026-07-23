@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from functools import cache
 from pathlib import Path
 from typing import Final, TypeVar
@@ -33,6 +33,12 @@ from robata.queue.stage import StageStatus
 from robata.queue.wire import (
     PersistedBarrier,
     validate_registered_persisted_barrier,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _APPLICATION_ID: Final = 0x52424152  # "RBAR"
@@ -220,9 +226,15 @@ _ResultT = TypeVar("_ResultT")
 class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
     """One SQLite authority for generic and inference-call barrier facts."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be a pathlib.Path")
+        self._runtime_observer = runtime_observer
         try:
             if database_path.exists() and database_path.is_symlink():
                 raise SQLiteBarrierStorageError(
@@ -261,7 +273,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             ).fetchone()
             return None if row is None else self._barrier_from_row(row)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_barrier", operation=read)
 
     def save_barrier(self, barrier: Barrier) -> None:
         checked = _strict_model(barrier, Barrier, "barrier")
@@ -322,7 +334,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
                 ),
             )
 
-        self._transaction(write=True, operation=save)
+        self._transaction(write=True, operation_name="save_barrier", operation=save)
 
     def get_state(self, barrier_id: str) -> BarrierState | None:
         key = _nonempty_string(barrier_id, "barrier_id")
@@ -337,7 +349,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             _barrier, state, _members, _version = self._load_generic_barrier(connection, key)
             return state
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_state", operation=read)
 
     def save_state(self, state: BarrierState) -> None:
         checked = _strict_model(state, BarrierState, "barrier state")
@@ -358,7 +370,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
                     "barrier state is derived from its immutable definition and terminal members"
                 )
 
-        self._transaction(write=True, operation=save)
+        self._transaction(write=True, operation_name="save_state", operation=save)
 
     def add_member(
         self,
@@ -450,7 +462,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
                     f"barrier state compare-and-swap did not match: {barrier_key}"
                 )
 
-        self._transaction(write=True, operation=add)
+        self._transaction(write=True, operation_name="add_member", operation=add)
 
     def get_members(self, barrier_id: str) -> tuple[BarrierMember, ...]:
         key = _nonempty_string(barrier_id, "barrier_id")
@@ -465,7 +477,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             _barrier, _state, members, _version = self._load_generic_barrier(connection, key)
             return members
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_members", operation=read)
 
     def get_persisted_barrier_snapshot(
         self,
@@ -501,7 +513,11 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             )
             return validate_registered_persisted_barrier(snapshot)
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(
+            write=False,
+            operation_name="get_persisted_barrier_snapshot",
+            operation=read,
+        )
 
     def append_definition(
         self,
@@ -563,7 +579,11 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             )
             return checked
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_definition",
+            operation=append,
+        )
 
     def get_definition(self, barrier_id: str) -> InferenceCallBarrierDefinition | None:
         key = _nonempty_string(barrier_id, "barrier_id")
@@ -590,7 +610,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             _validate_call_definition_binding(self._barrier_from_row(barrier_row), definition)
             return definition
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_definition", operation=read)
 
     def append_completion(
         self,
@@ -672,7 +692,11 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             )
             return checked
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_completion",
+            operation=append,
+        )
 
     def list_completions(
         self,
@@ -696,7 +720,11 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
                 _validate_completion_binding(definition, item)
             return completions
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(
+            write=False,
+            operation_name="list_completions",
+            operation=read,
+        )
 
     def append_reduction(
         self,
@@ -751,7 +779,11 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             )
             return checked
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_reduction",
+            operation=append,
+        )
 
     def get_reduction(self, barrier_id: str) -> InferenceCallReduction | None:
         key = _nonempty_string(barrier_id, "barrier_id")
@@ -769,7 +801,7 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
             self._validate_reduction(connection, definition, completions, reduction)
             return reduction
 
-        return self._transaction(write=False, operation=read)
+        return self._transaction(write=False, operation_name="get_reduction", operation=read)
 
     def _load_generic_barrier(
         self,
@@ -1064,46 +1096,53 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
         connection: sqlite3.Connection | None = None
         try:
             connection = self._open()
-            connection.execute("BEGIN")
-            preflight_version = _pragma_int(connection, "user_version")
-            preflight_application_id = _pragma_int(connection, "application_id")
-            preflight_has_schema = _has_user_schema(connection)
-            if preflight_version == 0:
-                if preflight_application_id != 0 or preflight_has_schema:
-                    raise SQLiteBarrierStorageError(
-                        "refusing to adopt a nonempty or claimed unversioned barrier database"
-                    )
-            elif (
-                preflight_version != _SCHEMA_VERSION or preflight_application_id != _APPLICATION_ID
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="initialize_preflight",
             ):
-                raise SQLiteBarrierStorageError(
-                    "barrier database header belongs to another schema version"
-                )
-            connection.commit()
+                preflight_version = _pragma_int(connection, "user_version")
+                preflight_application_id = _pragma_int(connection, "application_id")
+                preflight_has_schema = _has_user_schema(connection)
+                if preflight_version == 0:
+                    if preflight_application_id != 0 or preflight_has_schema:
+                        raise SQLiteBarrierStorageError(
+                            "refusing to adopt a nonempty or claimed unversioned barrier database"
+                        )
+                elif (
+                    preflight_version != _SCHEMA_VERSION
+                    or preflight_application_id != _APPLICATION_ID
+                ):
+                    raise SQLiteBarrierStorageError(
+                        "barrier database header belongs to another schema version"
+                    )
 
             journal = connection.execute("PRAGMA journal_mode = WAL").fetchone()
             if journal is None or not isinstance(journal[0], str) or journal[0].lower() != "wal":
                 raise SQLiteBarrierStorageError("SQLite WAL mode could not be enabled")
 
-            connection.execute("BEGIN IMMEDIATE")
-            user_version = _pragma_int(connection, "user_version")
-            application_id = _pragma_int(connection, "application_id")
-            has_schema = _has_user_schema(connection)
-            if user_version == 0:
-                if application_id != 0 or has_schema:
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="initialize_schema",
+            ):
+                user_version = _pragma_int(connection, "user_version")
+                application_id = _pragma_int(connection, "application_id")
+                has_schema = _has_user_schema(connection)
+                if user_version == 0:
+                    if application_id != 0 or has_schema:
+                        raise SQLiteBarrierStorageError(
+                            "refusing to adopt a nonempty or claimed unversioned barrier database"
+                        )
+                    for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                elif user_version != _SCHEMA_VERSION or application_id != _APPLICATION_ID:
                     raise SQLiteBarrierStorageError(
-                        "refusing to adopt a nonempty or claimed unversioned barrier database"
+                        "barrier database header belongs to another schema version"
                     )
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif user_version != _SCHEMA_VERSION or application_id != _APPLICATION_ID:
-                raise SQLiteBarrierStorageError(
-                    "barrier database header belongs to another schema version"
-                )
-            self._verify_database(connection)
-            connection.commit()
+                self._verify_database(connection)
         except SQLiteBarrierStorageError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -1157,26 +1196,121 @@ class SQLiteBarrierStorage(BarrierStorage, InferenceCallBarrierStorage):
         self,
         *,
         write: bool,
+        operation_name: str,
         operation: Callable[[sqlite3.Connection], _ResultT],
     ) -> _ResultT:
         connection = self._open()
         try:
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            self._verify_header(connection)
-            result = operation(connection)
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                write=write,
+                operation_name=operation_name,
+            ):
+                self._verify_header(connection)
+                result = operation(connection)
             return result
         except (InferenceCallBarrierError, KeyError, TypeError, ValueError):
-            _rollback_quietly(connection)
             raise
         except sqlite3.IntegrityError as exc:
-            _rollback_quietly(connection)
             raise SQLiteBarrierStorageError(f"SQLite rejected barrier persistence: {exc}") from exc
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteBarrierStorageError(f"barrier storage transaction failed: {exc}") from exc
         finally:
             connection.close()
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.barrier.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.barrier.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.barrier.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            try:
+                connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.barrier.commit_failures",
+                    attributes=attributes,
+                )
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.barrier.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.barrier.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.barrier.commits",
+                attributes=attributes,
+            )
 
     def _verify_database(self, connection: sqlite3.Connection) -> None:
         self._verify_header(connection)

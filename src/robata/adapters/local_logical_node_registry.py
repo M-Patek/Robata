@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Final, cast
@@ -43,6 +44,12 @@ from robata.ports.revision_registry import (
     RevisionSelectionRegistryError,
     RevisionSelectionRegistryErrorCode,
     VerifiedRevisionSubject,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _NODE_TYPE_ADAPTER: Final[TypeAdapter[NodeType]] = TypeAdapter(NodeType)
@@ -644,12 +651,18 @@ _EXPECTED_SCHEMA_SQL_V2: Final = _EXPECTED_SCHEMA_SQL_V1 | _EXPECTED_REVISION_SC
 class LocalLogicalNodeRegistry:
     """Local durable registry whose transaction attaches node and run together."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(root, Path):
             raise LogicalNodeRegistryError(
                 LogicalNodeRegistryErrorCode.INVALID_REQUEST,
                 "registry root must be a pathlib.Path",
             )
+        self._runtime_observer = runtime_observer
         try:
             if root.is_symlink():
                 raise LogicalNodeRegistryError(
@@ -676,7 +689,11 @@ class LocalLogicalNodeRegistry:
                 LogicalNodeRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot initialize logical-node storage at {root}: {error}",
             ) from error
-        self._initialize_database()
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.logical_node_registry.initialization",
+        ):
+            self._initialize_database()
 
     @property
     def root(self) -> Path:
@@ -705,6 +722,16 @@ class LocalLogicalNodeRegistry:
                 )
             if user_version == 0:
                 connection.executescript(_SCHEMA_V1_SQL)
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.logical_node_registry.transactions",
+                    attributes={"operation": "initialize_schema", "write": True},
+                )
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.logical_node_registry.commits",
+                    attributes={"operation": "initialize_schema", "write": True},
+                )
                 user_version = 1
             if user_version == 1:
                 self._verify_database_schema(connection, expected_version=1)
@@ -715,6 +742,11 @@ class LocalLogicalNodeRegistry:
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.transaction_outcomes_unknown",
+                attributes={"operation": "initialize_schema", "write": True},
+            )
             raise LogicalNodeRegistryError(
                 LogicalNodeRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot initialize SQLite logical-node registry: {error}",
@@ -753,31 +785,149 @@ class LocalLogicalNodeRegistry:
                 f"cannot open SQLite logical-node registry: {error}",
             ) from error
 
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        operation: str,
+        write: bool,
+        rollback_on_success: bool = False,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.logical_node_registry.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                self._rollback_observed(
+                    connection,
+                    operation=operation,
+                    write=write,
+                    suppress_errors=True,
+                )
+                raise
+            else:
+                if rollback_on_success or connection.in_transaction:
+                    self._rollback_observed(
+                        connection,
+                        operation=operation,
+                        write=write,
+                        suppress_errors=False,
+                    )
+
+    def _commit_observed(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        operation: str,
+        write: bool,
+        use_commit_hook: bool = True,
+    ) -> None:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation,
+            "write": write,
+        }
+        try:
+            if use_commit_hook:
+                self._commit(connection)
+            else:
+                connection.commit()
+        except BaseException:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.commit_failures",
+                attributes=attributes,
+            )
+            raise
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.logical_node_registry.commits",
+            attributes=attributes,
+        )
+
+    def _rollback_observed(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        operation: str,
+        write: bool,
+        suppress_errors: bool,
+    ) -> None:
+        if not connection.in_transaction:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.transaction_outcomes_unknown",
+                attributes={"operation": operation, "write": write},
+            )
+            return
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation,
+            "write": write,
+        }
+        try:
+            self._rollback(connection)
+        except BaseException:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.rollback_failures",
+                attributes=attributes,
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.transaction_outcomes_unknown",
+                attributes=attributes,
+            )
+            if not suppress_errors:
+                raise
+        else:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.logical_node_registry.rollbacks",
+                attributes=attributes,
+            )
+
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            current_version = _pragma_int(connection, "user_version")
-            if current_version == 2:
-                connection.rollback()
-                return
-            if current_version != 1:
-                raise LogicalNodeRegistryError(
-                    LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
-                    f"cannot migrate logical-node schema version {current_version}",
+            with self._observed_transaction_scope(
+                connection,
+                operation="migrate_v1_to_v2",
+                write=True,
+            ):
+                current_version = _pragma_int(connection, "user_version")
+                if current_version == 2:
+                    return
+                if current_version != 1:
+                    raise LogicalNodeRegistryError(
+                        LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
+                        f"cannot migrate logical-node schema version {current_version}",
+                    )
+                self._verify_database_schema(connection, expected_version=1)
+                self._verify_database_health(connection)
+                for statement in _REVISION_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 2")
+                self._commit_observed(
+                    connection,
+                    operation="migrate_v1_to_v2",
+                    write=True,
+                    use_commit_hook=False,
                 )
-            self._verify_database_schema(connection, expected_version=1)
-            self._verify_database_health(connection)
-            for statement in _REVISION_SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            connection.execute("PRAGMA user_version = 2")
-            connection.commit()
         except LogicalNodeRegistryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise LogicalNodeRegistryError(
                 LogicalNodeRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot migrate SQLite logical-node registry to schema version 2: {error}",
@@ -950,91 +1100,94 @@ class LocalLogicalNodeRegistry:
         node_inserted = False
         membership_inserted = False
         commit_error: sqlite3.Error | None = None
+        commit_started = False
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            node_row = self._select_node_row(
+            with self._observed_transaction_scope(
                 connection,
-                checked_node.node_type,
-                checked_node.node_logical_key,
-            )
-            membership_row = self._select_membership_row(connection, requested.identity)
+                operation="attach_run_node",
+                write=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                node_row = self._select_node_row(
+                    connection,
+                    checked_node.node_type,
+                    checked_node.node_logical_key,
+                )
+                membership_row = self._select_membership_row(connection, requested.identity)
 
-            if membership_row is not None:
+                if membership_row is not None:
+                    if node_row is None:
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
+                            "stored membership references an absent logical node",
+                        )
+                    verified = self._verified_node_from_connection(
+                        connection,
+                        checked_node.node_type,
+                        checked_node.node_logical_key,
+                    )
+                    if canonical_json_bytes(verified.node) != node_bytes:
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.NODE_CONFLICT,
+                            "logical-node identity is already bound to different immutable content",
+                        )
+                    stored_membership = self._membership_from_row(membership_row)
+                    if not self._is_idempotent_retry(stored_membership, requested):
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.MEMBERSHIP_CONFLICT,
+                            "run-node membership identity is already bound to different content",
+                        )
+                    return PublishedRunNodeMembership(
+                        node=verified.node,
+                        membership=stored_membership,
+                        node_inserted=False,
+                        membership_inserted=False,
+                    )
+
                 if node_row is None:
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
-                        "stored membership references an absent logical node",
+                    if requested.disposition is not RunNodeDisposition.REUSED:
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.NODE_NOT_FOUND,
+                            f"{requested.disposition.value} requires an existing verified node",
+                        )
+                    expected_membership = requested.model_copy(
+                        update={"disposition": RunNodeDisposition.CREATED}
                     )
-                verified = self._verified_node_from_connection(
-                    connection,
-                    checked_node.node_type,
-                    checked_node.node_logical_key,
-                )
-                if canonical_json_bytes(verified.node) != node_bytes:
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.NODE_CONFLICT,
-                        "logical-node identity is already bound to different immutable content",
+                    self._insert_node(connection, checked_node, node_bytes)
+                    node_inserted = True
+                else:
+                    verified = self._verified_node_from_connection(
+                        connection,
+                        checked_node.node_type,
+                        checked_node.node_logical_key,
                     )
-                stored_membership = self._membership_from_row(membership_row)
-                if not self._is_idempotent_retry(stored_membership, requested):
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.MEMBERSHIP_CONFLICT,
-                        "run-node membership identity is already bound to different content",
-                    )
-                connection.rollback()
-                return PublishedRunNodeMembership(
-                    node=verified.node,
-                    membership=stored_membership,
-                    node_inserted=False,
-                    membership_inserted=False,
-                )
+                    if canonical_json_bytes(verified.node) != node_bytes:
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.NODE_CONFLICT,
+                            "logical-node identity is already bound to different immutable content",
+                        )
 
-            if node_row is None:
-                if requested.disposition is not RunNodeDisposition.REUSED:
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.NODE_NOT_FOUND,
-                        f"{requested.disposition.value} requires an existing verified node",
-                    )
-                expected_membership = requested.model_copy(
-                    update={"disposition": RunNodeDisposition.CREATED}
-                )
-                self._insert_node(connection, checked_node, node_bytes)
-                node_inserted = True
-            else:
-                verified = self._verified_node_from_connection(
+                membership_bytes = canonical_json_bytes(expected_membership)
+                self._insert_membership(connection, expected_membership, membership_bytes)
+                membership_inserted = True
+                commit_started = True
+                self._commit_observed(
                     connection,
-                    checked_node.node_type,
-                    checked_node.node_logical_key,
+                    operation="attach_run_node",
+                    write=True,
                 )
-                if canonical_json_bytes(verified.node) != node_bytes:
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.NODE_CONFLICT,
-                        "logical-node identity is already bound to different immutable content",
-                    )
-
-            membership_bytes = canonical_json_bytes(expected_membership)
-            self._insert_membership(connection, expected_membership, membership_bytes)
-            membership_inserted = True
-            try:
-                self._commit(connection)
-            except sqlite3.Error as error:
-                commit_error = error
-                with suppress(sqlite3.Error):
-                    connection.rollback()
         except LogicalNodeRegistryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
-            raise LogicalNodeRegistryError(
-                LogicalNodeRegistryErrorCode.TRANSACTION_FAILED,
-                f"logical-node attach transaction failed: {error}",
-            ) from error
+            if commit_started:
+                commit_error = error
+            else:
+                raise LogicalNodeRegistryError(
+                    LogicalNodeRegistryErrorCode.TRANSACTION_FAILED,
+                    f"logical-node attach transaction failed: {error}",
+                ) from error
         finally:
             connection.close()
 
@@ -1081,15 +1234,21 @@ class LocalLogicalNodeRegistry:
         checked_type, checked_key = self._validate_node_identity(node_type, node_logical_key)
         connection = self._connect()
         try:
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, checked_type, checked_key) is None:
-                return None
-            return self._verified_node_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                checked_type,
-                checked_key,
-            ).node
+                operation="lookup_node",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, checked_type, checked_key) is None:
+                    return None
+                return self._verified_node_from_connection(
+                    connection,
+                    checked_type,
+                    checked_key,
+                ).node
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
@@ -1115,19 +1274,29 @@ class LocalLogicalNodeRegistry:
         )
         connection = self._connect()
         try:
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            row = self._select_membership_row(connection, identity)
-            if row is None:
-                return None
-            membership = self._membership_from_row(row)
-            verified = self._verified_node_from_connection(connection, identity[1], identity[2])
-            if membership not in verified.memberships:
-                raise LogicalNodeRegistryError(
-                    LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
-                    "membership is absent from its node's verified membership set",
+            with self._observed_transaction_scope(
+                connection,
+                operation="lookup_membership",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                row = self._select_membership_row(connection, identity)
+                if row is None:
+                    return None
+                membership = self._membership_from_row(row)
+                verified = self._verified_node_from_connection(
+                    connection,
+                    identity[1],
+                    identity[2],
                 )
-            return membership
+                if membership not in verified.memberships:
+                    raise LogicalNodeRegistryError(
+                        LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
+                        "membership is absent from its node's verified membership set",
+                    )
+                return membership
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
@@ -1145,30 +1314,36 @@ class LocalLogicalNodeRegistry:
         checked_run = self._validate_uuid(run_id, "run_id")
         connection = self._connect()
         try:
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM processing_run_nodes
-                WHERE run_id = ?
-                ORDER BY node_type, node_logical_key, role
-                """,
-                (checked_run,),
-            ).fetchall()
-            memberships = tuple(self._membership_from_row(row) for row in rows)
-            for membership in memberships:
-                verified = self._verified_node_from_connection(
-                    connection,
-                    membership.node_type,
-                    membership.node_logical_key,
-                )
-                if membership not in verified.memberships:
-                    raise LogicalNodeRegistryError(
-                        LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
-                        "run membership is absent from its verified node",
+            with self._observed_transaction_scope(
+                connection,
+                operation="list_run_memberships",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM processing_run_nodes
+                    WHERE run_id = ?
+                    ORDER BY node_type, node_logical_key, role
+                    """,
+                    (checked_run,),
+                ).fetchall()
+                memberships = tuple(self._membership_from_row(row) for row in rows)
+                for membership in memberships:
+                    verified = self._verified_node_from_connection(
+                        connection,
+                        membership.node_type,
+                        membership.node_logical_key,
                     )
-            return memberships
+                    if membership not in verified.memberships:
+                        raise LogicalNodeRegistryError(
+                            LogicalNodeRegistryErrorCode.INTEGRITY_ERROR,
+                            "run membership is absent from its verified node",
+                        )
+                return memberships
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
@@ -1187,15 +1362,21 @@ class LocalLogicalNodeRegistry:
         checked_type, checked_key = self._validate_node_identity(node_type, node_logical_key)
         connection = self._connect()
         try:
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, checked_type, checked_key) is None:
-                return ()
-            return self._verified_node_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                checked_type,
-                checked_key,
-            ).memberships
+                operation="list_node_memberships",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, checked_type, checked_key) is None:
+                    return ()
+                return self._verified_node_from_connection(
+                    connection,
+                    checked_type,
+                    checked_key,
+                ).memberships
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
@@ -1214,14 +1395,24 @@ class LocalLogicalNodeRegistry:
         checked_type, checked_key = self._validate_node_identity(node_type, node_logical_key)
         connection = self._connect()
         try:
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, checked_type, checked_key) is None:
-                raise LogicalNodeRegistryError(
-                    LogicalNodeRegistryErrorCode.NODE_NOT_FOUND,
-                    f"logical node does not exist: {(checked_type, checked_key)!r}",
+            with self._observed_transaction_scope(
+                connection,
+                operation="verify_node",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, checked_type, checked_key) is None:
+                    raise LogicalNodeRegistryError(
+                        LogicalNodeRegistryErrorCode.NODE_NOT_FOUND,
+                        f"logical node does not exist: {(checked_type, checked_key)!r}",
+                    )
+                return self._verified_node_from_connection(
+                    connection,
+                    checked_type,
+                    checked_key,
                 )
-            return self._verified_node_from_connection(connection, checked_type, checked_key)
         except LogicalNodeRegistryError:
             raise
         except sqlite3.Error as error:
@@ -1238,69 +1429,69 @@ class LocalLogicalNodeRegistry:
         checked = self._validate_revision(revision)
         revision_bytes = canonical_json_bytes(checked)
         commit_error: sqlite3.Error | None = None
+        commit_started = False
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                checked.subject_type,
-                checked.subject_id,
-            )
-            id_row = self._select_revision_by_global_id(
-                connection,
-                checked.revision_id,
-            )
-            if id_row is not None:
-                stored = self._revision_from_row(id_row)
-                if not self._same_revision_command(stored, checked):
-                    raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.REVISION_CONFLICT,
-                        "revision_id is already bound to different immutable semantics",
-                    )
-                connection.rollback()
-                return PublishedRevision(revision=stored, inserted=False)
+                operation="publish_revision",
+                write=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                self._verified_revision_subject_from_connection(
+                    connection,
+                    checked.subject_type,
+                    checked.subject_id,
+                )
+                id_row = self._select_revision_by_global_id(
+                    connection,
+                    checked.revision_id,
+                )
+                if id_row is not None:
+                    stored = self._revision_from_row(id_row)
+                    if not self._same_revision_command(stored, checked):
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.REVISION_CONFLICT,
+                            "revision_id is already bound to different immutable semantics",
+                        )
+                    return PublishedRevision(revision=stored, inserted=False)
 
-            key_row = self._select_revision_by_logical_key(
-                connection,
-                checked.subject_type,
-                checked.subject_id,
-                checked.revision_logical_key,
-            )
-            if key_row is not None:
-                stored = self._revision_from_row(key_row)
-                if not self._same_revision_command(stored, checked):
-                    raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.REVISION_CONFLICT,
-                        "revision logical key is bound to different immutable semantics",
-                    )
-                connection.rollback()
-                return PublishedRevision(revision=stored, inserted=False)
+                key_row = self._select_revision_by_logical_key(
+                    connection,
+                    checked.subject_type,
+                    checked.subject_id,
+                    checked.revision_logical_key,
+                )
+                if key_row is not None:
+                    stored = self._revision_from_row(key_row)
+                    if not self._same_revision_command(stored, checked):
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.REVISION_CONFLICT,
+                            "revision logical key is bound to different immutable semantics",
+                        )
+                    return PublishedRevision(revision=stored, inserted=False)
 
-            self._verify_superseded_revision(connection, checked)
-            self._insert_revision(connection, checked, revision_bytes)
-            try:
-                self._commit(connection)
-            except sqlite3.Error as error:
-                commit_error = error
-                with suppress(sqlite3.Error):
-                    connection.rollback()
+                self._verify_superseded_revision(connection, checked)
+                self._insert_revision(connection, checked, revision_bytes)
+                commit_started = True
+                self._commit_observed(
+                    connection,
+                    operation="publish_revision",
+                    write=True,
+                )
         except RevisionSelectionRegistryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except LogicalNodeRegistryError as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise self._revision_error_from_logical(error) from error
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
-            raise RevisionSelectionRegistryError(
-                RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
-                f"immutable revision publication failed: {error}",
-            ) from error
+            if commit_started:
+                commit_error = error
+            else:
+                raise RevisionSelectionRegistryError(
+                    RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
+                    f"immutable revision publication failed: {error}",
+                ) from error
         finally:
             connection.close()
 
@@ -1364,181 +1555,179 @@ class LocalLogicalNodeRegistry:
         checked_selected_at = self._validate_revision_timestamp(selected_at, "selected_at")
         candidate: SelectionDecision | None = None
         commit_error: sqlite3.Error | None = None
+        commit_started = False
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            verified = self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            )
-            target = next(
-                (
-                    revision
-                    for revision in verified.revisions
-                    if revision.revision_id == checked_revision_id
-                ),
-                None,
-            )
-            if target is None:
-                raise RevisionSelectionRegistryError(
-                    RevisionSelectionRegistryErrorCode.REVISION_NOT_FOUND,
-                    f"selected revision does not exist under subject: {checked_revision_id}",
+                operation="select_revision",
+                write=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                verified = self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
                 )
-            if target.eligibility_at_publication is not RevisionEligibility.ELIGIBLE:
-                raise RevisionSelectionRegistryError(
-                    RevisionSelectionRegistryErrorCode.REVISION_INELIGIBLE,
-                    "selected revision was ineligible at publication",
-                )
-
-            id_row = self._select_decision_by_global_id(
-                connection,
-                checked_decision_id,
-            )
-            if id_row is not None:
-                stored = self._decision_from_row(id_row)
-                if not self._decision_matches_request(
-                    stored,
-                    subject=subject,
-                    selected_revision_id=checked_revision_id,
-                    selection_key_namespace=checked_namespace,
-                    previous_selection_decision_id=checked_previous_id,
-                    selection_policy_version=checked_policy,
-                ):
-                    raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.SELECTION_CONFLICT,
-                        "selection_decision_id is bound to a different immutable command",
-                    )
-                if verified.current is None:
-                    raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
-                        "stored selection decision has no current projection",
-                    )
-                connection.rollback()
-                return PublishedSelection(
-                    decision=stored,
-                    current=verified.current,
-                    decision_inserted=False,
-                    projection_advanced=False,
-                )
-
-            previous: SelectionDecision | None = None
-            if checked_previous_id is not None:
-                previous = next(
+                target = next(
                     (
-                        decision
-                        for decision in verified.decisions
-                        if decision.selection_decision_id == checked_previous_id
+                        revision
+                        for revision in verified.revisions
+                        if revision.revision_id == checked_revision_id
                     ),
                     None,
                 )
-                if previous is None:
+                if target is None:
                     raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.STALE_SELECTION,
-                        "expected previous selection decision does not exist",
+                        RevisionSelectionRegistryErrorCode.REVISION_NOT_FOUND,
+                        f"selected revision does not exist under subject: {checked_revision_id}",
                     )
-            candidate = create_selection_decision(
-                selection_decision_id=checked_decision_id,
-                selection_key_namespace=checked_namespace,
-                subject_type=subject[0],
-                subject_id=subject[1],
-                selected_revision_id=target.revision_id,
-                selected_revision_logical_key=target.revision_logical_key,
-                previous_selection_decision_id=(
-                    None if previous is None else previous.selection_decision_id
-                ),
-                previous_selection_decision_logical_key=(
-                    None if previous is None else previous.selection_decision_logical_key
-                ),
-                selection_sequence=(1 if previous is None else previous.selection_sequence + 1),
-                selection_policy_version=checked_policy,
-                projection_version=_CURRENT_PROJECTION_VERSION,
-                selected_at=checked_selected_at,
-            )
-            semantic_retry = next(
-                (
-                    decision
-                    for decision in verified.decisions
-                    if decision.selection_decision_logical_key
-                    == candidate.selection_decision_logical_key
-                ),
-                None,
-            )
-            if semantic_retry is not None:
-                if not self._same_selection_command(semantic_retry, candidate):
+                if target.eligibility_at_publication is not RevisionEligibility.ELIGIBLE:
                     raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.SELECTION_CONFLICT,
-                        "selection logical key is bound to different immutable semantics",
+                        RevisionSelectionRegistryErrorCode.REVISION_INELIGIBLE,
+                        "selected revision was ineligible at publication",
                     )
-                if verified.current is None:
-                    raise RevisionSelectionRegistryError(
-                        RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
-                        "stored selection decision has no current projection",
-                    )
-                connection.rollback()
-                return PublishedSelection(
-                    decision=semantic_retry,
-                    current=verified.current,
-                    decision_inserted=False,
-                    projection_advanced=False,
-                )
 
-            actual_previous_id = (
-                None if verified.current is None else verified.current.selection_decision_id
-            )
-            if actual_previous_id != checked_previous_id:
-                raise RevisionSelectionRegistryError(
-                    RevisionSelectionRegistryErrorCode.STALE_SELECTION,
-                    "current selection no longer matches the expected predecessor",
-                )
-
-            decision_bytes = canonical_json_bytes(candidate)
-            current = self._current_from_decision(candidate)
-            current_bytes = canonical_json_bytes(current)
-            self._insert_selection_decision(connection, candidate, decision_bytes)
-            if checked_previous_id is None:
-                self._insert_current_selection(connection, current, current_bytes)
-            else:
-                updated = self._compare_and_swap_current_selection(
+                id_row = self._select_decision_by_global_id(
                     connection,
-                    expected_previous_id=checked_previous_id,
-                    current=current,
-                    current_bytes=current_bytes,
+                    checked_decision_id,
                 )
-                if not updated:
+                if id_row is not None:
+                    stored = self._decision_from_row(id_row)
+                    if not self._decision_matches_request(
+                        stored,
+                        subject=subject,
+                        selected_revision_id=checked_revision_id,
+                        selection_key_namespace=checked_namespace,
+                        previous_selection_decision_id=checked_previous_id,
+                        selection_policy_version=checked_policy,
+                    ):
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.SELECTION_CONFLICT,
+                            "selection_decision_id is bound to a different immutable command",
+                        )
+                    if verified.current is None:
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
+                            "stored selection decision has no current projection",
+                        )
+                    return PublishedSelection(
+                        decision=stored,
+                        current=verified.current,
+                        decision_inserted=False,
+                        projection_advanced=False,
+                    )
+
+                previous: SelectionDecision | None = None
+                if checked_previous_id is not None:
+                    previous = next(
+                        (
+                            decision
+                            for decision in verified.decisions
+                            if decision.selection_decision_id == checked_previous_id
+                        ),
+                        None,
+                    )
+                    if previous is None:
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.STALE_SELECTION,
+                            "expected previous selection decision does not exist",
+                        )
+                candidate = create_selection_decision(
+                    selection_decision_id=checked_decision_id,
+                    selection_key_namespace=checked_namespace,
+                    subject_type=subject[0],
+                    subject_id=subject[1],
+                    selected_revision_id=target.revision_id,
+                    selected_revision_logical_key=target.revision_logical_key,
+                    previous_selection_decision_id=(
+                        None if previous is None else previous.selection_decision_id
+                    ),
+                    previous_selection_decision_logical_key=(
+                        None if previous is None else previous.selection_decision_logical_key
+                    ),
+                    selection_sequence=(1 if previous is None else previous.selection_sequence + 1),
+                    selection_policy_version=checked_policy,
+                    projection_version=_CURRENT_PROJECTION_VERSION,
+                    selected_at=checked_selected_at,
+                )
+                semantic_retry = next(
+                    (
+                        decision
+                        for decision in verified.decisions
+                        if decision.selection_decision_logical_key
+                        == candidate.selection_decision_logical_key
+                    ),
+                    None,
+                )
+                if semantic_retry is not None:
+                    if not self._same_selection_command(semantic_retry, candidate):
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.SELECTION_CONFLICT,
+                            "selection logical key is bound to different immutable semantics",
+                        )
+                    if verified.current is None:
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
+                            "stored selection decision has no current projection",
+                        )
+                    return PublishedSelection(
+                        decision=semantic_retry,
+                        current=verified.current,
+                        decision_inserted=False,
+                        projection_advanced=False,
+                    )
+
+                actual_previous_id = (
+                    None if verified.current is None else verified.current.selection_decision_id
+                )
+                if actual_previous_id != checked_previous_id:
                     raise RevisionSelectionRegistryError(
                         RevisionSelectionRegistryErrorCode.STALE_SELECTION,
-                        "current-selection compare-and-swap did not match",
+                        "current selection no longer matches the expected predecessor",
                     )
-            try:
-                self._commit(connection)
-            except sqlite3.Error as error:
-                commit_error = error
-                with suppress(sqlite3.Error):
-                    connection.rollback()
+
+                decision_bytes = canonical_json_bytes(candidate)
+                current = self._current_from_decision(candidate)
+                current_bytes = canonical_json_bytes(current)
+                self._insert_selection_decision(connection, candidate, decision_bytes)
+                if checked_previous_id is None:
+                    self._insert_current_selection(connection, current, current_bytes)
+                else:
+                    updated = self._compare_and_swap_current_selection(
+                        connection,
+                        expected_previous_id=checked_previous_id,
+                        current=current,
+                        current_bytes=current_bytes,
+                    )
+                    if not updated:
+                        raise RevisionSelectionRegistryError(
+                            RevisionSelectionRegistryErrorCode.STALE_SELECTION,
+                            "current-selection compare-and-swap did not match",
+                        )
+                commit_started = True
+                self._commit_observed(
+                    connection,
+                    operation="select_revision",
+                    write=True,
+                )
         except RevisionSelectionRegistryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except LogicalNodeRegistryError as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise self._revision_error_from_logical(error) from error
         except (ValidationError, ValueError) as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise RevisionSelectionRegistryError(
                 RevisionSelectionRegistryErrorCode.INVALID_REQUEST,
                 f"selection command is invalid: {error}",
             ) from error
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
-            raise RevisionSelectionRegistryError(
-                RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
-                f"selection transaction failed: {error}",
-            ) from error
+            if commit_started:
+                commit_error = error
+            else:
+                raise RevisionSelectionRegistryError(
+                    RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
+                    f"selection transaction failed: {error}",
+                ) from error
         finally:
             connection.close()
 
@@ -1590,23 +1779,28 @@ class LocalLogicalNodeRegistry:
         checked_revision_id = self._validate_revision_uuid(revision_id, "revision_id")
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                return None
-            verified = self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            )
-            return next(
-                (
-                    revision
-                    for revision in verified.revisions
-                    if revision.revision_id == checked_revision_id
-                ),
-                None,
-            )
+                operation="lookup_revision",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    return None
+                verified = self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                )
+                return next(
+                    (
+                        revision
+                        for revision in verified.revisions
+                        if revision.revision_id == checked_revision_id
+                    ),
+                    None,
+                )
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1617,8 +1811,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot look up immutable revision: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def lookup_selection_decision(
@@ -1634,23 +1826,28 @@ class LocalLogicalNodeRegistry:
         )
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                return None
-            verified = self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            )
-            return next(
-                (
-                    decision
-                    for decision in verified.decisions
-                    if decision.selection_decision_id == checked_decision_id
-                ),
-                None,
-            )
+                operation="lookup_selection_decision",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    return None
+                verified = self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                )
+                return next(
+                    (
+                        decision
+                        for decision in verified.decisions
+                        if decision.selection_decision_id == checked_decision_id
+                    ),
+                    None,
+                )
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1661,8 +1858,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot look up selection decision: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def lookup_current_selection(
@@ -1673,15 +1868,20 @@ class LocalLogicalNodeRegistry:
         subject = self._validate_revision_subject(subject_type, subject_id)
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                return None
-            return self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            ).current
+                operation="lookup_current_selection",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    return None
+                return self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                ).current
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1692,8 +1892,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot look up current selection: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def list_revisions(
@@ -1704,15 +1902,20 @@ class LocalLogicalNodeRegistry:
         subject = self._validate_revision_subject(subject_type, subject_id)
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                return ()
-            return self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            ).revisions
+                operation="list_revisions",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    return ()
+                return self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                ).revisions
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1723,8 +1926,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot list immutable revisions: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def list_selection_decisions(
@@ -1735,15 +1936,20 @@ class LocalLogicalNodeRegistry:
         subject = self._validate_revision_subject(subject_type, subject_id)
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                return ()
-            return self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            ).decisions
+                operation="list_selection_decisions",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    return ()
+                return self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                ).decisions
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1754,8 +1960,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot list selection decisions: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def verify_subject(
@@ -1766,18 +1970,23 @@ class LocalLogicalNodeRegistry:
         subject = self._validate_revision_subject(subject_type, subject_id)
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            if self._select_node_row(connection, *subject) is None:
-                raise RevisionSelectionRegistryError(
-                    RevisionSelectionRegistryErrorCode.SUBJECT_NOT_FOUND,
-                    f"revision subject does not exist: {subject!r}",
-                )
-            return self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                *subject,
-            )
+                operation="verify_subject",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                if self._select_node_row(connection, *subject) is None:
+                    raise RevisionSelectionRegistryError(
+                        RevisionSelectionRegistryErrorCode.SUBJECT_NOT_FOUND,
+                        f"revision subject does not exist: {subject!r}",
+                    )
+                return self._verified_revision_subject_from_connection(
+                    connection,
+                    *subject,
+                )
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -1788,8 +1997,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot verify revision subject: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def rebuild_current_projection(self) -> tuple[CurrentSelection, ...]:
@@ -1797,37 +2004,39 @@ class LocalLogicalNodeRegistry:
 
         expected: tuple[CurrentSelection, ...] = ()
         commit_error: sqlite3.Error | None = None
+        commit_started = False
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            expected = self._expected_current_projection_from_connection(connection)
-            connection.execute("DELETE FROM current_selections")
-            for current in expected:
-                current_bytes = canonical_json_bytes(current)
-                self._insert_current_selection(connection, current, current_bytes)
-            try:
-                self._commit(connection)
-            except sqlite3.Error as error:
-                commit_error = error
-                with suppress(sqlite3.Error):
-                    connection.rollback()
+            with self._observed_transaction_scope(
+                connection,
+                operation="rebuild_current_projection",
+                write=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                expected = self._expected_current_projection_from_connection(connection)
+                connection.execute("DELETE FROM current_selections")
+                for current in expected:
+                    current_bytes = canonical_json_bytes(current)
+                    self._insert_current_selection(connection, current, current_bytes)
+                commit_started = True
+                self._commit_observed(
+                    connection,
+                    operation="rebuild_current_projection",
+                    write=True,
+                )
         except RevisionSelectionRegistryError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except LogicalNodeRegistryError as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise self._revision_error_from_logical(error) from error
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
-            raise RevisionSelectionRegistryError(
-                RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
-                f"current-projection rebuild failed: {error}",
-            ) from error
+            if commit_started:
+                commit_error = error
+            else:
+                raise RevisionSelectionRegistryError(
+                    RevisionSelectionRegistryErrorCode.TRANSACTION_FAILED,
+                    f"current-projection rebuild failed: {error}",
+                ) from error
         finally:
             connection.close()
 
@@ -3056,28 +3265,33 @@ class LocalLogicalNodeRegistry:
     ) -> ImmutableNodeRevision | None:
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            row = self._select_revision_by_logical_key(
+            with self._observed_transaction_scope(
                 connection,
-                expected.subject_type,
-                expected.subject_id,
-                expected.revision_logical_key,
-            )
-            if row is None:
-                return None
-            stored = self._revision_from_row(row)
-            if not self._same_revision_command(stored, expected):
-                return None
-            verified = self._verified_revision_subject_from_connection(
-                connection,
-                expected.subject_type,
-                expected.subject_id,
-            )
-            if stored not in verified.revisions:
-                return None
-            return stored
+                operation="recover_uncertain_revision_commit",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                row = self._select_revision_by_logical_key(
+                    connection,
+                    expected.subject_type,
+                    expected.subject_id,
+                    expected.revision_logical_key,
+                )
+                if row is None:
+                    return None
+                stored = self._revision_from_row(row)
+                if not self._same_revision_command(stored, expected):
+                    return None
+                verified = self._verified_revision_subject_from_connection(
+                    connection,
+                    expected.subject_type,
+                    expected.subject_id,
+                )
+                if stored not in verified.revisions:
+                    return None
+                return stored
         except RevisionSelectionRegistryError as error:
             if error.code is RevisionSelectionRegistryErrorCode.SUBJECT_NOT_FOUND:
                 return None
@@ -3092,8 +3306,6 @@ class LocalLogicalNodeRegistry:
                 f"cannot recover uncertain revision commit: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def _recover_uncertain_selection_commit(
@@ -3102,30 +3314,35 @@ class LocalLogicalNodeRegistry:
     ) -> tuple[SelectionDecision, CurrentSelection] | None:
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            verified = self._verified_revision_subject_from_connection(
+            with self._observed_transaction_scope(
                 connection,
-                expected.subject_type,
-                expected.subject_id,
-            )
-            stored = next(
-                (
-                    decision
-                    for decision in verified.decisions
-                    if decision.selection_decision_logical_key
-                    == expected.selection_decision_logical_key
-                ),
-                None,
-            )
-            if (
-                stored is None
-                or not self._same_selection_command(stored, expected)
-                or verified.current is None
+                operation="recover_uncertain_selection_commit",
+                write=False,
+                rollback_on_success=True,
             ):
-                return None
-            return stored, verified.current
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                verified = self._verified_revision_subject_from_connection(
+                    connection,
+                    expected.subject_type,
+                    expected.subject_id,
+                )
+                stored = next(
+                    (
+                        decision
+                        for decision in verified.decisions
+                        if decision.selection_decision_logical_key
+                        == expected.selection_decision_logical_key
+                    ),
+                    None,
+                )
+                if (
+                    stored is None
+                    or not self._same_selection_command(stored, expected)
+                    or verified.current is None
+                ):
+                    return None
+                return stored, verified.current
         except RevisionSelectionRegistryError as error:
             if error.code is RevisionSelectionRegistryErrorCode.SUBJECT_NOT_FOUND:
                 return None
@@ -3140,31 +3357,34 @@ class LocalLogicalNodeRegistry:
                 f"cannot recover uncertain selection commit: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def _read_all_current_projection(self) -> tuple[CurrentSelection, ...]:
         connection = self._connect_revision()
         try:
-            connection.execute("BEGIN")
-            self._verify_database_schema(connection)
-            self._verify_database_health(connection)
-            expected = self._expected_current_projection_from_connection(connection)
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM current_selections
-                ORDER BY subject_type, subject_id
-                """
-            ).fetchall()
-            actual = tuple(self._current_from_row(row) for row in rows)
-            if actual != expected:
-                raise RevisionSelectionRegistryError(
-                    RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
-                    "current projection does not match verified decision-chain tails",
-                )
-            return actual
+            with self._observed_transaction_scope(
+                connection,
+                operation="read_all_current_projection",
+                write=False,
+                rollback_on_success=True,
+            ):
+                self._verify_database_schema(connection)
+                self._verify_database_health(connection)
+                expected = self._expected_current_projection_from_connection(connection)
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM current_selections
+                    ORDER BY subject_type, subject_id
+                    """
+                ).fetchall()
+                actual = tuple(self._current_from_row(row) for row in rows)
+                if actual != expected:
+                    raise RevisionSelectionRegistryError(
+                        RevisionSelectionRegistryErrorCode.INTEGRITY_ERROR,
+                        "current projection does not match verified decision-chain tails",
+                    )
+                return actual
         except RevisionSelectionRegistryError:
             raise
         except LogicalNodeRegistryError as error:
@@ -3175,12 +3395,15 @@ class LocalLogicalNodeRegistry:
                 f"cannot verify the rebuilt current projection: {error}",
             ) from error
         finally:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             connection.close()
 
     def _commit(self, connection: sqlite3.Connection) -> None:
         connection.commit()
+
+    def _rollback(self, connection: sqlite3.Connection) -> None:
+        """Rollback hook kept narrow so rollback failures can be fault-injected."""
+
+        connection.rollback()
 
 
 def _row_text(row: sqlite3.Row, column: str) -> str:

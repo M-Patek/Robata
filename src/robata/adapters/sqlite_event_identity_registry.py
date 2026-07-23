@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from functools import cache
 from itertools import pairwise
 from pathlib import Path
@@ -42,6 +43,12 @@ from robata.event_pipeline.identity_registry import (
     StableEventIdentity,
     StaleEventRegistryFenceError,
     validate_registered_event_identity_outbox_wire_record,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _RECORDING_IDENTITY_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
@@ -339,9 +346,11 @@ class SQLiteEventIdentityRegistryRepository:
         database_path: Path,
         *,
         registry: SchemaRegistry | None = None,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be a pathlib.Path")
+        self._runtime_observer = runtime_observer
         try:
             if database_path.exists() and database_path.is_symlink():
                 raise SQLiteEventIdentityRegistryError(
@@ -388,16 +397,18 @@ class SQLiteEventIdentityRegistryRepository:
         checked_identity = _validate_recording_identity(recording_identity)
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            self._verify_database(connection)
-            snapshot = self._snapshot_in_transaction(connection, checked_identity)
-            self._commit(connection)
-            return snapshot
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="snapshot",
+            ) as attributes:
+                self._verify_database(connection)
+                snapshot = self._snapshot_in_transaction(connection, checked_identity)
+                self._commit_observed(connection, attributes, use_commit_hook=True)
+                return snapshot
         except EventIdentityRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 f"cannot read event identity snapshot for {checked_identity}: {exc}"
             ) from exc
@@ -410,105 +421,118 @@ class SQLiteEventIdentityRegistryRepository:
         checked = _validate_mutation_contract(mutation)
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            self._verify_database(connection)
-            before = self._snapshot_in_transaction(connection, checked.recording_identity)
-            if before.generation != checked.expected_generation or before.fence != checked.fence:
-                raise StaleEventRegistryFenceError(checked.recording_identity)
-
-            existing_relations = self._relations_in_transaction(
-                connection, checked.recording_identity
-            )
-            existing_outbox = self._outbox_in_transaction(connection, checked.recording_identity)
-            self._validate_commit(
+            with self._observed_transaction_scope(
                 connection,
-                snapshot=before,
-                existing_relations=existing_relations,
-                existing_outbox=existing_outbox,
-                mutation=checked,
-            )
+                write=True,
+                operation_name="commit",
+            ) as attributes:
+                self._verify_database(connection)
+                before = self._snapshot_in_transaction(connection, checked.recording_identity)
+                if (
+                    before.generation != checked.expected_generation
+                    or before.fence != checked.fence
+                ):
+                    raise StaleEventRegistryFenceError(checked.recording_identity)
 
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO event_registry_partitions (
-                    recording_identity, generation, fence
-                ) VALUES (?, 0, 1)
-                """,
-                (checked.recording_identity,),
-            )
-            self._insert_identities(connection, checked.identities)
-            self._insert_assignments(connection, checked.assignments)
-            self._insert_relations(connection, checked.relations)
-            self._insert_outbox(connection, checked.outbox)
-            cursor = connection.execute(
-                """
-                UPDATE event_registry_partitions
-                SET generation = ?, fence = fence + 1
-                WHERE recording_identity = ? AND generation = ? AND fence = ?
-                """,
-                (
-                    checked.next_generation,
-                    checked.recording_identity,
-                    checked.expected_generation,
-                    checked.fence,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise StaleEventRegistryFenceError(checked.recording_identity)
-
-            committed = self._snapshot_in_transaction(connection, checked.recording_identity)
-            committed_relations = self._relations_in_transaction(
-                connection, checked.recording_identity
-            )
-            committed_outbox = self._outbox_in_transaction(connection, checked.recording_identity)
-            self._validate_auxiliary_integrity(
-                snapshot=committed,
-                relations=committed_relations,
-                outbox=committed_outbox,
-            )
-            if not self._matches_exact_mutation_state(
-                snapshot=committed,
-                relations=committed_relations,
-                outbox=committed_outbox,
-                before=before,
-                existing_relations=existing_relations,
-                existing_outbox=existing_outbox,
-                mutation=checked,
-            ):
-                raise SQLiteEventIdentityRegistryError(
-                    "tentative event identity state does not match the exact mutation"
+                existing_relations = self._relations_in_transaction(
+                    connection, checked.recording_identity
                 )
-            try:
-                self._commit(connection)
-            except sqlite3.Error as exc:
-                _rollback_quietly(connection)
-                try:
-                    recovered = self._recover_uncertain_commit(
-                        before=before,
-                        existing_relations=existing_relations,
-                        existing_outbox=existing_outbox,
-                        mutation=checked,
+                existing_outbox = self._outbox_in_transaction(
+                    connection, checked.recording_identity
+                )
+                self._validate_commit(
+                    connection,
+                    snapshot=before,
+                    existing_relations=existing_relations,
+                    existing_outbox=existing_outbox,
+                    mutation=checked,
+                )
+
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO event_registry_partitions (
+                        recording_identity, generation, fence
+                    ) VALUES (?, 0, 1)
+                    """,
+                    (checked.recording_identity,),
+                )
+                self._insert_identities(connection, checked.identities)
+                self._insert_assignments(connection, checked.assignments)
+                self._insert_relations(connection, checked.relations)
+                self._insert_outbox(connection, checked.outbox)
+                cursor = connection.execute(
+                    """
+                    UPDATE event_registry_partitions
+                    SET generation = ?, fence = fence + 1
+                    WHERE recording_identity = ? AND generation = ? AND fence = ?
+                    """,
+                    (
+                        checked.next_generation,
+                        checked.recording_identity,
+                        checked.expected_generation,
+                        checked.fence,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StaleEventRegistryFenceError(checked.recording_identity)
+
+                committed = self._snapshot_in_transaction(connection, checked.recording_identity)
+                committed_relations = self._relations_in_transaction(
+                    connection, checked.recording_identity
+                )
+                committed_outbox = self._outbox_in_transaction(
+                    connection, checked.recording_identity
+                )
+                self._validate_auxiliary_integrity(
+                    snapshot=committed,
+                    relations=committed_relations,
+                    outbox=committed_outbox,
+                )
+                if not self._matches_exact_mutation_state(
+                    snapshot=committed,
+                    relations=committed_relations,
+                    outbox=committed_outbox,
+                    before=before,
+                    existing_relations=existing_relations,
+                    existing_outbox=existing_outbox,
+                    mutation=checked,
+                ):
+                    raise SQLiteEventIdentityRegistryError(
+                        "tentative event identity state does not match the exact mutation"
                     )
-                except EventIdentityRegistryError:
-                    raise SQLiteEventIdentityRegistryUncertainCommitError(
-                        "event identity commit outcome is uncertain and reconciliation failed"
-                    ) from exc
-                if recovered is None:
-                    raise SQLiteEventIdentityRegistryUncertainCommitError(
-                        "event identity commit outcome did not match the exact expected mutation"
-                    ) from exc
-                return recovered
-            return committed
+                try:
+                    self._commit_observed(
+                        connection,
+                        attributes,
+                        use_commit_hook=True,
+                    )
+                except sqlite3.Error as exc:
+                    self._rollback_observed(connection, attributes)
+                    try:
+                        recovered = self._recover_uncertain_commit(
+                            before=before,
+                            existing_relations=existing_relations,
+                            existing_outbox=existing_outbox,
+                            mutation=checked,
+                        )
+                    except EventIdentityRegistryError:
+                        raise SQLiteEventIdentityRegistryUncertainCommitError(
+                            "event identity commit outcome is uncertain and reconciliation failed"
+                        ) from exc
+                    if recovered is None:
+                        raise SQLiteEventIdentityRegistryUncertainCommitError(
+                            "event identity commit outcome did not match "
+                            "the exact expected mutation"
+                        ) from exc
+                    return recovered
+                return committed
         except EventIdentityRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.IntegrityError as exc:
-            _rollback_quietly(connection)
             raise EventIdentityConflictError(
                 f"SQLite rejected an append-only event identity mutation: {exc}"
             ) from exc
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 f"event identity transaction failed for {checked.recording_identity}: {exc}"
             ) from exc
@@ -521,16 +545,18 @@ class SQLiteEventIdentityRegistryRepository:
         checked_identity = _validate_recording_identity(recording_identity)
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            self._verify_database(connection)
-            relations = self._relations_in_transaction(connection, checked_identity)
-            self._commit(connection)
-            return relations
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="list_relations",
+            ) as attributes:
+                self._verify_database(connection)
+                relations = self._relations_in_transaction(connection, checked_identity)
+                self._commit_observed(connection, attributes, use_commit_hook=True)
+                return relations
         except EventIdentityRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 f"cannot read event identity relations for {checked_identity}: {exc}"
             ) from exc
@@ -543,16 +569,18 @@ class SQLiteEventIdentityRegistryRepository:
         checked_identity = _validate_recording_identity(recording_identity)
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            self._verify_database(connection)
-            outbox = self._outbox_in_transaction(connection, checked_identity)
-            self._commit(connection)
-            return outbox
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="list_outbox",
+            ) as attributes:
+                self._verify_database(connection)
+                outbox = self._outbox_in_transaction(connection, checked_identity)
+                self._commit_observed(connection, attributes, use_commit_hook=True)
+                return outbox
         except EventIdentityRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 f"cannot read event identity outbox for {checked_identity}: {exc}"
             ) from exc
@@ -640,48 +668,50 @@ class SQLiteEventIdentityRegistryRepository:
             if not isinstance(journal_mode, str) or journal_mode.lower() != "wal":
                 raise SQLiteEventIdentityRegistryError("SQLite WAL mode could not be enabled")
 
-            connection.execute("BEGIN IMMEDIATE")
-            user_version = _pragma_int(connection, "user_version")
-            application_id = _pragma_int(connection, "application_id")
-            schema_row = connection.execute(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
-                ) AS has_user_schema
-                """
-            ).fetchone()
-            if schema_row is None:
-                raise SQLiteEventIdentityRegistryError("SQLite schema inventory returned no value")
-            has_user_schema = _row_int(schema_row, "has_user_schema") == 1
-
-            if user_version == 0:
-                if application_id != 0 or has_user_schema:
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="initialize_schema",
+            ) as attributes:
+                user_version = _pragma_int(connection, "user_version")
+                application_id = _pragma_int(connection, "application_id")
+                schema_row = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+                    ) AS has_user_schema
+                    """
+                ).fetchone()
+                if schema_row is None:
                     raise SQLiteEventIdentityRegistryError(
-                        "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        "SQLite schema inventory returned no value"
                     )
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-            elif application_id != _APPLICATION_ID:
-                raise SQLiteEventIdentityRegistryError(
-                    "event identity database has an unexpected SQLite application identity"
-                )
-            elif user_version == 1:
-                self._migrate_v1_outbox_payloads(connection)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif user_version != _SCHEMA_VERSION:
-                raise SQLiteEventIdentityRegistryError(
-                    f"unsupported event identity database schema version: {user_version}"
-                )
+                has_user_schema = _row_int(schema_row, "has_user_schema") == 1
 
-            self._verify_database(connection)
-            connection.commit()
+                if user_version == 0:
+                    if application_id != 0 or has_user_schema:
+                        raise SQLiteEventIdentityRegistryError(
+                            "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        )
+                    for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                elif application_id != _APPLICATION_ID:
+                    raise SQLiteEventIdentityRegistryError(
+                        "event identity database has an unexpected SQLite application identity"
+                    )
+                elif user_version == 1:
+                    self._migrate_v1_outbox_payloads(connection)
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                elif user_version != _SCHEMA_VERSION:
+                    raise SQLiteEventIdentityRegistryError(
+                        f"unsupported event identity database schema version: {user_version}"
+                    )
+
+                self._verify_database(connection)
+                self._commit_observed(connection, attributes)
         except EventIdentityRegistryError:
-            if connection is not None:
-                _rollback_quietly(connection)
             raise
         except sqlite3.Error as exc:
-            if connection is not None:
-                _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 f"cannot initialize SQLite event identity registry: {exc}"
             ) from exc
@@ -1494,37 +1524,39 @@ class SQLiteEventIdentityRegistryRepository:
     ) -> EventRegistrySnapshot | None:
         connection = self._connect()
         try:
-            connection.execute("BEGIN")
-            self._verify_database(connection)
-            snapshot = self._snapshot_in_transaction(
+            with self._observed_transaction_scope(
                 connection,
-                mutation.recording_identity,
-            )
-            relations = self._relations_in_transaction(
-                connection,
-                mutation.recording_identity,
-            )
-            outbox = self._outbox_in_transaction(
-                connection,
-                mutation.recording_identity,
-            )
-            connection.commit()
-            if not self._matches_exact_mutation_state(
-                snapshot=snapshot,
-                relations=relations,
-                outbox=outbox,
-                before=before,
-                existing_relations=existing_relations,
-                existing_outbox=existing_outbox,
-                mutation=mutation,
-            ):
-                return None
-            return snapshot
+                write=False,
+                operation_name="recover_uncertain_commit",
+            ) as attributes:
+                self._verify_database(connection)
+                snapshot = self._snapshot_in_transaction(
+                    connection,
+                    mutation.recording_identity,
+                )
+                relations = self._relations_in_transaction(
+                    connection,
+                    mutation.recording_identity,
+                )
+                outbox = self._outbox_in_transaction(
+                    connection,
+                    mutation.recording_identity,
+                )
+                self._commit_observed(connection, attributes)
+                if not self._matches_exact_mutation_state(
+                    snapshot=snapshot,
+                    relations=relations,
+                    outbox=outbox,
+                    before=before,
+                    existing_relations=existing_relations,
+                    existing_outbox=existing_outbox,
+                    mutation=mutation,
+                ):
+                    return None
+                return snapshot
         except EventIdentityRegistryError:
-            _rollback_quietly(connection)
             raise
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteEventIdentityRegistryError(
                 "cannot reconcile uncertain event identity commit"
             ) from exc
@@ -1568,6 +1600,107 @@ class SQLiteEventIdentityRegistryRepository:
             and snapshot.assignments == expected_assignments
             and relations == expected_relations
             and outbox == expected_outbox
+        )
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[dict[str, RuntimeAttributeValue]]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.event_identity.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.event_identity.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield attributes
+            except BaseException:
+                self._rollback_observed(connection, attributes)
+                raise
+
+    def _commit_observed(
+        self,
+        connection: sqlite3.Connection,
+        attributes: dict[str, RuntimeAttributeValue],
+        *,
+        use_commit_hook: bool = False,
+    ) -> None:
+        if use_commit_hook:
+            try:
+                self._commit(connection)
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.event_identity.commit_failures",
+                    attributes=attributes,
+                )
+                if not connection.in_transaction:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.event_identity.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+        else:
+            try:
+                connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.event_identity.commit_failures",
+                    attributes=attributes,
+                )
+                if not connection.in_transaction:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.event_identity.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.event_identity.commits",
+            attributes=attributes,
+        )
+
+    def _rollback_observed(
+        self,
+        connection: sqlite3.Connection,
+        attributes: dict[str, RuntimeAttributeValue],
+    ) -> None:
+        if not connection.in_transaction:
+            return
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.event_identity.rollback_failures",
+                attributes=attributes,
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.event_identity.transaction_outcomes_unknown",
+                attributes=attributes,
+            )
+            return
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.event_identity.rollbacks",
+            attributes=attributes,
         )
 
     def _commit(self, connection: sqlite3.Connection) -> None:

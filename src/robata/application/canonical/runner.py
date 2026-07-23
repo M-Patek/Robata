@@ -222,6 +222,11 @@ from robata.qa_pipeline.dense import (
 )
 from robata.queue.barrier import BarrierCoordinator, BarrierStorage, InMemoryBarrierStorage
 from robata.queue.stage import StageStatus
+from robata.runtime.observability import (
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
+)
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     FrameArtifactResolver,
@@ -298,10 +303,16 @@ def _canonical_call_dependency_sha256(
 
 
 class _CountingVisionModelAdapter:
-    """Count actual adapter dispatches without extending the provider port."""
+    """Observe actual adapter dispatches without extending the provider port."""
 
-    def __init__(self, delegate: VisionModelAdapter) -> None:
+    def __init__(
+        self,
+        delegate: VisionModelAdapter,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         self._delegate = delegate
+        self._runtime_observer = runtime_observer
         self._infer_calls = 0
 
     @property
@@ -324,7 +335,30 @@ class _CountingVisionModelAdapter:
         request: VisionInferenceRequest,
     ) -> VisionInferenceSuccess | VisionInferenceFailure:
         self._infer_calls += 1
-        return await self._delegate.infer(request)
+        attributes = {
+            "provider": self.provider,
+            "task": request.task.value,
+        }
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_dispatches",
+            attributes=attributes,
+        )
+        with runtime_span(
+            self._runtime_observer,
+            "inference.provider_dispatch",
+            attributes,
+        ):
+            outcome = await self._delegate.infer(request)
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_outcomes",
+            attributes={
+                **attributes,
+                "outcome": type(outcome).__name__,
+            },
+        )
+        return outcome
 
 
 class CanonicalOfflinePipeline:
@@ -353,6 +387,7 @@ class CanonicalOfflinePipeline:
         barrier_storage: BarrierStorage | None = None,
         call_barrier_storage: InferenceCallBarrierStorage | None = None,
         clock: Callable[[], datetime] | None = None,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not isinstance(package_builder, PackageSetBuilder):
             raise TypeError("package_builder must be a PackageSetBuilder")
@@ -417,7 +452,10 @@ class CanonicalOfflinePipeline:
         self._materializer = materializer
         self._input_preparer = input_preparer
         self._adapter = adapter
-        self._dispatch_adapter = _CountingVisionModelAdapter(adapter)
+        self._dispatch_adapter = _CountingVisionModelAdapter(
+            adapter,
+            runtime_observer=runtime_observer,
+        )
         self._raw_store = raw_store
         self._parser = parser
         self._coarse_qa_policy = coarse_qa_policy
@@ -430,6 +468,7 @@ class CanonicalOfflinePipeline:
         self._logical_node_registry = logical_node_registry
         self._execution_policy = execution_policy
         self._clock = clock or _utc_now
+        self._runtime_observer = runtime_observer
         self._validate_configuration()
 
         self._ledger = (
@@ -1302,6 +1341,34 @@ class CanonicalOfflinePipeline:
         rendered_item_factory: RenderedItemFactory | None,
         dependency_config: Mapping[str, object] | None = None,
     ) -> tuple[InferenceInputPlan, ProviderReferenceCatalog]:
+        with runtime_span(
+            self._runtime_observer,
+            "inference.prepare_serialize",
+            {"task": task.value},
+        ):
+            return await self._prepare_inference_stage_unobserved(
+                task=task,
+                inference_policy=inference_policy,
+                lineage=lineage,
+                package_set=package_set,
+                materialized=materialized,
+                created_at=created_at,
+                rendered_item_factory=rendered_item_factory,
+                dependency_config=dependency_config,
+            )
+
+    async def _prepare_inference_stage_unobserved(
+        self,
+        *,
+        task: VisionTask,
+        inference_policy: InferencePolicy,
+        lineage: PackageLineage,
+        package_set: TemporalPackageSet,
+        materialized: tuple[MaterializedTemporalPackage, ...],
+        created_at: str,
+        rendered_item_factory: RenderedItemFactory | None,
+        dependency_config: Mapping[str, object] | None = None,
+    ) -> tuple[InferenceInputPlan, ProviderReferenceCatalog]:
         capabilities = await self._adapter.capabilities(
             inference_policy.model_name,
             inference_policy.model_version,
@@ -1779,19 +1846,45 @@ class CanonicalOfflinePipeline:
         part: InferenceCallPart,
         dependency_config: Mapping[str, object] | None = None,
     ) -> CanonicalOfflinePartResult:
-        terminal, selection, attempts_used = await self._orchestrate_call_part(
-            task=task,
-            inference_policy=inference_policy,
-            context=context,
-            window=window,
-            sampling_plan=sampling_plan,
-            package_set=package_set,
-            package_inputs=package_inputs,
-            input_plan=input_plan,
-            part=part,
-            dependency_config=dependency_config,
+        call_attributes = {
+            "part_count": part.part_count,
+            "part_ordinal": part.ordinal,
+            "task": task.value,
+        }
+        runtime_increment(
+            self._runtime_observer,
+            "inference.call_parts",
+            attributes={"task": task.value},
+        )
+        with runtime_span(
+            self._runtime_observer,
+            "inference.orchestration",
+            call_attributes,
+        ):
+            terminal, selection, attempts_used = await self._orchestrate_call_part(
+                task=task,
+                inference_policy=inference_policy,
+                context=context,
+                window=window,
+                sampling_plan=sampling_plan,
+                package_set=package_set,
+                package_inputs=package_inputs,
+                input_plan=input_plan,
+                part=part,
+                dependency_config=dependency_config,
+            )
+        runtime_increment(
+            self._runtime_observer,
+            "inference.orchestration_attempts",
+            attempts_used,
+            {"task": task.value},
         )
         if terminal.status is not InferenceStatus.SUCCEEDED:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.call_outcomes",
+                attributes={"status": terminal.status.value, "task": task.value},
+            )
             failure = terminal.failure
             error = _canonical_error(
                 CanonicalOfflineStage.INFERENCE,
@@ -1824,15 +1917,30 @@ class CanonicalOfflinePipeline:
             raise CanonicalOfflineConfigurationError(
                 "selected success is missing its selection decision"
             )
-        raw, parsed, selected_output, enriched, lineage_error = self._build_selected_part_lineage(
-            task=task,
-            inference_policy=inference_policy,
-            context=context,
-            input_plan=input_plan,
-            reference_catalog=reference_catalog,
-            part=part,
-            selected_terminal=terminal,
-            selection=selection,
+        with runtime_span(
+            self._runtime_observer,
+            "inference.parse_validate_enrich",
+            call_attributes,
+        ):
+            raw, parsed, selected_output, enriched, lineage_error = (
+                self._build_selected_part_lineage(
+                    task=task,
+                    inference_policy=inference_policy,
+                    context=context,
+                    input_plan=input_plan,
+                    reference_catalog=reference_catalog,
+                    part=part,
+                    selected_terminal=terminal,
+                    selection=selection,
+                )
+            )
+        runtime_increment(
+            self._runtime_observer,
+            "inference.call_outcomes",
+            attributes={
+                "status": ("SUCCEEDED" if lineage_error is None else "POST_SELECTION_INVALID"),
+                "task": task.value,
+            },
         )
         completion = self._call_barrier.submit_part_terminal(
             input_plan,
@@ -1900,6 +2008,49 @@ class CanonicalOfflinePipeline:
             ) from exc
 
     async def _execute_qa_call_plan(
+        self,
+        *,
+        task: VisionTask,
+        inference_policy: InferencePolicy,
+        context: AdmittedRecordingContextV2,
+        window: CanonicalRootWindow
+        | CanonicalCandidateDenseWindow
+        | CanonicalBoundaryRefinementWindow,
+        sampling_plan: SamplingPlan,
+        package_set: TemporalPackageSet,
+        input_plan: InferenceInputPlan,
+        reference_catalog: ProviderReferenceCatalog,
+        created_at: str,
+        code_prefix: str,
+        dependency_config: Mapping[str, object] | None = None,
+    ) -> tuple[
+        tuple[CanonicalOfflinePartResult, ...],
+        InferenceCallReduction,
+        tuple[OrchestratorEnrichedOutput, ...],
+    ]:
+        with runtime_span(
+            self._runtime_observer,
+            "inference.call_plan",
+            {
+                "part_count": len(input_plan.call_plan.parts),
+                "task": task.value,
+            },
+        ):
+            return await self._execute_qa_call_plan_unobserved(
+                task=task,
+                inference_policy=inference_policy,
+                context=context,
+                window=window,
+                sampling_plan=sampling_plan,
+                package_set=package_set,
+                input_plan=input_plan,
+                reference_catalog=reference_catalog,
+                created_at=created_at,
+                code_prefix=code_prefix,
+                dependency_config=dependency_config,
+            )
+
+    async def _execute_qa_call_plan_unobserved(
         self,
         *,
         task: VisionTask,

@@ -7,8 +7,8 @@ Broker messages are delivery projections, never the state authority.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -27,6 +27,12 @@ from robata.queue.models import (
     WorkLeaseClaim,
 )
 from robata.queue.stage import DependencyCriticality, Stage
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
+)
 
 _APPLICATION_ID = 0x5242574B
 _SCHEMA_VERSION = 1
@@ -133,8 +139,14 @@ class WorkStateError(WorkSchedulerError):
 class SQLiteWorkScheduler:
     """Local durable scheduler with atomic SQLite claim and fenced mutation."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         self._database_path = Path(database_path)
+        self._runtime_observer = runtime_observer
         if self._database_path.exists() and self._database_path.is_dir():
             raise WorkStorageError("work-ledger path must identify a file")
         if not self._database_path.parent.exists():
@@ -260,13 +272,14 @@ class SQLiteWorkScheduler:
             self._refresh_planned(connection, _parse_timestamp(created_at))
             return self._load_item(connection, checked_plan.work_item_id)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="plan", operation=operation)
 
     def get(self, work_item_id: str) -> WorkItem:
         """Read one snapshot without implicitly advancing wall-clock time."""
 
         return self._transaction(
             write=False,
+            operation_name="get",
             operation=lambda connection: self._load_item(connection, work_item_id),
         )
 
@@ -277,7 +290,7 @@ class SQLiteWorkScheduler:
             self._load_item(connection, work_item_id)
             return self._dependencies(connection, work_item_id)
 
-        return self._transaction(write=False, operation=operation)
+        return self._transaction(write=False, operation_name="dependencies", operation=operation)
 
     def list_attempts(self, work_item_id: str) -> tuple[WorkAttempt, ...]:
         """Return append-oriented execution history for one work item."""
@@ -293,7 +306,7 @@ class SQLiteWorkScheduler:
             ).fetchall()
             return tuple(self._attempt_from_row(row) for row in rows)
 
-        return self._transaction(write=False, operation=operation)
+        return self._transaction(write=False, operation_name="list_attempts", operation=operation)
 
     def reconcile(self, *, now: datetime | None = None) -> int:
         """Advance hard expiry, abandoned leases, retries, and dependencies."""
@@ -301,6 +314,7 @@ class SQLiteWorkScheduler:
         checked_now = _checked_now(now)
         return self._transaction(
             write=True,
+            operation_name="reconcile",
             operation=lambda connection: self._maintain(connection, checked_now),
         )
 
@@ -401,7 +415,7 @@ class SQLiteWorkScheduler:
             )
             return WorkLeaseClaim(work_item=item, lease=lease)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="claim", operation=operation)
 
     def start(self, lease: WorkLease, *, now: datetime | None = None) -> WorkItem:
         """Move an exact live claim from LEASED to RUNNING."""
@@ -452,7 +466,7 @@ class SQLiteWorkScheduler:
                 raise WorkStorageError("active attempt is missing while starting")
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="start", operation=operation)
 
     def heartbeat(
         self,
@@ -498,7 +512,7 @@ class SQLiteWorkScheduler:
                 lease_expires_at=expires_at,
             )
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="heartbeat", operation=operation)
 
     def succeed(
         self,
@@ -542,7 +556,7 @@ class SQLiteWorkScheduler:
             self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="succeed", operation=operation)
 
     def fail(
         self,
@@ -619,7 +633,7 @@ class SQLiteWorkScheduler:
                 self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(write=True, operation_name="fail", operation=operation)
 
     def cancel(
         self,
@@ -732,7 +746,11 @@ class SQLiteWorkScheduler:
             self._maintain(connection, checked_now)
             return self._load_item(connection, work_item_id)
 
-        return self._transaction(write=True, operation=operation)
+        return self._transaction(
+            write=True,
+            operation_name=f"terminal_{state.value.lower()}",
+            operation=operation,
+        )
 
     def _maintain(self, connection: sqlite3.Connection, now: datetime) -> int:
         changed = self._expire_hard_deadlines(connection, now)
@@ -1103,27 +1121,34 @@ class SQLiteWorkScheduler:
             journal = connection.execute("PRAGMA journal_mode = WAL").fetchone()
             if journal is None or str(journal[0]).lower() != "wal":
                 raise WorkStorageError("SQLite WAL mode could not be enabled")
-            connection.execute("BEGIN IMMEDIATE")
-            user_version = _pragma_int(connection, "user_version")
-            application_id = _pragma_int(connection, "application_id")
-            inventory = connection.execute(
-                """
-                SELECT EXISTS(
-                    SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
-                )
-                """
-            ).fetchone()
-            has_schema = inventory is not None and int(inventory[0]) == 1
-            if user_version == 0:
-                if application_id != 0 or has_schema:
-                    raise WorkStorageError("refusing to adopt a nonempty unversioned work database")
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif user_version != _SCHEMA_VERSION or application_id != _APPLICATION_ID:
-                raise WorkStorageError("work database belongs to another application or version")
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="initialize_schema",
+            ):
+                user_version = _pragma_int(connection, "user_version")
+                application_id = _pragma_int(connection, "application_id")
+                inventory = connection.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+                    )
+                    """
+                ).fetchone()
+                has_schema = inventory is not None and int(inventory[0]) == 1
+                if user_version == 0:
+                    if application_id != 0 or has_schema:
+                        raise WorkStorageError(
+                            "refusing to adopt a nonempty unversioned work database"
+                        )
+                    for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                elif user_version != _SCHEMA_VERSION or application_id != _APPLICATION_ID:
+                    raise WorkStorageError(
+                        "work database belongs to another application or version"
+                    )
         except WorkSchedulerError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -1170,25 +1195,120 @@ class SQLiteWorkScheduler:
         self,
         *,
         write: bool,
+        operation_name: str,
         operation: Callable[[sqlite3.Connection], T],
     ) -> T:
         connection = self._open()
         try:
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            result = operation(connection)
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                write=write,
+                operation_name=operation_name,
+            ):
+                result = operation(connection)
             return result
         except (WorkSchedulerError, TypeError, ValueError):
-            _rollback_quietly(connection)
             raise
         except sqlite3.IntegrityError as error:
-            _rollback_quietly(connection)
             raise WorkConflictError(f"SQLite rejected durable work: {error}") from error
         except sqlite3.Error as error:
-            _rollback_quietly(connection)
             raise WorkStorageError(f"work scheduler transaction failed: {error}") from error
         finally:
             connection.close()
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.work_scheduler.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.work_scheduler.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.work_scheduler.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            try:
+                connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.commit_failures",
+                    attributes=attributes,
+                )
+                if connection.in_transaction:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.work_scheduler.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.work_scheduler.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.work_scheduler.commits",
+                attributes=attributes,
+            )
 
 
 def _require_model[T](value: object, model_type: type[T], label: str) -> T:

@@ -1,0 +1,56 @@
+{
+  "fixture_version": "stream-identity-chain-v1",
+  "digest_seed": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "capture": {
+    "capture_scope_digest": "ba4c1ab9dd51ef64a406b24864869943e9b19b8d89e381e71c85bb6008297b36",
+    "capture_scope_key": "pre-eos-capture-v1:ba4c1ab9dd51ef64a406b24864869943e9b19b8d89e381e71c85bb6008297b36",
+    "capture_scope_id": "5c30db80-fee6-5ac6-bd71-25e406010b36"
+  },
+  "segments": [
+    {"camera_id": "cam_01", "segment_semantic_sha256": "17fd18b9fa81b6591e754c32de68c66b8d7fefc7da9e2da6014119fb6cac91f4", "segment_key": "stream-segment-v1:17fd18b9fa81b6591e754c32de68c66b8d7fefc7da9e2da6014119fb6cac91f4", "segment_id": "25e6c902-010a-5bb8-a778-bea49729d304"},
+    {"camera_id": "cam_02", "segment_semantic_sha256": "c045f7bcf0c0f7246da6332b260644cf8a5c48d48b67c12e04c9c5d382e7d4a5", "segment_key": "stream-segment-v1:c045f7bcf0c0f7246da6332b260644cf8a5c48d48b67c12e04c9c5d382e7d4a5", "segment_id": "41ccfe82-e84a-5068-b220-cb0a710ba6ed"},
+    {"camera_id": "cam_03", "segment_semantic_sha256": "ff538bb192d383ef9b60dacda1e7379d6a792ef8a7e457f6f9f701fa308adea2", "segment_key": "stream-segment-v1:ff538bb192d383ef9b60dacda1e7379d6a792ef8a7e457f6f9f701fa308adea2", "segment_id": "f0c555d2-7b6e-54b0-aa04-fd4099e655d1"},
+    {"camera_id": "cam_04", "segment_semantic_sha256": "46b80344919b5fdcf53d6e2069ea409157807bc99324e3b0e04f4a7e84857e61", "segment_key": "stream-segment-v1:46b80344919b5fdcf53d6e2069ea409157807bc99324e3b0e04f4a7e84857e61", "segment_id": "2e146494-222a-53f8-a45c-68c8ef4d4655"},
+    {"camera_id": "cam_05", "segment_semantic_sha256": "538cd5ee3519da217e7f2969e7646da726c7819420b47c1165a978fcfb4d98d8", "segment_key": "stream-segment-v1:538cd5ee3519da217e7f2969e7646da726c7819420b47c1165a978fcfb4d98d8", "segment_id": "37c0f350-5ac8-5aa6-ac22-8b17b6a93212"},
+    {"camera_id": "cam_06", "segment_semantic_sha256": "08b1250304c4b10f0248c9889e88337b98a5461f489833861ad2130edfc04f4e", "segment_key": "stream-segment-v1:08b1250304c4b10f0248c9889e88337b98a5461f489833861ad2130edfc04f4e", "segment_id": "825efe59-9f13-544c-a098-9892ed5acd0f"}
+  ],
+  "window": {
+    "window_semantic_sha256": "34eea19392c1d8aa5a7f30afd4899ea72222907d9e4f3138f0a279e7f356a564",
+    "window_key": "incremental-window-v1:34eea19392c1d8aa5a7f30afd4899ea72222907d9e4f3138f0a279e7f356a564",
+    "window_id": "eb1218c3-75b4-5bde-b709-61fd7d5e4871"
+  },
+  "inference": {
+    "inference_semantic_sha256": "9881952ccbdce681abb70d2fc88e7c9f98dfa2787718dc9ba9c45c55b5e0dd68",
+    "inference_key": "stream-inference-v1:9881952ccbdce681abb70d2fc88e7c9f98dfa2787718dc9ba9c45c55b5e0dd68",
+    "stream_inference_logical_id": "34755923-faa1-5507-8988-bb9a1405dda2"
+  },
+  "inference_attempt": {
+    "inference_attempt_key": "stream-inference-attempt-v1:34755923-faa1-5507-8988-bb9a1405dda2:1",
+    "inference_attempt_id": "429cf430-d0d9-5499-8324-8fff39e6e9b0"
+  },
+  "work": {
+    "work_logical_key": "stream-work-v1:d9c607fb8bd06f763f8a9aec0eaf530bc15871eb38a756b6b300384ed3a30c98",
+    "work_item_id": "c7e39e9b-3289-5fd6-bce1-d38cafd5ad54",
+    "created_at": "2026-01-01T00:00:00Z"
+  },
+  "plan": {
+    "plan_key": "expected-window-plan-v1:6924d58876901307954e9b57db3e80588e8aa22af36a1e28116e15b4d097f0c6",
+    "plan_digest": "6924d58876901307954e9b57db3e80588e8aa22af36a1e28116e15b4d097f0c6"
+  },
+  "declaration": {
+    "declaration_semantic_sha256": "8d56c4719e69949b0a63ff815b130c6c1aec3d98fb78aab309abb626e08084ce",
+    "append_chain_sha256": "3a6fecb036ec4779cc8bac5a8c258e444bfa6b77c0db73852cb46feb412020f3"
+  },
+  "seal": {
+    "seal_semantic_sha256": "ad2740cd9acdbe2a72e857ea88717c8e2930ed6a54ce1426c09c4201740d3869"
+  },
+  "closure": {
+    "terminal_member_semantic_sha256": "d56f7feca5ae8528d1a67deca28387c56eda1b409b482d79448798e0a7443d64",
+    "terminal_member_root": "4896dfd13e2f9ab5f1aa8e0bbca36f487be74b45be3df61b557f827948bfa9a5",
+    "terminal_closure_digest": "9eb344af29992e6deabec21835b046b3e262c924b101c6973247620cd6b3a2bf"
+  },
+  "finalization": {
+    "finalization_key": "recording-finalization-map-v1:d4f300ca60fda9daff7cc714ff11b3412d3686fea62496142d413b515268c7b0",
+    "finalization_semantic_sha256": "d4f300ca60fda9daff7cc714ff11b3412d3686fea62496142d413b515268c7b0"
+  }
+}

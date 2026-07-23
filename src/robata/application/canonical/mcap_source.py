@@ -104,6 +104,7 @@ from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.video_export import VideoExporterMode
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
 from robata.ports.ingestion import ChannelInspection, DecoderProbeResult, McapInspection
+from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 from robata.sampling.grid import FrameCandidate, SamplingGrid, SamplingRate, SelectionStatus
 from robata.sampling.materializer import (
     CameraSourceFrameIndex,
@@ -168,6 +169,7 @@ class _VerifiedMcapArtifactResolver:
     requested_interval: NanosecondInterval
     output_root: Path
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact]
+    runtime_observer: RuntimeObserver | None = None
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _frames_by_id: dict[CameraId, dict[str, IndexedSourceFrame]] = field(
         init=False,
@@ -202,14 +204,35 @@ class _VerifiedMcapArtifactResolver:
         with self._lock:
             cached = self.artifacts.get(key)
             if cached is not None:
+                runtime_increment(
+                    self.runtime_observer,
+                    "source.artifact_resolver.requests",
+                    attributes={"cache": "HIT", "camera_id": camera_id.value},
+                )
                 return cached
-            artifact = _materialize_verified_source_frame(
-                camera_id=camera_id,
-                ledger=self.ledgers[camera_id],
-                source_frame=canonical,
-                output_root=self.output_root,
+            attributes = {"camera_id": camera_id.value}
+            runtime_increment(
+                self.runtime_observer,
+                "source.artifact_resolver.requests",
+                attributes={"cache": "MISS", **attributes},
             )
+            with runtime_span(
+                self.runtime_observer,
+                "source.lazy_materialize",
+                attributes,
+            ):
+                artifact = _materialize_verified_source_frame(
+                    camera_id=camera_id,
+                    ledger=self.ledgers[camera_id],
+                    source_frame=canonical,
+                    output_root=self.output_root,
+                )
             self.artifacts[key] = artifact
+            runtime_increment(
+                self.runtime_observer,
+                "source.lazy_materialized_artifacts",
+                attributes=attributes,
+            )
             return artifact
 
 
@@ -240,6 +263,7 @@ def load_canonical_mcap_source(
     max_duration_ns: int | None = None,
     schema_registry: SchemaRegistry | None = None,
     clock: Callable[[], datetime] | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
 
@@ -257,6 +281,7 @@ def load_canonical_mcap_source(
             max_duration_ns=max_duration_ns,
             schema_registry=schema_registry or SchemaRegistry(),
             clock=clock or (lambda: datetime.now(tz=UTC)),
+            runtime_observer=runtime_observer,
         )
     except CanonicalMcapSourceError:
         raise
@@ -273,149 +298,222 @@ def _load_canonical_mcap_source(
     max_duration_ns: int | None,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
+    runtime_observer: RuntimeObserver | None,
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
-    inspection = OfficialMcapInspector().inspect(source)
+    stage_attributes = {"camera_count": len(CAMERA_IDS)}
+    with runtime_span(runtime_observer, "source.inspect", stage_attributes):
+        inspection = OfficialMcapInspector().inspect(source)
+    if inspection.message_count > 0:
+        runtime_increment(
+            runtime_observer,
+            "source.message_count",
+            inspection.message_count,
+            stage_attributes,
+        )
+    if inspection.first_message_time_ns is not None and inspection.last_message_time_ns is not None:
+        source_span_duration_ns = inspection.last_message_time_ns - inspection.first_message_time_ns
+        if source_span_duration_ns > 0:
+            runtime_increment(
+                runtime_observer,
+                "source.span_duration_ns",
+                source_span_duration_ns,
+                stage_attributes,
+            )
     if inspection.source_sha256 != expected_source_sha256:
         raise CanonicalMcapSourceError("source bytes changed after the run identity was derived")
-    channels = authorization.policy.resolve(inspection)
-    probes = _probe_channels(source, channels)
+    with runtime_span(runtime_observer, "source.mapping.resolve", stage_attributes):
+        channels = authorization.policy.resolve(inspection)
+    with runtime_span(runtime_observer, "source.demux.probe", stage_attributes):
+        probes = _probe_channels(source, channels)
 
     state_dir.mkdir(parents=True, exist_ok=True)
-    publication = _export_registered_videos(
-        source=source,
-        state_dir=state_dir,
-        inspection=inspection,
-        channels=channels,
-        authorization=authorization,
-        schema_registry=schema_registry,
-        clock=clock,
-    )
-    view, manifest = _validate_publication(publication)
-    ledgers = {
-        record.camera_id: _load_camera_ledger(view, manifest, record) for record in manifest.cameras
-    }
-    mapping_policy = SemanticPolicyReference(
-        version=authorization.profile.version,
-        semantic_sha256=authorization.policy.semantic_digest,
-    )
-    stream_records = _build_stream_records(
-        inspection=inspection,
-        channels=channels,
-        probes=probes,
-    )
-    camera_mappings = tuple(
-        ValidationCameraMappingV2(
-            camera_id=camera_id,
-            role=camera_id.value,
-            stream_id=stream_records[camera_id][0].stream_id,
-            stream_semantic_sha256=stream_records[camera_id][0].stream_semantic_sha256,
+    with runtime_span(runtime_observer, "source.export", stage_attributes):
+        publication = _export_registered_videos(
+            source=source,
+            state_dir=state_dir,
+            inspection=inspection,
+            channels=channels,
+            authorization=authorization,
+            schema_registry=schema_registry,
+            clock=clock,
+            runtime_observer=runtime_observer,
         )
-        for camera_id in CAMERA_IDS
+    with runtime_span(runtime_observer, "source.export.validate", stage_attributes):
+        view, manifest = _validate_publication(publication)
+    with runtime_span(runtime_observer, "source.decode.ledger_load", stage_attributes):
+        ledgers = {
+            record.camera_id: _load_camera_ledger(view, manifest, record)
+            for record in manifest.cameras
+        }
+    with runtime_span(runtime_observer, "source.metadata.build", stage_attributes):
+        mapping_policy = SemanticPolicyReference(
+            version=authorization.profile.version,
+            semantic_sha256=authorization.policy.semantic_digest,
+        )
+        stream_records = _build_stream_records(
+            inspection=inspection,
+            channels=channels,
+            probes=probes,
+        )
+        camera_mappings = tuple(
+            ValidationCameraMappingV2(
+                camera_id=camera_id,
+                role=camera_id.value,
+                stream_id=stream_records[camera_id][0].stream_id,
+                stream_semantic_sha256=stream_records[camera_id][0].stream_semantic_sha256,
+            )
+            for camera_id in CAMERA_IDS
+        )
+        mapping_digest = compute_camera_mapping_semantic_sha256_v2(
+            source_content_sha256=inspection.source_sha256,
+            mapping_policy=mapping_policy,
+            camera_mappings=camera_mappings,
+        )
+        recording_id = recording_identity(MCAP_RECORDING_NAMESPACE, inspection.source_sha256)
+        if manifest.recording_identity != recording_id:
+            raise CanonicalMcapSourceError(
+                "registered video export recording identity is inconsistent"
+            )
+        mcap_id = _stable_uuid("canonical-mcap-source", inspection.source_sha256)
+        validation_report = _validation_report(
+            schema_registry=schema_registry,
+            inspection=inspection,
+            recording_id=recording_id,
+            mcap_id=mcap_id,
+            mapping_policy=mapping_policy,
+            mapping_digest=mapping_digest,
+            stream_records=stream_records,
+            camera_mappings=camera_mappings,
+            observed_at=observed_at,
+        )
+        ready_manifest = _ready_manifest(
+            schema_registry=schema_registry,
+            inspection=inspection,
+            validation_report=validation_report,
+            mapping_policy=mapping_policy,
+            publication=publication,
+            channels=channels,
+            ledgers=ledgers,
+            observed_at=observed_at,
+        )
+        alignment_manifest = _alignment_manifest(
+            schema_registry=schema_registry,
+            ready_manifest=ready_manifest,
+            ledgers=ledgers,
+            observed_at=observed_at,
+        )
+        primary_policy = PrimaryAdmissionPolicy.create(
+            version=MCAP_SOURCE_POLICY_VERSION,
+            admissible_alignment_outcomes=(AlignmentAdmissionOutcome.VALID,),
+        )
+        evaluation = PrimaryAdmissionEvaluation(
+            recording_identity=recording_id,
+            ready_manifest_id=ready_manifest.ready_manifest_id,
+            ready_manifest_semantic_sha256=ready_manifest.ready_manifest_semantic_sha256,
+            source_outcome=SourceAdmissionOutcome.READY,
+            alignment_outcome=AlignmentAdmissionOutcome.VALID,
+            alignment_id=alignment_manifest.alignment_id,
+            alignment_semantic_sha256=alignment_manifest.alignment_semantic_sha256,
+            policy_version=primary_policy.version,
+            policy_sha256=primary_policy.semantic_sha256,
+            admissible=True,
+            reason_code="ADMISSIBLE",
+        )
+        admitted_context = AdmissionContextResolver().resolve_v2(
+            evaluation=evaluation,
+            policy=primary_policy,
+            validation_report=validation_report,
+            ready_manifest=ready_manifest,
+            alignment_manifest=alignment_manifest,
+            registry=schema_registry,
+        )
+    runtime_increment(
+        runtime_observer,
+        "source.recording_duration_ns",
+        ready_manifest.recording.duration_ns,
+        stage_attributes,
     )
-    mapping_digest = compute_camera_mapping_semantic_sha256_v2(
-        source_content_sha256=inspection.source_sha256,
-        mapping_policy=mapping_policy,
-        camera_mappings=camera_mappings,
+    with runtime_span(runtime_observer, "source.frame_index", stage_attributes):
+        frame_index = _frame_index(
+            context=admitted_context,
+            stream_records=stream_records,
+            ledgers=ledgers,
+        )
+    runtime_increment(
+        runtime_observer,
+        "source.frame_index.frames",
+        sum(len(frame_index.cameras[camera_id].frames) for camera_id in CAMERA_IDS),
+        stage_attributes,
     )
-    recording_id = recording_identity(MCAP_RECORDING_NAMESPACE, inspection.source_sha256)
-    if manifest.recording_identity != recording_id:
-        raise CanonicalMcapSourceError("registered video export recording identity is inconsistent")
-    mcap_id = _stable_uuid("canonical-mcap-source", inspection.source_sha256)
-    validation_report = _validation_report(
-        schema_registry=schema_registry,
-        inspection=inspection,
-        recording_id=recording_id,
-        mcap_id=mcap_id,
-        mapping_policy=mapping_policy,
-        mapping_digest=mapping_digest,
-        stream_records=stream_records,
-        camera_mappings=camera_mappings,
-        observed_at=observed_at,
-    )
-    ready_manifest = _ready_manifest(
-        schema_registry=schema_registry,
-        inspection=inspection,
-        validation_report=validation_report,
-        mapping_policy=mapping_policy,
-        publication=publication,
-        channels=channels,
-        ledgers=ledgers,
-        observed_at=observed_at,
-    )
-    alignment_manifest = _alignment_manifest(
-        schema_registry=schema_registry,
-        ready_manifest=ready_manifest,
-        ledgers=ledgers,
-        observed_at=observed_at,
-    )
-    primary_policy = PrimaryAdmissionPolicy.create(
-        version=MCAP_SOURCE_POLICY_VERSION,
-        admissible_alignment_outcomes=(AlignmentAdmissionOutcome.VALID,),
-    )
-    evaluation = PrimaryAdmissionEvaluation(
-        recording_identity=recording_id,
-        ready_manifest_id=ready_manifest.ready_manifest_id,
-        ready_manifest_semantic_sha256=ready_manifest.ready_manifest_semantic_sha256,
-        source_outcome=SourceAdmissionOutcome.READY,
-        alignment_outcome=AlignmentAdmissionOutcome.VALID,
-        alignment_id=alignment_manifest.alignment_id,
-        alignment_semantic_sha256=alignment_manifest.alignment_semantic_sha256,
-        policy_version=primary_policy.version,
-        policy_sha256=primary_policy.semantic_sha256,
-        admissible=True,
-        reason_code="ADMISSIBLE",
-    )
-    admitted_context = AdmissionContextResolver().resolve_v2(
-        evaluation=evaluation,
-        policy=primary_policy,
-        validation_report=validation_report,
-        ready_manifest=ready_manifest,
-        alignment_manifest=alignment_manifest,
-        registry=schema_registry,
-    )
-    frame_index = _frame_index(
-        context=admitted_context,
-        stream_records=stream_records,
-        ledgers=ledgers,
-    )
-    quality_timings = _frame_timing_evidence(frame_index=frame_index, ledgers=ledgers)
+    with runtime_span(runtime_observer, "source.quality.timing", stage_attributes):
+        quality_timings = _frame_timing_evidence(frame_index=frame_index, ledgers=ledgers)
     requested_end_ns = ready_manifest.recording.duration_ns
     if max_duration_ns is not None:
         requested_end_ns = min(requested_end_ns, max_duration_ns)
     requested_interval = NanosecondInterval(start_ns=0, end_ns=requested_end_ns)
+    runtime_increment(
+        runtime_observer,
+        "source.requested_duration_ns",
+        requested_interval.duration_ns,
+        stage_attributes,
+    )
     frame_output_root = state_dir / "frames"
-    artifacts, quality_observations = _materialize_selected_frames(
-        frame_index=frame_index,
-        ledgers=ledgers,
-        quality_timings=quality_timings,
-        requested_interval=requested_interval,
-        output_root=frame_output_root,
-        stop_after_selected=(requested_end_ns < ready_manifest.recording.duration_ns),
-    )
-    media_quality_report = build_local_media_quality_report(
-        requested_max_duration_ns=max_duration_ns,
-        recording_duration_ns=ready_manifest.recording.duration_ns,
-        requested_interval=requested_interval,
-        timings=quality_timings,
-        frame_observations=quality_observations,
-    )
-    _publish_exact_state_file(
-        state_dir / "media-quality-report.json",
-        canonical_json_bytes(
-            registered_local_media_quality_report_document(
-                media_quality_report,
-                schema_registry,
-            )
-        ),
-        label="media quality report",
-    )
+    window_limited = requested_end_ns < ready_manifest.recording.duration_ns
+    materialize_attributes = {
+        **stage_attributes,
+        "max_duration_limited": window_limited,
+    }
+    with runtime_span(runtime_observer, "source.materialize", materialize_attributes):
+        artifacts, quality_observations = _materialize_selected_frames(
+            frame_index=frame_index,
+            ledgers=ledgers,
+            quality_timings=quality_timings,
+            requested_interval=requested_interval,
+            output_root=frame_output_root,
+            stop_after_selected=window_limited,
+        )
+    if artifacts:
+        runtime_increment(
+            runtime_observer,
+            "source.materialized_artifacts",
+            len(artifacts),
+            materialize_attributes,
+        )
+    frame_observation_count = sum(len(items) for items in quality_observations.values())
+    if frame_observation_count > 0:
+        runtime_increment(
+            runtime_observer,
+            "source.frame_observations",
+            frame_observation_count,
+            materialize_attributes,
+        )
+    with runtime_span(runtime_observer, "source.quality.report", materialize_attributes):
+        media_quality_report = build_local_media_quality_report(
+            requested_max_duration_ns=max_duration_ns,
+            recording_duration_ns=ready_manifest.recording.duration_ns,
+            requested_interval=requested_interval,
+            timings=quality_timings,
+            frame_observations=quality_observations,
+        )
+    with runtime_span(runtime_observer, "source.quality.publish", materialize_attributes):
+        _publish_exact_state_file(
+            state_dir / "media-quality-report.json",
+            canonical_json_bytes(
+                registered_local_media_quality_report_document(
+                    media_quality_report,
+                    schema_registry,
+                )
+            ),
+            label="media quality report",
+        )
     artifact_resolver = _VerifiedMcapArtifactResolver(
         frame_index=frame_index,
         ledgers=MappingProxyType(dict(ledgers)),
         requested_interval=requested_interval,
         output_root=frame_output_root,
         artifacts=artifacts,
+        runtime_observer=runtime_observer,
     )
     return CanonicalMcapSourceBundle(
         source_content_sha256=inspection.source_sha256,
@@ -471,6 +569,7 @@ def _export_registered_videos(
     authorization: AuthorizedMcapMapping,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
+    runtime_observer: RuntimeObserver | None,
 ) -> PublishedRegisteredVideoExport:
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
@@ -486,7 +585,10 @@ def _export_registered_videos(
     )
     service = RegisteredSixCameraVideoExportService(
         PyAvH264Mp4Exporter(),
-        LocalArtifactRegistry(state_dir / "artifact-registry"),
+        LocalArtifactRegistry(
+            state_dir / "artifact-registry",
+            runtime_observer=runtime_observer,
+        ),
         schema_registry,
         clock=clock,
     )

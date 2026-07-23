@@ -10,7 +10,8 @@ restart and replay semantics are executable now.
 from __future__ import annotations
 
 import sqlite3
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from functools import cache
 from pathlib import Path
 from typing import Final
@@ -49,6 +50,12 @@ from robata.event_pipeline.identity_registry import (
     EventRegistrySnapshot,
     StableEventIdentity,
     validate_registered_event_identity_outbox_wire_record,
+)
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
 )
 
 _APPLICATION_ID: Final = 0x52504341  # "RPCA"
@@ -351,10 +358,12 @@ class SQLitePrimaryCompletionRepository:
         path: Path,
         *,
         registry: SchemaRegistry | None = None,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not isinstance(path, Path):
             raise TypeError("path must be pathlib.Path")
         self._path = path.resolve()
+        self._runtime_observer = runtime_observer
         try:
             self._registry = registry or default_schema_registry()
             self._outbox_schema_ref = self._registry.resolve_version(
@@ -389,50 +398,50 @@ class SQLitePrimaryCompletionRepository:
         candidate = context.to_record()
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM primary_runs WHERE run_id = ?",
-                (candidate.run_id,),
-            ).fetchone()
-            if row is not None:
-                stored = self._run_from_row(row)
-                if _run_binding(stored) != _run_binding(candidate):
-                    raise PrimaryCompletionError(
-                        PrimaryCompletionErrorCode.RUN_CONFLICT,
-                        "run ID already has a different immutable binding",
-                    )
-                connection.rollback()
-                return stored
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="begin_run",
+            ) as attributes:
+                row = connection.execute(
+                    "SELECT * FROM primary_runs WHERE run_id = ?",
+                    (candidate.run_id,),
+                ).fetchone()
+                if row is not None:
+                    stored = self._run_from_row(row)
+                    if _run_binding(stored) != _run_binding(candidate):
+                        raise PrimaryCompletionError(
+                            PrimaryCompletionErrorCode.RUN_CONFLICT,
+                            "run ID already has a different immutable binding",
+                        )
+                    self._rollback_observed(connection, attributes)
+                    return stored
 
-            payload = canonical_json_bytes(candidate)
-            connection.execute(
-                """
-                INSERT INTO primary_runs (
-                    run_id, recording_identity, mcap_id, pipeline_version,
-                    config_sha256, started_at, primary_status, completed_at,
-                    run_version, command_sha256, run_json, run_json_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', NULL, 0, NULL, ?, ?)
-                """,
-                (
-                    candidate.run_id,
-                    candidate.recording_identity,
-                    candidate.mcap_id,
-                    candidate.pipeline_version,
-                    candidate.config_sha256,
-                    candidate.started_at,
-                    sqlite3.Binary(payload),
-                    exact_bytes_sha256(payload),
-                ),
-            )
-            connection.commit()
-            return candidate
+                payload = canonical_json_bytes(candidate)
+                connection.execute(
+                    """
+                    INSERT INTO primary_runs (
+                        run_id, recording_identity, mcap_id, pipeline_version,
+                        config_sha256, started_at, primary_status, completed_at,
+                        run_version, command_sha256, run_json, run_json_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', NULL, 0, NULL, ?, ?)
+                    """,
+                    (
+                        candidate.run_id,
+                        candidate.recording_identity,
+                        candidate.mcap_id,
+                        candidate.pipeline_version,
+                        candidate.config_sha256,
+                        candidate.started_at,
+                        sqlite3.Binary(payload),
+                        exact_bytes_sha256(payload),
+                    ),
+                )
+                self._commit_observed(connection, attributes)
+                return candidate
         except PrimaryCompletionError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.TRANSACTION_FAILED,
                 f"cannot begin primary run: {error}",
@@ -445,87 +454,87 @@ class SQLitePrimaryCompletionRepository:
             raise TypeError("recording_identity must be a nonempty string")
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO event_registry_partitions (
-                    recording_identity, generation, fence
-                ) VALUES (?, 0, 1)
-                ON CONFLICT (recording_identity) DO NOTHING
-                """,
-                (recording_identity,),
-            )
-            partition = connection.execute(
-                """
-                SELECT generation, fence
-                FROM event_registry_partitions
-                WHERE recording_identity = ?
-                """,
-                (recording_identity,),
-            ).fetchone()
-            assert partition is not None
-            identities = tuple(
-                self._identity_from_row(row)
-                for row in connection.execute(
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="snapshot",
+            ) as attributes:
+                connection.execute(
                     """
-                    SELECT * FROM stable_event_identities
-                    WHERE recording_identity = ? ORDER BY event_id
+                    INSERT INTO event_registry_partitions (
+                        recording_identity, generation, fence
+                    ) VALUES (?, 0, 1)
+                    ON CONFLICT (recording_identity) DO NOTHING
                     """,
                     (recording_identity,),
-                ).fetchall()
-            )
-            assignments = tuple(
-                sorted(
-                    (
-                        self._assignment_from_row(row)
-                        for row in connection.execute(
-                            """
-                            SELECT * FROM event_identity_assignments
-                            WHERE recording_identity = ?
-                            """,
-                            (recording_identity,),
-                        ).fetchall()
-                    ),
-                    key=lambda item: (
-                        item.event_hypothesis_logical_key,
-                        item.identity_policy_version,
-                        item.identity_policy_sha256,
-                        item.assignment_logical_key,
-                    ),
                 )
-            )
-            current_revisions = tuple(
-                sorted(
-                    (
-                        self._publication_from_row(row).current_revision
-                        for row in connection.execute(
-                            """
-                            SELECT * FROM action_event_publications
-                            WHERE recording_identity = ?
-                            """,
-                            (recording_identity,),
-                        ).fetchall()
-                    ),
-                    key=lambda item: item.event_id,
+                partition = connection.execute(
+                    """
+                    SELECT generation, fence
+                    FROM event_registry_partitions
+                    WHERE recording_identity = ?
+                    """,
+                    (recording_identity,),
+                ).fetchone()
+                assert partition is not None
+                identities = tuple(
+                    self._identity_from_row(row)
+                    for row in connection.execute(
+                        """
+                        SELECT * FROM stable_event_identities
+                        WHERE recording_identity = ? ORDER BY event_id
+                        """,
+                        (recording_identity,),
+                    ).fetchall()
                 )
-            )
-            connection.commit()
-            return EventRegistrySnapshot(
-                schema_version="1.0",
-                recording_identity=recording_identity,
-                generation=int(partition["generation"]),
-                fence=int(partition["fence"]),
-                identities=identities,
-                current_revisions=current_revisions,
-                assignments=assignments,
-            )
+                assignments = tuple(
+                    sorted(
+                        (
+                            self._assignment_from_row(row)
+                            for row in connection.execute(
+                                """
+                                SELECT * FROM event_identity_assignments
+                                WHERE recording_identity = ?
+                                """,
+                                (recording_identity,),
+                            ).fetchall()
+                        ),
+                        key=lambda item: (
+                            item.event_hypothesis_logical_key,
+                            item.identity_policy_version,
+                            item.identity_policy_sha256,
+                            item.assignment_logical_key,
+                        ),
+                    )
+                )
+                current_revisions = tuple(
+                    sorted(
+                        (
+                            self._publication_from_row(row).current_revision
+                            for row in connection.execute(
+                                """
+                                SELECT * FROM action_event_publications
+                                WHERE recording_identity = ?
+                                """,
+                                (recording_identity,),
+                            ).fetchall()
+                        ),
+                        key=lambda item: item.event_id,
+                    )
+                )
+                self._commit_observed(connection, attributes)
+                return EventRegistrySnapshot(
+                    schema_version="1.0",
+                    recording_identity=recording_identity,
+                    generation=int(partition["generation"]),
+                    fence=int(partition["fence"]),
+                    identities=identities,
+                    current_revisions=current_revisions,
+                    assignments=assignments,
+                )
         except (PrimaryCompletionError, ValidationError):
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.TRANSACTION_FAILED,
                 f"cannot read event registry snapshot: {error}",
@@ -538,13 +547,18 @@ class SQLitePrimaryCompletionRepository:
             raise TypeError("run_id must be a nonempty string")
         connection = self._connect()
         try:
-            row = connection.execute(
-                "SELECT * FROM primary_completions WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            return self._committed_from_row(connection, row)
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="get",
+            ) as attributes:
+                row = connection.execute(
+                    "SELECT * FROM primary_completions WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                committed = None if row is None else self._committed_from_row(connection, row)
+                self._commit_observed(connection, attributes)
+                return committed
         except PrimaryCompletionError:
             raise
         except sqlite3.Error as error:
@@ -560,133 +574,133 @@ class SQLitePrimaryCompletionRepository:
         connection = self._connect()
         commit_attempted = False
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT * FROM primary_completions WHERE run_id = ?",
-                (checked.detail.run_id,),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["command_sha256"]) != checked.command_sha256:
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="commit",
+            ) as attributes:
+                existing = connection.execute(
+                    "SELECT * FROM primary_completions WHERE run_id = ?",
+                    (checked.detail.run_id,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["command_sha256"]) != checked.command_sha256:
+                        raise PrimaryCompletionError(
+                            PrimaryCompletionErrorCode.RUN_CONFLICT,
+                            "run already completed with a different command",
+                        )
+                    committed = self._committed_from_row(connection, existing)
+                    self._rollback_observed(connection, attributes)
+                    return PrimaryCompletionCommitResult(committed=committed, replayed=True)
+
+                run_row = connection.execute(
+                    "SELECT * FROM primary_runs WHERE run_id = ?",
+                    (checked.detail.run_id,),
+                ).fetchone()
+                if run_row is None:
                     raise PrimaryCompletionError(
                         PrimaryCompletionErrorCode.RUN_CONFLICT,
-                        "run already completed with a different command",
+                        "begin_run must persist the run binding before completion",
                     )
-                committed = self._committed_from_row(connection, existing)
-                connection.rollback()
-                return PrimaryCompletionCommitResult(committed=committed, replayed=True)
+                stored_run = self._run_from_row(run_row)
+                if (
+                    stored_run.primary_status.value != "RUNNING"
+                    or int(run_row["run_version"]) != 0
+                    or _run_binding(stored_run) != _run_binding(checked.detail.processing_run)
+                ):
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.STALE_RUN,
+                        "processing run is no longer the expected RUNNING binding",
+                    )
 
-            run_row = connection.execute(
-                "SELECT * FROM primary_runs WHERE run_id = ?",
-                (checked.detail.run_id,),
-            ).fetchone()
-            if run_row is None:
-                raise PrimaryCompletionError(
-                    PrimaryCompletionErrorCode.RUN_CONFLICT,
-                    "begin_run must persist the run binding before completion",
+                identity_result = self._apply_identity_and_publications(connection, checked)
+                detail_bytes = canonical_json_bytes(checked.detail)
+                self._insert_or_verify_detail(connection, checked, detail_bytes)
+                self._after_staged_facts(connection, checked)
+                outbox = identity_result.outbox if identity_result is not None else ()
+                committed = CommittedPrimaryCompletion(
+                    schema_version="1.0",
+                    command_sha256=checked.command_sha256,
+                    processing_run=checked.detail.processing_run,
+                    completion=checked.completion,
+                    detail=checked.detail,
+                    identity_result=identity_result,
+                    action_event_publications=checked.detail.action_event_publications,
+                    outbox=outbox,
+                    evidence_references=checked.evidence_references,
                 )
-            stored_run = self._run_from_row(run_row)
-            if (
-                stored_run.primary_status.value != "RUNNING"
-                or int(run_row["run_version"]) != 0
-                or _run_binding(stored_run) != _run_binding(checked.detail.processing_run)
-            ):
-                raise PrimaryCompletionError(
-                    PrimaryCompletionErrorCode.STALE_RUN,
-                    "processing run is no longer the expected RUNNING binding",
+                command_bytes = canonical_json_bytes(checked)
+                committed_bytes = canonical_json_bytes(committed)
+                connection.execute(
+                    """
+                    INSERT INTO primary_completions (
+                        run_id, command_sha256, command_json, command_json_sha256,
+                        committed_json, committed_json_sha256,
+                        detailed_result_artifact_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checked.detail.run_id,
+                        checked.command_sha256,
+                        sqlite3.Binary(command_bytes),
+                        exact_bytes_sha256(command_bytes),
+                        sqlite3.Binary(committed_bytes),
+                        exact_bytes_sha256(committed_bytes),
+                        checked.completion.detailed_result.artifact_id,
+                    ),
                 )
+                for ordinal, item in enumerate(outbox):
+                    self._insert_outbox(
+                        connection,
+                        checked.detail.run_id,
+                        ordinal,
+                        item,
+                    )
 
-            identity_result = self._apply_identity_and_publications(connection, checked)
-            detail_bytes = canonical_json_bytes(checked.detail)
-            self._insert_or_verify_detail(connection, checked, detail_bytes)
-            self._after_staged_facts(connection, checked)
-            outbox = identity_result.outbox if identity_result is not None else ()
-            committed = CommittedPrimaryCompletion(
-                schema_version="1.0",
-                command_sha256=checked.command_sha256,
-                processing_run=checked.detail.processing_run,
-                completion=checked.completion,
-                detail=checked.detail,
-                identity_result=identity_result,
-                action_event_publications=checked.detail.action_event_publications,
-                outbox=outbox,
-                evidence_references=checked.evidence_references,
-            )
-            command_bytes = canonical_json_bytes(checked)
-            committed_bytes = canonical_json_bytes(committed)
-            connection.execute(
-                """
-                INSERT INTO primary_completions (
-                    run_id, command_sha256, command_json, command_json_sha256,
-                    committed_json, committed_json_sha256,
-                    detailed_result_artifact_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    checked.detail.run_id,
-                    checked.command_sha256,
-                    sqlite3.Binary(command_bytes),
-                    exact_bytes_sha256(command_bytes),
-                    sqlite3.Binary(committed_bytes),
-                    exact_bytes_sha256(committed_bytes),
-                    checked.completion.detailed_result.artifact_id,
-                ),
-            )
-            for ordinal, item in enumerate(outbox):
-                self._insert_outbox(
+                terminal_bytes = canonical_json_bytes(checked.detail.processing_run)
+                updated = connection.execute(
+                    """
+                    UPDATE primary_runs
+                    SET primary_status = ?, completed_at = ?, run_version = 1,
+                        command_sha256 = ?, run_json = ?, run_json_sha256 = ?
+                    WHERE run_id = ? AND primary_status = 'RUNNING'
+                        AND run_version = 0 AND command_sha256 IS NULL
+                    """,
+                    (
+                        checked.detail.status,
+                        checked.detail.processing_run.completed_at,
+                        checked.command_sha256,
+                        sqlite3.Binary(terminal_bytes),
+                        exact_bytes_sha256(terminal_bytes),
+                        checked.detail.run_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.STALE_RUN,
+                        "processing run completion compare-and-swap did not match",
+                    )
+
+                commit_attempted = True
+                self._commit_observed(
                     connection,
-                    checked.detail.run_id,
-                    ordinal,
-                    item,
+                    attributes,
+                    use_commit_hook=True,
                 )
-
-            terminal_bytes = canonical_json_bytes(checked.detail.processing_run)
-            updated = connection.execute(
-                """
-                UPDATE primary_runs
-                SET primary_status = ?, completed_at = ?, run_version = 1,
-                    command_sha256 = ?, run_json = ?, run_json_sha256 = ?
-                WHERE run_id = ? AND primary_status = 'RUNNING'
-                    AND run_version = 0 AND command_sha256 IS NULL
-                """,
-                (
-                    checked.detail.status,
-                    checked.detail.processing_run.completed_at,
-                    checked.command_sha256,
-                    sqlite3.Binary(terminal_bytes),
-                    exact_bytes_sha256(terminal_bytes),
-                    checked.detail.run_id,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise PrimaryCompletionError(
-                    PrimaryCompletionErrorCode.STALE_RUN,
-                    "processing run completion compare-and-swap did not match",
-                )
-
-            commit_attempted = True
-            self._commit_connection(connection)
-            return PrimaryCompletionCommitResult(committed=committed, replayed=False)
+                return PrimaryCompletionCommitResult(committed=committed, replayed=False)
         except PrimaryCompletionError:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         except (ValidationError, TypeError, ValueError) as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INVALID_COMMAND,
                 f"primary completion command is invalid: {error}",
             ) from error
         except sqlite3.IntegrityError as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
                 f"primary completion constraint failed: {error}",
             ) from error
         except sqlite3.Error as error:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             if commit_attempted:
                 recovered = self._recover_uncertain_commit(checked)
                 if recovered is not None:
@@ -709,17 +723,24 @@ class SQLitePrimaryCompletionRepository:
             raise TypeError("recording_identity must be a nonempty string")
         connection = self._connect()
         try:
-            return tuple(
-                self._outbox_from_row(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM primary_outbox
-                    WHERE recording_identity = ?
-                    ORDER BY completion_run_id, outbox_ordinal
-                    """,
-                    (recording_identity,),
-                ).fetchall()
-            )
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="list_outbox",
+            ) as attributes:
+                outbox = tuple(
+                    self._outbox_from_row(row)
+                    for row in connection.execute(
+                        """
+                        SELECT * FROM primary_outbox
+                        WHERE recording_identity = ?
+                        ORDER BY completion_run_id, outbox_ordinal
+                        """,
+                        (recording_identity,),
+                    ).fetchall()
+                )
+                self._commit_observed(connection, attributes)
+                return outbox
         except sqlite3.Error as error:
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.TRANSACTION_FAILED,
@@ -1107,10 +1128,27 @@ class SQLitePrimaryCompletionRepository:
         self,
         command: PrimaryCompletionCommand,
     ) -> CommittedPrimaryCompletion | None:
+        connection: sqlite3.Connection | None = None
         try:
-            recovered = self.get(command.detail.run_id)
+            connection = self._connect()
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="recover_uncertain_commit",
+            ) as attributes:
+                row = connection.execute(
+                    "SELECT * FROM primary_completions WHERE run_id = ?",
+                    (command.detail.run_id,),
+                ).fetchone()
+                recovered = None if row is None else self._committed_from_row(connection, row)
+                self._commit_observed(connection, attributes)
         except PrimaryCompletionError:
             return None
+        except sqlite3.Error:
+            return None
+        finally:
+            if connection is not None:
+                connection.close()
         if recovered is None:
             return None
         if recovered.command_sha256 != command.command_sha256:
@@ -1480,32 +1518,36 @@ class SQLitePrimaryCompletionRepository:
                     )
                 return
             if user_version == 1 and application_id == _APPLICATION_ID:
-                connection.execute("BEGIN IMMEDIATE")
-                locked_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                if locked_version == _SCHEMA_VERSION:
+                with self._observed_transaction_scope(
+                    connection,
+                    write=True,
+                    operation_name="initialize_migration",
+                ) as attributes:
+                    locked_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                    if locked_version == _SCHEMA_VERSION:
+                        if not _primary_schema_is_current(connection):
+                            raise PrimaryCompletionError(
+                                PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                                "concurrently migrated primary completion DDL is not canonical",
+                            )
+                        self._commit_observed(connection, attributes)
+                        return
+                    if locked_version != 1:
+                        raise PrimaryCompletionError(
+                            PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                            "primary completion schema changed during migration",
+                        )
+                    self._migrate_v1_outbox_payloads(connection)
+                    for statement in _V1_TO_V2_SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                     if not _primary_schema_is_current(connection):
                         raise PrimaryCompletionError(
                             PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                            "concurrently migrated primary completion DDL is not canonical",
+                            "migrated primary completion DDL is not canonical",
                         )
-                    connection.commit()
+                    self._commit_observed(connection, attributes)
                     return
-                if locked_version != 1:
-                    raise PrimaryCompletionError(
-                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                        "primary completion schema changed during migration",
-                    )
-                self._migrate_v1_outbox_payloads(connection)
-                for statement in _V1_TO_V2_SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                if not _primary_schema_is_current(connection):
-                    raise PrimaryCompletionError(
-                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                        "migrated primary completion DDL is not canonical",
-                    )
-                connection.commit()
-                return
             if user_version != 0 or application_id != 0:
                 raise PrimaryCompletionError(
                     PrimaryCompletionErrorCode.INTEGRITY_ERROR,
@@ -1522,20 +1564,22 @@ class SQLitePrimaryCompletionRepository:
                     PrimaryCompletionErrorCode.INTEGRITY_ERROR,
                     "refusing to initialize over an existing SQLite schema",
                 )
-            connection.execute("BEGIN IMMEDIATE")
-            for statement in _SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            if not _primary_schema_is_current(connection):
-                raise PrimaryCompletionError(
-                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                    "new primary completion DDL is not canonical",
-                )
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="initialize_schema",
+            ) as attributes:
+                for statement in _SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                if not _primary_schema_is_current(connection):
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                        "new primary completion DDL is not canonical",
+                    )
+                self._commit_observed(connection, attributes)
         except Exception:
-            with suppress(sqlite3.Error):
-                connection.rollback()
             raise
         finally:
             connection.close()
@@ -1589,6 +1633,107 @@ class SQLitePrimaryCompletionRepository:
                 PrimaryCompletionErrorCode.INTEGRITY_ERROR,
                 "cannot open or verify the primary completion database",
             ) from error
+
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[dict[str, RuntimeAttributeValue]]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.primary_completion.transaction",
+            attributes,
+        ):
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.primary_completion.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield attributes
+            except BaseException:
+                self._rollback_observed(connection, attributes)
+                raise
+
+    def _commit_observed(
+        self,
+        connection: sqlite3.Connection,
+        attributes: dict[str, RuntimeAttributeValue],
+        *,
+        use_commit_hook: bool = False,
+    ) -> None:
+        if use_commit_hook:
+            try:
+                self._commit_connection(connection)
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.primary_completion.commit_failures",
+                    attributes=attributes,
+                )
+                if not connection.in_transaction:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.primary_completion.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+        else:
+            try:
+                connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.primary_completion.commit_failures",
+                    attributes=attributes,
+                )
+                if not connection.in_transaction:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.primary_completion.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.primary_completion.commits",
+            attributes=attributes,
+        )
+
+    def _rollback_observed(
+        self,
+        connection: sqlite3.Connection,
+        attributes: dict[str, RuntimeAttributeValue],
+    ) -> None:
+        if not connection.in_transaction:
+            return
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.primary_completion.rollback_failures",
+                attributes=attributes,
+            )
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.primary_completion.transaction_outcomes_unknown",
+                attributes=attributes,
+            )
+            return
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.primary_completion.rollbacks",
+            attributes=attributes,
+        )
 
     def _commit_connection(self, connection: sqlite3.Connection) -> None:
         """Narrow test hook for commit-outcome uncertainty."""

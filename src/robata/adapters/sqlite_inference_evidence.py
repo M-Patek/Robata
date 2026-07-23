@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import cache
@@ -42,6 +42,12 @@ from robata.inference.offline_fixture import (
     StoredRawProviderBytes,
 )
 from robata.inference.orchestrator import InferenceIntent, InferenceLedgerError
+from robata.runtime.observability import (
+    RuntimeAttributeValue,
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
+)
 
 INFERENCE_INTENT_SCHEMA_ID: Final = "https://schemas.robata.dev/inference-intent"
 MODEL_INFERENCE_SCHEMA_ID: Final = "https://schemas.robata.dev/model-inference"
@@ -328,11 +334,18 @@ class SQLiteInferenceEvidenceLedger:
     rows; construction also performs this complete audit before the ledger is used.
     """
 
-    def __init__(self, database_path: Path, schema_registry: SchemaRegistry) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        schema_registry: SchemaRegistry,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(database_path, Path):
             raise TypeError("database_path must be a pathlib.Path")
         if not isinstance(schema_registry, SchemaRegistry):
             raise TypeError("schema_registry must be a SchemaRegistry")
+        self._runtime_observer = runtime_observer
         self._schema_registry = schema_registry
         self._pins = {
             "intent": self._resolve_pin(INFERENCE_INTENT_SCHEMA_ID, _CONTRACT_VERSION),
@@ -365,7 +378,11 @@ class SQLiteInferenceEvidenceLedger:
         def audit(connection: sqlite3.Connection) -> None:
             self._load_state(connection)
 
-        self._transaction(write=False, operation=audit)
+        self._transaction(
+            write=False,
+            operation_name="verify_integrity",
+            operation=audit,
+        )
 
     def append_intent(self, intent: InferenceIntent) -> InferenceIntent:
         checked, payload = self._prepare_model(intent, InferenceIntent, "intent")
@@ -414,11 +431,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_intent",
+            operation=append,
+        )
 
     def get_intent(self, inference_id: str) -> InferenceIntent | None:
         return self._transaction(
             write=False,
+            operation_name="get_intent",
             operation=lambda connection: self._intent_by_inference_id(connection, inference_id),
         )
 
@@ -504,11 +526,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append_raw)
+        return self._transaction(
+            write=True,
+            operation_name="append_raw_provider_response",
+            operation=append_raw,
+        )
 
     def get(self, artifact_id: str) -> StoredRawProviderBytes:
         record = self._transaction(
             write=False,
+            operation_name="get_raw_provider_response",
             operation=lambda connection: self._raw_by_artifact_id(connection, artifact_id),
         )
         if record is None:
@@ -524,7 +551,11 @@ class SQLiteInferenceEvidenceLedger:
                 ).fetchall()
             )
 
-        return self._transaction(write=False, operation=load)
+        return self._transaction(
+            write=False,
+            operation_name="list_raw_provider_responses",
+            operation=load,
+        )
 
     def append_terminal(self, inference: ModelInference) -> ModelInference:
         checked, payload = self._prepare_model(inference, ModelInference, "terminal")
@@ -599,11 +630,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_terminal",
+            operation=append,
+        )
 
     def get_terminal(self, inference_id: str) -> ModelInference | None:
         return self._transaction(
             write=False,
+            operation_name="get_terminal",
             operation=lambda connection: self._terminal_by_inference_id(connection, inference_id),
         )
 
@@ -668,13 +704,18 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_selection",
+            operation=append,
+        )
 
     def get_selection(
         self, logical_invocation_id: str, policy_version: str
     ) -> InferenceAttemptSelection | None:
         return self._transaction(
             write=False,
+            operation_name="get_selection",
             operation=lambda connection: self._selection_by_logical_key(
                 connection, logical_invocation_id, policy_version
             ),
@@ -688,6 +729,7 @@ class SQLiteInferenceEvidenceLedger:
         )
         return self._transaction(
             write=True,
+            operation_name="append_raw_artifact",
             operation=lambda connection: self._append_raw_artifact_row(
                 connection, checked, payload=payload
             ),
@@ -696,6 +738,7 @@ class SQLiteInferenceEvidenceLedger:
     def get_raw_artifact(self, artifact_id: str) -> RawProviderResponseArtifact | None:
         return self._transaction(
             write=False,
+            operation_name="get_raw_artifact",
             operation=lambda connection: self._raw_artifact_by_id(connection, artifact_id),
         )
 
@@ -765,11 +808,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_parsed_claim",
+            operation=append,
+        )
 
     def get_parsed_claim(self, artifact_id: str) -> ParsedProviderClaimArtifact | None:
         return self._transaction(
             write=False,
+            operation_name="get_parsed_claim",
             operation=lambda connection: self._parsed_by_artifact_id(connection, artifact_id),
         )
 
@@ -828,11 +876,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_selected_output",
+            operation=append,
+        )
 
     def get_selected_output(self, selection_id: str) -> SelectedAttemptOutput | None:
         return self._transaction(
             write=False,
+            operation_name="get_selected_output",
             operation=lambda connection: self._selected_by_selection_id(connection, selection_id),
         )
 
@@ -900,11 +953,16 @@ class SQLiteInferenceEvidenceLedger:
                 )
             return stored
 
-        return self._transaction(write=True, operation=append)
+        return self._transaction(
+            write=True,
+            operation_name="append_enriched_output",
+            operation=append,
+        )
 
     def get_enriched_output(self, artifact_id: str) -> OrchestratorEnrichedOutput | None:
         return self._transaction(
             write=False,
+            operation_name="get_enriched_output",
             operation=lambda connection: self._enriched_by_artifact_id(connection, artifact_id),
         )
 
@@ -917,6 +975,19 @@ class SQLiteInferenceEvidenceLedger:
             ) from exc
 
     def _prepare_model(
+        self,
+        value: _ModelT,
+        model_type: type[_ModelT],
+        contract: str,
+    ) -> tuple[_ModelT, bytes]:
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.inference_evidence.serialize_validate",
+            {"contract": contract},
+        ):
+            return self._prepare_model_unobserved(value, model_type, contract)
+
+    def _prepare_model_unobserved(
         self,
         value: _ModelT,
         model_type: type[_ModelT],
@@ -975,55 +1046,68 @@ class SQLiteInferenceEvidenceLedger:
             ) from exc
 
     def _initialize_database(self) -> None:
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.inference_evidence.initialize",
+        ):
+            self._initialize_database_unobserved()
+
+    def _initialize_database_unobserved(self) -> None:
         connection: sqlite3.Connection | None = None
         try:
             connection = self._connect()
-            connection.execute("BEGIN")
-            preflight_version = _pragma_int(connection, "user_version")
-            preflight_application_id = _pragma_int(connection, "application_id")
-            preflight_has_schema = _has_user_schema(connection)
-            if preflight_version == 0:
-                if preflight_application_id != 0 or preflight_has_schema:
+            with self._observed_transaction_scope(
+                connection,
+                write=False,
+                operation_name="initialize_preflight",
+            ):
+                preflight_version = _pragma_int(connection, "user_version")
+                preflight_application_id = _pragma_int(connection, "application_id")
+                preflight_has_schema = _has_user_schema(connection)
+                if preflight_version == 0:
+                    if preflight_application_id != 0 or preflight_has_schema:
+                        raise SQLiteInferenceEvidenceLedgerError(
+                            "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        )
+                elif preflight_version != _SCHEMA_VERSION:
                     raise SQLiteInferenceEvidenceLedgerError(
-                        "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        f"unsupported inference evidence schema version: {preflight_version}"
                     )
-            elif preflight_version != _SCHEMA_VERSION:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    f"unsupported inference evidence schema version: {preflight_version}"
-                )
-            elif preflight_application_id != _APPLICATION_ID:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "inference evidence database has an unexpected application identity"
-                )
-            connection.commit()
+                elif preflight_application_id != _APPLICATION_ID:
+                    raise SQLiteInferenceEvidenceLedgerError(
+                        "inference evidence database has an unexpected application identity"
+                    )
             _enable_wal_mode(connection)
 
-            connection.execute("BEGIN IMMEDIATE")
-            # Another constructor can initialize the same empty file while this
-            # connection waits for the write lock. Re-read only after the lock.
-            user_version = _pragma_int(connection, "user_version")
-            application_id = _pragma_int(connection, "application_id")
-            has_schema = _has_user_schema(connection)
-            if user_version == 0:
-                if application_id != 0 or has_schema:
+            with self._observed_transaction_scope(
+                connection,
+                write=True,
+                operation_name="initialize_schema",
+            ):
+                # Another constructor can initialize the same empty file while this
+                # connection waits for the write lock. Re-read only after the lock.
+                user_version = _pragma_int(connection, "user_version")
+                application_id = _pragma_int(connection, "application_id")
+                has_schema = _has_user_schema(connection)
+                if user_version == 0:
+                    if application_id != 0 or has_schema:
+                        raise SQLiteInferenceEvidenceLedgerError(
+                            "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        )
+                    for statement in _SCHEMA_STATEMENTS:
+                        connection.execute(statement)
+                    connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                elif user_version != _SCHEMA_VERSION:
                     raise SQLiteInferenceEvidenceLedgerError(
-                        "refusing to adopt a nonempty or claimed unversioned SQLite database"
+                        f"unsupported inference evidence schema version: {user_version}"
                     )
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif user_version != _SCHEMA_VERSION:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    f"unsupported inference evidence schema version: {user_version}"
-                )
-            elif application_id != _APPLICATION_ID:
-                raise SQLiteInferenceEvidenceLedgerError(
-                    "inference evidence database has an unexpected application identity"
-                )
-            self._verify_database(connection)
-            self._load_state(connection)
-            connection.commit()
+                elif application_id != _APPLICATION_ID:
+                    raise SQLiteInferenceEvidenceLedgerError(
+                        "inference evidence database has an unexpected application identity"
+                    )
+                self._verify_database(connection)
+                self._load_state(connection)
         except SQLiteInferenceEvidenceLedgerError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -1039,6 +1123,18 @@ class SQLiteInferenceEvidenceLedger:
                 connection.close()
 
     def _connect(self) -> sqlite3.Connection:
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.inference_evidence.connect",
+        ):
+            connection = self._connect_unobserved()
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.inference_evidence.connections",
+        )
+        return connection
+
+    def _connect_unobserved(self) -> sqlite3.Connection:
         if self._database_path.is_symlink():
             raise SQLiteInferenceEvidenceLedgerError(
                 f"inference evidence database became a symlink: {self._database_path}"
@@ -1077,32 +1173,180 @@ class SQLiteInferenceEvidenceLedger:
         self,
         *,
         write: bool,
+        operation_name: str,
+        operation: Callable[[sqlite3.Connection], _ResultT],
+    ) -> _ResultT:
+        return self._transaction_unobserved(
+            write=write,
+            operation_name=operation_name,
+            operation=operation,
+        )
+
+    def _transaction_unobserved(
+        self,
+        *,
+        write: bool,
+        operation_name: str,
         operation: Callable[[sqlite3.Connection], _ResultT],
     ) -> _ResultT:
         connection = self._connect()
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
         try:
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            self._verify_database(connection)
-            result = operation(connection)
-            connection.commit()
+            with self._observed_transaction_scope(
+                connection,
+                write=write,
+                operation_name=operation_name,
+            ):
+                self._verify_database(connection)
+                with runtime_span(
+                    self._runtime_observer,
+                    "sqlite.inference_evidence.operation",
+                    attributes,
+                ):
+                    result = operation(connection)
             return result
         except (InferenceLedgerError, RawProviderBytesStoreError):
-            _rollback_quietly(connection)
             raise
         except sqlite3.IntegrityError as exc:
-            _rollback_quietly(connection)
             raise SQLiteInferenceEvidenceLedgerError(
                 f"SQLite rejected append-only inference evidence: {exc}"
             ) from exc
         except sqlite3.Error as exc:
-            _rollback_quietly(connection)
             raise SQLiteInferenceEvidenceLedgerError(
                 f"inference evidence transaction failed: {exc}"
             ) from exc
         finally:
             connection.close()
 
+    @contextmanager
+    def _observed_transaction_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        write: bool,
+        operation_name: str,
+    ) -> Iterator[None]:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+        }
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.inference_evidence.transaction",
+            attributes,
+        ):
+            with runtime_span(
+                self._runtime_observer,
+                "sqlite.inference_evidence.begin",
+                attributes,
+            ):
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.inference_evidence.transactions",
+                attributes=attributes,
+            )
+            try:
+                yield
+            except BaseException:
+                if connection.in_transaction:
+                    try:
+                        with runtime_span(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollback",
+                            attributes,
+                        ):
+                            connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.inference_evidence.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            try:
+                with runtime_span(
+                    self._runtime_observer,
+                    "sqlite.inference_evidence.commit",
+                    attributes,
+                ):
+                    connection.commit()
+            except BaseException:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.inference_evidence.commit_failures",
+                    attributes=attributes,
+                )
+                if connection.in_transaction:
+                    try:
+                        with runtime_span(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollback",
+                            attributes,
+                        ):
+                            connection.rollback()
+                    except sqlite3.Error:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollback_failures",
+                            attributes=attributes,
+                        )
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.transaction_outcomes_unknown",
+                            attributes=attributes,
+                        )
+                    else:
+                        runtime_increment(
+                            self._runtime_observer,
+                            "sqlite.inference_evidence.rollbacks",
+                            attributes=attributes,
+                        )
+                else:
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sqlite.inference_evidence.transaction_outcomes_unknown",
+                        attributes=attributes,
+                    )
+                raise
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.inference_evidence.commits",
+                attributes=attributes,
+            )
+
     def _verify_database(self, connection: sqlite3.Connection) -> None:
+        runtime_increment(
+            self._runtime_observer,
+            "sqlite.inference_evidence.integrity_checks",
+        )
+        with runtime_span(
+            self._runtime_observer,
+            "sqlite.inference_evidence.integrity_check",
+        ):
+            self._verify_database_unobserved(connection)
+
+    def _verify_database_unobserved(self, connection: sqlite3.Connection) -> None:
         if _pragma_int(connection, "application_id") != _APPLICATION_ID:
             raise SQLiteInferenceEvidenceLedgerError(
                 "inference evidence database application identity changed"

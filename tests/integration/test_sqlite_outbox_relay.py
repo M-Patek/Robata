@@ -22,6 +22,7 @@ from robata.queue import (
     OutboxRelay,
     OutboxRetryPolicy,
 )
+from robata.runtime.observability import RuntimeProfileRecorder
 from tests.integration.test_sqlite_primary_completion import _run_case
 
 
@@ -77,6 +78,63 @@ def _committed_outbox(tmp_path: Path, *, run_value: int) -> tuple[Path, str, byt
     finally:
         connection.close()
     return repository.path, record.outbox_id, payload
+
+
+def _counter_total(recorder: RuntimeProfileRecorder, name: str) -> int:
+    return sum(counter.value for counter in recorder.snapshot().counters if counter.name == name)
+
+
+def test_runtime_observation_counts_exact_outbox_transaction_outcomes(
+    tmp_path: Path,
+) -> None:
+    database_path, _, _ = _committed_outbox(tmp_path, run_value=90_010)
+    clock = _MutableClock(datetime(2026, 7, 21, 17, tzinfo=UTC))
+    delivery_recorder = RuntimeProfileRecorder()
+    store = SQLitePrimaryOutboxDeliveryStore(
+        database_path,
+        retry_policy=_policy(),
+        clock=clock,
+        runtime_observer=delivery_recorder,
+    )
+
+    abandoned = store.claim(worker_id="relay-a", lease_duration=timedelta(seconds=10))
+    assert abandoned is not None
+    clock.advance(seconds=11)
+    recovered = store.claim(worker_id="relay-b", lease_duration=timedelta(seconds=10))
+    assert recovered is not None
+    with pytest.raises(OutboxFenceError, match="stale"):
+        store.acknowledge(abandoned)
+
+    delivery_snapshot = delivery_recorder.snapshot()
+    assert _counter_total(delivery_recorder, "sqlite.outbox_delivery.transactions") == 3
+    assert _counter_total(delivery_recorder, "sqlite.outbox_delivery.commits") == 2
+    assert _counter_total(delivery_recorder, "sqlite.outbox_delivery.rollbacks") == 1
+    assert (
+        sum(span.name == "sqlite.outbox_delivery.transaction" for span in delivery_snapshot.spans)
+        == 3
+    )
+
+    sink_recorder = RuntimeProfileRecorder()
+    sink = SQLiteIdempotentOutboxSink(
+        tmp_path / "observed-sink.sqlite3",
+        clock=clock,
+        runtime_observer=sink_recorder,
+    )
+    sink.publish(recovered.message)
+    conflicting_payload = b"{}"
+    conflicting = replace(
+        recovered.message,
+        payload=conflicting_payload,
+        payload_sha256=exact_bytes_sha256(conflicting_payload),
+    )
+    with pytest.raises(OutboxDeliveryError, match="different bytes"):
+        sink.publish(conflicting)
+
+    sink_snapshot = sink_recorder.snapshot()
+    assert _counter_total(sink_recorder, "sqlite.outbox_sink.transactions") == 3
+    assert _counter_total(sink_recorder, "sqlite.outbox_sink.commits") == 2
+    assert _counter_total(sink_recorder, "sqlite.outbox_sink.rollbacks") == 1
+    assert sum(span.name == "sqlite.outbox_sink.transaction" for span in sink_snapshot.spans) == 3
 
 
 def test_relay_refuses_to_create_a_missing_primary_authority(tmp_path: Path) -> None:

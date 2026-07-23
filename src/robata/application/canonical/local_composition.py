@@ -159,6 +159,11 @@ from robata.qa_pipeline.supplemental_wire import (
     LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_VERSION,
     LocalSupplementalQaEvidence,
 )
+from robata.runtime.observability import (
+    RuntimeObserver,
+    runtime_increment,
+    runtime_span,
+)
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     IndexedSourceFrame,
@@ -186,6 +191,9 @@ LOCAL_CANONICAL_EVENT_ALLOCATOR_VERSION = "canonical-local-event-uuid5-v1"
 LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v4"]] = (
     "canonical-local-run-receipt-v4"
 )
+LOCAL_CANONICAL_RUNTIME_DESCRIPTOR_MODEL_VERSION: Final[
+    Literal["canonical-local-runtime-descriptor-v1"]
+] = "canonical-local-runtime-descriptor-v1"
 
 
 class CanonicalLocalCompositionErrorCode(StrEnum):
@@ -236,12 +244,59 @@ class CanonicalLocalRunReceipt(StrictModel):
     production_eligible: Literal[False]
 
 
+class LocalCanonicalRuntimeDescriptor(StrictModel):
+    """Non-authoritative policy pins for reproducible local profiling."""
+
+    schema_version: Literal["1.0"]
+    model_version: Literal["canonical-local-runtime-descriptor-v1"]
+    composition_version: str
+    pipeline_version: str
+    execution_policy_semantic_sha256: str
+    runtime_policy_semantic_sha256: str
+    input_planner_version: str
+    parser_version: str
+    inference_policy_versions: tuple[str, ...]
+    evidence_class: Literal["LOCAL_CONFORMANCE"]
+    production_eligible: Literal[False]
+
+
 @dataclass(frozen=True, slots=True)
 class _LocalCanonicalRuntime:
     registry: SchemaRegistry
     execution_policy: CanonicalOfflineExecutionPolicy
     pipeline: CanonicalOfflinePipeline
     inference_evidence: SQLiteInferenceEvidenceLedger
+
+
+def local_canonical_runtime_descriptor() -> LocalCanonicalRuntimeDescriptor:
+    """Return the exact policy pins used by the local canonical composition."""
+
+    registry = SchemaRegistry()
+    execution_policy = _execution_policy()
+    policies = _local_inference_policies(registry)
+    runtime_policy_sha256 = _local_runtime_policy_sha256(
+        coarse_qa_policy=policies[0],
+        dense_qa_policy=policies[1],
+        event_proposal_policy=policies[2],
+        action_evidence_policy=policies[3],
+        boundary_refinement_policy=policies[4],
+        inference_policy=policies[5],
+    )
+    return LocalCanonicalRuntimeDescriptor(
+        schema_version="1.0",
+        model_version=LOCAL_CANONICAL_RUNTIME_DESCRIPTOR_MODEL_VERSION,
+        composition_version=LOCAL_CANONICAL_COMPOSITION_VERSION,
+        pipeline_version=CANONICAL_OFFLINE_PIPELINE_VERSION,
+        execution_policy_semantic_sha256=execution_policy.semantic_sha256,
+        runtime_policy_semantic_sha256=runtime_policy_sha256,
+        input_planner_version=INFERENCE_INPUT_PLANNER_VERSION,
+        parser_version=LOCAL_CANONICAL_PARSER_VERSION,
+        inference_policy_versions=tuple(
+            f"{policy.task.value}:{policy.policy_version}" for policy in policies
+        ),
+        evidence_class="LOCAL_CONFORMANCE",
+        production_eligible=False,
+    )
 
 
 class _CanonicalSourceInputs(Protocol):
@@ -309,13 +364,16 @@ def run_local_canonical_fixture(
     source_path: Path,
     state_dir: Path,
     run_key: str = "primary",
+    *,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a JSON source fixture."""
 
     source = _require_path(source_path, "source_path")
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
-    source_sha256, _, clock_value = _source_run_binding(source)
+    with runtime_span(runtime_observer, "source.fixture.read_validate"):
+        source_sha256, _, clock_value = _source_run_binding(source)
     source_binding_sha256 = semantic_sha256(
         {
             "source_binding_policy_version": "canonical-local-source-binding-v1",
@@ -337,6 +395,7 @@ def run_local_canonical_fixture(
         source_sha256=source_sha256,
         source_binding_sha256=source_binding_sha256,
         source_loader=load_source,
+        runtime_observer=runtime_observer,
     )
 
 
@@ -348,6 +407,7 @@ def run_local_canonical_mcap(
     *,
     allow_unapproved_profile: bool = False,
     max_duration_ns: int | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a real MCAP."""
 
@@ -378,11 +438,13 @@ def run_local_canonical_mcap(
         )
     try:
         # Authorization must precede the first source read.
-        authorization = authorize_mcap_mapping(
-            mapping,
-            allow_unapproved_profile=allow_unapproved_profile,
-        )
-        source_sha256 = _hash_source_file(source, label="MCAP source")
+        with runtime_span(runtime_observer, "source.mapping.authorize"):
+            authorization = authorize_mcap_mapping(
+                mapping,
+                allow_unapproved_profile=allow_unapproved_profile,
+            )
+        with runtime_span(runtime_observer, "source.hash"):
+            source_sha256 = _hash_source_file(source, label="MCAP source")
     except CanonicalMcapSourceError as error:
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
@@ -458,6 +520,7 @@ def run_local_canonical_mcap(
                 schema_registry=registry,
                 clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
                 max_duration_ns=max_duration_ns,
+                runtime_observer=runtime_observer,
             )
         except CanonicalMcapSourceError as error:
             raise CanonicalLocalCompositionError(
@@ -524,6 +587,7 @@ def run_local_canonical_mcap(
         media_quality_document_loader=load_media_quality_document,
         supplemental_qa_evidence_builder=build_supplemental_qa_evidence,
         supplemental_qa_evidence_loader=load_supplemental_qa_evidence,
+        runtime_observer=runtime_observer,
     )
 
 
@@ -537,6 +601,33 @@ def _run_local_canonical(
     media_quality_document_loader: _MediaQualityDocumentLoader | None = None,
     supplemental_qa_evidence_builder: _SupplementalQaEvidenceBuilder | None = None,
     supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
+    runtime_observer: RuntimeObserver | None = None,
+) -> CanonicalLocalRunReceipt:
+    with runtime_span(runtime_observer, "canonical.composition"):
+        return _run_local_canonical_inner(
+            state_root=state_root,
+            run_key=run_key,
+            source_sha256=source_sha256,
+            source_binding_sha256=source_binding_sha256,
+            source_loader=source_loader,
+            media_quality_document_loader=media_quality_document_loader,
+            supplemental_qa_evidence_builder=supplemental_qa_evidence_builder,
+            supplemental_qa_evidence_loader=supplemental_qa_evidence_loader,
+            runtime_observer=runtime_observer,
+        )
+
+
+def _run_local_canonical_inner(
+    *,
+    state_root: Path,
+    run_key: str,
+    source_sha256: str,
+    source_binding_sha256: str,
+    source_loader: _CanonicalSourceLoader,
+    media_quality_document_loader: _MediaQualityDocumentLoader | None = None,
+    supplemental_qa_evidence_builder: _SupplementalQaEvidenceBuilder | None = None,
+    supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run the shared canonical flow after source authorization and binding."""
 
@@ -572,32 +663,57 @@ def _run_local_canonical(
         run_key=run_key,
     )
     try:
-        state_root.mkdir(parents=True, exist_ok=True)
-        completion_repository = SQLitePrimaryCompletionRepository(
-            state_root / "primary-completion.sqlite3",
-            registry=registry,
-        )
-        publish_work = CanonicalActionPublishWorkCoordinator(
-            scheduler=SQLiteWorkScheduler(state_root / "work-scheduler.sqlite3"),
-            repository=completion_repository,
-        )
-        recovered = completion_repository.get(run_id)
-        if recovered is not None:
-            publish_work.reconcile(recovered)
-            outbox_delivery = _reconcile_local_outbox(
-                recovered,
-                state_root=state_root,
-                primary_database_path=completion_repository.path,
+        with runtime_span(runtime_observer, "completion.storage.open"):
+            state_root.mkdir(parents=True, exist_ok=True)
+            completion_repository = SQLitePrimaryCompletionRepository(
+                state_root / "primary-completion.sqlite3",
                 registry=registry,
+                runtime_observer=runtime_observer,
             )
-            media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
-                media_quality_document_loader, registry
+            publish_work = CanonicalActionPublishWorkCoordinator(
+                scheduler=SQLiteWorkScheduler(
+                    state_root / "work-scheduler.sqlite3",
+                    runtime_observer=runtime_observer,
+                ),
+                repository=completion_repository,
             )
-            supplemental_qa_evidence = (
-                None
-                if supplemental_qa_evidence_loader is None
-                else supplemental_qa_evidence_loader(registry)
+        with runtime_span(runtime_observer, "completion.recovery.lookup"):
+            recovered = completion_repository.get(run_id)
+        if recovered is not None:
+            runtime_increment(
+                runtime_observer,
+                "canonical.execution_paths",
+                attributes={"replayed": True},
             )
+            with runtime_span(runtime_observer, "completion.scheduler.reconcile"):
+                publish_work.reconcile(recovered)
+            runtime_increment(
+                runtime_observer,
+                "durable_work.terminal_outcomes",
+                attributes={
+                    "replayed": True,
+                    "stage": "ACTION_PUBLISH",
+                    "state": "SUCCEEDED",
+                },
+            )
+            with runtime_span(runtime_observer, "delivery.outbox.reconcile"):
+                outbox_delivery = _reconcile_local_outbox(
+                    recovered,
+                    state_root=state_root,
+                    primary_database_path=completion_repository.path,
+                    registry=registry,
+                    runtime_observer=runtime_observer,
+                )
+            with runtime_span(runtime_observer, "quality.evidence.load"):
+                media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
+                    media_quality_document_loader,
+                    registry,
+                )
+                supplemental_qa_evidence = (
+                    None
+                    if supplemental_qa_evidence_loader is None
+                    else supplemental_qa_evidence_loader(registry)
+                )
             evidence_references = _local_completion_evidence_references(
                 media_quality_document=media_quality_document,
                 supplemental_qa_evidence=supplemental_qa_evidence,
@@ -617,41 +733,51 @@ def _run_local_canonical(
                 media_quality_binding=media_quality_binding,
                 supplemental_qa_evidence=supplemental_qa_evidence,
                 outbox_delivery=outbox_delivery,
+                runtime_observer=runtime_observer,
             )
 
-        bundle = source_loader(registry)
+        runtime_increment(
+            runtime_observer,
+            "canonical.execution_paths",
+            attributes={"replayed": False},
+        )
+        with runtime_span(runtime_observer, "source.prepare"):
+            bundle = source_loader(registry)
         if bundle.source_content_sha256 != source_sha256:
             raise CanonicalLocalCompositionError(
                 CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
                 "source bytes changed while preparing the canonical run",
             )
-        media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
-            media_quality_document_loader,
-            registry,
-        )
-        supplemental_qa_evidence = (
-            None
-            if supplemental_qa_evidence_builder is None
-            else supplemental_qa_evidence_builder(registry, bundle)
-        )
+        with runtime_span(runtime_observer, "quality.evidence.prepare"):
+            media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
+                media_quality_document_loader,
+                registry,
+            )
+            supplemental_qa_evidence = (
+                None
+                if supplemental_qa_evidence_builder is None
+                else supplemental_qa_evidence_builder(registry, bundle)
+            )
         evidence_references = _local_completion_evidence_references(
             media_quality_document=media_quality_document,
             supplemental_qa_evidence=supplemental_qa_evidence,
         )
-        runtime = _build_runtime(
-            state_root=state_root,
-            run_id=run_id,
-            registry=registry,
-            execution_policy=execution_policy,
-            coarse_qa_policy=coarse_qa_policy,
-            dense_qa_policy=dense_qa_policy,
-            event_proposal_policy=event_proposal_policy,
-            action_evidence_policy=action_evidence_policy,
-            boundary_refinement_policy=boundary_refinement_policy,
-            inference_policy=inference_policy,
-            clock_value=clock_value,
-            observed_at=started_at,
-        )
+        with runtime_span(runtime_observer, "canonical.runtime.build"):
+            runtime = _build_runtime(
+                state_root=state_root,
+                run_id=run_id,
+                registry=registry,
+                execution_policy=execution_policy,
+                coarse_qa_policy=coarse_qa_policy,
+                dense_qa_policy=dense_qa_policy,
+                event_proposal_policy=event_proposal_policy,
+                action_evidence_policy=action_evidence_policy,
+                boundary_refinement_policy=boundary_refinement_policy,
+                inference_policy=inference_policy,
+                clock_value=clock_value,
+                observed_at=started_at,
+                runtime_observer=runtime_observer,
+            )
         processing_run = CanonicalProcessingRunContext.fresh(
             run_id=run_id,
             recording_identity=bundle.admitted_context.recording_identity,
@@ -660,18 +786,25 @@ def _run_local_canonical(
             config_sha256=execution_policy.semantic_sha256,
             started_at=started_at,
         )
-        processing_run = CanonicalProcessingRunContext.resume(
-            completion_repository.begin_run(processing_run)
-        )
-        result = asyncio.run(
-            runtime.pipeline.run(
-                processing_run=processing_run,
-                admitted_context=bundle.admitted_context,
-                requested_interval=bundle.requested_interval,
-                sampling_plan=bundle.sampling_plan,
-                frame_index=bundle.frame_index,
-                artifact_resolver=bundle.resolve_artifact,
+        with runtime_span(runtime_observer, "completion.run.begin"):
+            processing_run = CanonicalProcessingRunContext.resume(
+                completion_repository.begin_run(processing_run)
             )
+        with runtime_span(runtime_observer, "inference.pipeline"):
+            result = asyncio.run(
+                runtime.pipeline.run(
+                    processing_run=processing_run,
+                    admitted_context=bundle.admitted_context,
+                    requested_interval=bundle.requested_interval,
+                    sampling_plan=bundle.sampling_plan,
+                    frame_index=bundle.frame_index,
+                    artifact_resolver=bundle.resolve_artifact,
+                )
+            )
+        runtime_increment(
+            runtime_observer,
+            "inference.fixture_calls",
+            result.adapter_infer_calls,
         )
         if result.status not in {
             CanonicalOfflineRunStatus.SUCCEEDED,
@@ -707,29 +840,43 @@ def _run_local_canonical(
                 allocator=_DeterministicLocalEventIdAllocator(),
                 output_admission_policy=execution_policy.output_admission_policy,
             )
-            prepared_identities = identity_service.prepare_batch(
-                snapshot=completion_repository.snapshot(result.recording_identity),
-                admitted_context=bundle.admitted_context,
-                hypotheses=result.hypotheses,
-                enriched_outputs=enriched_outputs,
-                decided_at=decided_at,
-            )
+            with runtime_span(runtime_observer, "completion.identity.prepare"):
+                prepared_identities = identity_service.prepare_batch(
+                    snapshot=completion_repository.snapshot(result.recording_identity),
+                    admitted_context=bundle.admitted_context,
+                    hypotheses=result.hypotheses,
+                    enriched_outputs=enriched_outputs,
+                    decided_at=decided_at,
+                )
 
-        publications = prepare_initial_action_event_publications(
-            context=bundle.admitted_context,
-            result=result,
-            prepared_identities=prepared_identities,
-            execution_policy=execution_policy,
+        with runtime_span(runtime_observer, "completion.publications.prepare"):
+            publications = prepare_initial_action_event_publications(
+                context=bundle.admitted_context,
+                result=result,
+                prepared_identities=prepared_identities,
+                execution_policy=execution_policy,
+            )
+        with runtime_span(runtime_observer, "completion.evidence.audit"):
+            runtime.inference_evidence.verify_integrity()
+        with runtime_span(runtime_observer, "completion.command.serialize_validate"):
+            command = create_primary_completion_command(
+                result=result,
+                prepared_identities=prepared_identities,
+                action_event_publications=publications,
+                evidence_references=evidence_references,
+                registry=registry,
+            )
+        with runtime_span(runtime_observer, "completion.commit"):
+            commit_result = publish_work.commit(command)
+        runtime_increment(
+            runtime_observer,
+            "durable_work.terminal_outcomes",
+            attributes={
+                "replayed": commit_result.replayed,
+                "stage": "ACTION_PUBLISH",
+                "state": "SUCCEEDED",
+            },
         )
-        runtime.inference_evidence.verify_integrity()
-        command = create_primary_completion_command(
-            result=result,
-            prepared_identities=prepared_identities,
-            action_event_publications=publications,
-            evidence_references=evidence_references,
-            registry=registry,
-        )
-        commit_result = publish_work.commit(command)
         return _receipt(
             commit_result.committed,
             replayed=commit_result.replayed,
@@ -739,6 +886,7 @@ def _run_local_canonical(
             registry=registry,
             media_quality_binding=media_quality_binding,
             supplemental_qa_evidence=supplemental_qa_evidence,
+            runtime_observer=runtime_observer,
         )
     except CanonicalLocalCompositionError:
         raise
@@ -784,15 +932,18 @@ def _build_runtime(
     inference_policy: InferencePolicy,
     clock_value: datetime,
     observed_at: str,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> _LocalCanonicalRuntime:
     """Compose runtime adapters from the exact policies bound into the run ID."""
 
     inference_evidence = SQLiteInferenceEvidenceLedger(
         state_root / "inference-evidence.sqlite3",
         registry,
+        runtime_observer=runtime_observer,
     )
     barrier_storage = SQLiteBarrierStorage(
-        state_root / "runs" / run_id / "inference-call-barrier.sqlite3"
+        state_root / "runs" / run_id / "inference-call-barrier.sqlite3",
+        runtime_observer=runtime_observer,
     )
     parser = StrictProviderClaimParser(
         registry,
@@ -841,13 +992,17 @@ def _build_runtime(
         boundary_refinement_policy=boundary_refinement_policy,
         inference_policy=inference_policy,
         schema_registry=registry,
-        logical_node_registry=LocalLogicalNodeRegistry(state_root / "logical-nodes"),
+        logical_node_registry=LocalLogicalNodeRegistry(
+            state_root / "logical-nodes",
+            runtime_observer=runtime_observer,
+        ),
         execution_policy=execution_policy,
         inference_ledger=inference_evidence,
         evidence_store=inference_evidence,
         barrier_storage=barrier_storage,
         call_barrier_storage=barrier_storage,
         clock=lambda: clock_value,
+        runtime_observer=runtime_observer,
     )
     return _LocalCanonicalRuntime(
         registry=registry,
@@ -1472,6 +1627,7 @@ def _reconcile_local_outbox(
     state_root: Path,
     primary_database_path: Path,
     registry: SchemaRegistry,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> LocalOutboxDeliverySummary:
     try:
         return reconcile_local_primary_outbox(
@@ -1479,6 +1635,7 @@ def _reconcile_local_outbox(
             sink_database_path=state_root / "outbox-sink.sqlite3",
             outbox=committed.outbox,
             registry=registry,
+            runtime_observer=runtime_observer,
         )
     except Exception as error:
         # Completion is already authoritative; delivery remains observable recovery work.
@@ -1496,28 +1653,61 @@ def _receipt(
     media_quality_binding: LocalMediaQualityBinding | None,
     supplemental_qa_evidence: LocalSupplementalQaEvidence | None,
     outbox_delivery: LocalOutboxDeliverySummary | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> CanonicalLocalRunReceipt:
     publications = committed.action_event_publications.publications
-    delivery = (
-        outbox_delivery
-        if outbox_delivery is not None
-        else _reconcile_local_outbox(
-            committed,
-            state_root=state_root,
-            primary_database_path=primary_database_path,
-            registry=registry,
-        )
+    if outbox_delivery is None:
+        with runtime_span(runtime_observer, "delivery.outbox.reconcile"):
+            delivery = _reconcile_local_outbox(
+                committed,
+                state_root=state_root,
+                primary_database_path=primary_database_path,
+                registry=registry,
+                runtime_observer=runtime_observer,
+            )
+    else:
+        delivery = outbox_delivery
+    runtime_increment(
+        runtime_observer,
+        "delivery.outbox.outcomes",
+        attributes={"outcome": delivery.outcome.value, "replayed": replayed},
     )
-    try:
-        review = route_local_review_after_completion(
-            committed,
-            state_root=state_root,
-            registry=registry,
-            media_quality_binding=media_quality_binding,
+    if delivery.relay_attempt_count:
+        runtime_increment(
+            runtime_observer,
+            "delivery.outbox.relay_attempts",
+            delivery.relay_attempt_count,
+            {"replayed": replayed},
         )
-    except Exception as error:
-        # Review is downstream of primary completion and cannot replace its truth.
-        review = failed_local_review_routing(error)
+    with runtime_span(runtime_observer, "review.route"):
+        try:
+            review = route_local_review_after_completion(
+                committed,
+                state_root=state_root,
+                registry=registry,
+                media_quality_binding=media_quality_binding,
+                runtime_observer=runtime_observer,
+            )
+        except Exception as error:
+            # Review is downstream of primary completion and cannot replace its truth.
+            review = failed_local_review_routing(error)
+    runtime_increment(
+        runtime_observer,
+        "review.routing_outcomes",
+        attributes={"disposition": review.disposition.value, "replayed": replayed},
+    )
+    if committed.outbox:
+        runtime_increment(
+            runtime_observer,
+            "delivery.outbox.committed_rows_observed",
+            len(committed.outbox),
+            {"replayed": replayed},
+        )
+    runtime_increment(
+        runtime_observer,
+        "completion.receipts",
+        attributes={"replayed": replayed, "status": committed.detail.status},
+    )
     return CanonicalLocalRunReceipt(
         schema_version="1.0",
         model_version=LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION,

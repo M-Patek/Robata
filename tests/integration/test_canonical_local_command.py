@@ -25,6 +25,7 @@ from robata.application.canonical.local_composition import (
 from robata.application.canonical.local_outbox_delivery import LocalOutboxDeliveryOutcome
 from robata.queue.models import WorkAttemptOutcome, WorkItemState
 from robata.review.routing import ReviewRoutingDisposition
+from robata.runtime.observability import RuntimeProfileRecorder
 
 SOURCE_FIXTURE = Path(__file__).parents[1] / "fixtures" / "canonical" / "source-recording.json"
 
@@ -104,6 +105,115 @@ def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> N
     assert unreconciled.outbox_delivery.outcome is LocalOutboxDeliveryOutcome.FAILED
     assert unreconciled.outbox_delivery.last_error is not None
     assert "cannot reconcile delivered rows" in unreconciled.outbox_delivery.last_error
+
+
+def test_runtime_observation_preserves_canonical_identity_and_replay(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    recorder = RuntimeProfileRecorder()
+
+    observed = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="instrumented-exact-replay",
+        runtime_observer=recorder,
+    )
+    profile = recorder.snapshot()
+    replay_recorder = RuntimeProfileRecorder()
+    replay = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="instrumented-exact-replay",
+        runtime_observer=replay_recorder,
+    )
+    replay_profile = replay_recorder.snapshot()
+
+    _assert_local_conformance(observed)
+    assert observed.replayed is False
+    assert replay.replayed is True
+    assert replay.fixture_inference_calls == 0
+    assert replay.run_id == observed.run_id
+    assert replay.recording_identity == observed.recording_identity
+    assert replay.command_sha256 == observed.command_sha256
+    assert replay.completion_semantic_sha256 == observed.completion_semantic_sha256
+    assert replay.event_ids == observed.event_ids
+    assert replay.revision_ids == observed.revision_ids
+    assert replay.outbox_ids == observed.outbox_ids
+    span_names = {span.name for span in profile.spans}
+    assert {
+        "canonical.composition",
+        "inference.pipeline",
+        "inference.orchestration",
+        "inference.provider_dispatch",
+        "sqlite.inference_evidence.transaction",
+        "sqlite.inference_evidence.begin",
+        "sqlite.inference_evidence.integrity_check",
+        "sqlite.inference_evidence.operation",
+        "sqlite.inference_evidence.commit",
+        "sqlite.barrier.transaction",
+        "sqlite.work_scheduler.transaction",
+        "sqlite.logical_node_registry.transaction",
+        "sqlite.primary_completion.transaction",
+        "sqlite.outbox_delivery.transaction",
+        "sqlite.outbox_sink.transaction",
+        "sqlite.review_queue.transaction",
+        "completion.commit",
+        "delivery.outbox.reconcile",
+        "review.route",
+    } <= span_names
+    transaction_count = sum(
+        counter.value
+        for counter in profile.counters
+        if counter.name == "sqlite.inference_evidence.transactions"
+    )
+    assert transaction_count > observed.fixture_inference_calls
+    provider_dispatch_count = sum(
+        counter.value
+        for counter in profile.counters
+        if counter.name == "inference.provider_dispatches"
+    )
+    assert provider_dispatch_count == observed.fixture_inference_calls
+    assert (
+        sum(
+            counter.value
+            for counter in profile.counters
+            if counter.name == "durable_work.terminal_outcomes"
+        )
+        == 1
+    )
+    replay_span_names = {span.name for span in replay_profile.spans}
+    assert "delivery.outbox.reconcile" in replay_span_names
+    assert "delivery.outbox.relay" not in replay_span_names
+    assert "inference.provider_dispatch" not in replay_span_names
+    assert not any(
+        counter.name == "inference.provider_dispatches" for counter in replay_profile.counters
+    )
+    assert (
+        sum(
+            counter.value
+            for counter in replay_profile.counters
+            if counter.name == "durable_work.terminal_outcomes"
+        )
+        == 1
+    )
+    assert any(
+        counter.name == "delivery.outbox.outcomes"
+        and any(
+            attribute.name == "outcome" and attribute.value == replay.outbox_delivery.outcome.value
+            for attribute in counter.attributes
+        )
+        for counter in replay_profile.counters
+    )
+    assert any(
+        counter.name == "review.routing_outcomes"
+        and any(
+            attribute.name == "disposition"
+            and attribute.value == replay.review_routing.disposition.value
+            for attribute in counter.attributes
+        )
+        for counter in replay_profile.counters
+    )
 
 
 def test_committed_completion_reconciles_publish_work_after_crash(

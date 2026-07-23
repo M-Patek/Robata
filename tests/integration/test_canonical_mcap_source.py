@@ -28,6 +28,7 @@ from robata.contracts.cameras import CAMERA_IDS
 from robata.contracts.hashing import canonical_json_bytes
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.review.routing import ReviewRoutingDisposition
+from robata.runtime.observability import RuntimeProfileRecorder, RuntimeSpanStatus
 from tests.support.six_camera_mcap import (
     SIX_CAMERA_MCAP_SHA256,
     SIX_CAMERA_TOPICS,
@@ -103,18 +104,116 @@ def test_real_mcap_builds_admitted_canonical_source_bundle(tmp_path: Path) -> No
     assert "dropped_by_total_budget" in supplemental
 
 
+def test_runtime_observation_preserves_canonical_source_facts(tmp_path: Path) -> None:
+    source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
+    authorization = authorize_mcap_mapping(
+        _write_mapping(tmp_path / "mapping.json"),
+        allow_unapproved_profile=True,
+    )
+    state_dir = tmp_path / "media-state"
+    baseline = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=state_dir,
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    recorder = RuntimeProfileRecorder()
+
+    observed = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=state_dir,
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+        runtime_observer=recorder,
+    )
+    snapshot = recorder.snapshot()
+
+    assert observed.source_content_sha256 == baseline.source_content_sha256
+    assert observed.admitted_context == baseline.admitted_context
+    assert observed.requested_interval == baseline.requested_interval
+    assert observed.sampling_plan == baseline.sampling_plan
+    assert observed.frame_index == baseline.frame_index
+    assert observed.media_quality_report == baseline.media_quality_report
+    assert dict(observed._artifacts) == dict(baseline._artifacts)
+    source_spans = tuple(span for span in snapshot.spans if span.parent_sequence is None)
+    assert tuple(span.name for span in source_spans) == (
+        "source.inspect",
+        "source.mapping.resolve",
+        "source.demux.probe",
+        "source.export",
+        "source.export.validate",
+        "source.decode.ledger_load",
+        "source.metadata.build",
+        "source.frame_index",
+        "source.quality.timing",
+        "source.materialize",
+        "source.quality.report",
+        "source.quality.publish",
+    )
+    assert all(span.status is RuntimeSpanStatus.OK for span in snapshot.spans)
+    assert any(
+        span.name == "sqlite.artifact_registry.transaction" and span.parent_sequence is not None
+        for span in snapshot.spans
+    )
+    assert all(
+        {attribute.name: attribute.value for attribute in span.attributes}["camera_count"]
+        == len(CAMERA_IDS)
+        for span in source_spans
+    )
+
+    counters = {
+        counter.name: counter.value
+        for counter in snapshot.counters
+        if counter.name.startswith("source.")
+    }
+    indexed_frame_count = sum(
+        len(observed.frame_index.cameras[camera_id].frames) for camera_id in CAMERA_IDS
+    )
+    quality_observation_count = sum(
+        len(ledger.decoded_observations) for ledger in observed.media_quality_report.camera_ledgers
+    )
+    source_timestamps = tuple(
+        frame.source_timestamp_ns
+        for camera_id in CAMERA_IDS
+        for frame in observed.frame_index.cameras[camera_id].frames
+    )
+    assert counters == {
+        "source.frame_observations": quality_observation_count,
+        "source.frame_index.frames": indexed_frame_count,
+        "source.materialized_artifacts": len(observed._artifacts),
+        "source.message_count": indexed_frame_count,
+        "source.recording_duration_ns": (
+            observed.admitted_context.ready_manifest.recording.duration_ns
+        ),
+        "source.requested_duration_ns": observed.requested_interval.duration_ns,
+        "source.span_duration_ns": max(source_timestamps) - min(source_timestamps),
+    }
+    assert (
+        sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.artifact_registry.transactions"
+        )
+        > 0
+    )
+
+
 def test_cache_miss_lazily_materializes_exact_verified_frame(tmp_path: Path) -> None:
     source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
     authorization = authorize_mcap_mapping(
         _write_mapping(tmp_path / "mapping.json"),
         allow_unapproved_profile=True,
     )
+    recorder = RuntimeProfileRecorder()
     bundle = load_canonical_mcap_source(
         source,
         authorization=authorization,
         state_dir=tmp_path / "media-state",
         expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
         clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+        runtime_observer=recorder,
     )
     camera_id = CAMERA_IDS[1]
     frame = bundle.frame_index.cameras[camera_id].frames[-1]
@@ -131,6 +230,27 @@ def test_cache_miss_lazily_materializes_exact_verified_frame(tmp_path: Path) -> 
     tampered = frame.model_copy(update={"source_timestamp_ns": frame.source_timestamp_ns + 1})
     with pytest.raises(CanonicalMcapSourceError, match="canonical frame index"):
         bundle.resolve_artifact(camera_id, tampered)
+    snapshot = recorder.snapshot()
+    lazy_spans = tuple(span for span in snapshot.spans if span.name == "source.lazy_materialize")
+    assert len(lazy_spans) == 1
+    assert all(span.status is RuntimeSpanStatus.OK for span in lazy_spans)
+    assert any(span.name == "sqlite.artifact_registry.transaction" for span in snapshot.spans)
+    resolver_counts = {
+        next(
+            attribute.value for attribute in counter.attributes if attribute.name == "cache"
+        ): counter.value
+        for counter in snapshot.counters
+        if counter.name == "source.artifact_resolver.requests"
+    }
+    assert resolver_counts == {"HIT": 2, "MISS": 1}
+    assert (
+        sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "source.lazy_materialized_artifacts"
+        )
+        == 1
+    )
 
 
 def test_max_duration_clamps_half_open_source_and_quality_window(tmp_path: Path) -> None:
@@ -139,6 +259,7 @@ def test_max_duration_clamps_half_open_source_and_quality_window(tmp_path: Path)
         _write_mapping(tmp_path / "mapping.json"),
         allow_unapproved_profile=True,
     )
+    recorder = RuntimeProfileRecorder()
     bundle = load_canonical_mcap_source(
         source,
         authorization=authorization,
@@ -146,6 +267,7 @@ def test_max_duration_clamps_half_open_source_and_quality_window(tmp_path: Path)
         expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
         max_duration_ns=250_000_000,
         clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+        runtime_observer=recorder,
     )
 
     assert bundle.requested_interval.start_ns == 0
@@ -160,6 +282,13 @@ def test_max_duration_clamps_half_open_source_and_quality_window(tmp_path: Path)
         outside = bundle.frame_index.cameras[camera_id].frames[-1]
         assert outside.alignment_projection.aligned_timestamp_ns >= bundle.requested_interval.end_ns
         assert bundle.resolve_artifact(camera_id, outside) is None
+    materialize_span = next(
+        span for span in recorder.snapshot().spans if span.name == "source.materialize"
+    )
+    assert {attribute.name: attribute.value for attribute in materialize_span.attributes} == {
+        "camera_count": len(CAMERA_IDS),
+        "max_duration_limited": True,
+    }
 
 
 def test_existing_quality_report_bytes_fail_closed(tmp_path: Path) -> None:

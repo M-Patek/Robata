@@ -26,8 +26,9 @@ from robata.inference.models import (
     InferenceStatus,
     inference_attempt_selection_logical_key,
 )
-from robata.queue.barrier import BarrierCoordinator, ReductionPolicy
+from robata.queue.barrier import Barrier, BarrierCoordinator, ReductionPolicy
 from robata.queue.stage import StageStatus
+from robata.runtime.observability import RuntimeProfileRecorder
 
 NOW = "2026-07-20T12:00:00Z"
 
@@ -38,6 +39,54 @@ def _uuid(value: int) -> str:
 
 def _digest(value: int) -> str:
     return f"{value:064x}"
+
+
+def test_observes_exact_transaction_boundaries_and_actual_rollback(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    storage = SQLiteBarrierStorage(
+        tmp_path / "barriers.sqlite3",
+        runtime_observer=recorder,
+    )
+    barrier = Barrier(
+        barrier_id=_uuid(900),
+        logical_key="observed-barrier",
+        expected_member_count=1,
+        empty_semantics=StageStatus.SKIPPED_NOT_NEEDED.value,
+        reduction_policy="reduce-1",
+        status="OPEN",
+        required_success_count=1,
+        max_degraded_failures=0,
+    )
+    storage.save_barrier(barrier)
+
+    conflicting = barrier.model_copy(update={"logical_key": "conflicting-barrier"})
+    with pytest.raises(ValueError, match="different definition"):
+        storage.save_barrier(conflicting)
+
+    snapshot = recorder.snapshot()
+    transactions = tuple(
+        counter for counter in snapshot.counters if counter.name == "sqlite.barrier.transactions"
+    )
+    commits = sum(
+        counter.value for counter in snapshot.counters if counter.name == "sqlite.barrier.commits"
+    )
+    rollbacks = sum(
+        counter.value for counter in snapshot.counters if counter.name == "sqlite.barrier.rollbacks"
+    )
+    writes = {
+        attribute.value
+        for counter in transactions
+        for attribute in counter.attributes
+        if attribute.name == "write"
+    }
+
+    assert sum(counter.value for counter in transactions) == 4
+    assert commits == 3
+    assert rollbacks == 1
+    assert writes == {False, True}
+    assert sum(span.name == "sqlite.barrier.transaction" for span in snapshot.spans) == 4
 
 
 def _declare(storage: SQLiteBarrierStorage) -> InferenceCallBarrierDefinition:
