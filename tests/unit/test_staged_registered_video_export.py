@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -103,6 +104,17 @@ def test_staged_publication_calls_single_traversal_once_and_skips_exporter(
     assert tuple(path.name for path in published.output_directory.glob("*.mp4")) == tuple(
         f"{camera_id.value}.mp4" for camera_id in CAMERA_IDS
     )
+    for record in published.manifest.cameras:
+        view_path = published.output_directory / f"{record.camera_id.value}.mp4"
+        blob_path = (
+            tmp_path
+            / "registry"
+            / "blobs"
+            / "sha256"
+            / record.video_artifact.sha256[:2]
+            / record.video_artifact.sha256
+        )
+        assert os.path.samefile(view_path, blob_path)
 
 
 def test_staged_publication_rejects_source_identity_mismatch_without_commit(

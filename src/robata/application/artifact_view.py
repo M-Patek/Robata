@@ -351,6 +351,29 @@ def _copy_registry_blob(source: Path, destination: Path, artifact: _ViewArtifact
         raise _FileValidationError("registry manifest changed while being copied")
 
 
+def _materialize_registry_blob(
+    source: Path,
+    destination: Path,
+    artifact: _ViewArtifact,
+) -> None:
+    """Prefer a same-filesystem hardlink and copy only when links are unsupported."""
+
+    try:
+        os.link(source, destination, follow_symlinks=False)
+        return
+    except OSError as error:
+        unsupported = {
+            errno.EXDEV,
+            errno.EPERM,
+            errno.EACCES,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if error.errno not in unsupported:
+            raise
+    _copy_registry_blob(source, destination, artifact)
+
+
 def _sync_directory(directory: Path) -> None:
     if os.name == "nt":
         return
@@ -460,7 +483,7 @@ def materialize_camera_video_view(
         try:
             for artifact in artifacts:
                 source = sources[artifact.entry.artifact_id]
-                _copy_registry_blob(source, staging / artifact.filename, artifact)
+                _materialize_registry_blob(source, staging / artifact.filename, artifact)
             _validate_view(staging, artifacts)
             _sync_directory(staging)
         except _FileValidationError as error:

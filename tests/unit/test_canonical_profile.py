@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -296,6 +297,34 @@ def test_state_snapshot_rejects_nonempty_wal_without_mutating_it(tmp_path: Path)
         assert "nonempty SQLite WAL" in error.detail
     finally:
         connection.close()
+
+
+def test_state_snapshot_counts_hardlinked_view_bytes_once(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    blob = state / "artifact-registry" / "blobs" / "sha256" / "aa" / ("a" * 64)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"one physical payload")
+    view = state / "video-view" / "cam_01.mp4"
+    view.parent.mkdir()
+    os.link(blob, view)
+
+    snapshot = snapshot_state_tree(state)
+    reconciliation = build_profile_reconciliation(
+        observer=_observer(),
+        state_after=snapshot,
+        manifest=_manifest(),
+        execution_mode="UNKNOWN",
+    )
+
+    assert snapshot.file_identity_status == "AVAILABLE"
+    assert snapshot.file_count == 2
+    assert snapshot.unique_file_count == 1
+    assert snapshot.byte_count == 2 * len(b"one physical payload")
+    assert snapshot.unique_byte_count == len(b"one physical payload")
+    assert snapshot.hardlink_duplicate_path_count == 1
+    assert snapshot.hardlink_duplicate_path_bytes == len(b"one physical payload")
+    assert reconciliation.artifact_bytes.physical_duplication_status == "AVAILABLE"
+    assert reconciliation.artifact_bytes.unique_state_bytes == len(b"one physical payload")
 
 
 def test_duration_discovery_selects_matching_source_and_half_open_interval(

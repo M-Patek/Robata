@@ -230,6 +230,11 @@ class StateTreeSnapshot(StrictModel):
     byte_count: NonNegativeInt
     classes: tuple[StateFileClassSnapshot, ...]
     sqlite_databases: tuple[SQLiteDatabaseSnapshot, ...]
+    file_identity_status: Literal["AVAILABLE", "NOT_AVAILABLE"] = "NOT_AVAILABLE"
+    unique_file_count: NonNegativeInt | None = None
+    unique_byte_count: NonNegativeInt | None = None
+    hardlink_duplicate_path_count: NonNegativeInt | None = None
+    hardlink_duplicate_path_bytes: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_accounting(self) -> Self:
@@ -242,6 +247,26 @@ class StateTreeSnapshot(StrictModel):
         paths = tuple(item.relative_path for item in self.sqlite_databases)
         if paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
             raise ValueError("SQLite database snapshots must be unique and ordered")
+        identity_values = (
+            self.unique_file_count,
+            self.unique_byte_count,
+            self.hardlink_duplicate_path_count,
+            self.hardlink_duplicate_path_bytes,
+        )
+        if self.file_identity_status == "NOT_AVAILABLE":
+            if any(value is not None for value in identity_values):
+                raise ValueError("unavailable file identity cannot report unique-byte facts")
+            return self
+        if any(value is None for value in identity_values):
+            raise ValueError("available file identity requires complete unique-byte facts")
+        assert self.unique_file_count is not None
+        assert self.unique_byte_count is not None
+        assert self.hardlink_duplicate_path_count is not None
+        assert self.hardlink_duplicate_path_bytes is not None
+        if self.unique_file_count + self.hardlink_duplicate_path_count != self.file_count:
+            raise ValueError("unique and duplicate file paths do not reconcile")
+        if self.unique_byte_count + self.hardlink_duplicate_path_bytes != self.byte_count:
+            raise ValueError("unique and duplicate file bytes do not reconcile")
         return self
 
 
@@ -381,7 +406,9 @@ class ArtifactByteReconciliation(StrictModel):
     json_bytes: NonNegativeInt
     content_addressed_blob_bytes: NonNegativeInt
     other_bytes: NonNegativeInt
-    physical_duplication_status: Literal["NOT_AVAILABLE"] = "NOT_AVAILABLE"
+    physical_duplication_status: Literal["AVAILABLE", "NOT_AVAILABLE"] = "NOT_AVAILABLE"
+    unique_state_bytes: NonNegativeInt | None = None
+    hardlink_duplicate_path_bytes: NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_state_sum(self) -> Self:
@@ -397,6 +424,17 @@ class ArtifactByteReconciliation(StrictModel):
         )
         if classes_sum != self.state_bytes:
             raise ValueError("artifact byte classes do not reconcile to state_bytes")
+        if self.physical_duplication_status == "NOT_AVAILABLE":
+            if (
+                self.unique_state_bytes is not None
+                or self.hardlink_duplicate_path_bytes is not None
+            ):
+                raise ValueError("unavailable file identity cannot report physical bytes")
+            return self
+        if self.unique_state_bytes is None or self.hardlink_duplicate_path_bytes is None:
+            raise ValueError("available file identity requires physical byte accounting")
+        if self.unique_state_bytes + self.hardlink_duplicate_path_bytes != self.state_bytes:
+            raise ValueError("physical and duplicate path bytes do not reconcile")
         return self
 
 
@@ -547,6 +585,9 @@ def snapshot_state_tree(
     excluded = frozenset(path.resolve() for path in excluded_paths)
     counts = {file_class: [0, 0] for file_class in _STATE_FILE_CLASS_ORDER}
     files: list[tuple[str, Path, StateFileClass, int]] = []
+    identities: dict[tuple[int, int], int] = {}
+    file_identity_available = True
+    unique_byte_count = 0
     if root.exists():
         for path in root.rglob("*"):
             resolved = path.resolve()
@@ -564,6 +605,21 @@ def snapshot_state_tree(
             files.append((relative, path, file_class, byte_count))
             counts[file_class][0] += 1
             counts[file_class][1] += byte_count
+            try:
+                identity_stat = path.lstat() if path.is_symlink() else path.stat()
+            except OSError:
+                file_identity_available = False
+            else:
+                identity = (identity_stat.st_dev, identity_stat.st_ino)
+                if identity_stat.st_ino == 0:
+                    file_identity_available = False
+                elif identity not in identities:
+                    identities[identity] = byte_count
+                    unique_byte_count += byte_count
+                elif identities[identity] != byte_count:
+                    raise CanonicalProfileError(
+                        f"hardlinked state paths report different sizes for '{relative}'"
+                    )
 
     files.sort(key=lambda item: item[0])
     database_snapshots = tuple(
@@ -586,6 +642,17 @@ def snapshot_state_tree(
         byte_count=sum(item.byte_count for item in classes),
         classes=classes,
         sqlite_databases=database_snapshots,
+        file_identity_status=("AVAILABLE" if file_identity_available else "NOT_AVAILABLE"),
+        unique_file_count=(len(identities) if file_identity_available else None),
+        unique_byte_count=(unique_byte_count if file_identity_available else None),
+        hardlink_duplicate_path_count=(
+            len(files) - len(identities) if file_identity_available else None
+        ),
+        hardlink_duplicate_path_bytes=(
+            sum(item[3] for item in files) - unique_byte_count
+            if file_identity_available
+            else None
+        ),
     )
 
 
@@ -902,6 +969,9 @@ def _reconcile_artifact_bytes(
         json_bytes=class_values["json_bytes"],
         content_addressed_blob_bytes=class_values["content_addressed_blob_bytes"],
         other_bytes=class_values["other_bytes"],
+        physical_duplication_status=snapshot.file_identity_status,
+        unique_state_bytes=snapshot.unique_byte_count,
+        hardlink_duplicate_path_bytes=snapshot.hardlink_duplicate_path_bytes,
     )
 
 
