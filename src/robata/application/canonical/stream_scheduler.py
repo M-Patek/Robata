@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 from uuid import UUID, uuid5
@@ -74,18 +74,40 @@ from robata.queue.stream_models import (
 )
 
 INTERNAL_STREAM_EXECUTION_PROJECTION_VERSION: Final = "internal-stream-execution-projection-v1"
-STREAM_WINDOW_DAG_POLICY_VERSION: Final = "stream-window-dag-v1"
+STREAM_WINDOW_DAG_POLICY_VERSION: Final = "stream-window-dag-v2"
 WATERMARK_SOURCE_FACTS_PROJECTION_VERSION: Final = "bounded-watermark-source-facts-v1"
 PLANNER_EOS_PROJECTION_VERSION: Final = "bounded-planner-eos-v1"
 
 _INTERNAL_EXECUTION_NAMESPACE: Final = UUID("d13666a6-112f-5ab7-9f70-240de5557fe1")
 _INTERNAL_DEPENDENCY_NAMESPACE: Final = UUID("67d7e565-bc31-55e1-9168-57331a0c6eb3")
 
-_WINDOW_DAG_STAGES: Final = (
-    StreamStage.WINDOW,
-    StreamStage.QA_COARSE,
-    StreamStage.WINDOW_REDUCTION,
+_WINDOW_DAG_TOPOLOGY: Final = (
+    (StreamStage.WINDOW, ()),
+    (StreamStage.QA_COARSE, (StreamStage.WINDOW,)),
+    (StreamStage.QA_DENSE, (StreamStage.QA_COARSE,)),
+    (
+        StreamStage.EVENT_PROPOSAL,
+        (StreamStage.QA_COARSE, StreamStage.QA_DENSE),
+    ),
+    (StreamStage.ACTION_DENSE, (StreamStage.EVENT_PROPOSAL,)),
+    (StreamStage.BOUNDARY_REFINEMENT, (StreamStage.ACTION_DENSE,)),
+    (
+        StreamStage.WINDOW_REDUCTION,
+        (
+            StreamStage.WINDOW,
+            StreamStage.QA_COARSE,
+            StreamStage.QA_DENSE,
+            StreamStage.EVENT_PROPOSAL,
+            StreamStage.ACTION_DENSE,
+            StreamStage.BOUNDARY_REFINEMENT,
+        ),
+    ),
 )
+_WINDOW_DAG_STAGES: Final = tuple(stage for stage, _dependencies in _WINDOW_DAG_TOPOLOGY)
+
+# Local-conformance scheduling budgets. They are operational fields rather than
+# logical-identity inputs and remain explicitly unqualified for production SLOs.
+_LOCAL_STAGE_SLA_STEP_SECONDS: Final = 5 * 60
 
 _STAGE_EXECUTION_PROJECTION: Final = {
     StreamStage.SEGMENT: Stage.MCAP_INGEST,
@@ -712,38 +734,56 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
     ) -> tuple[StreamWorkItemPlan, ...]:
         plans: list[StreamWorkItemPlan] = []
         authority_created_at = self._timestamp_now() if created_at is None else created_at
-        for stage in _WINDOW_DAG_STAGES:
-            dependencies: tuple[StreamWorkDependency, ...] = ()
-            if plans:
-                dependencies = (
-                    StreamWorkDependency(
-                        upstream_work_logical_key=plans[-1].work_logical_key,
-                        criticality=DependencyCriticality.REQUIRED,
+        authority_created = _parse_timestamp(authority_created_at)
+        plans_by_stage: dict[StreamStage, StreamWorkItemPlan] = {}
+        for stage_index, (stage, upstream_stages) in enumerate(_WINDOW_DAG_TOPOLOGY):
+            dependencies = tuple(
+                sorted(
+                    (
+                        StreamWorkDependency(
+                            upstream_work_logical_key=plans_by_stage[
+                                upstream_stage
+                            ].work_logical_key,
+                            criticality=DependencyCriticality.DEGRADABLE,
+                        )
+                        for upstream_stage in upstream_stages
                     ),
+                    key=lambda value: value.upstream_work_logical_key,
                 )
+            )
             input_digest = semantic_sha256(
                 {
                     "version": STREAM_WINDOW_DAG_POLICY_VERSION,
                     "window_semantic_sha256": window.window_semantic_sha256,
                     "stage": stage.value,
-                    "ordered_upstream_work_keys": [
-                        value.upstream_work_logical_key for value in dependencies
+                    "ordered_upstream_work": [
+                        {
+                            "work_logical_key": value.upstream_work_logical_key,
+                            "criticality": value.criticality.value,
+                        }
+                        for value in dependencies
                     ],
                 }
             )
-            plans.append(
-                create_stream_work_item_plan(
-                    schema_ref=self._schema_refs.stream_work_plan,
-                    stream_run_id=self._stream_run_id,
-                    source_subject=self._source_subject,
-                    stage=stage,
-                    subject=window.reference(),
-                    input_semantic_sha256=input_digest,
-                    config_semantic_sha256=self._dag_config_semantic_sha256,
-                    ordered_dependencies=dependencies,
-                    created_at=authority_created_at,
-                )
+            plan = create_stream_work_item_plan(
+                schema_ref=self._schema_refs.stream_work_plan,
+                stream_run_id=self._stream_run_id,
+                source_subject=self._source_subject,
+                stage=stage,
+                subject=window.reference(),
+                input_semantic_sha256=input_digest,
+                config_semantic_sha256=self._dag_config_semantic_sha256,
+                ordered_dependencies=dependencies,
+                sla_deadline_at=_format_timestamp(
+                    authority_created
+                    + timedelta(
+                        seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (stage_index + 1)
+                    )
+                ),
+                created_at=authority_created_at,
             )
+            plans.append(plan)
+            plans_by_stage[stage] = plan
         return tuple(plans)
 
     def _finalization_work_plan(
@@ -777,6 +817,8 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             identity_policy_version=seal.seal_projection_version,
             schema_ref=seal.schema_ref,
         )
+        authority_created_at = self._timestamp_now() if created_at is None else created_at
+        authority_created = _parse_timestamp(authority_created_at)
         return create_stream_work_item_plan(
             schema_ref=self._schema_refs.stream_work_plan,
             stream_run_id=self._stream_run_id,
@@ -794,7 +836,13 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             config_semantic_sha256=self._dag_config_semantic_sha256,
             ordered_dependencies=dependencies,
             priority=100,
-            created_at=self._timestamp_now() if created_at is None else created_at,
+            sla_deadline_at=_format_timestamp(
+                authority_created
+                + timedelta(
+                    seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (len(_WINDOW_DAG_STAGES) + 1)
+                )
+            ),
+            created_at=authority_created_at,
         )
 
     def _internal_execution_projection(
@@ -1215,7 +1263,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             )
             if len(companions) != len(_WINDOW_DAG_STAGES):
                 raise StreamSchedulerCompositionError(
-                    "expected window lacks its exact three-node DAG"
+                    "expected window lacks its exact canonical DAG"
                 )
             first = parsed_work[companions[0].work_item_id]
             expected_plans = self._window_work_plans(
@@ -1518,6 +1566,10 @@ def _parse_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
     return parsed.astimezone(UTC)
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 __all__ = [

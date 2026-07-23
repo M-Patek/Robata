@@ -45,6 +45,7 @@ from robata.contracts.stream_common import (
 from robata.contracts.stream_planning import create_expected_window_plan
 from robata.contracts.stream_source import PreEosCaptureSubject, create_pre_eos_capture_subject
 from robata.queue.models import WorkItemState
+from robata.queue.stage import DependencyCriticality
 from robata.queue.stream_models import (
     StreamTerminalEvidence,
     StreamWorkItemState,
@@ -211,9 +212,14 @@ def _composition(
     )
 
 
-def _terminal_evidence(value: int, completed_at: datetime) -> StreamTerminalEvidence:
+def _terminal_evidence(
+    value: int,
+    completed_at: datetime,
+    *,
+    outcome: TerminalOutcome = TerminalOutcome.SUCCEEDED,
+) -> StreamTerminalEvidence:
     return StreamTerminalEvidence(
-        outcome=TerminalOutcome.SUCCEEDED,
+        outcome=outcome,
         evidence_ref={
             "artifact_id": _uuid(200 + value),
             "exact_sha256": _digest(300 + value),
@@ -240,6 +246,7 @@ def _complete(
     stage: StreamStage,
     *,
     base_seconds: int,
+    outcome: TerminalOutcome = TerminalOutcome.SUCCEEDED,
 ) -> None:
     plan = _plan_for(composition, stage)
     claim = composition.claim(
@@ -252,10 +259,37 @@ def _complete(
     composition.start(claim.lease, now=_NOW + timedelta(seconds=base_seconds + 1))
     completed = composition.complete(
         claim.lease,
-        _terminal_evidence(base_seconds, _NOW + timedelta(seconds=base_seconds + 2)),
+        _terminal_evidence(
+            base_seconds,
+            _NOW + timedelta(seconds=base_seconds + 2),
+            outcome=outcome,
+        ),
         now=_NOW + timedelta(seconds=base_seconds + 2),
     )
-    assert completed.state is StreamWorkItemState.SUCCEEDED
+    expected_state = {
+        TerminalOutcome.SUCCEEDED: StreamWorkItemState.SUCCEEDED,
+        TerminalOutcome.SKIPPED_NOT_NEEDED: StreamWorkItemState.SKIPPED_NOT_NEEDED,
+    }[outcome]
+    assert completed.state is expected_state
+
+
+def _complete_window_chain(
+    composition: DurableStreamWindowScheduler,
+    *,
+    start_seconds: int = 0,
+) -> None:
+    for offset, stage in enumerate(
+        (
+            StreamStage.WINDOW,
+            StreamStage.QA_COARSE,
+            StreamStage.QA_DENSE,
+            StreamStage.EVENT_PROPOSAL,
+            StreamStage.ACTION_DENSE,
+            StreamStage.BOUNDARY_REFINEMENT,
+            StreamStage.WINDOW_REDUCTION,
+        )
+    ):
+        _complete(composition, stage, base_seconds=start_seconds + offset * 3)
 
 
 def test_declaration_is_durable_before_child_projection_and_restart_recovers(
@@ -287,7 +321,7 @@ def test_declaration_is_durable_before_child_projection_and_restart_recovers(
 
     reopened = _composition(tmp_path, capture=capture, scheduler=execution)
     assert len(reopened.declarations()) == 1
-    assert len(reopened.work_plans()) == 3
+    assert len(reopened.work_plans()) == 7
     assert execution.get(root_id).state is WorkItemState.READY
     assert reopened.append_window(_window(capture, 0)) == reopened.declarations()[0]
 
@@ -567,18 +601,22 @@ def test_terminal_execution_crash_is_reconciled_without_redispatch(tmp_path: Pat
     composition.append_window(_window(capture, 0))
     _complete(composition, StreamStage.WINDOW, base_seconds=0)
     _complete(composition, StreamStage.QA_COARSE, base_seconds=3)
+    _complete(composition, StreamStage.QA_DENSE, base_seconds=6)
+    _complete(composition, StreamStage.EVENT_PROPOSAL, base_seconds=9)
+    _complete(composition, StreamStage.ACTION_DENSE, base_seconds=12)
+    _complete(composition, StreamStage.BOUNDARY_REFINEMENT, base_seconds=15)
     armed = True
     reduction = _plan_for(composition, StreamStage.WINDOW_REDUCTION)
     claim = composition.claim(
-        "worker", 30, work_item_id=reduction.work_item_id, now=_NOW + timedelta(seconds=6)
+        "worker", 30, work_item_id=reduction.work_item_id, now=_NOW + timedelta(seconds=18)
     )
     assert claim is not None
-    composition.start(claim.lease, now=_NOW + timedelta(seconds=7))
+    composition.start(claim.lease, now=_NOW + timedelta(seconds=19))
     with pytest.raises(RuntimeError, match="execution commit"):
         composition.complete(
             claim.lease,
-            _terminal_evidence(9, _NOW + timedelta(seconds=8)),
-            now=_NOW + timedelta(seconds=8),
+            _terminal_evidence(21, _NOW + timedelta(seconds=20)),
+            now=_NOW + timedelta(seconds=20),
         )
     assert execution.get(reduction.work_item_id).state is WorkItemState.SUCCEEDED
 
@@ -653,9 +691,7 @@ def test_complete_barriers_publish_ready_finalization_and_query_age(tmp_path: Pa
     composition.seal(_finish())
     composition.finalize_eos(_eos(1_000_000_000))
 
-    _complete(composition, StreamStage.WINDOW, base_seconds=0)
-    _complete(composition, StreamStage.QA_COARSE, base_seconds=3)
-    _complete(composition, StreamStage.WINDOW_REDUCTION, base_seconds=6)
+    _complete_window_chain(composition)
     composition.mark_export_barrier_complete(
         export_manifest_semantic_sha256=_digest(71), completed_member_count=6
     )
@@ -665,7 +701,68 @@ def test_complete_barriers_publish_ready_finalization_and_query_age(tmp_path: Pa
 
     finalization = _plan_for(composition, StreamStage.FINALIZATION)
     assert execution.get(finalization.work_item_id).state is WorkItemState.READY
-    snapshot = composition.backlog(now=_NOW + timedelta(seconds=20))
+    snapshot = composition.backlog(now=_NOW + timedelta(seconds=25))
     assert snapshot.finalization_published
     assert snapshot.active_backlog == 1
-    assert snapshot.oldest_active_age_seconds == 20.0
+    assert snapshot.oldest_active_age_seconds == 25.0
+
+
+def test_full_window_dag_has_deadlines_and_governed_skip_releases_downstream(
+    tmp_path: Path,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+    composition.append_window(_window(capture, 0))
+
+    plans = composition.work_plans()
+    assert tuple(plan.stage for plan in plans) == (
+        StreamStage.WINDOW,
+        StreamStage.QA_COARSE,
+        StreamStage.QA_DENSE,
+        StreamStage.EVENT_PROPOSAL,
+        StreamStage.ACTION_DENSE,
+        StreamStage.BOUNDARY_REFINEMENT,
+        StreamStage.WINDOW_REDUCTION,
+    )
+    assert all(plan.sla_deadline_at is not None for plan in plans)
+    assert all(plan.execution_expiry_at is None for plan in plans)
+    assert plans[0].ordered_dependencies == ()
+    by_stage = {plan.stage: plan for plan in plans}
+    assert {
+        dependency.upstream_work_logical_key
+        for dependency in by_stage[StreamStage.EVENT_PROPOSAL].ordered_dependencies
+    } == {
+        by_stage[StreamStage.QA_COARSE].work_logical_key,
+        by_stage[StreamStage.QA_DENSE].work_logical_key,
+    }
+    assert {
+        dependency.upstream_work_logical_key
+        for dependency in by_stage[StreamStage.WINDOW_REDUCTION].ordered_dependencies
+    } == {
+        by_stage[stage].work_logical_key
+        for stage in (
+            StreamStage.WINDOW,
+            StreamStage.QA_COARSE,
+            StreamStage.QA_DENSE,
+            StreamStage.EVENT_PROPOSAL,
+            StreamStage.ACTION_DENSE,
+            StreamStage.BOUNDARY_REFINEMENT,
+        )
+    }
+    assert all(
+        dependency.criticality is DependencyCriticality.DEGRADABLE
+        for plan in plans
+        for dependency in plan.ordered_dependencies
+    )
+
+    _complete(composition, StreamStage.WINDOW, base_seconds=0)
+    _complete(composition, StreamStage.QA_COARSE, base_seconds=3)
+    _complete(
+        composition,
+        StreamStage.QA_DENSE,
+        base_seconds=6,
+        outcome=TerminalOutcome.SKIPPED_NOT_NEEDED,
+    )
+    event = _plan_for(composition, StreamStage.EVENT_PROPOSAL)
+    assert execution.get(event.work_item_id).state is WorkItemState.READY
