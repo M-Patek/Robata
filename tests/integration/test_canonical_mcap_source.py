@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -7,8 +8,12 @@ from urllib.request import url2pathname
 
 import pytest
 
+from robata.adapters.mcap_single_pass import McapSinglePassH264Tee
+from robata.adapters.pyav_decoder import PyAvH264DecoderProbe
+from robata.adapters.pyav_mp4_exporter import PyAvH264Mp4Exporter
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 from robata.application.canonical import local_composition as local_composition_module
+from robata.application.canonical import mcap_source as mcap_source_module
 from robata.application.canonical.local_composition import (
     CanonicalLocalCompositionError,
     CanonicalLocalCompositionErrorCode,
@@ -104,6 +109,72 @@ def test_real_mcap_builds_admitted_canonical_source_bundle(tmp_path: Path) -> No
     assert "dropped_by_total_budget" in supplemental
 
 
+def test_canonical_source_uses_one_spool_tee_and_no_legacy_media_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
+    authorization = authorize_mcap_mapping(
+        _write_mapping(tmp_path / "mapping.json"),
+        allow_unapproved_profile=True,
+    )
+    state_dir = tmp_path / "media-state"
+    tee_calls = 0
+    original_traverse = McapSinglePassH264Tee.traverse
+
+    def observed_traverse(
+        tee: McapSinglePassH264Tee,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal tee_calls
+        tee_calls += 1
+        return original_traverse(tee, *args, **kwargs)  # type: ignore[arg-type]
+
+    def reject_legacy_read(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("legacy per-camera source read must not run")
+
+    monkeypatch.setattr(McapSinglePassH264Tee, "traverse", observed_traverse)
+    monkeypatch.setattr(PyAvH264DecoderProbe, "probe", reject_legacy_read)
+    monkeypatch.setattr(PyAvH264Mp4Exporter, "export", reject_legacy_read)
+
+    bundle = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=state_dir,
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    assert tee_calls == 1
+    assert len(CAMERA_IDS) == mcap_source_module.MCAP_SPOOL_EXPORT_WORKERS
+    seal_path = state_dir / "h264-spools" / "h264-spool-set.seal.json"
+    seal_bytes = seal_path.read_bytes()
+    seal = json.loads(seal_bytes)
+    assert canonical_json_bytes(seal) == seal_bytes
+    assert seal["source"] == {
+        "message_count": 12,
+        "sha256": SIX_CAMERA_MCAP_SHA256,
+        "size_bytes": source.stat().st_size,
+    }
+    assert seal["selected_packet_count"] == 12
+    assert seal["camera_packet_counts"] == {camera_id.value: 2 for camera_id in CAMERA_IDS}
+    assert [spool["packet_count"] for spool in seal["spools"]] == [2] * len(CAMERA_IDS)
+    assert all(
+        (state_dir / "h264-spools" / spool["path"]).stat().st_size == spool["size_bytes"]
+        for spool in seal["spools"]
+    )
+    probe_facts = bundle.admitted_context.validation_report.probed_stream_facts
+    assert len(probe_facts) == len(CAMERA_IDS)
+    assert all(
+        fact.decoder_probe.probe.name == "pyav-h264-remux-decode-validation"
+        and fact.decoder_probe.decoded_frame_count == 2
+        and fact.decoder_probe.decoded_width > 0
+        and fact.decoder_probe.decoded_height > 0
+        for fact in probe_facts
+    )
+
+
 def test_runtime_observation_preserves_canonical_source_facts(tmp_path: Path) -> None:
     source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
     authorization = authorize_mcap_mapping(
@@ -141,10 +212,9 @@ def test_runtime_observation_preserves_canonical_source_facts(tmp_path: Path) ->
     assert tuple(span.name for span in source_spans) == (
         "source.inspect",
         "source.mapping.resolve",
-        "source.demux.probe",
-        "source.export",
-        "source.export.validate",
-        "source.decode.ledger_load",
+        "source.stream.capture_publish",
+        "source.video.publication_validate",
+        "source.video.ledger_load",
         "source.metadata.build",
         "source.frame_index",
         "source.quality.timing",

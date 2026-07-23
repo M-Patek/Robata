@@ -18,7 +18,6 @@ from pydantic import ValidationError
 
 from robata.adapters.local_artifact_registry import LocalArtifactRegistry
 from robata.adapters.mcap_inspector import OfficialMcapInspector
-from robata.adapters.pyav_decoder import PyAvH264DecoderProbe
 from robata.adapters.pyav_frame_materializer import (
     _CameraLedger,
     _encode_png,
@@ -41,6 +40,9 @@ from robata.admission.ledger import (
     PrimaryAdmissionPolicy,
     SourceAdmissionOutcome,
 )
+from robata.application.canonical.bounded_media import (
+    BoundedMediaPolicy,
+)
 from robata.application.canonical.media_quality import (
     FrameQualityObservation,
     FrameTimingEvidence,
@@ -48,6 +50,9 @@ from robata.application.canonical.media_quality import (
     LocalMediaQualityReport,
     build_local_media_quality_report,
     registered_local_media_quality_report_document,
+)
+from robata.application.canonical.single_pass_video import (
+    DurableSinglePassVideoProducer,
 )
 from robata.application.registered_video_export import (
     PublishedRegisteredVideoExport,
@@ -103,7 +108,7 @@ from robata.contracts.sampling_plan import FrameBudget, OverflowPolicy, Sampling
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.video_export import VideoExporterMode
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
-from robata.ports.ingestion import ChannelInspection, DecoderProbeResult, McapInspection
+from robata.ports.ingestion import ChannelInspection, McapInspection
 from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 from robata.sampling.grid import FrameCandidate, SamplingGrid, SamplingRate, SelectionStatus
 from robata.sampling.materializer import (
@@ -121,6 +126,9 @@ MCAP_SAMPLING_POLICY_VERSION = "canonical-development-sampling-v1"
 MCAP_RECORDING_NAMESPACE = "robata-canonical-development-mcap-v1"
 MCAP_PNG_EXTRACTOR_VERSION = "canonical-mcap-png-320-v1"
 MCAP_PNG_MAX_WIDTH: Final = 320
+MCAP_PRE_EOS_POLICY_VERSION: Final = "canonical-mcap-pre-eos-v1"
+MCAP_PRE_EOS_CLOCK_POLICY_VERSION: Final = "canonical-mcap-log-time-clock-v1"
+MCAP_SPOOL_EXPORT_WORKERS: Final = 6
 
 
 class CanonicalMcapSourceError(ValueError):
@@ -324,11 +332,9 @@ def _load_canonical_mcap_source(
         raise CanonicalMcapSourceError("source bytes changed after the run identity was derived")
     with runtime_span(runtime_observer, "source.mapping.resolve", stage_attributes):
         channels = authorization.policy.resolve(inspection)
-    with runtime_span(runtime_observer, "source.demux.probe", stage_attributes):
-        probes = _probe_channels(source, channels)
 
     state_dir.mkdir(parents=True, exist_ok=True)
-    with runtime_span(runtime_observer, "source.export", stage_attributes):
+    with runtime_span(runtime_observer, "source.stream.capture_publish", stage_attributes):
         publication = _export_registered_videos(
             source=source,
             state_dir=state_dir,
@@ -339,9 +345,9 @@ def _load_canonical_mcap_source(
             clock=clock,
             runtime_observer=runtime_observer,
         )
-    with runtime_span(runtime_observer, "source.export.validate", stage_attributes):
+    with runtime_span(runtime_observer, "source.video.publication_validate", stage_attributes):
         view, manifest = _validate_publication(publication)
-    with runtime_span(runtime_observer, "source.decode.ledger_load", stage_attributes):
+    with runtime_span(runtime_observer, "source.video.ledger_load", stage_attributes):
         ledgers = {
             record.camera_id: _load_camera_ledger(view, manifest, record)
             for record in manifest.cameras
@@ -354,7 +360,7 @@ def _load_canonical_mcap_source(
         stream_records = _build_stream_records(
             inspection=inspection,
             channels=channels,
-            probes=probes,
+            publication=publication,
         )
         camera_mappings = tuple(
             ValidationCameraMappingV2(
@@ -527,39 +533,6 @@ def _load_canonical_mcap_source(
     )
 
 
-def _probe_channels(
-    source: Path,
-    channels: SixCameraMap[ChannelInspection],
-) -> dict[CameraId, DecoderProbeResult]:
-    probe = PyAvH264DecoderProbe()
-    results: dict[CameraId, DecoderProbeResult] = {}
-    for camera_id in CAMERA_IDS:
-        channel = channels[camera_id]
-        if (
-            channel.message_count < 1
-            or channel.first_message_time_ns is None
-            or channel.last_message_time_ns is None
-            or not channel.monotonic
-            or channel.schema_encoding is None
-            or channel.schema_content_sha256 is None
-        ):
-            raise CanonicalMcapSourceError(
-                f"{camera_id.value} lacks complete monotonic source/schema facts"
-            )
-        result = probe.probe(source, channel)
-        if (
-            not result.success
-            or result.decoded_frames < 1
-            or result.width is None
-            or result.height is None
-        ):
-            raise CanonicalMcapSourceError(
-                f"{camera_id.value} did not pass the real H264 decoder probe"
-            )
-        results[camera_id] = result
-    return results
-
-
 def _export_registered_videos(
     *,
     source: Path,
@@ -583,8 +556,9 @@ def _export_registered_videos(
         profile_version=EXPORT_PROFILE_VERSION,
         canonical_config_sha256=semantic_sha256(EXPORT_CONFIG),
     )
+    exporter = PyAvH264Mp4Exporter()
     service = RegisteredSixCameraVideoExportService(
-        PyAvH264Mp4Exporter(),
+        exporter,
         LocalArtifactRegistry(
             state_dir / "artifact-registry",
             runtime_observer=runtime_observer,
@@ -592,32 +566,94 @@ def _export_registered_videos(
         schema_registry,
         clock=clock,
     )
-    return service.export_local(
-        LocalVideoExportRequest(
-            source=source,
-            output_directory=state_dir / "video-view",
-            namespace=MCAP_RECORDING_NAMESPACE,
-            inspection=inspection,
-            channels=channels,
-            mapping_profile=authorization.profile,
-            mapping_profile_digest=authorization.semantic_sha256,
-            exporter=descriptor,
-        )
+    source_origin_ns, source_end_ns = _mapped_source_bounds(channels)
+    request = LocalVideoExportRequest(
+        source=source,
+        output_directory=state_dir / "video-view",
+        namespace=MCAP_RECORDING_NAMESPACE,
+        inspection=inspection,
+        channels=channels,
+        mapping_profile=authorization.profile,
+        mapping_profile_digest=authorization.semantic_sha256,
+        exporter=descriptor,
     )
+    producer = DurableSinglePassVideoProducer(
+        inspection=inspection,
+        channels=channels,
+        planner_policy=_pre_eos_media_policy(
+            inspection=inspection,
+            authorization=authorization,
+            source_origin_ns=source_origin_ns,
+        ),
+        spool_directory=state_dir / "h264-spools",
+        final_end_ns=source_end_ns,
+        max_parallel_exports=MCAP_SPOOL_EXPORT_WORKERS,
+        exporter=exporter,
+    )
+    return service.export_staged_local(request, producer)
+
+
+def _pre_eos_media_policy(
+    *,
+    inspection: McapInspection,
+    authorization: AuthorizedMcapMapping,
+    source_origin_ns: int,
+) -> BoundedMediaPolicy:
+    clock_policy_sha256 = semantic_sha256(
+        {
+            "clock_policy_version": MCAP_PRE_EOS_CLOCK_POLICY_VERSION,
+            "source_clock": "MCAP_LOG_TIME_NS",
+            "pre_alignment_transform": "IDENTITY",
+            "source_origin_policy": "MINIMUM_MAPPED_FIRST_LOG_TIME",
+        }
+    )
+    return BoundedMediaPolicy(
+        source_scope_digest=inspection.source_sha256,
+        mapping_semantic_sha256=authorization.semantic_sha256,
+        alignment_semantic_sha256=clock_policy_sha256,
+        source_origin_ns=source_origin_ns,
+        segmentation_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-segmentation",
+        window_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-window",
+        quality_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-quality",
+    )
+
+
+def _mapped_source_bounds(
+    channels: SixCameraMap[ChannelInspection],
+) -> tuple[int, int]:
+    first_times: list[int] = []
+    last_times: list[int] = []
+    for camera_id in CAMERA_IDS:
+        channel = channels[camera_id]
+        if (
+            channel.message_count < 1
+            or channel.first_message_time_ns is None
+            or channel.last_message_time_ns is None
+            or not channel.monotonic
+            or channel.schema_encoding is None
+            or channel.schema_content_sha256 is None
+        ):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} lacks complete monotonic source/schema facts"
+            )
+        first_times.append(channel.first_message_time_ns)
+        last_times.append(channel.last_message_time_ns)
+    return min(first_times), max(last_times) + 1
 
 
 def _build_stream_records(
     *,
     inspection: McapInspection,
     channels: SixCameraMap[ChannelInspection],
-    probes: Mapping[CameraId, DecoderProbeResult],
+    publication: PublishedRegisteredVideoExport,
 ) -> dict[CameraId, tuple[StreamSchemaEvidenceV2, ProbedVideoStreamFactV2]]:
     schema_policy = _policy("protobuf-compressed-image-schema")
-    probe_component = _component("pyav-h264-decoder-probe")
+    probe_component = _component("pyav-h264-remux-decode-validation")
+    publication_records = {record.camera_id: record for record in publication.manifest.cameras}
     records: dict[CameraId, tuple[StreamSchemaEvidenceV2, ProbedVideoStreamFactV2]] = {}
     for camera_id in CAMERA_IDS:
         channel = channels[camera_id]
-        result = probes[camera_id]
+        result = publication_records[camera_id]
         assert channel.schema_name is not None
         assert channel.schema_encoding is not None
         assert channel.schema_content_sha256 is not None
@@ -641,14 +677,14 @@ def _build_stream_records(
             topic=channel.topic,
             channel_id=channel.channel_id,
             message_encoding=channel.message_encoding,
-            codec=result.codec,
+            codec=result.source.codec,
             message_count=channel.message_count,
             first_timestamp_ns=channel.first_message_time_ns,
             last_timestamp_ns=channel.last_message_time_ns,
             decoder_probe=DecoderProbeEvidenceV2(
                 probe=probe_component,
                 outcome=DecoderProbeOutcome.PASSED,
-                decoded_frame_count=result.decoded_frames,
+                decoded_frame_count=result.exported_frame_count,
                 decoded_width=result.width,
                 decoded_height=result.height,
                 diagnostic_ids=(),
