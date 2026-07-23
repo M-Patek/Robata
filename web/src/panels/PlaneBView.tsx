@@ -76,6 +76,7 @@ export default function PlaneBView() {
 
 function ExpectedWindowPlanCard({ plan }: { plan: ExpectedWindowPlan }) {
   const windows = usePipelineStore((s) => s.streamView.windows)
+  const inferences = usePipelineStore((s) => s.streamView.inferences)
   const isSealed = plan.sealed_manifest !== null
 
   return (
@@ -140,11 +141,9 @@ function ExpectedWindowPlanCard({ plan }: { plan: ExpectedWindowPlan }) {
               const window = windows.get(decl.window_key)
               const purpose = window?.purpose ?? 'QA_COARSE'
               const purposeColor = PURPOSE_COLORS[purpose]
-              const inferences = usePipelineStore((s) =>
-                Array.from(s.streamView.inferences.values()).filter((inf) => inf.window_key === decl.window_key),
-              )
-              const hasSucceeded = inferences.some((inf) => inf.terminal_outcome === 'SUCCEEDED')
-              const hasFailed = inferences.some((inf) => inf.terminal_outcome === 'FAILED')
+              const windowInferences = Array.from(inferences.values()).filter((inf) => inf.window_key === decl.window_key)
+              const hasSucceeded = windowInferences.some((inf) => inf.terminal_outcome === 'SUCCEEDED')
+              const hasFailed = windowInferences.some((inf) => inf.terminal_outcome === 'FAILED')
               const status = hasFailed ? 'FAILED' : hasSucceeded ? 'COMPLETE' : 'PENDING'
               const style = STATUS_STYLE[status]
 

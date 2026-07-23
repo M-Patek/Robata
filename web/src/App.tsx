@@ -1,11 +1,11 @@
 import { useState } from 'react'
 import { usePipelineStore } from '@/store'
 import { useWebSocket } from '@/hooks/useWebSocket'
-import PlaneAView from '@/panels/PlaneAView'
-import PlaneBView from '@/panels/PlaneBView'
 import TimelineBand from '@/panels/TimelineBand'
 import WatermarkBar from '@/panels/WatermarkBar'
 import SubjectDetailDrawer from '@/panels/SubjectDetailDrawer'
+import PlaneAView from '@/panels/PlaneAView'
+import PlaneBView from '@/panels/PlaneBView'
 
 export default function App() {
   const streamView = usePipelineStore((s) => s.streamView)
@@ -143,7 +143,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Timeline band ───────────────────────────────────────────────────── */}
+      {/* ── Timeline band (clickable flame graph) ───────────────────────────── */}
       <div style={{ flexShrink: 0 }}>
         <TimelineBand />
       </div>
@@ -188,18 +188,17 @@ export default function App() {
       {/* ── Subject detail drawer ─────────────────────────────────────────── */}
       <SubjectDetailDrawer />
 
-      {/* ── Event log panel (optional) ────────────────────────────────────── */}
+      {/* ── Event log panel (optional, right side) ────────────────────────── */}
       {showEventLog && <EventLogPanel onClose={() => setShowEventLog(false)} />}
     </div>
   )
 }
 
-// ── Event log panel ──────────────────────────────────────────────────────────
+// ── Event log panel (right side, vertical) ────────────────────────────────────
 
 function EventLogPanel({ onClose }: { onClose: () => void }) {
   const streamView = usePipelineStore((s) => s.streamView)
 
-  // Build a simple event log from current state
   const events = [
     streamView.capture_scope && { type: 'CAPTURE_SCOPE', key: streamView.capture_scope.capture_scope_key, time: 0 },
     ...Array.from(streamView.segments.values()).map((s, i) => ({ type: 'SEGMENT', key: s.segment_key, time: i })),
@@ -212,23 +211,23 @@ function EventLogPanel({ onClose }: { onClose: () => void }) {
 
   return (
     <div style={{
-      position: 'fixed', bottom: 0, left: 0, right: 0,
-      height: 200, zIndex: 90,
+      position: 'fixed', top: 56, right: 0, bottom: 0,
+      width: 320, zIndex: 90,
       background: '#FDFAF5',
-      borderTop: '1px solid rgba(26,23,20,0.10)',
-      boxShadow: '0 -4px 24px rgba(26,23,20,0.08)',
+      borderLeft: '1px solid rgba(26,23,20,0.10)',
+      boxShadow: '-4px 0 24px rgba(26,23,20,0.08)',
       display: 'flex', flexDirection: 'column',
     }}>
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '8px 20px',
+        padding: '12px 16px',
         borderBottom: '1px solid rgba(26,23,20,0.06)',
       }}>
         <span style={{
           fontFamily: 'Inter, sans-serif', fontSize: 12, fontWeight: 600,
           color: '#6B5E55', textTransform: 'uppercase', letterSpacing: '0.07em',
         }}>
-          Event Log ({events.length} events)
+          Event Log ({events.length})
         </span>
         <button
           onClick={onClose}
@@ -245,16 +244,19 @@ function EventLogPanel({ onClose }: { onClose: () => void }) {
         </button>
       </div>
       <div style={{
-        flex: 1, overflow: 'auto', padding: '8px 20px',
-        fontFamily: 'JetBrains Mono, monospace', fontSize: 11,
+        flex: 1, overflow: 'auto', padding: '8px 12px',
+        fontFamily: 'JetBrains Mono, monospace', fontSize: 10,
       }}>
         {events.map((ev, i) => (
           <div key={i} style={{
-            display: 'flex', gap: 12, padding: '3px 0',
+            display: 'flex', flexDirection: 'column', gap: 2,
+            padding: '6px 8px',
             borderBottom: '1px solid rgba(26,23,20,0.04)',
+            borderRadius: 4,
+            marginBottom: 4,
           }}>
-            <span style={{ color: '#A89B93', flexShrink: 0, width: 80 }}>{ev.type}</span>
-            <span style={{ color: '#6B5E55', overflow: 'hidden', textOverflow: 'ellipsis' }}>{ev.key}</span>
+            <span style={{ color: '#A89B93', fontSize: 9, textTransform: 'uppercase' }}>{ev.type}</span>
+            <span style={{ color: '#6B5E55', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ev.key}</span>
           </div>
         ))}
       </div>

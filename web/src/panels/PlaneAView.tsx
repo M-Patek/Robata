@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { usePipelineStore } from '@/store'
 import { PURPOSE_LABEL, PURPOSE_COLORS, TERMINAL_OUTCOME_STATUS, STATUS_STYLE, STATUS_LABEL } from '@/types'
-import type { CaptureScope, IncrementalWindow, StreamInference, StreamSegment } from '@/types'
+import type { CaptureScope, IncrementalWindow, StreamInference } from '@/types'
 
 // ── Plane A: Media + Inference (replaceable execution plane) ─────────────────
 // Shows the live execution view: capture scope → segments → windows → inferences
@@ -9,25 +9,8 @@ import type { CaptureScope, IncrementalWindow, StreamInference, StreamSegment } 
 export default function PlaneAView() {
   const streamView = usePipelineStore((s) => s.streamView)
   const captureScope = streamView.capture_scope
-  const segments = Array.from(streamView.segments.values())
   const windows = Array.from(streamView.windows.values())
   const inferences = Array.from(streamView.inferences.values())
-
-  // Group segments by camera
-  const segmentsByCamera = useMemo(() => {
-    const map = new Map<string, StreamSegment[]>()
-    for (const seg of segments) {
-      const existing = map.get(seg.camera_id) ?? []
-      existing.push(seg)
-      map.set(seg.camera_id, existing)
-    }
-    // Sort each camera's segments by time
-    for (const [cameraId, segs] of map) {
-      segs.sort((a, b) => Number(a.effective_interval.start_ns - b.effective_interval.start_ns))
-      map.set(cameraId, segs)
-    }
-    return map
-  }, [segments])
 
   // Group inferences by window
   const inferencesByWindow = useMemo(() => {
@@ -83,20 +66,6 @@ export default function PlaneAView() {
 
       {/* Capture Scope Card */}
       <CaptureScopeCard scope={captureScope} />
-
-      {/* Segment Timeline */}
-      {segments.length > 0 && (
-        <div style={{ marginTop: 24 }}>
-          <h3 style={{
-            fontFamily: 'Inter, sans-serif', fontSize: 12, fontWeight: 600,
-            color: '#6B5E55', textTransform: 'uppercase', letterSpacing: '0.07em',
-            margin: '0 0 12px',
-          }}>
-            Segments ({segments.length} total)
-          </h3>
-          <SegmentTimeline segmentsByCamera={segmentsByCamera} />
-        </div>
-      )}
 
       {/* Windows */}
       {windows.length > 0 && (
@@ -173,59 +142,6 @@ function CaptureScopeCard({ scope }: { scope: CaptureScope }) {
           </span>
         ))}
       </div>
-    </div>
-  )
-}
-
-// ── Segment Timeline ──────────────────────────────────────────────────────────
-
-function SegmentTimeline({ segmentsByCamera }: { segmentsByCamera: Map<string, StreamSegment[]> }) {
-  const cameraIds = Array.from(segmentsByCamera.keys()).sort()
-
-  return (
-    <div style={{
-      background: '#FDFAF5',
-      border: '1px solid rgba(26,23,20,0.08)',
-      borderRadius: 12,
-      padding: '12px 16px',
-      overflowX: 'auto',
-    }}>
-      {cameraIds.map((cameraId) => {
-        const segs = segmentsByCamera.get(cameraId) ?? []
-        return (
-          <div key={cameraId} style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '4px 0', borderBottom: '1px solid rgba(26,23,20,0.04)',
-          }}>
-            <span style={{
-              fontFamily: 'JetBrains Mono, monospace', fontSize: 10,
-              color: '#A89B93', width: 60, flexShrink: 0,
-            }}>
-              {cameraId}
-            </span>
-            <div style={{
-              display: 'flex', gap: 2, flex: 1, minWidth: 0,
-            }}>
-              {segs.map((seg) => {
-                const hasQualityIssue = seg.quality_observations.some(
-                  (q) => q.kind === 'FREEZE' || q.kind === 'LUMINANCE' && q.value < 20,
-                )
-                return (
-                  <div
-                    key={seg.segment_key}
-                    title={`${cameraId} [${Number(seg.effective_interval.start_ns) / 1e9}s, ${Number(seg.effective_interval.end_ns) / 1e9}s)`}
-                    style={{
-                      flex: 1, height: 20, minWidth: 4,
-                      background: hasQualityIssue ? '#C96442' : '#4A7A5A',
-                      borderRadius: 2, opacity: 0.8,
-                    }}
-                  />
-                )
-              })}
-            </div>
-          </div>
-        )
-      })}
     </div>
   )
 }
