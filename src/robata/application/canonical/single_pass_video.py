@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from robata.adapters.mcap_inspector import McapPreflight
 from robata.adapters.mcap_single_pass import (
+    PLANNING_MODE_EOS_SPOOL_REPLAY,
+    PLANNING_MODE_LIVE_BOOTSTRAP,
+    PLANNING_MODE_LIVE_INDEXED,
     AppendOnlyH264SpoolBranch,
     H264PacketEnvelope,
     H264SpoolFacts,
@@ -49,7 +53,7 @@ from robata.contracts import (
 from robata.ports import ChannelInspection, ExportedCameraVideoFacts, McapInspection
 from robata.tempfiles import make_staging_directory
 
-SPOOL_SET_VERSION: Final = "robata-h264-spool-set-v1"
+SPOOL_SET_VERSION: Final = "robata-h264-spool-set-v2"
 SPOOL_SEAL_FILENAME: Final = "h264-spool-set.seal.json"
 _READ_CHUNK_BYTES: Final = 1024 * 1024
 
@@ -73,6 +77,9 @@ class H264SpoolSetFacts:
     final_end_ns: int
     planner_policy_sha256: Sha256Digest
     spools: SixCameraMap[H264SpoolFacts]
+    inspection: McapInspection
+    planning_mode: str
+    preflight_message_indexes_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,12 +103,14 @@ class DurableSinglePassVideoProducer:
         *,
         inspection: McapInspection,
         channels: SixCameraMap[ChannelInspection],
-        planner_policy: BoundedMediaPolicy,
+        planner_policy: BoundedMediaPolicy | None,
         spool_directory: Path,
         final_end_ns: int | None = None,
         max_parallel_exports: int = 2,
         align_timestamp: Callable[[CameraId, int], int] | None = None,
         planning_sink: SinglePassPlanningSink | None = None,
+        preflight: McapPreflight | None = None,
+        planner_policy_factory: Callable[[int], BoundedMediaPolicy] | None = None,
         tee: McapSinglePassH264Tee | None = None,
         exporter: PyAvH264Mp4Exporter | None = None,
     ) -> None:
@@ -109,17 +118,36 @@ class DurableSinglePassVideoProducer:
             raise TypeError("max_parallel_exports must be an integer")
         if not 1 <= max_parallel_exports <= len(CAMERA_IDS):
             raise ValueError("max_parallel_exports must be between one and six")
-        resolved_final_end = (
-            inspection.last_message_time_ns + 1
-            if final_end_ns is None and inspection.last_message_time_ns is not None
-            else final_end_ns
-        )
-        if isinstance(resolved_final_end, bool) or not isinstance(resolved_final_end, int):
-            raise ValueError("final_end_ns requires an inspected end time or an explicit integer")
-        if resolved_final_end <= planner_policy.source_origin_ns:
-            raise ValueError("final_end_ns must be after the planner source origin")
-        if planner_policy.source_scope_digest != inspection.source_sha256:
-            raise ValueError("planner source scope differs from the inspected source")
+        if planner_policy is None:
+            if (
+                preflight is None
+                or preflight.message_indexes_complete
+                or planner_policy_factory is None
+                or final_end_ns is not None
+            ):
+                raise ValueError(
+                    "deferred planner policy requires an incomplete-index preflight, "
+                    "a policy factory, and no provisional final_end_ns"
+                )
+            resolved_final_end: int | None = None
+        else:
+            if preflight is not None and not preflight.message_indexes_complete:
+                raise ValueError(
+                    "incomplete-index preflight requires deferred planner policy"
+                )
+            resolved_final_end = (
+                inspection.last_message_time_ns + 1
+                if final_end_ns is None and inspection.last_message_time_ns is not None
+                else final_end_ns
+            )
+            if isinstance(resolved_final_end, bool) or not isinstance(resolved_final_end, int):
+                raise ValueError(
+                    "final_end_ns requires an inspected end time or an explicit integer"
+                )
+            if resolved_final_end <= planner_policy.source_origin_ns:
+                raise ValueError("final_end_ns must be after the planner source origin")
+            if planner_policy.source_scope_digest != inspection.source_sha256:
+                raise ValueError("planner source scope differs from the inspected source")
         self._inspection = inspection
         self._channels = channels
         self._planner_policy = planner_policy
@@ -128,9 +156,17 @@ class DurableSinglePassVideoProducer:
         self._max_parallel_exports = max_parallel_exports
         self._align_timestamp = align_timestamp
         self._planning_sink = planning_sink
+        self._preflight = preflight
+        self._planner_policy_factory = planner_policy_factory
         self._tee = tee or McapSinglePassH264Tee()
         self._exporter = exporter or PyAvH264Mp4Exporter()
         self._last_facts: SinglePassVideoProductionFacts | None = None
+        self._prepared: tuple[
+            H264SpoolSetFacts,
+            BoundedSinglePassMediaPlanner,
+            SinglePassTraversalResult,
+            bool,
+        ] | None = None
 
     def __call__(self, staging_directory: Path, /) -> StagedSixCameraVideoExport:
         facts = self.produce(staging_directory)
@@ -146,13 +182,7 @@ class DurableSinglePassVideoProducer:
                 "staging_directory must be an existing private directory"
             )
 
-        if self._spool_directory.exists():
-            spool_set = self._load_spool_set()
-            planner, traversal = self._replay_planner(spool_set)
-            reused = True
-        else:
-            spool_set, planner, traversal = self._capture_fresh_spool_set()
-            reused = False
+        spool_set, planner, traversal, reused = self._prepare()
 
         camera_facts = self._export_spools(spool_set, staging_directory)
         staged = StagedSixCameraVideoExport(
@@ -164,13 +194,51 @@ class DurableSinglePassVideoProducer:
             staged_export=staged,
             traversal=traversal,
             spool_set=spool_set,
-            planner_finish=traversal.planner_finish,
+            planner_finish=_required_planner_finish(traversal),
             planner_ring_snapshots=planner.ring_snapshots(),
             reused_spool_set=reused,
             max_parallel_exports=self._max_parallel_exports,
         )
         self._last_facts = facts
         return facts
+
+    def prepare(self) -> H264SpoolSetFacts:
+        """Capture or recover the accepted spool set without exporting it twice."""
+
+        return self._prepare()[0]
+
+    def _prepare(
+        self,
+    ) -> tuple[
+        H264SpoolSetFacts,
+        BoundedSinglePassMediaPlanner,
+        SinglePassTraversalResult,
+        bool,
+    ]:
+        if self._prepared is not None:
+            return self._prepared
+        if self._spool_directory.exists():
+            spool_set = self._load_spool_set()
+            planner, traversal = self._replay_planner(spool_set)
+            reused = True
+        else:
+            spool_set, planner, traversal = self._capture_fresh_spool_set()
+            reused = False
+        self._accept_inspection(spool_set.inspection)
+        self._prepared = (spool_set, planner, traversal, reused)
+        return self._prepared
+
+    @property
+    def inspection(self) -> McapInspection:
+        if self._prepared is None:
+            raise RuntimeError("single-pass inspection is available only after prepare")
+        return self._inspection
+
+    @property
+    def channels(self) -> SixCameraMap[ChannelInspection]:
+        if self._prepared is None:
+            raise RuntimeError("single-pass channels are available only after prepare")
+        return self._channels
 
     @property
     def last_facts(self) -> SinglePassVideoProductionFacts:
@@ -196,7 +264,23 @@ class DurableSinglePassVideoProducer:
             prefix=f".{self._spool_directory.name}.capture-",
         )
         published = False
-        planner = BoundedSinglePassMediaPlanner(self._planner_policy)
+        planner = (
+            BoundedSinglePassMediaPlanner(self._planner_policy)
+            if self._planner_policy is not None
+            else None
+        )
+        bootstrap_planners: list[BoundedSinglePassMediaPlanner] = []
+
+        def create_bootstrap_planner(source_origin_ns: int) -> BoundedSinglePassMediaPlanner:
+            if self._planner_policy_factory is None or bootstrap_planners:
+                raise SinglePassVideoProductionError(
+                    "bootstrap planner factory is unavailable or was already used"
+                )
+            policy = self._planner_policy_factory(source_origin_ns)
+            created = BoundedSinglePassMediaPlanner(policy)
+            bootstrap_planners.append(created)
+            return created
+
         branches = {
             camera_id: AppendOnlyH264SpoolBranch(
                 camera_id,
@@ -213,12 +297,59 @@ class DurableSinglePassVideoProducer:
                 align_timestamp=self._align_timestamp,
                 planning_sink=self._planning_sink,
                 final_end_ns=self._final_end_ns,
+                preflight=self._preflight,
+                expected_source_sha256=self._inspection.source_sha256,
+                bootstrap_planner_factory=(
+                    create_bootstrap_planner if planner is None else None
+                ),
             )
-            self._verify_fresh_traversal(traversal)
             spool_facts = SixCameraMap[H264SpoolFacts].model_validate(
                 {camera_id: branches[camera_id].facts for camera_id in CAMERA_IDS},
                 strict=True,
             )
+            if planner is None:
+                final_channels = _mapped_channels_from_inspection(
+                    self._channels,
+                    traversal.inspection,
+                )
+                if self._planner_policy_factory is None:
+                    raise SinglePassVideoProductionError(
+                        "deferred planner policy factory is absent"
+                    )
+                source_origin_ns, self._final_end_ns = _mapped_channel_bounds(final_channels)
+                if bootstrap_planners:
+                    planner = bootstrap_planners[0]
+                    policy = planner.policy
+                    self._planner_policy = policy
+                    if (
+                        traversal.planning_mode != PLANNING_MODE_LIVE_BOOTSTRAP
+                        or policy.source_origin_ns != source_origin_ns
+                        or traversal.final_end_ns != self._final_end_ns
+                    ):
+                        raise SinglePassVideoProductionError(
+                            "bootstrap planner differs from final mapped source bounds"
+                        )
+                else:
+                    policy = self._planner_policy_factory(source_origin_ns)
+                    self._planner_policy = policy
+                    deferred_spool_set = H264SpoolSetFacts(
+                        directory=temporary,
+                        seal_path=temporary / SPOOL_SEAL_FILENAME,
+                        seal_sha256="0" * 64,
+                        source_size_bytes=traversal.source_size_bytes,
+                        source_sha256=traversal.source_sha256,
+                        source_message_count=traversal.source_message_count,
+                        selected_packet_count=traversal.selected_packet_count,
+                        camera_packet_counts=traversal.camera_packet_counts,
+                        final_end_ns=self._final_end_ns,
+                        planner_policy_sha256=_policy_sha256(policy),
+                        spools=spool_facts,
+                        inspection=traversal.inspection,
+                        planning_mode=PLANNING_MODE_EOS_SPOOL_REPLAY,
+                        preflight_message_indexes_complete=False,
+                    )
+                    planner, traversal = self._replay_planner(deferred_spool_set)
+            self._verify_fresh_traversal(traversal)
             for camera_id in CAMERA_IDS:
                 _sync_file(spool_facts[camera_id].path)
             seal_document = self._seal_document(traversal, spool_facts)
@@ -265,8 +396,15 @@ class DurableSinglePassVideoProducer:
             selected_packet_count=traversal.selected_packet_count,
             camera_packet_counts=traversal.camera_packet_counts,
             final_end_ns=traversal.final_end_ns,
-            planner_policy_sha256=_policy_sha256(self._planner_policy),
+            planner_policy_sha256=_policy_sha256(_required_policy(self._planner_policy)),
             spools=final_spools,
+            inspection=traversal.inspection,
+            planning_mode=traversal.planning_mode,
+            preflight_message_indexes_complete=(
+                self._preflight.message_indexes_complete
+                if self._preflight is not None
+                else traversal.planning_mode == PLANNING_MODE_LIVE_INDEXED
+            ),
         )
         return spool_set, planner, traversal
 
@@ -277,7 +415,9 @@ class DurableSinglePassVideoProducer:
             or traversal.source_sha256 != self._inspection.source_sha256
             or traversal.source_message_count != self._inspection.message_count
             or traversal.selected_packet_count != expected_selected
+            or self._final_end_ns is None
             or traversal.final_end_ns != self._final_end_ns
+            or traversal.planner_finish is None
         ):
             raise SinglePassVideoProductionError(
                 "single-pass traversal differs from inspected source identity or counts"
@@ -287,6 +427,19 @@ class DurableSinglePassVideoProducer:
                 raise SinglePassVideoProductionError(
                     f"single-pass count differs for {camera_id.value}"
                 )
+
+    def _accept_inspection(self, inspection: McapInspection) -> None:
+        if (
+            inspection.source != self._inspection.source
+            or inspection.source_size_bytes != self._inspection.source_size_bytes
+            or inspection.source_sha256 != self._inspection.source_sha256
+            or inspection.message_count != self._inspection.message_count
+        ):
+            raise SinglePassVideoProductionError(
+                "accepted inspection differs from the expected source identity"
+            )
+        self._channels = _mapped_channels_from_inspection(self._channels, inspection)
+        self._inspection = inspection
 
     def _seal_document(
         self,
@@ -298,11 +451,22 @@ class DurableSinglePassVideoProducer:
                 camera_id.value: traversal.camera_packet_counts[camera_id]
                 for camera_id in CAMERA_IDS
             },
-            "channels": _channel_document(self._channels),
+            "channels": _channel_document(
+                _mapped_channels_from_inspection(self._channels, traversal.inspection)
+            ),
             "final_end_ns": str(traversal.final_end_ns),
-            "planner_policy": _policy_document(self._planner_policy),
-            "planner_policy_sha256": _policy_sha256(self._planner_policy),
+            "planner_policy": _policy_document(_required_policy(self._planner_policy)),
+            "planner_policy_sha256": _policy_sha256(
+                _required_policy(self._planner_policy)
+            ),
+            "planning_mode": traversal.planning_mode,
+            "preflight_message_indexes_complete": (
+                self._preflight.message_indexes_complete
+                if self._preflight is not None
+                else traversal.planning_mode == PLANNING_MODE_LIVE_INDEXED
+            ),
             "selected_packet_count": traversal.selected_packet_count,
+            "inspection": _inspection_document(traversal.inspection),
             "source": {
                 "message_count": traversal.source_message_count,
                 "sha256": traversal.source_sha256,
@@ -341,10 +505,24 @@ class DurableSinglePassVideoProducer:
             raise SinglePassVideoProductionError("spool-set seal is not canonical JSON")
         if document.get("spool_set_version") != SPOOL_SET_VERSION:
             raise SinglePassVideoProductionError("spool-set seal version is unsupported")
-        if document.get("channels") != _channel_document(self._channels):
-            raise SinglePassVideoProductionError("spool-set channel mapping differs")
-        policy_document = _policy_document(self._planner_policy)
-        policy_sha256 = _policy_sha256(self._planner_policy)
+        planning_mode = _planning_mode(document.get("planning_mode"))
+        preflight_message_indexes_complete = _boolean(
+            document.get("preflight_message_indexes_complete"),
+            "preflight_message_indexes_complete",
+        )
+        if (
+            preflight_message_indexes_complete
+            and planning_mode != PLANNING_MODE_LIVE_INDEXED
+        ) or (
+            not preflight_message_indexes_complete
+            and planning_mode == PLANNING_MODE_LIVE_INDEXED
+        ):
+            raise SinglePassVideoProductionError(
+                "spool-set planning mode differs from its preflight capability"
+            )
+        policy = _required_policy(self._planner_policy)
+        policy_document = _policy_document(policy)
+        policy_sha256 = _policy_sha256(policy)
         if (
             document.get("planner_policy") != policy_document
             or document.get("planner_policy_sha256") != policy_sha256
@@ -365,6 +543,16 @@ class DurableSinglePassVideoProducer:
             or source_messages != self._inspection.message_count
         ):
             raise SinglePassVideoProductionError("spool-set source identity differs")
+        sealed_inspection = _inspection_from_document(
+            document.get("inspection"),
+            source=self._inspection.source,
+            source_size_bytes=source_size,
+            source_sha256=source_digest,
+            source_message_count=source_messages,
+        )
+        sealed_channels = _mapped_channels_from_inspection(self._channels, sealed_inspection)
+        if document.get("channels") != _channel_document(sealed_channels):
+            raise SinglePassVideoProductionError("spool-set channel mapping differs")
 
         final_end_ns = _integer_string(document.get("final_end_ns"), "final_end_ns")
         if final_end_ns != self._final_end_ns:
@@ -452,13 +640,16 @@ class DurableSinglePassVideoProducer:
             final_end_ns=final_end_ns,
             planner_policy_sha256=policy_sha256,
             spools=SixCameraMap[H264SpoolFacts].model_validate(spool_map, strict=True),
+            inspection=sealed_inspection,
+            planning_mode=planning_mode,
+            preflight_message_indexes_complete=preflight_message_indexes_complete,
         )
 
     def _replay_planner(
         self,
         spool_set: H264SpoolSetFacts,
     ) -> tuple[BoundedSinglePassMediaPlanner, SinglePassTraversalResult]:
-        planner = BoundedSinglePassMediaPlanner(self._planner_policy)
+        planner = BoundedSinglePassMediaPlanner(_required_policy(self._planner_policy))
         iterators: dict[CameraId, Iterator[H264PacketEnvelope]] = {
             camera_id: iter_h264_spool(spool_set.spools[camera_id].path) for camera_id in CAMERA_IDS
         }
@@ -514,6 +705,8 @@ class DurableSinglePassVideoProducer:
             camera_packet_counts=spool_set.camera_packet_counts,
             final_end_ns=spool_set.final_end_ns,
             planner_finish=finish,
+            inspection=spool_set.inspection,
+            planning_mode=spool_set.planning_mode,
         )
         return planner, traversal
 
@@ -566,6 +759,280 @@ class DurableSinglePassVideoProducer:
             return session.facts
         finally:
             session.abort()
+
+
+def read_sealed_mcap_inspection(
+    spool_directory: Path,
+    *,
+    source: Path,
+    expected_source_sha256: Sha256Digest,
+) -> McapInspection:
+    """Restore complete inspection facts from a canonical V2 seal without opening source."""
+
+    directory = Path(spool_directory)
+    seal_path = directory / SPOOL_SEAL_FILENAME
+    if not directory.is_dir() or directory.is_symlink():
+        raise SinglePassVideoProductionError("sealed spool directory is not reusable")
+    if not seal_path.is_file() or seal_path.is_symlink():
+        raise SinglePassVideoProductionError("sealed spool directory has no complete seal")
+    raw = seal_path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SinglePassVideoProductionError("spool-set seal is not valid JSON") from exc
+    if not isinstance(document, dict) or canonical_json_bytes(document) != raw:
+        raise SinglePassVideoProductionError("spool-set seal is not canonical JSON")
+    if document.get("spool_set_version") != SPOOL_SET_VERSION:
+        raise SinglePassVideoProductionError("spool-set seal version is unsupported")
+    source_document = _object(document.get("source"), "source")
+    source_size = _integer(source_document.get("size_bytes"), "source.size_bytes", minimum=1)
+    source_digest = _digest(source_document.get("sha256"), "source.sha256")
+    source_messages = _integer(
+        source_document.get("message_count"),
+        "source.message_count",
+        minimum=1,
+    )
+    if source_digest != expected_source_sha256:
+        raise SinglePassVideoProductionError("spool-set source digest differs")
+    return _inspection_from_document(
+        document.get("inspection"),
+        source=Path(source),
+        source_size_bytes=source_size,
+        source_sha256=source_digest,
+        source_message_count=source_messages,
+    )
+
+
+def _mapped_channels_from_inspection(
+    expected: SixCameraMap[ChannelInspection],
+    inspection: McapInspection,
+) -> SixCameraMap[ChannelInspection]:
+    by_id = {channel.channel_id: channel for channel in inspection.channels}
+    resolved: dict[CameraId, ChannelInspection] = {}
+    for camera_id in CAMERA_IDS:
+        prior = expected[camera_id]
+        channel = by_id.get(prior.channel_id)
+        if (
+            channel is None
+            or channel.topic != prior.topic
+            or channel.schema_name != prior.schema_name
+            or channel.message_encoding != prior.message_encoding
+            or channel.schema_encoding != prior.schema_encoding
+            or channel.schema_content_sha256 != prior.schema_content_sha256
+        ):
+            raise SinglePassVideoProductionError(
+                f"accepted inspection changes mapped identity for {camera_id.value}"
+            )
+        resolved[camera_id] = channel
+    return SixCameraMap[ChannelInspection].model_validate(resolved, strict=True)
+
+
+def _mapped_channel_bounds(
+    channels: SixCameraMap[ChannelInspection],
+) -> tuple[int, int]:
+    first: list[int] = []
+    last: list[int] = []
+    for camera_id in CAMERA_IDS:
+        channel = channels[camera_id]
+        if (
+            channel.message_count < 1
+            or channel.first_message_time_ns is None
+            or channel.last_message_time_ns is None
+            or not channel.monotonic
+        ):
+            raise SinglePassVideoProductionError(
+                f"accepted {camera_id.value} channel lacks monotonic timestamp bounds"
+            )
+        first.append(channel.first_message_time_ns)
+        last.append(channel.last_message_time_ns)
+    return min(first), max(last) + 1
+
+
+def _required_policy(policy: BoundedMediaPolicy | None) -> BoundedMediaPolicy:
+    if policy is None:
+        raise SinglePassVideoProductionError("planner policy has not been resolved")
+    return policy
+
+
+def _required_planner_finish(traversal: SinglePassTraversalResult) -> PlannerFinish:
+    if traversal.planner_finish is None:
+        raise SinglePassVideoProductionError("planner was not finalized before production")
+    return traversal.planner_finish
+
+
+def _planning_mode(value: object) -> str:
+    if value not in {
+        PLANNING_MODE_LIVE_INDEXED,
+        PLANNING_MODE_LIVE_BOOTSTRAP,
+        PLANNING_MODE_EOS_SPOOL_REPLAY,
+    }:
+        raise SinglePassVideoProductionError("spool-set planning_mode is unsupported")
+    assert isinstance(value, str)
+    return value
+
+
+def _inspection_document(inspection: McapInspection) -> dict[str, object]:
+    return {
+        "channel_count": inspection.channel_count,
+        "channels": [
+            {
+                "channel_id": channel.channel_id,
+                "codec": channel.codec,
+                "first_message_time_ns": _optional_integer_document(
+                    channel.first_message_time_ns
+                ),
+                "frame_id": channel.frame_id,
+                "last_message_time_ns": _optional_integer_document(
+                    channel.last_message_time_ns
+                ),
+                "message_count": channel.message_count,
+                "message_encoding": channel.message_encoding,
+                "monotonic": channel.monotonic,
+                "schema_content_sha256": channel.schema_content_sha256,
+                "schema_encoding": channel.schema_encoding,
+                "schema_name": channel.schema_name,
+                "topic": channel.topic,
+            }
+            for channel in inspection.channels
+        ],
+        "first_message_time_ns": _optional_integer_document(
+            inspection.first_message_time_ns
+        ),
+        "header_library": inspection.header_library,
+        "header_profile": inspection.header_profile,
+        "last_message_time_ns": _optional_integer_document(inspection.last_message_time_ns),
+        "message_count": inspection.message_count,
+        "summary_available": inspection.summary_available,
+    }
+
+
+def _inspection_from_document(
+    value: object,
+    *,
+    source: Path,
+    source_size_bytes: int,
+    source_sha256: Sha256Digest,
+    source_message_count: int,
+) -> McapInspection:
+    document = _exact_object(
+        value,
+        "inspection",
+        {
+            "channel_count",
+            "channels",
+            "first_message_time_ns",
+            "header_library",
+            "header_profile",
+            "last_message_time_ns",
+            "message_count",
+            "summary_available",
+        },
+    )
+    raw_channels = document.get("channels")
+    if not isinstance(raw_channels, list):
+        raise SinglePassVideoProductionError("spool-set inspection.channels is not an array")
+    channels: list[ChannelInspection] = []
+    channel_fields = {
+        "channel_id",
+        "codec",
+        "first_message_time_ns",
+        "frame_id",
+        "last_message_time_ns",
+        "message_count",
+        "message_encoding",
+        "monotonic",
+        "schema_content_sha256",
+        "schema_encoding",
+        "schema_name",
+        "topic",
+    }
+    for index, raw_channel in enumerate(raw_channels):
+        field = f"inspection.channels[{index}]"
+        channel = _exact_object(raw_channel, field, channel_fields)
+        schema_digest_value = channel.get("schema_content_sha256")
+        schema_digest = (
+            None
+            if schema_digest_value is None
+            else _digest(schema_digest_value, f"{field}.schema_content_sha256")
+        )
+        channels.append(
+            ChannelInspection(
+                channel_id=_integer(channel.get("channel_id"), f"{field}.channel_id", minimum=0),
+                topic=_string(channel.get("topic"), f"{field}.topic"),
+                schema_name=_optional_string(channel.get("schema_name"), f"{field}.schema_name"),
+                message_encoding=_string(
+                    channel.get("message_encoding"),
+                    f"{field}.message_encoding",
+                ),
+                message_count=_integer(
+                    channel.get("message_count"),
+                    f"{field}.message_count",
+                    minimum=0,
+                ),
+                first_message_time_ns=_optional_integer_string(
+                    channel.get("first_message_time_ns"),
+                    f"{field}.first_message_time_ns",
+                ),
+                last_message_time_ns=_optional_integer_string(
+                    channel.get("last_message_time_ns"),
+                    f"{field}.last_message_time_ns",
+                ),
+                monotonic=_boolean(channel.get("monotonic"), f"{field}.monotonic"),
+                codec=_optional_string(channel.get("codec"), f"{field}.codec"),
+                frame_id=_optional_string(channel.get("frame_id"), f"{field}.frame_id"),
+                schema_encoding=_optional_string(
+                    channel.get("schema_encoding"),
+                    f"{field}.schema_encoding",
+                ),
+                schema_content_sha256=schema_digest,
+            )
+        )
+    channel_count = _integer(
+        document.get("channel_count"),
+        "inspection.channel_count",
+        minimum=0,
+    )
+    message_count = _integer(
+        document.get("message_count"),
+        "inspection.message_count",
+        minimum=0,
+    )
+    if channel_count != len(channels) or message_count != source_message_count:
+        raise SinglePassVideoProductionError(
+            "spool-set inspection counts differ from its source facts"
+        )
+    if tuple(channel.channel_id for channel in channels) != tuple(
+        sorted(channel.channel_id for channel in channels)
+    ) or len({channel.channel_id for channel in channels}) != len(channels):
+        raise SinglePassVideoProductionError(
+            "spool-set inspection channels are not unique canonical channel order"
+        )
+    return McapInspection(
+        source=Path(source),
+        source_size_bytes=source_size_bytes,
+        source_sha256=source_sha256,
+        header_profile=_string(document.get("header_profile"), "inspection.header_profile"),
+        header_library=_string(document.get("header_library"), "inspection.header_library"),
+        summary_available=_boolean(
+            document.get("summary_available"),
+            "inspection.summary_available",
+        ),
+        channel_count=channel_count,
+        message_count=message_count,
+        first_message_time_ns=_optional_integer_string(
+            document.get("first_message_time_ns"),
+            "inspection.first_message_time_ns",
+        ),
+        last_message_time_ns=_optional_integer_string(
+            document.get("last_message_time_ns"),
+            "inspection.last_message_time_ns",
+        ),
+        channels=tuple(channels),
+    )
+
+
+def _optional_integer_document(value: int | None) -> str | None:
+    return None if value is None else str(value)
 
 
 def _spool_filename(camera_id: CameraId) -> str:
@@ -628,6 +1095,31 @@ def _object(value: object, field: str) -> dict[str, Any]:
     return value
 
 
+def _exact_object(value: object, field: str, expected_fields: set[str]) -> dict[str, Any]:
+    document = _object(value, field)
+    if set(document) != expected_fields:
+        raise SinglePassVideoProductionError(f"spool-set {field} fields differ")
+    return document
+
+
+def _string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise SinglePassVideoProductionError(f"spool-set {field} is not a nonempty string")
+    return value
+
+
+def _optional_string(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, field)
+
+
+def _boolean(value: object, field: str) -> bool:
+    if type(value) is not bool:
+        raise SinglePassVideoProductionError(f"spool-set {field} is not a boolean")
+    return value
+
+
 def _integer(value: object, field: str, *, minimum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise SinglePassVideoProductionError(f"spool-set {field} is not an integer")
@@ -646,6 +1138,12 @@ def _integer_string(value: object, field: str) -> int:
     if str(result) != value:
         raise SinglePassVideoProductionError(f"spool-set {field} is not canonical")
     return result
+
+
+def _optional_integer_string(value: object, field: str) -> int | None:
+    if value is None:
+        return None
+    return _integer_string(value, field)
 
 
 def _digest(value: object, field: str) -> Sha256Digest:
@@ -697,4 +1195,5 @@ __all__ = [
     "H264SpoolSetFacts",
     "SinglePassVideoProductionError",
     "SinglePassVideoProductionFacts",
+    "read_sealed_mcap_inspection",
 ]

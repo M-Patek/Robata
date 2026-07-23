@@ -8,6 +8,7 @@ from urllib.request import url2pathname
 
 import pytest
 
+from robata.adapters.mcap_inspector import OfficialMcapInspector
 from robata.adapters.mcap_single_pass import McapSinglePassH264Tee
 from robata.adapters.pyav_decoder import PyAvH264DecoderProbe
 from robata.adapters.pyav_mp4_exporter import PyAvH264Mp4Exporter
@@ -135,6 +136,13 @@ def test_canonical_source_uses_one_spool_tee_and_no_legacy_media_reads(
         raise AssertionError("legacy per-camera source read must not run")
 
     monkeypatch.setattr(McapSinglePassH264Tee, "traverse", observed_traverse)
+    monkeypatch.setattr(
+        OfficialMcapInspector,
+        "inspect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("canonical source must not run the legacy full inspector")
+        ),
+    )
     monkeypatch.setattr(PyAvH264DecoderProbe, "probe", reject_legacy_read)
     monkeypatch.setattr(PyAvH264Mp4Exporter, "export", reject_legacy_read)
 

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 import robata.adapters.mcap_single_pass as subject
+from robata.adapters.mcap_inspector import McapPreflight
 from robata.adapters.mcap_single_pass import (
     AppendOnlyH264SpoolBranch,
     McapSinglePassH264Tee,
@@ -32,6 +33,8 @@ class _FakeChannel:
 class _FakeSchema:
     id: int = 100
     name: str = COMPRESSED_IMAGE_SCHEMA
+    encoding: str = "protobuf"
+    data: bytes = b"fake-schema"
 
 
 class _FakeReader:
@@ -65,6 +68,40 @@ def _channel(camera_id: CameraId) -> ChannelInspection:
         monotonic=True,
         codec="h264",
         frame_id=camera_id.value,
+        schema_encoding="protobuf",
+        schema_content_sha256=sha256(b"fake-schema").hexdigest(),
+    )
+
+
+def _preflight(source: Path, source_bytes: bytes) -> McapPreflight:
+    channels = (
+        *(_channel(camera_id) for camera_id in CAMERA_IDS),
+        ChannelInspection(
+            channel_id=999,
+            topic="/unmapped",
+            schema_name=COMPRESSED_IMAGE_SCHEMA,
+            message_encoding="raw",
+            message_count=1,
+            first_message_time_ns=1,
+            last_message_time_ns=1,
+            monotonic=True,
+            codec=None,
+            frame_id=None,
+            schema_encoding="protobuf",
+            schema_content_sha256=sha256(b"fake-schema").hexdigest(),
+        ),
+    )
+    return McapPreflight(
+        source=source,
+        source_size_bytes=len(source_bytes),
+        header_profile="fixture",
+        header_library="fixture",
+        channel_count=len(channels),
+        message_count=13,
+        first_message_time_ns=0,
+        last_message_time_ns=500_000_000,
+        channels=channels,
+        message_indexes_complete=True,
     )
 
 
@@ -108,10 +145,10 @@ def _rows() -> list[tuple[Any, Any, Any]]:
     return rows
 
 
-def _planner() -> BoundedSinglePassMediaPlanner:
+def _planner(source_sha256: str = "a" * 64) -> BoundedSinglePassMediaPlanner:
     return BoundedSinglePassMediaPlanner(
         BoundedMediaPolicy(
-            source_scope_digest="a" * 64,
+            source_scope_digest=source_sha256,
             mapping_semantic_sha256="b" * 64,
             alignment_semantic_sha256="c" * 64,
             source_origin_ns=0,
@@ -144,7 +181,8 @@ def test_one_reader_traversal_feeds_six_ordered_spools_and_bounded_planner(
         camera_id: AppendOnlyH264SpoolBranch(camera_id, tmp_path / f"{camera_id.value}.spool")
         for camera_id in CAMERA_IDS
     }
-    planner = _planner()
+    source_sha256 = sha256(source_bytes).hexdigest()
+    planner = _planner(source_sha256)
 
     result = McapSinglePassH264Tee().traverse(
         source,
@@ -152,6 +190,8 @@ def test_one_reader_traversal_feeds_six_ordered_spools_and_bounded_planner(
         planner,
         spool_branches,
         final_end_ns=1_000_000_000,
+        preflight=_preflight(source, source_bytes),
+        expected_source_sha256=source_sha256,
     )
 
     assert reader_calls == 1
@@ -190,7 +230,8 @@ def test_branch_failure_aborts_every_spool_without_sealing(
     )
     monkeypatch.setattr(subject, "DecoderFactory", _FakeDecoderFactory)
     source = tmp_path / "source.mcap"
-    source.write_bytes(b"fake")
+    source_bytes = b"fake"
+    source.write_bytes(source_bytes)
     channels = SixCameraMap[ChannelInspection].model_validate(
         {camera_id: _channel(camera_id) for camera_id in CAMERA_IDS}, strict=True
     )
@@ -205,7 +246,13 @@ def test_branch_failure_aborts_every_spool_without_sealing(
 
     monkeypatch.setattr(failing, "append_access_unit", fail)
     with pytest.raises(subject.SinglePassMcapError, match="disk full"):
-        McapSinglePassH264Tee().traverse(source, channels, _planner(), spool_branches)
+        McapSinglePassH264Tee().traverse(
+            source,
+            channels,
+            _planner(sha256(source_bytes).hexdigest()),
+            spool_branches,
+            preflight=_preflight(source, source_bytes),
+        )
 
     assert all(branch._stream.closed for branch in spool_branches.values())
     assert all(branch._facts is None for branch in spool_branches.values())

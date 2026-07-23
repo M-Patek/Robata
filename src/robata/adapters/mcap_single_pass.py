@@ -16,11 +16,16 @@ import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Final, Protocol, cast
 
 from mcap.reader import make_reader
 from mcap_protobuf.decoder import DecoderFactory
 
+from robata.adapters.mcap_inspector import (
+    McapInspectionAccumulator,
+    McapPreflight,
+    OfficialMcapInspector,
+)
 from robata.application.canonical.bounded_media import (
     ACCESS_UNIT_FRAMING_VERSION,
     BoundedSinglePassMediaPlanner,
@@ -30,12 +35,17 @@ from robata.application.canonical.bounded_media import (
     SinglePassPlanningSink,
 )
 from robata.contracts import CAMERA_IDS, CameraId, SixCameraMap, canonical_json_bytes
-from robata.ports import COMPRESSED_IMAGE_SCHEMA, ChannelInspection
+from robata.ports import COMPRESSED_IMAGE_SCHEMA, ChannelInspection, McapInspection
 
 _SPOOL_MAGIC = b"ROBATA-H264-SPOOL-V1\n"
 _MAX_METADATA_BYTES = 64 * 1024
+_MAX_BOOTSTRAP_ENVELOPES = 256
+_MAX_BOOTSTRAP_PAYLOAD_BYTES = 32 * 1024 * 1024
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+PLANNING_MODE_LIVE_INDEXED: Final = "LIVE_INDEXED"
+PLANNING_MODE_LIVE_BOOTSTRAP: Final = "LIVE_BOOTSTRAP"
+PLANNING_MODE_EOS_SPOOL_REPLAY: Final = "EOS_SPOOL_REPLAY"
 
 
 class SinglePassMcapError(RuntimeError):
@@ -173,7 +183,9 @@ class SinglePassTraversalResult:
     selected_packet_count: int
     camera_packet_counts: SixCameraMap[int]
     final_end_ns: int
-    planner_finish: PlannerFinish
+    planner_finish: PlannerFinish | None
+    inspection: McapInspection
+    planning_mode: str
 
 
 class McapSinglePassH264Tee:
@@ -186,12 +198,17 @@ class McapSinglePassH264Tee:
         self,
         source: Path,
         channels: SixCameraMap[ChannelInspection],
-        planner: BoundedSinglePassMediaPlanner,
+        planner: BoundedSinglePassMediaPlanner | None,
         branches: Mapping[CameraId, H264PacketBranch],
         *,
         align_timestamp: Callable[[CameraId, int], int] | None = None,
         planning_sink: SinglePassPlanningSink | None = None,
         final_end_ns: int | None = None,
+        preflight: McapPreflight | None = None,
+        expected_source_sha256: str | None = None,
+        bootstrap_planner_factory: (
+            Callable[[int], BoundedSinglePassMediaPlanner] | None
+        ) = None,
     ) -> SinglePassTraversalResult:
         source = Path(source)
         if not source.is_file():
@@ -204,6 +221,48 @@ class McapSinglePassH264Tee:
         selected_packet_count = 0
         max_aligned_ns: int | None = None
         completed = False
+        if planner is not None and bootstrap_planner_factory is not None:
+            raise SinglePassMcapError(
+                "live planner and bootstrap planner factory are mutually exclusive"
+            )
+        if planner is None and bootstrap_planner_factory is None and planning_sink is not None:
+            raise SinglePassMcapError(
+                "planning sink requires a live planner during MCAP traversal"
+            )
+        resolved_preflight = preflight or OfficialMcapInspector(
+            validate_crcs=self._validate_crcs
+        ).preflight(source)
+        if resolved_preflight.source.resolve() != source.resolve():
+            raise SinglePassMcapError("MCAP preflight source differs from the traversal source")
+        if (
+            bootstrap_planner_factory is not None
+            and resolved_preflight.message_indexes_complete
+        ):
+            raise SinglePassMcapError(
+                "bootstrap planning requires an incomplete-index MCAP preflight"
+            )
+        resolved_expected_digest = expected_source_sha256 or (
+            planner.policy.source_scope_digest if planner is not None else None
+        )
+        if resolved_expected_digest is None:
+            raise SinglePassMcapError(
+                "capture-only traversal requires an expected source digest"
+            )
+        inspection_accumulator = McapInspectionAccumulator(
+            resolved_preflight,
+            expected_source_sha256=resolved_expected_digest,
+        )
+        active_planner = planner
+        planning_mode = (
+            PLANNING_MODE_LIVE_INDEXED
+            if active_planner is not None
+            else PLANNING_MODE_EOS_SPOOL_REPLAY
+        )
+        bootstrap_envelopes: list[H264PacketEnvelope] = []
+        bootstrap_payload_bytes = 0
+        bootstrap_first_times: dict[CameraId, int] = {}
+        bootstrap_last_order: dict[CameraId, tuple[int, int, int]] = {}
+        bootstrap_fallback = False
 
         try:
             with source.open("rb") as raw_stream:
@@ -218,6 +277,7 @@ class McapSinglePassH264Tee:
                     source_message_count += 1
                     camera_id = channel_map.get(channel.id)
                     if camera_id is None:
+                        inspection_accumulator.observe(schema, channel, message)
                         continue
                     expected = channels[camera_id]
                     if channel.topic != expected.topic or channel.id != expected.channel_id:
@@ -230,6 +290,12 @@ class McapSinglePassH264Tee:
                             "mapped camera channel has no protobuf decoder"
                         )
                     decoded = decoder(message.data)
+                    inspection_accumulator.observe(
+                        schema,
+                        channel,
+                        message,
+                        decoded=decoded,
+                    )
                     envelope = _envelope(
                         traversal_index=traversal_index,
                         camera_id=camera_id,
@@ -241,14 +307,66 @@ class McapSinglePassH264Tee:
                         align_timestamp=align,
                     )
                     packet = envelope.packet
-                    emission = planner.push(packet)
-                    branch_map[camera_id].append_access_unit(
-                        envelope,
-                        packet.reference(),
-                        framing_version=ACCESS_UNIT_FRAMING_VERSION,
-                    )
-                    if planning_sink is not None:
-                        planning_sink.append_emission(emission)
+                    if active_planner is not None:
+                        emission = active_planner.push(packet)
+                        branch_map[camera_id].append_access_unit(
+                            envelope,
+                            packet.reference(),
+                            framing_version=ACCESS_UNIT_FRAMING_VERSION,
+                        )
+                        if planning_sink is not None:
+                            planning_sink.append_emission(emission)
+                    else:
+                        previous = bootstrap_last_order.get(camera_id)
+                        current = (
+                            packet.source_sequence,
+                            packet.source_timestamp_ns,
+                            packet.aligned_timestamp_ns,
+                        )
+                        if previous is not None and any(
+                            current[index] <= previous[index] for index in range(3)
+                        ):
+                            raise SinglePassMcapError(
+                                f"{camera_id.value} bootstrap packet order is not monotonic"
+                            )
+                        bootstrap_last_order[camera_id] = current
+                        branch_map[camera_id].append_access_unit(
+                            envelope,
+                            packet.reference(),
+                            framing_version=ACCESS_UNIT_FRAMING_VERSION,
+                        )
+                        if bootstrap_planner_factory is not None and not bootstrap_fallback:
+                            bootstrap_envelopes.append(envelope)
+                            bootstrap_payload_bytes += packet.payload_bytes
+                            bootstrap_first_times.setdefault(
+                                camera_id,
+                                packet.source_timestamp_ns,
+                            )
+                            if len(bootstrap_first_times) == len(CAMERA_IDS):
+                                source_origin_ns = min(bootstrap_first_times.values())
+                                active_planner = bootstrap_planner_factory(source_origin_ns)
+                                if (
+                                    active_planner.policy.source_origin_ns != source_origin_ns
+                                    or active_planner.policy.source_scope_digest
+                                    != resolved_expected_digest
+                                ):
+                                    raise SinglePassMcapError(
+                                        "bootstrap planner policy differs from source identity"
+                                    )
+                                for buffered in bootstrap_envelopes:
+                                    buffered_emission = active_planner.push(buffered.packet)
+                                    if planning_sink is not None:
+                                        planning_sink.append_emission(buffered_emission)
+                                bootstrap_envelopes.clear()
+                                bootstrap_payload_bytes = 0
+                                planning_mode = PLANNING_MODE_LIVE_BOOTSTRAP
+                            elif (
+                                len(bootstrap_envelopes) > _MAX_BOOTSTRAP_ENVELOPES
+                                or bootstrap_payload_bytes > _MAX_BOOTSTRAP_PAYLOAD_BYTES
+                            ):
+                                bootstrap_envelopes.clear()
+                                bootstrap_payload_bytes = 0
+                                bootstrap_fallback = True
                     source_orders[camera_id] += 1
                     selected_packet_count += 1
                     max_aligned_ns = (
@@ -260,11 +378,20 @@ class McapSinglePassH264Tee:
                 # Cover any reader-specific footer tail with the same source handle.
                 stream.drain()
 
+            inspection = inspection_accumulator.finish(
+                source_size_bytes=stream.size_bytes,
+                source_sha256=stream.sha256,
+            )
+
             if max_aligned_ns is None:
                 raise SinglePassMcapError("MCAP contains no messages for the six mapped channels")
             resolved_end_ns = max_aligned_ns + 1 if final_end_ns is None else final_end_ns
-            finish = planner.finish(resolved_end_ns)
-            if planning_sink is not None:
+            finish = (
+                active_planner.finish(resolved_end_ns)
+                if active_planner is not None
+                else None
+            )
+            if planning_sink is not None and finish is not None:
                 planning_sink.seal(finish)
             for camera_id in CAMERA_IDS:
                 branch_map[camera_id].seal()
@@ -277,6 +404,8 @@ class McapSinglePassH264Tee:
                 camera_packet_counts=SixCameraMap[int].model_validate(source_orders, strict=True),
                 final_end_ns=resolved_end_ns,
                 planner_finish=finish,
+                inspection=inspection,
+                planning_mode=planning_mode,
             )
         except SinglePassMcapError:
             raise
@@ -529,6 +658,9 @@ class _HashingNonSeekingStream(io.BufferedIOBase):
 
 
 __all__ = [
+    "PLANNING_MODE_EOS_SPOOL_REPLAY",
+    "PLANNING_MODE_LIVE_BOOTSTRAP",
+    "PLANNING_MODE_LIVE_INDEXED",
     "AppendOnlyH264SpoolBranch",
     "H264PacketBranch",
     "H264PacketEnvelope",

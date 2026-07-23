@@ -17,7 +17,7 @@ import av
 from pydantic import ValidationError
 
 from robata.adapters.local_artifact_registry import LocalArtifactRegistry
-from robata.adapters.mcap_inspector import OfficialMcapInspector
+from robata.adapters.mcap_inspector import McapPreflight, OfficialMcapInspector
 from robata.adapters.pyav_frame_materializer import (
     _CameraLedger,
     _encode_png,
@@ -53,6 +53,7 @@ from robata.application.canonical.media_quality import (
 )
 from robata.application.canonical.single_pass_video import (
     DurableSinglePassVideoProducer,
+    read_sealed_mcap_inspection,
 )
 from robata.application.registered_video_export import (
     PublishedRegisteredVideoExport,
@@ -166,6 +167,13 @@ class CanonicalMcapSourceBundle:
         frame: IndexedSourceFrame,
     ) -> MaterializedFrameArtifactFact | None:
         return self._artifact_resolver(camera_id, frame)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedVideoPublication:
+    publication: PublishedRegisteredVideoExport
+    inspection: McapInspection
+    channels: SixCameraMap[ChannelInspection]
 
 
 @dataclass(slots=True)
@@ -310,8 +318,39 @@ def _load_canonical_mcap_source(
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
     stage_attributes = {"camera_count": len(CAMERA_IDS)}
+    spool_directory = state_dir / "h264-spools"
     with runtime_span(runtime_observer, "source.inspect", stage_attributes):
-        inspection = OfficialMcapInspector().inspect(source)
+        if spool_directory.exists():
+            inspection = read_sealed_mcap_inspection(
+                spool_directory,
+                source=source,
+                expected_source_sha256=expected_source_sha256,
+            )
+            preflight: McapPreflight | None = None
+        else:
+            preflight = OfficialMcapInspector().preflight(source)
+            inspection = preflight.as_mapping_inspection(expected_source_sha256)
+    if inspection.source_sha256 != expected_source_sha256:
+        raise CanonicalMcapSourceError("source bytes changed after the run identity was derived")
+    with runtime_span(runtime_observer, "source.mapping.resolve", stage_attributes):
+        channels = authorization.policy.resolve(inspection)
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with runtime_span(runtime_observer, "source.stream.capture_publish", stage_attributes):
+        prepared_publication = _export_registered_videos(
+            source=source,
+            state_dir=state_dir,
+            inspection=inspection,
+            channels=channels,
+            authorization=authorization,
+            schema_registry=schema_registry,
+            clock=clock,
+            runtime_observer=runtime_observer,
+            preflight=preflight,
+        )
+        publication = prepared_publication.publication
+        inspection = prepared_publication.inspection
+        channels = prepared_publication.channels
     if inspection.message_count > 0:
         runtime_increment(
             runtime_observer,
@@ -328,23 +367,6 @@ def _load_canonical_mcap_source(
                 source_span_duration_ns,
                 stage_attributes,
             )
-    if inspection.source_sha256 != expected_source_sha256:
-        raise CanonicalMcapSourceError("source bytes changed after the run identity was derived")
-    with runtime_span(runtime_observer, "source.mapping.resolve", stage_attributes):
-        channels = authorization.policy.resolve(inspection)
-
-    state_dir.mkdir(parents=True, exist_ok=True)
-    with runtime_span(runtime_observer, "source.stream.capture_publish", stage_attributes):
-        publication = _export_registered_videos(
-            source=source,
-            state_dir=state_dir,
-            inspection=inspection,
-            channels=channels,
-            authorization=authorization,
-            schema_registry=schema_registry,
-            clock=clock,
-            runtime_observer=runtime_observer,
-        )
     with runtime_span(runtime_observer, "source.video.publication_validate", stage_attributes):
         view, manifest = _validate_publication(publication)
     with runtime_span(runtime_observer, "source.video.ledger_load", stage_attributes):
@@ -543,7 +565,8 @@ def _export_registered_videos(
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
     runtime_observer: RuntimeObserver | None,
-) -> PublishedRegisteredVideoExport:
+    preflight: McapPreflight | None,
+) -> _PreparedVideoPublication:
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
             "the local registered exporter requires a development UNAPPROVED profile"
@@ -566,31 +589,68 @@ def _export_registered_videos(
         schema_registry,
         clock=clock,
     )
-    source_origin_ns, source_end_ns = _mapped_source_bounds(channels)
+    planner_policy_factory: Callable[[int], BoundedMediaPolicy] | None = None
+    if preflight is not None and not preflight.message_indexes_complete:
+        planner_policy = None
+        source_end_ns = None
+
+        def planner_policy_factory(
+            source_origin_ns: int,
+        ) -> BoundedMediaPolicy:
+            return _pre_eos_media_policy(
+                inspection=inspection,
+                authorization=authorization,
+                source_origin_ns=source_origin_ns,
+            )
+
+    else:
+        source_origin_ns, source_end_ns = _mapped_source_bounds(channels)
+        planner_policy = _pre_eos_media_policy(
+            inspection=inspection,
+            authorization=authorization,
+            source_origin_ns=source_origin_ns,
+        )
+    producer = DurableSinglePassVideoProducer(
+        inspection=inspection,
+        channels=channels,
+        planner_policy=planner_policy,
+        spool_directory=state_dir / "h264-spools",
+        final_end_ns=source_end_ns,
+        max_parallel_exports=MCAP_SPOOL_EXPORT_WORKERS,
+        preflight=preflight,
+        planner_policy_factory=planner_policy_factory,
+        exporter=exporter,
+    )
+    spool_set = producer.prepare()
+    runtime_increment(
+        runtime_observer,
+        "media.planning_mode",
+        attributes={
+            "message_indexes_complete": spool_set.preflight_message_indexes_complete,
+            "mode": spool_set.planning_mode,
+        },
+    )
+    final_inspection = producer.inspection
+    final_channels = authorization.policy.resolve(final_inspection)
+    if final_channels != producer.channels:
+        raise CanonicalMcapSourceError(
+            "final mapped channels differ from the single-pass accepted mapping"
+        )
     request = LocalVideoExportRequest(
         source=source,
         output_directory=state_dir / "video-view",
         namespace=MCAP_RECORDING_NAMESPACE,
-        inspection=inspection,
-        channels=channels,
+        inspection=final_inspection,
+        channels=final_channels,
         mapping_profile=authorization.profile,
         mapping_profile_digest=authorization.semantic_sha256,
         exporter=descriptor,
     )
-    producer = DurableSinglePassVideoProducer(
-        inspection=inspection,
-        channels=channels,
-        planner_policy=_pre_eos_media_policy(
-            inspection=inspection,
-            authorization=authorization,
-            source_origin_ns=source_origin_ns,
-        ),
-        spool_directory=state_dir / "h264-spools",
-        final_end_ns=source_end_ns,
-        max_parallel_exports=MCAP_SPOOL_EXPORT_WORKERS,
-        exporter=exporter,
+    return _PreparedVideoPublication(
+        publication=service.export_staged_local(request, producer),
+        inspection=final_inspection,
+        channels=final_channels,
     )
-    return service.export_staged_local(request, producer)
 
 
 def _pre_eos_media_policy(
