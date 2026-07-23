@@ -1,22 +1,36 @@
 # Robata Web UI
 
-ComfyUI-inspired visual workflow interface for the Robata canonical pipeline.
+Streaming-architecture visual interface for the Robata canonical pipeline.
 
 ## Features
 
-- **Real-time node graph** — Live status updates via WebSocket (or auto-demo mode)
-- **Schema-typed edges** — Color-coded connections matching Architecture V1.1 contracts
-- **Six-camera 3D view** — Interactive Three.js visualization of multi-view geometry
-- **Node inspector** — Detailed metrics, schema versions, and architecture references
-- **Run summary** — Stage counts, review queue, evidence class tracking
+- **Two-plane layout** — Plane A (Media + Inference) and Plane B (Durable Window DAG)
+- **Event-time timeline** — Visual bands for segments, windows, and watermark progression
+- **Live simulation** — Mock stream events replay with configurable speed
+- **Subject inspection** — Click any subject to see its complete identity (SHA-256, keys, digests)
+- **Backpressure monitoring** — Queue depth, oldest age, and pressure class visualization
+
+## Architecture
+
+The frontend reflects the streaming-throughput rearchitecture (WP0–WP7):
+
+| UI Component | Backend Counterpart | Contract |
+|---|---|---|
+| `CaptureScopeCard` | `PreEosCaptureSubject` | `stream_source.py` |
+| `SegmentTimeline` | `StreamSegment` | `stream_source.py` |
+| `WindowCard` | `IncrementalWindow` | `stream_window.py` |
+| `InferenceCard` | `StreamInference` | `stream_window.py` |
+| `ExpectedWindowPlanCard` | `ExpectedWindowPlan` | `stream_planning.py` |
+| `TerminalClosureCard` | `WindowTerminalClosure` | `stream_finalization.py` |
+| `FinalizationCard` | `RecordingFinalizationMap` | `stream_finalization.py` |
+| `TimelineBand` | Event-time / watermark | `stream_common.py` |
+| `WatermarkBar` | Backpressure state | `stream_common.py` |
 
 ## Tech Stack
 
 - React + TypeScript + Vite
-- **React Flow** — Node graph editor
-- **Tailwind CSS** — Styling
-- **Three.js + React Three Fiber** — 3D six-camera layout
-- **Zustand** — State management
+- Zustand — State management
+- Tailwind CSS — Styling
 
 ## Quick Start
 
@@ -24,7 +38,7 @@ ComfyUI-inspired visual workflow interface for the Robata canonical pipeline.
 # Install dependencies
 npm install
 
-# Development server (auto-reloads on changes)
+# Development server
 npm run dev
 
 # Production build
@@ -34,60 +48,80 @@ npm run preview
 
 The dev server runs at **http://localhost:5173** by default.
 
-## Architecture Mapping
+## Mock Data
 
-| UI Component | Python Backend | Section |
-|---|---|---|
-| `RobataNode` | `CanonicalRunner` stages | 25.10 |
-| `SchemaEdge` | Wire contracts (44 registered schemas) | 25.7 |
-| `SixCameraPanel` | Multi-view geometry | 25.1 |
-| `NodeInspector` | Metrics from `StageMetrics` | — |
-| `RunSummaryPanel` | `RobataRun` projection | — |
-| WebSocket | Real-time updates (planned: FastAPI backend) | — |
+The demo uses a deterministic mock event stream for a 40.89-second six-camera recording:
 
-## Demo Mode
+- **40 segments** per camera (1-second logical chunks)
+- **39 windows** (2s width, 1s hop)
+- **Multiple inferences** per window (QA_COARSE, QA_DENSE, EVENT_PROPOSAL, etc.)
+- **Expected window plan** with sealed manifest
+- **Terminal closure** with reconciled outcomes
+- **Recording finalization** mapping
 
-If no WebSocket backend is available at `ws://localhost:8000/ws/pipeline`, the UI automatically falls back to a simulated run with realistic stage progression.
+Mock data is generated in `src/data/mock_stream_events.ts` and mirrors the Python contract shapes.
 
-To integrate with the Python backend, implement a WebSocket endpoint that emits:
+## Two-Plane Model
 
-```typescript
-// Run initialization
-{ type: 'run_update', run: RobataRun }
+### Plane A: Media + Inference (Replaceable)
 
-// Stage status changes
-{ type: 'node_status', node_id: string, status: NodeStatus }
+Shows the live execution of one window. This plane is replaceable because the same window identity can be produced by PyAV (local) or DeepStream/Triton (accelerated).
 
-// Review queue updates
-{ type: 'review_tasks', tasks: ReviewTask[] }
 ```
+CaptureScope
+  ├── Segment[0..5] (one per camera)
+  ├── Window (purpose, interval, semantic SHA-256)
+  ├── Inference (attempt, terminal outcome)
+  └── WindowResult (evidence ref)
+```
+
+### Plane B: Durable Window DAG (Persistent)
+
+Shows the append-only expected-window plan and its terminal closure. This plane survives restarts and is the authority for recording finalization.
+
+```
+ExpectedWindowPlan
+  ├── Declarations (appended before child publication)
+  ├── Sealed manifest (at EOS)
+  └── Terminal closure (reconciled after execution)
+
+RecordingFinalizationMap
+  ├── Capture scope → Final source identity
+  └── Incremental windows → Recording-scoped identities
+```
+
+## Evidence Class
+
+All displayed runs are marked `LOCAL_CONFORMANCE` and `production_eligible: false` per Architecture V1.1 Section 25.11.
 
 ## Next Steps
 
-1. **Backend integration** — Add FastAPI WebSocket endpoint to `src/robata/` 
-2. **Review UI** — Embed six-video player in review nodes
-3. **Video streaming** — Serve MP4 exports with signed URLs
-4. **Authentication** — Add reviewer identity and permissions
-5. **Metrics dashboard** — Real-time capacity and SLO charts
+1. **Backend integration** — Connect to FastAPI WebSocket endpoint when WP3–WP6 complete
+2. **Real-time updates** — Replace mock simulation with live stream events
+3. **Video player** — Embed six-video player in segment detail
+4. **Metrics dashboard** — Real-time capacity and SLO charts
 
 ## Project Structure
 
 ```
 web/
 ├── src/
-│   ├── nodes/          # Node types (RobataNode)
-│   ├── edges/          # Edge types (SchemaEdge)
-│   ├── panels/         # Side panels (Inspector, 6-Cam, Summary)
-│   ├── hooks/          # WebSocket and other hooks
-│   ├── data/           # Mock pipeline graph
-│   ├── types.ts        # Domain types
-│   ├── store.ts        # Zustand state
-│   └── App.tsx
-├── public/
+│   ├── data/
+│   │   └── mock_stream_events.ts   # Mock event stream data
+│   ├── hooks/
+│   │   └── useWebSocket.ts         # WebSocket + simulation hook
+│   ├── panels/
+│   │   ├── PlaneAView.tsx          # Media + Inference plane
+│   │   ├── PlaneBView.tsx          # Durable Window DAG plane
+│   │   ├── TimelineBand.tsx        # Event-time timeline
+│   │   ├── WatermarkBar.tsx        # Watermark + backpressure
+│   │   └── SubjectDetailDrawer.tsx # Subject identity inspector
+│   ├── types.ts                    # Domain types (mirrors Python contracts)
+│   ├── store.ts                    # Zustand store (StreamViewState)
+│   ├── App.tsx                     # Two-plane layout
+│   └── main.tsx                    # Entry point
+├── dist/                           # Production build
 ├── index.html
-└── package.json
+├── package.json
+└── README.md
 ```
-
-## Evidence Class
-
-All displayed runs are marked `LOCAL_CONFORMANCE` and `production_eligible: false` per Architecture V1.1 Section 25.11.
