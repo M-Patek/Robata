@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import ValidationError
 
@@ -123,6 +124,22 @@ class PublishedVideoExport:
     manifest: CameraVideoExportManifest
     manifest_sha256: Sha256Digest
     reused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StagedSixCameraVideoExport:
+    """Six camera artifacts and exact source identity from one source traversal."""
+
+    source_size_bytes: int
+    source_sha256: Sha256Digest
+    camera_facts: tuple[ExportedCameraVideoFacts, ...]
+
+
+class StagedSixCameraVideoProducer(Protocol):
+    """Produce all six camera artifacts inside service-owned private staging."""
+
+    def __call__(self, staging_directory: Path, /) -> StagedSixCameraVideoExport:
+        """Traverse the source once and return canonical-order export facts."""
 
 
 class SixCameraVideoExportService:
@@ -251,6 +268,44 @@ class SixCameraVideoExportService:
             video_path,
             sidecar_path,
         )
+        return self._verify_camera_facts(request, camera_id, staging_directory, facts)
+
+    def _verify_staged_export(
+        self,
+        request: LocalVideoExportRequest,
+        staging_directory: Path,
+        staged: StagedSixCameraVideoExport,
+    ) -> tuple[ExportedCameraVideoFacts, ...]:
+        """Verify one traversal result without re-reading or re-hashing the source."""
+
+        if (
+            staged.source_size_bytes != request.inspection.source_size_bytes
+            or staged.source_sha256 != request.inspection.source_sha256
+        ):
+            raise VideoExportRunError(
+                VideoExportRunErrorCode.SOURCE_CHANGED,
+                "single-traversal source identity differs from the inspected source",
+            )
+        if len(staged.camera_facts) != len(CAMERA_IDS):
+            raise VideoExportRunError(
+                VideoExportRunErrorCode.DERIVED_ARTIFACT_INVALID,
+                "single-traversal export must return exactly six camera facts",
+            )
+        return tuple(
+            self._verify_camera_facts(request, camera_id, staging_directory, facts)
+            for camera_id, facts in zip(CAMERA_IDS, staged.camera_facts, strict=True)
+        )
+
+    @staticmethod
+    def _verify_camera_facts(
+        request: LocalVideoExportRequest,
+        camera_id: CameraId,
+        staging_directory: Path,
+        facts: ExportedCameraVideoFacts,
+    ) -> ExportedCameraVideoFacts:
+        channel = request.channels[camera_id]
+        video_path = staging_directory / f"{camera_id.value}.mp4"
+        sidecar_path = staging_directory / f"{camera_id.value}.timestamps.jsonl"
         try:
             if (
                 facts.camera_id is not camera_id
@@ -721,6 +776,8 @@ __all__ = [
     "LocalVideoExportRequest",
     "PublishedVideoExport",
     "SixCameraVideoExportService",
+    "StagedSixCameraVideoExport",
+    "StagedSixCameraVideoProducer",
     "VideoExportRunError",
     "VideoExportRunErrorCode",
     "VideoExporterDescriptor",

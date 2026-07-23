@@ -22,6 +22,7 @@ from robata.application.video_export import (
     MANIFEST_FILENAME,
     LocalVideoExportRequest,
     SixCameraVideoExportService,
+    StagedSixCameraVideoProducer,
     VideoExportRunError,
     VideoExportRunErrorCode,
     _drop_provenance,
@@ -158,8 +159,25 @@ class RegisteredSixCameraVideoExportService:
     ) -> PublishedRegisteredVideoExport:
         """Resolve or atomically register one local six-camera V2 derivation."""
 
+        return self._run_export_local(request, staged_producer=None)
+
+    def export_staged_local(
+        self,
+        request: LocalVideoExportRequest,
+        staged_producer: StagedSixCameraVideoProducer,
+    ) -> PublishedRegisteredVideoExport:
+        """Publish six artifacts produced by one source traversal in private staging."""
+
+        return self._run_export_local(request, staged_producer=staged_producer)
+
+    def _run_export_local(
+        self,
+        request: LocalVideoExportRequest,
+        *,
+        staged_producer: StagedSixCameraVideoProducer | None,
+    ) -> PublishedRegisteredVideoExport:
         try:
-            return self._export_local(request)
+            return self._export_local(request, staged_producer=staged_producer)
         except VideoExportRunError:
             raise
         except ArtifactViewError as error:
@@ -186,6 +204,8 @@ class RegisteredSixCameraVideoExportService:
     def _export_local(
         self,
         request: LocalVideoExportRequest,
+        *,
+        staged_producer: StagedSixCameraVideoProducer | None,
     ) -> PublishedRegisteredVideoExport:
         SixCameraVideoExportService._validate_request(request)
         output_directory = self._resolve_output_directory(request.output_directory)
@@ -195,7 +215,8 @@ class RegisteredSixCameraVideoExportService:
 
         committed = self._artifact_registry.lookup_derivation(logical_key)
         if committed is not None:
-            SixCameraVideoExportService._verify_source_unchanged(request)
+            if staged_producer is None:
+                SixCameraVideoExportService._verify_source_unchanged(request)
             manifest, manifest_bytes = self._load_committed_manifest(
                 committed.snapshot,
                 committed.manifest_artifact_id,
@@ -231,11 +252,19 @@ class RegisteredSixCameraVideoExportService:
             prefix=f".{output_directory.name}.artifacts-",
         )
         try:
-            facts = self._verified_export._export_all_cameras(
-                request,
-                staging_directory,
-            )
-            SixCameraVideoExportService._verify_source_unchanged(request)
+            if staged_producer is None:
+                facts = self._verified_export._export_all_cameras(
+                    request,
+                    staging_directory,
+                )
+                SixCameraVideoExportService._verify_source_unchanged(request)
+            else:
+                staged = staged_producer(staging_directory)
+                facts = self._verified_export._verify_staged_export(
+                    request,
+                    staging_directory,
+                    staged,
+                )
             built = self._build_derivation(
                 request,
                 inputs,
