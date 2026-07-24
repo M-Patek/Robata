@@ -8,6 +8,7 @@ from robata.queue.backpressure import (
     AdmissionDecision,
     BackpressureConfig,
     BackpressureController,
+    PressureClass,
     QueueMetrics,
     SheddingAction,
 )
@@ -109,6 +110,7 @@ __all__ = [
     "PersistedBarrier",
     "PersistedBarrierMember",
     "PersistedBarrierStatus",
+    "PressureClass",
     "QueueMetrics",
     "RedisTaskQueue",
     "ReductionPolicy",

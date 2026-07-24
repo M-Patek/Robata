@@ -1,0 +1,57 @@
+Robata Software License
+
+Copyright (c) 2026 Robata Contributors. All rights reserved.
+
+1. GRANT OF LICENSE
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to use,
+   copy, modify, and distribute the Software for evaluation and development
+   purposes, subject to the following conditions:
+
+2. RESTRICTIONS
+
+   a) Production Use: The Software is provided for evaluation and development
+      purposes only. Production deployment or commercial use requires explicit
+      written authorization from the copyright holders.
+
+   b) Model Qualification: The Software includes fixture-backed inference
+      adapters for local testing. Use with real model endpoints (Qwen, GPT,
+      or other providers) requires separate qualification and compliance with
+      provider terms of service.
+
+   c) Infrastructure: The Software is designed for local conformance testing.
+      Production deployment requires qualification of database, broker, object
+      storage, and compute infrastructure not included in this distribution.
+
+3. EVIDENCE CLASSES
+
+   The Software operates under the following evidence classifications:
+
+   - LOCAL_CONFORMANCE: Mechanism verified in local environment only.
+   - NOT_PRODUCTION_QUALIFIED: Not approved for production deployment.
+   - NOT_MEASURED: Performance claims based on fixture/mock data, not
+     representative production workload.
+
+4. DISCLAIMER
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+   IN THE SOFTWARE.
+
+5. ATTRIBUTION
+
+   Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+6. GOVERNING LAW
+
+   This license shall be governed by and construed in accordance with the laws
+   of the jurisdiction in which the copyright holders reside, without regard to
+   its conflict of law provisions.
+
+For production qualification inquiries, contact the maintainers.

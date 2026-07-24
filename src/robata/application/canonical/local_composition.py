@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, Protocol
@@ -23,7 +23,9 @@ from robata.adapters.sqlite_inference_evidence import (
     SQLiteInferenceEvidenceLedger,
     SQLiteInferenceEvidenceLedgerError,
 )
+from robata.adapters.sqlite_outbox import SQLiteIdempotentOutboxSink
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
+from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkSchedulerError
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.action_event_revision import (
@@ -43,6 +45,18 @@ from robata.application.canonical.local_review_routing import (
     LocalReviewRoutingSummary,
     failed_local_review_routing,
     route_local_review_after_completion,
+)
+from robata.application.canonical.local_stream_finalization import (
+    LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION,
+    LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION,
+    LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
+    LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
+    FinalRecordingFacts,
+    LocalConformanceStreamFinalizer,
+    LocalStreamFinalizationError,
+    LocalStreamFinalizationOutcome,
+    LocalStreamFinalizationSchemaRefs,
+    load_completed_local_stream_recording_result,
 )
 from robata.application.canonical.local_supplemental_qa import (
     LOCAL_SUPPLEMENTAL_DEDUPE_POLICY_VERSION,
@@ -85,6 +99,7 @@ from robata.application.canonical.primary_completion import (
     PrimaryCompletionEvidenceRole,
     create_primary_completion_command,
 )
+from robata.application.canonical.result_validation import CanonicalOfflineRunResult
 from robata.application.canonical.runner import CanonicalOfflinePipeline
 from robata.application.canonical.source_fixture import (
     CanonicalSourceBundle,
@@ -92,6 +107,18 @@ from robata.application.canonical.source_fixture import (
     CanonicalSourceFixtureError,
     load_canonical_source_fixture,
 )
+from robata.application.canonical.stream_recording_reduction import (
+    LOCAL_STREAM_RECORDING_REDUCTION_POLICY_VERSION,
+    LOCAL_STREAM_RECORDING_RESULT_SCHEMA_ID,
+    LOCAL_STREAM_RECORDING_RESULT_V4_SCHEMA_VERSION,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_ID,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+    LocalStreamRecordingResult,
+    LocalStreamRecordingResultV2,
+    LocalStreamRecordingResultV3,
+    LocalStreamRecordingResultV4,
+)
+from robata.application.canonical.stream_scheduler import DurableStreamWindowScheduler
 from robata.application.canonical_run_membership import CanonicalProcessingRunContext
 from robata.contracts.cameras import CameraId
 from robata.contracts.common import NanosecondInterval, StrictModel
@@ -100,8 +127,35 @@ from robata.contracts.hashing import (
     exact_bytes_sha256,
     semantic_sha256,
 )
+from robata.contracts.local_stream_causal import (
+    LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_ID,
+    LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_VERSION,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_ID,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_VERSION,
+)
 from robata.contracts.sampling_plan import SamplingPlan
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
+from robata.contracts.stream_common import ArtifactEvidenceRef, StreamPurpose
+from robata.contracts.stream_finalization import (
+    RECORDING_FINALIZATION_SCHEMA_ID,
+    RECORDING_FINALIZATION_SCHEMA_VERSION,
+)
+from robata.contracts.stream_inference import (
+    STREAM_ACCEPTED_CALL_SCHEMA_ID,
+    STREAM_ACCEPTED_CALL_SCHEMA_VERSION,
+    STREAM_INFERENCE_INTENT_SCHEMA_ID,
+    STREAM_INFERENCE_INTENT_SCHEMA_VERSION,
+    STREAM_INFERENCE_TERMINAL_SCHEMA_ID,
+    STREAM_INFERENCE_TERMINAL_SCHEMA_VERSION,
+    STREAM_WINDOW_RESULT_SCHEMA_ID,
+    STREAM_WINDOW_RESULT_SCHEMA_VERSION,
+)
+from robata.contracts.stream_window import (
+    STREAM_INFERENCE_ATTEMPT_SCHEMA_ID,
+    STREAM_INFERENCE_ATTEMPT_SCHEMA_VERSION,
+    STREAM_INFERENCE_SCHEMA_ID,
+    STREAM_INFERENCE_SCHEMA_VERSION,
+)
 from robata.event_pipeline.identity_registry import (
     EventIdAllocator,
     EventIdentityPolicyRef,
@@ -159,6 +213,7 @@ from robata.qa_pipeline.supplemental_wire import (
     LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_VERSION,
     LocalSupplementalQaEvidence,
 )
+from robata.queue.outbox import OutboxRelay, OutboxRetryPolicy
 from robata.runtime.observability import (
     RuntimeObserver,
     runtime_increment,
@@ -179,7 +234,7 @@ from robata.sampling.supplemental import (
     SUPPLEMENTAL_TARGET_PLAN_PROJECTION_VERSION,
 )
 
-LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v18"
+LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v21"
 LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION = "canonical-local-execution-clock-v1"
 LOCAL_CANONICAL_EXECUTION_TIME = "2026-07-20T00:00:00Z"
 _LOCAL_CANONICAL_EXECUTION_DATETIME: Final = datetime(2026, 7, 20, tzinfo=UTC)
@@ -322,7 +377,10 @@ class _CanonicalSourceInputs(Protocol):
     ) -> MaterializedFrameArtifactFact | None: ...
 
 
-_CanonicalSourceLoader = Callable[[SchemaRegistry], _CanonicalSourceInputs]
+_CanonicalSourceLoader = Callable[
+    [SchemaRegistry, SQLiteWorkScheduler, str],
+    _CanonicalSourceInputs,
+]
 _MediaQualityDocumentLoader = Callable[[SchemaRegistry], dict[str, object]]
 _SupplementalQaEvidenceBuilder = Callable[
     [SchemaRegistry, _CanonicalSourceInputs],
@@ -382,7 +440,11 @@ def run_local_canonical_fixture(
         }
     )
 
-    def load_source(registry: SchemaRegistry) -> CanonicalSourceBundle:
+    def load_source(
+        registry: SchemaRegistry,
+        _execution_scheduler: SQLiteWorkScheduler,
+        _stream_run_id: str,
+    ) -> CanonicalSourceBundle:
         return load_canonical_source_fixture(
             source,
             schema_registry=registry,
@@ -462,7 +524,7 @@ def run_local_canonical_mcap(
     ).ref
     source_binding_sha256 = semantic_sha256(
         {
-            "source_binding_policy_version": "canonical-local-mcap-source-binding-v5",
+            "source_binding_policy_version": "canonical-local-mcap-source-binding-v6",
             "source_kind": "mcap",
             "source_content_sha256": source_sha256,
             "mapping_profile_semantic_sha256": authorization.semantic_sha256,
@@ -510,7 +572,11 @@ def run_local_canonical_mcap(
         state_root / "mcap" / _stable_uuid("canonical-mcap-source-state", source_binding_sha256)
     )
 
-    def load_source(registry: SchemaRegistry) -> CanonicalMcapSourceBundle:
+    def load_source(
+        registry: SchemaRegistry,
+        execution_scheduler: SQLiteWorkScheduler,
+        stream_run_id: str,
+    ) -> CanonicalMcapSourceBundle:
         try:
             return load_canonical_mcap_source(
                 source,
@@ -521,6 +587,9 @@ def run_local_canonical_mcap(
                 clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
                 max_duration_ns=max_duration_ns,
                 runtime_observer=runtime_observer,
+                execution_scheduler=execution_scheduler,
+                stream_run_id=stream_run_id,
+                stream_artifact_root=state_root / "stream-artifacts",
             )
         except CanonicalMcapSourceError as error:
             raise CanonicalLocalCompositionError(
@@ -670,12 +739,23 @@ def _run_local_canonical_inner(
                 registry=registry,
                 runtime_observer=runtime_observer,
             )
+            work_scheduler = SQLiteWorkScheduler(
+                state_root / "work-scheduler.sqlite3",
+                runtime_observer=runtime_observer,
+            )
             publish_work = CanonicalActionPublishWorkCoordinator(
-                scheduler=SQLiteWorkScheduler(
-                    state_root / "work-scheduler.sqlite3",
-                    runtime_observer=runtime_observer,
-                ),
+                scheduler=work_scheduler,
                 repository=completion_repository,
+            )
+            stream_schedulers = DurableStreamWindowScheduler.recover_registered(
+                execution_scheduler=work_scheduler,
+                stream_run_id=run_id,
+                clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+            )
+            runtime_increment(
+                runtime_observer,
+                "stream.scheduler.recovered_graphs",
+                len(stream_schedulers),
             )
         with runtime_span(runtime_observer, "completion.recovery.lookup"):
             recovered = completion_repository.get(run_id)
@@ -687,6 +767,32 @@ def _run_local_canonical_inner(
             )
             with runtime_span(runtime_observer, "completion.scheduler.reconcile"):
                 publish_work.reconcile(recovered)
+            with runtime_span(runtime_observer, "stream.finalization.recover"):
+                recording_result_references = tuple(
+                    reference
+                    for reference in recovered.evidence_references
+                    if reference.role is PrimaryCompletionEvidenceRole.STREAM_RECORDING_RESULT
+                )
+                if len(recording_result_references) != len(stream_schedulers):
+                    raise CanonicalLocalCompositionError(
+                        CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                        "stream scheduler and authoritative recording evidence disagree",
+                    )
+                stream_recording_evidence = tuple(
+                    load_completed_local_stream_recording_result(
+                        scheduler=scheduler,
+                        artifact_root=state_root / "stream-artifacts",
+                        schema_ref=reference.schema_ref,
+                        expected_exact_sha256=reference.exact_bytes_sha256,
+                        expected_byte_count=reference.byte_count,
+                    )
+                    for scheduler, reference in zip(
+                        stream_schedulers,
+                        recording_result_references,
+                        strict=True,
+                    )
+                )
+                _relay_local_stream_outbox(stream_schedulers, state_root)
             runtime_increment(
                 runtime_observer,
                 "durable_work.terminal_outcomes",
@@ -717,6 +823,7 @@ def _run_local_canonical_inner(
             evidence_references = _local_completion_evidence_references(
                 media_quality_document=media_quality_document,
                 supplemental_qa_evidence=supplemental_qa_evidence,
+                stream_recording_evidence=stream_recording_evidence,
             )
             if recovered.evidence_references != evidence_references:
                 raise CanonicalLocalCompositionError(
@@ -742,12 +849,22 @@ def _run_local_canonical_inner(
             attributes={"replayed": False},
         )
         with runtime_span(runtime_observer, "source.prepare"):
-            bundle = source_loader(registry)
+            bundle = source_loader(registry, work_scheduler, run_id)
         if bundle.source_content_sha256 != source_sha256:
             raise CanonicalLocalCompositionError(
                 CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
                 "source bytes changed while preparing the canonical run",
             )
+        stream_schedulers = DurableStreamWindowScheduler.recover_registered(
+            execution_scheduler=work_scheduler,
+            stream_run_id=run_id,
+            clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+        )
+        runtime_increment(
+            runtime_observer,
+            "stream.scheduler.prepared_graphs",
+            len(stream_schedulers),
+        )
         with runtime_span(runtime_observer, "quality.evidence.prepare"):
             media_quality_document, media_quality_binding = _load_local_media_quality_evidence(
                 media_quality_document_loader,
@@ -758,10 +875,6 @@ def _run_local_canonical_inner(
                 if supplemental_qa_evidence_builder is None
                 else supplemental_qa_evidence_builder(registry, bundle)
             )
-        evidence_references = _local_completion_evidence_references(
-            media_quality_document=media_quality_document,
-            supplemental_qa_evidence=supplemental_qa_evidence,
-        )
         with runtime_span(runtime_observer, "canonical.runtime.build"):
             runtime = _build_runtime(
                 state_root=state_root,
@@ -815,6 +928,33 @@ def _run_local_canonical_inner(
                 CanonicalLocalCompositionErrorCode.RUN_NOT_COMPLETABLE,
                 f"canonical run ended as {result.status.value}: {detail}",
             )
+
+        with runtime_span(runtime_observer, "stream.finalization.execute"):
+            stream_finalizations = _finalize_local_stream_graphs(
+                schedulers=stream_schedulers,
+                state_root=state_root,
+                registry=registry,
+                bundle=bundle,
+                canonical_result=result,
+            )
+        runtime_increment(
+            runtime_observer,
+            "stream.finalization.completed_graphs",
+            len(stream_finalizations),
+        )
+        runtime_increment(
+            runtime_observer,
+            "stream.finalization.executed_work",
+            sum(item.newly_executed_work_count for item in stream_finalizations),
+        )
+        evidence_references = _local_completion_evidence_references(
+            media_quality_document=media_quality_document,
+            supplemental_qa_evidence=supplemental_qa_evidence,
+            stream_recording_evidence=tuple(
+                (item.recording_result, item.recording_result_evidence_ref)
+                for item in stream_finalizations
+            ),
+        )
 
         prepared_identities = None
         if result.status is CanonicalOfflineRunStatus.SUCCEEDED:
@@ -898,6 +1038,7 @@ def _run_local_canonical_inner(
     except (
         SQLiteBarrierStorageError,
         SQLiteInferenceEvidenceLedgerError,
+        LocalStreamFinalizationError,
         LogicalNodeRegistryError,
         WorkSchedulerError,
         CanonicalDurableWorkError,
@@ -939,6 +1080,7 @@ def _build_runtime(
     inference_evidence = SQLiteInferenceEvidenceLedger(
         state_root / "inference-evidence.sqlite3",
         registry,
+        raw_bytes_cas_root=state_root / "raw-provider-cas",
         runtime_observer=runtime_observer,
     )
     barrier_storage = SQLiteBarrierStorage(
@@ -997,6 +1139,7 @@ def _build_runtime(
             runtime_observer=runtime_observer,
         ),
         execution_policy=execution_policy,
+        max_concurrent_call_parts=6,
         inference_ledger=inference_evidence,
         evidence_store=inference_evidence,
         barrier_storage=barrier_storage,
@@ -1173,7 +1316,7 @@ def _local_runtime_policy_sha256(
 
     return semantic_sha256(
         {
-            "semantic_projection_version": "canonical-local-runtime-policy-v8",
+            "semantic_projection_version": "canonical-local-runtime-policy-v10",
             "pipeline_version": CANONICAL_OFFLINE_PIPELINE_VERSION,
             "coarse_qa_inference_policy": coarse_qa_policy.model_dump(mode="json"),
             "coarse_qa_projection_policy_version": LOCAL_COARSE_QA_POLICY_VERSION,
@@ -1192,6 +1335,13 @@ def _local_runtime_policy_sha256(
                 version=LOCAL_QA_COMPLETION_POLICY_VERSION
             ).model_dump(mode="json"),
             "fusion_inference_policy": inference_policy.model_dump(mode="json"),
+            "local_stream_mock_executor_policy_version": (
+                LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION
+            ),
+            "local_stream_reduction_policy_version": (LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION),
+            "local_stream_recording_reduction_policy_version": (
+                LOCAL_STREAM_RECORDING_REDUCTION_POLICY_VERSION
+            ),
         }
     )
 
@@ -1584,8 +1734,20 @@ def _local_completion_evidence_references(
     *,
     media_quality_document: Mapping[str, object] | None,
     supplemental_qa_evidence: LocalSupplementalQaEvidence | None,
+    stream_recording_evidence: tuple[
+        tuple[
+            LocalStreamRecordingResult
+            | LocalStreamRecordingResultV2
+            | LocalStreamRecordingResultV3
+            | LocalStreamRecordingResultV4,
+            ArtifactEvidenceRef,
+        ],
+        ...,
+    ] = (),
 ) -> tuple[PrimaryCompletionEvidenceReference, ...]:
     references: list[PrimaryCompletionEvidenceReference] = []
+    if len(stream_recording_evidence) > 1:
+        raise ValueError("one primary completion may bind only one stream recording result")
     if media_quality_document is not None:
         references.append(
             _registered_evidence_reference(
@@ -1598,6 +1760,23 @@ def _local_completion_evidence_references(
             _registered_evidence_reference(
                 role=PrimaryCompletionEvidenceRole.SUPPLEMENTAL_QA_EVIDENCE,
                 document=supplemental_qa_evidence.model_dump(mode="json"),
+            )
+        )
+    for result, artifact_ref in stream_recording_evidence:
+        payload = canonical_json_bytes(result)
+        if (
+            artifact_ref.schema_ref != result.schema_ref
+            or artifact_ref.exact_sha256 != exact_bytes_sha256(payload)
+            or artifact_ref.byte_count != len(payload)
+        ):
+            raise ValueError("stream recording result differs from its content-addressed artifact")
+        references.append(
+            PrimaryCompletionEvidenceReference(
+                role=PrimaryCompletionEvidenceRole.STREAM_RECORDING_RESULT,
+                schema_ref=result.schema_ref,
+                semantic_sha256=result.recording_result_semantic_sha256,
+                exact_bytes_sha256=artifact_ref.exact_sha256,
+                byte_count=artifact_ref.byte_count,
             )
         )
     return tuple(sorted(references, key=lambda reference: reference.role.value))
@@ -1619,6 +1798,144 @@ def _registered_evidence_reference(
         exact_bytes_sha256=exact_bytes_sha256(payload),
         byte_count=len(payload),
     )
+
+
+def _finalize_local_stream_graphs(
+    *,
+    schedulers: tuple[DurableStreamWindowScheduler, ...],
+    state_root: Path,
+    registry: SchemaRegistry,
+    bundle: _CanonicalSourceInputs,
+    canonical_result: CanonicalOfflineRunResult,
+) -> tuple[LocalStreamFinalizationOutcome, ...]:
+    if not schedulers:
+        return ()
+    schema_refs = LocalStreamFinalizationSchemaRefs(
+        local_work_receipt=registry.resolve_version(
+            LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
+            LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
+        ).ref,
+        stream_window_result=registry.resolve_version(
+            STREAM_WINDOW_RESULT_SCHEMA_ID,
+            STREAM_WINDOW_RESULT_SCHEMA_VERSION,
+        ).ref,
+        recording_finalization=registry.resolve_version(
+            RECORDING_FINALIZATION_SCHEMA_ID,
+            RECORDING_FINALIZATION_SCHEMA_VERSION,
+        ).ref,
+        stream_recording_result=registry.resolve_version(
+            LOCAL_STREAM_RECORDING_RESULT_SCHEMA_ID,
+            LOCAL_STREAM_RECORDING_RESULT_V4_SCHEMA_VERSION,
+        ).ref,
+        window_inference_plan=registry.resolve_version(
+            LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_ID,
+            LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_VERSION,
+        ).ref,
+        window_semantic_evidence_v2=registry.resolve_version(
+            LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_ID,
+            LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_VERSION,
+        ).ref,
+        stream_inference_identity=registry.resolve_version(
+            STREAM_INFERENCE_SCHEMA_ID,
+            STREAM_INFERENCE_SCHEMA_VERSION,
+        ).ref,
+        stream_inference_attempt=registry.resolve_version(
+            STREAM_INFERENCE_ATTEMPT_SCHEMA_ID,
+            STREAM_INFERENCE_ATTEMPT_SCHEMA_VERSION,
+        ).ref,
+        stream_inference_intent=registry.resolve_version(
+            STREAM_INFERENCE_INTENT_SCHEMA_ID,
+            STREAM_INFERENCE_INTENT_SCHEMA_VERSION,
+        ).ref,
+        stream_accepted_call=registry.resolve_version(
+            STREAM_ACCEPTED_CALL_SCHEMA_ID,
+            STREAM_ACCEPTED_CALL_SCHEMA_VERSION,
+        ).ref,
+        stream_inference_terminal=registry.resolve_version(
+            STREAM_INFERENCE_TERMINAL_SCHEMA_ID,
+            STREAM_INFERENCE_TERMINAL_SCHEMA_VERSION,
+        ).ref,
+        window_semantic_evidence=registry.resolve_version(
+            LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_ID,
+            LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+        ).ref,
+    )
+    ready = bundle.admitted_context.ready_manifest
+    final_recording = FinalRecordingFacts(
+        final_source_subject_type="MCAP_RECORDING",
+        final_source_subject_id=ready.mcap_id,
+        final_source_exact_sha256=bundle.source_content_sha256,
+        final_recording_identity=ready.recording_identity,
+        final_duration_ns=ready.recording.duration_ns,
+    )
+    delivery = _local_stream_delivery_authority(schedulers)
+    outcomes = tuple(
+        LocalConformanceStreamFinalizer(
+            scheduler=scheduler,
+            delivery_authority=delivery,
+            artifact_root=state_root / "stream-artifacts",
+            schema_refs=schema_refs,
+            final_recording=final_recording,
+            canonical_result=canonical_result,
+            source_timeline_origin_ns=(
+                bundle.admitted_context.alignment_manifest.canonical_origin.reference_timestamp_ns
+            ),
+            canonical_requested_interval=bundle.requested_interval,
+            window_purpose=StreamPurpose.EVENT_PROPOSAL,
+            recover_graph_before_execute=False,
+            clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+        ).execute()
+        for scheduler in schedulers
+    )
+    _relay_local_stream_outbox(schedulers, state_root, authority=delivery)
+    return outcomes
+
+
+def _local_stream_delivery_authority(
+    schedulers: tuple[DurableStreamWindowScheduler, ...],
+) -> SQLiteStreamDeliveryAuthority:
+    if not schedulers:
+        raise ValueError("stream delivery authority requires a scheduler")
+    database_path = schedulers[0].database_path
+    if any(scheduler.database_path != database_path for scheduler in schedulers):
+        raise LocalStreamFinalizationError(
+            "one canonical run cannot span multiple stream authority databases"
+        )
+    return SQLiteStreamDeliveryAuthority(
+        SQLiteWorkScheduler(database_path),
+        retry_policy=OutboxRetryPolicy(
+            version="local-stream-delivery-retry-v1",
+            max_attempts=3,
+            base_delay_seconds=1,
+            max_delay_seconds=30,
+        ),
+        clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+    )
+
+
+def _relay_local_stream_outbox(
+    schedulers: tuple[DurableStreamWindowScheduler, ...],
+    state_root: Path,
+    *,
+    authority: SQLiteStreamDeliveryAuthority | None = None,
+) -> int:
+    if not schedulers:
+        return 0
+    store = authority or _local_stream_delivery_authority(schedulers)
+    store.reconcile()
+    relay = OutboxRelay(
+        store=store,
+        sink=SQLiteIdempotentOutboxSink(
+            state_root / "stream-outbox-sink.sqlite3",
+            clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+        ),
+        worker_id="local-stream-outbox-relay",
+        lease_duration=timedelta(minutes=5),
+    )
+    delivered = 0
+    while relay.deliver_once() is not None:
+        delivered += 1
+    return delivered
 
 
 def _reconcile_local_outbox(

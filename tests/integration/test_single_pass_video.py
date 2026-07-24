@@ -77,7 +77,7 @@ def _source_context(
     )
     assert inspection.first_message_time_ns is not None
     policy = BoundedMediaPolicy(
-        source_scope_digest=inspection.source_sha256,
+        source_scope_digest="d" * 64,
         mapping_semantic_sha256="b" * 64,
         alignment_semantic_sha256="c" * 64,
         source_origin_ns=inspection.first_message_time_ns,
@@ -157,11 +157,14 @@ def test_fresh_and_recovered_spool_production_match_legacy_export_exactly(
         assert actual.sidecar_path.read_bytes() == legacy_facts[camera_id].sidecar_path.read_bytes()
 
     inspection.source.unlink()
-    assert read_sealed_mcap_inspection(
-        spool_directory,
-        source=inspection.source,
-        expected_source_sha256=inspection.source_sha256,
-    ) == inspection
+    assert (
+        read_sealed_mcap_inspection(
+            spool_directory,
+            source=inspection.source,
+            expected_source_sha256=inspection.source_sha256,
+        )
+        == inspection
+    )
     recovery_tee = _CountingTee()
     recovery_sink = _RecordingPlanningSink()
     recovered_producer = DurableSinglePassVideoProducer(
@@ -266,7 +269,7 @@ def test_real_no_index_capture_is_one_pass_and_recovery_never_opens_source(
         source_origin_ns: int,
     ) -> BoundedMediaPolicy:
         return BoundedMediaPolicy(
-            source_scope_digest=expected.source_sha256,
+            source_scope_digest="d" * 64,
             mapping_semantic_sha256=authorization.semantic_sha256,
             alignment_semantic_sha256="c" * 64,
             source_origin_ns=source_origin_ns,
@@ -297,6 +300,7 @@ def test_real_no_index_capture_is_one_pass_and_recovery_never_opens_source(
         planner_policy_factory=policy_factory,
         preflight=preflight,
         spool_directory=spool_directory,
+        planner_source_scope_digest="d" * 64,
         planning_sink=fresh_sink,
         tee=fresh_tee,
     )
@@ -310,13 +314,17 @@ def test_real_no_index_capture_is_one_pass_and_recovery_never_opens_source(
     assert len(fresh_sink.emissions) == fresh.selected_packet_count
     assert fresh_sink.source_positions
     assert fresh_sink.source_positions[0] < expected.source_size_bytes
+    assert fresh_producer.planner_finish == fresh_sink.finishes[0]
 
     final_channels = authorization.policy.resolve(expected)
-    final_end_ns = max(
-        channel.last_message_time_ns
-        for channel in final_channels.values()
-        if channel.last_message_time_ns is not None
-    ) + 1
+    final_end_ns = (
+        max(
+            channel.last_message_time_ns
+            for channel in final_channels.values()
+            if channel.last_message_time_ns is not None
+        )
+        + 1
+    )
     recovery_tee = _CountingTee()
     recovery_sink = _RecordingPlanningSink()
     recovered_producer = DurableSinglePassVideoProducer(

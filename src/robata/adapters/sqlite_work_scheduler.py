@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from robata.queue.models import (
@@ -111,6 +112,43 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+# These indexes are additive so databases created by an earlier v1 runtime can
+# receive the same query plan without a destructive schema migration.
+_INDEX_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS work_items_state_retry
+    ON work_items(state, retry_not_before_at, created_at, work_item_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_expiry
+    ON work_items(execution_expiry_at)
+    WHERE completed_at IS NULL AND execution_expiry_at IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_due_expiry
+    ON work_items(execution_expiry_at, work_item_id)
+    WHERE completed_at IS NULL AND execution_expiry_at IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_lease_expiry
+    ON work_items(lease_expires_at)
+    WHERE state IN ('LEASED', 'RUNNING')
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_due_lease
+    ON work_items(state, lease_expires_at, work_item_id)
+    WHERE lease_expires_at IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_run_state
+    ON work_items(run_id, state, work_item_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_dependencies_downstream
+    ON work_dependencies(downstream_work_item_id, upstream_work_item_id)
+    """,
+)
+
 
 class WorkSchedulerError(RuntimeError):
     """Base error for durable scheduling operations."""
@@ -144,9 +182,13 @@ class SQLiteWorkScheduler:
         database_path: str | Path,
         *,
         runtime_observer: RuntimeObserver | None = None,
+        synchronous: Literal["FULL", "NORMAL"] = "FULL",
     ) -> None:
         self._database_path = Path(database_path)
         self._runtime_observer = runtime_observer
+        if synchronous not in {"FULL", "NORMAL"}:
+            raise ValueError("synchronous must be FULL or NORMAL")
+        self._synchronous = synchronous
         if self._database_path.exists() and self._database_path.is_dir():
             raise WorkStorageError("work-ledger path must identify a file")
         if not self._database_path.parent.exists():
@@ -303,6 +345,24 @@ class SQLiteWorkScheduler:
             operation=lambda connection: self._load_item(connection, work_item_id),
         )
 
+    def items_for_run(self, run_id: str) -> tuple[WorkItem, ...]:
+        """Read one run's work snapshots in a single authority transaction."""
+
+        checked_run_id = _nonempty(run_id, "run_id")
+
+        def operation(connection: sqlite3.Connection) -> tuple[WorkItem, ...]:
+            rows = connection.execute(
+                "SELECT * FROM work_items WHERE run_id = ? ORDER BY work_item_id",
+                (checked_run_id,),
+            ).fetchall()
+            return tuple(self._item_from_row(row) for row in rows)
+
+        return self._transaction(
+            write=False,
+            operation_name="items_for_run",
+            operation=operation,
+        )
+
     def dependencies(self, work_item_id: str) -> tuple[WorkDependency, ...]:
         """Return upstream edges in deterministic dependency-id order."""
 
@@ -442,7 +502,6 @@ class SQLiteWorkScheduler:
 
         checked_lease = _require_model(lease, WorkLease, "lease")
         checked_now = _checked_now(now)
-        self.reconcile(now=checked_now)
 
         def operation(connection: sqlite3.Connection) -> WorkItem:
             item = self._require_lease(connection, checked_lease, checked_now)
@@ -486,7 +545,11 @@ class SQLiteWorkScheduler:
                 raise WorkStorageError("active attempt is missing while starting")
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation_name="start", operation=operation)
+        try:
+            return self._transaction(write=True, operation_name="start", operation=operation)
+        except WorkFenceError:
+            self._reconcile_exact_due_state(checked_lease.work_item_id, checked_now)
+            raise
 
     def heartbeat(
         self,
@@ -551,7 +614,6 @@ class SQLiteWorkScheduler:
             _nonempty(result_reference, "result_reference")
             _sha256(result_sha256)
         checked_now = _checked_now(now)
-        self.reconcile(now=checked_now)
 
         def operation(connection: sqlite3.Connection) -> WorkItem:
             item = self._require_lease(connection, checked_lease, checked_now)
@@ -576,7 +638,11 @@ class SQLiteWorkScheduler:
             self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation_name="succeed", operation=operation)
+        try:
+            return self._transaction(write=True, operation_name="succeed", operation=operation)
+        except WorkFenceError:
+            self._reconcile_exact_due_state(checked_lease.work_item_id, checked_now)
+            raise
 
     def fail(
         self,
@@ -794,18 +860,60 @@ class SQLiteWorkScheduler:
         changed += self._refresh_planned(connection, now)
         return changed
 
+    def _reconcile_exact_due_state(self, work_item_id: str, now: datetime) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            changed = self._expire_hard_deadlines(
+                connection,
+                now,
+                work_item_id=work_item_id,
+            )
+            changed += self._recover_expired_leases(
+                connection,
+                now,
+                work_item_id=work_item_id,
+            )
+            if changed:
+                item = self._load_item(connection, work_item_id)
+                if item.state in TERMINAL_WORK_STATES:
+                    changed += self._refresh_planned(connection, now)
+            return changed
+
+        return self._transaction(
+            write=True,
+            operation_name="reconcile_exact_due_state",
+            operation=operation,
+        )
+
     def _expire_hard_deadlines(
         self,
         connection: sqlite3.Connection,
         now: datetime,
+        *,
+        work_item_id: str | None = None,
     ) -> int:
-        rows = connection.execute(
-            """
-            SELECT * FROM work_items
-            WHERE completed_at IS NULL AND execution_expiry_at IS NOT NULL
-            ORDER BY work_item_id
-            """
-        ).fetchall()
+        timestamp = _format_timestamp(now)
+        if work_item_id is None:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_items
+                WHERE completed_at IS NULL
+                  AND execution_expiry_at IS NOT NULL
+                  AND execution_expiry_at <= ?
+                ORDER BY execution_expiry_at, work_item_id
+                """,
+                (timestamp,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_items
+                WHERE work_item_id = ?
+                  AND completed_at IS NULL
+                  AND execution_expiry_at IS NOT NULL
+                  AND execution_expiry_at <= ?
+                """,
+                (work_item_id, timestamp),
+            ).fetchall()
         changed = 0
         for row in rows:
             item = self._item_from_row(row)
@@ -835,14 +943,41 @@ class SQLiteWorkScheduler:
         self,
         connection: sqlite3.Connection,
         now: datetime,
+        *,
+        work_item_id: str | None = None,
     ) -> int:
-        rows = connection.execute(
-            """
-            SELECT * FROM work_items
-            WHERE state IN (?, ?) ORDER BY work_item_id
-            """,
-            (WorkItemState.LEASED.value, WorkItemState.RUNNING.value),
-        ).fetchall()
+        timestamp = _format_timestamp(now)
+        if work_item_id is None:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_items
+                WHERE lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                  AND state IN (?, ?)
+                ORDER BY state, lease_expires_at, work_item_id
+                """,
+                (
+                    timestamp,
+                    WorkItemState.LEASED.value,
+                    WorkItemState.RUNNING.value,
+                ),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_items
+                WHERE work_item_id = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                  AND state IN (?, ?)
+                """,
+                (
+                    work_item_id,
+                    timestamp,
+                    WorkItemState.LEASED.value,
+                    WorkItemState.RUNNING.value,
+                ),
+            ).fetchall()
         changed = 0
         for row in rows:
             item = self._item_from_row(row)
@@ -972,6 +1107,10 @@ class SQLiteWorkScheduler:
             or item.leased_by != lease.worker_id
             or item.lease_expires_at is None
             or _parse_timestamp(item.lease_expires_at) <= now
+            or (
+                item.execution_expiry_at is not None
+                and _parse_timestamp(item.execution_expiry_at) <= now
+            )
         ):
             raise WorkFenceError("work lease is stale, expired, or inactive")
         return item
@@ -1169,6 +1308,8 @@ class SQLiteWorkScheduler:
                     raise WorkStorageError(
                         "work database belongs to another application or version"
                     )
+                for statement in _INDEX_STATEMENTS:
+                    connection.execute(statement)
         except WorkSchedulerError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -1191,7 +1332,7 @@ class SQLiteWorkScheduler:
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute(f"PRAGMA synchronous = {self._synchronous}")
             connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             if check_header:
                 self._verify_header(connection)

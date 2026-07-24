@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Annotated
 
 from pydantic import Field
@@ -12,6 +13,14 @@ from robata.queue.models import NonEmptyString, NonNegativeInt
 from robata.queue.stage import Stage
 
 NonNegativeFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
+
+
+class PressureClass(StrEnum):
+    """Operational pressure classification; never a work-result outcome."""
+
+    NORMAL = "NORMAL"
+    ELEVATED = "ELEVATED"
+    THROTTLED = "THROTTLED"
 
 
 class BackpressureConfig(StrictModel):
@@ -45,6 +54,10 @@ class AdmissionDecision(StrictModel):
     """Result of a single admission check."""
 
     admitted: bool
+    policy_version: NonEmptyString = "unversioned-backpressure"
+    pressure_class: PressureClass = PressureClass.NORMAL
+    signals: tuple[NonEmptyString, ...] = ()
+    shedding_actions: tuple[NonEmptyString, ...] = ()
     reason: NonEmptyString | None = None
     suggested_delay_ms: NonNegativeInt | None = None
 
@@ -122,25 +135,50 @@ class BackpressureController:
         when all thresholds are satisfied, or ``False`` with a reason and
         optional suggested delay otherwise.
         """
+        signals: list[str] = []
+        delays: list[int] = []
         if metrics.depth > self._config.queue_depth_threshold:
-            return AdmissionDecision(
-                admitted=False,
-                reason="queue depth exceeds threshold",
-                suggested_delay_ms=1000,
-            )
+            signals.append("QUEUE_DEPTH")
+            delays.append(1_000)
         if metrics.oldest_age_ms > self._config.oldest_age_threshold_ms:
-            return AdmissionDecision(
-                admitted=False,
-                reason="oldest item age exceeds threshold",
-                suggested_delay_ms=500,
-            )
+            signals.append("OLDEST_AGE")
+            delays.append(500)
         if metrics.backlog_slope > self._config.backlog_slope_threshold:
+            signals.append("BACKLOG_SLOPE")
+            delays.append(2_000)
+        if signals:
             return AdmissionDecision(
                 admitted=False,
-                reason="backlog slope exceeds threshold",
-                suggested_delay_ms=2000,
+                policy_version=self._config.version,
+                pressure_class=PressureClass.THROTTLED,
+                signals=tuple(signals),
+                shedding_actions=("THROTTLE_LEDGER",),
+                reason=f"{stage.value} admission is throttled by {','.join(signals)}",
+                suggested_delay_ms=max(delays),
             )
-        return AdmissionDecision(admitted=True)
+
+        elevated = any(
+            _at_least_three_quarters(value, threshold)
+            for value, threshold in (
+                (metrics.depth, self._config.queue_depth_threshold),
+                (metrics.oldest_age_ms, self._config.oldest_age_threshold_ms),
+                (metrics.backlog_slope, self._config.backlog_slope_threshold),
+            )
+        )
+        if elevated:
+            return AdmissionDecision(
+                admitted=True,
+                policy_version=self._config.version,
+                pressure_class=PressureClass.ELEVATED,
+                signals=("APPROACHING_LIMIT",),
+                shedding_actions=("STOP_OPTIONAL_DEEP",),
+                reason=f"{stage.value} admission is approaching a pressure limit",
+            )
+        return AdmissionDecision(
+            admitted=True,
+            policy_version=self._config.version,
+            pressure_class=PressureClass.NORMAL,
+        )
 
     def get_shedding_order(self) -> Sequence[SheddingAction]:
         """Return the ordered sequence of shedding actions.
@@ -150,10 +188,15 @@ class BackpressureController:
         return tuple(self._shedding_actions)
 
 
+def _at_least_three_quarters(value: int | float, threshold: int | float) -> bool:
+    return threshold > 0 and value * 4 >= threshold * 3
+
+
 __all__ = [
     "AdmissionDecision",
     "BackpressureConfig",
     "BackpressureController",
+    "PressureClass",
     "QueueMetrics",
     "SheddingAction",
 ]

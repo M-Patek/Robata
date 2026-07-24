@@ -64,6 +64,7 @@ def test_real_mcap_single_pass_reconciles_source_and_six_camera_spools(
         planner,
         branches,
         final_end_ns=inspection.last_message_time_ns + 1,
+        expected_source_sha256=inspection.source_sha256,
     )
 
     assert result.source_sha256 == inspection.source_sha256 == SIX_CAMERA_MCAP_SHA256

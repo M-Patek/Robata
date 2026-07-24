@@ -8,6 +8,13 @@ from robata.adapters.local_artifact_registry import (
 )
 from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
 from robata.adapters.sqlite_barrier import SQLiteBarrierStorage, SQLiteBarrierStorageError
+from robata.adapters.sqlite_capture_authority import (
+    SQLiteCaptureAuthority,
+    SQLiteCaptureAuthorityConflict,
+    SQLiteCaptureAuthorityError,
+    SQLiteCaptureAuthorityStorageError,
+    SQLiteLocalCaptureAuthority,
+)
 from robata.adapters.sqlite_inference_evidence import (
     SQLiteInferenceEvidenceLedger,
     SQLiteInferenceEvidenceLedgerError,
@@ -18,6 +25,12 @@ from robata.adapters.sqlite_outbox import (
 )
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 from robata.adapters.sqlite_review_queue import SQLiteReviewQueue
+from robata.adapters.sqlite_stream_delivery import (
+    SQLiteStreamDeliveryAuthority,
+    SQLiteStreamDeliveryConflict,
+    SQLiteStreamDeliveryError,
+    StreamPublicationCommit,
+)
 from robata.adapters.sqlite_work_scheduler import (
     SQLiteWorkScheduler,
     WorkConflictError,
@@ -85,13 +98,22 @@ __all__ = [
     "PyAvH264Mp4Exporter",
     "SQLiteBarrierStorage",
     "SQLiteBarrierStorageError",
+    "SQLiteCaptureAuthority",
+    "SQLiteCaptureAuthorityConflict",
+    "SQLiteCaptureAuthorityError",
+    "SQLiteCaptureAuthorityStorageError",
     "SQLiteIdempotentOutboxSink",
     "SQLiteInferenceEvidenceLedger",
     "SQLiteInferenceEvidenceLedgerError",
+    "SQLiteLocalCaptureAuthority",
     "SQLitePrimaryCompletionRepository",
     "SQLitePrimaryOutboxDeliveryStore",
     "SQLiteReviewQueue",
+    "SQLiteStreamDeliveryAuthority",
+    "SQLiteStreamDeliveryConflict",
+    "SQLiteStreamDeliveryError",
     "SQLiteWorkScheduler",
+    "StreamPublicationCommit",
     "WorkConflictError",
     "WorkFenceError",
     "WorkNotFoundError",

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
+from unittest.mock import MagicMock
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
 
@@ -13,8 +15,10 @@ from robata.adapters.mcap_single_pass import McapSinglePassH264Tee
 from robata.adapters.pyav_decoder import PyAvH264DecoderProbe
 from robata.adapters.pyav_mp4_exporter import PyAvH264Mp4Exporter
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
+from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
 from robata.application.canonical import local_composition as local_composition_module
 from robata.application.canonical import mcap_source as mcap_source_module
+from robata.application.canonical.bounded_media import PlannerEmission
 from robata.application.canonical.local_composition import (
     CanonicalLocalCompositionError,
     CanonicalLocalCompositionErrorCode,
@@ -30,6 +34,7 @@ from robata.application.canonical.media_quality import (
     validate_registered_local_media_quality_report_document,
 )
 from robata.application.canonical.primary_completion import PrimaryCompletionEvidenceRole
+from robata.application.canonical.stream_scheduler import DurableStreamWindowScheduler
 from robata.contracts.cameras import CAMERA_IDS
 from robata.contracts.hashing import canonical_json_bytes
 from robata.contracts.schema_registry import SchemaRegistry
@@ -65,6 +70,31 @@ def _write_mapping(path: Path) -> Path:
         )
     )
     return path
+
+
+def test_incremental_sink_skips_executor_drain_for_empty_emissions() -> None:
+    scheduler = MagicMock()
+    executor = MagicMock()
+    sink = mcap_source_module._IncrementalLocalStreamPlanningSink(
+        scheduler=scheduler,
+        executor=executor,
+        runtime_observer=None,
+    )
+    empty_emission = MagicMock(spec=PlannerEmission)
+    empty_emission.windows = ()
+
+    sink.append_emission(empty_emission)
+
+    scheduler.append_emission.assert_called_once_with(empty_emission)
+    executor.drain_ready.assert_not_called()
+
+    window_emission = MagicMock(spec=PlannerEmission)
+    window_emission.windows = (object(),)
+    executor.drain_ready.return_value = 5
+
+    sink.append_emission(window_emission)
+
+    executor.drain_ready.assert_called_once_with(max_items=5)
 
 
 def test_real_mcap_builds_admitted_canonical_source_bundle(tmp_path: Path) -> None:
@@ -156,22 +186,7 @@ def test_canonical_source_uses_one_spool_tee_and_no_legacy_media_reads(
 
     assert tee_calls == 1
     assert len(CAMERA_IDS) == mcap_source_module.MCAP_SPOOL_EXPORT_WORKERS
-    seal_path = state_dir / "h264-spools" / "h264-spool-set.seal.json"
-    seal_bytes = seal_path.read_bytes()
-    seal = json.loads(seal_bytes)
-    assert canonical_json_bytes(seal) == seal_bytes
-    assert seal["source"] == {
-        "message_count": 12,
-        "sha256": SIX_CAMERA_MCAP_SHA256,
-        "size_bytes": source.stat().st_size,
-    }
-    assert seal["selected_packet_count"] == 12
-    assert seal["camera_packet_counts"] == {camera_id.value: 2 for camera_id in CAMERA_IDS}
-    assert [spool["packet_count"] for spool in seal["spools"]] == [2] * len(CAMERA_IDS)
-    assert all(
-        (state_dir / "h264-spools" / spool["path"]).stat().st_size == spool["size_bytes"]
-        for spool in seal["spools"]
-    )
+    assert not (state_dir / "h264-spools").exists()
     probe_facts = bundle.admitted_context.validation_report.probed_stream_facts
     assert len(probe_facts) == len(CAMERA_IDS)
     assert all(
@@ -181,6 +196,135 @@ def test_canonical_source_uses_one_spool_tee_and_no_legacy_media_reads(
         and fact.decoder_probe.decoded_height > 0
         for fact in probe_facts
     )
+
+
+def test_canonical_mcap_composes_and_exactly_recovers_stream_scheduler(
+    tmp_path: Path,
+) -> None:
+    source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
+    authorization = authorize_mcap_mapping(
+        _write_mapping(tmp_path / "mapping.json"),
+        allow_unapproved_profile=True,
+    )
+    state_dir = tmp_path / "media-state"
+    scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    stream_run_id = "00000000-0000-0000-0000-000000000321"
+
+    def clock() -> datetime:
+        return datetime(2026, 7, 20, tzinfo=UTC)
+
+    first = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=state_dir,
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=clock,
+        execution_scheduler=scheduler,
+        stream_run_id=stream_run_id,
+    )
+    recovered = DurableStreamWindowScheduler.recover_registered(
+        execution_scheduler=scheduler,
+        stream_run_id=stream_run_id,
+        clock=clock,
+    )
+    assert len(recovered) == 1
+    stream = recovered[0]
+    assert stream.declarations()
+    assert stream.expected_plan_seal() is not None
+    assert stream.export_barrier().complete
+    assert stream.backlog(now=clock()).finalization_published is False
+
+    with sqlite3.connect(scheduler.database_path) as connection:
+        before = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "capture_authority_receipts",
+                "stream_plans",
+                "expected_windows",
+                "stream_work_plans",
+                "work_items",
+            )
+        )
+
+    second = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=state_dir,
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=clock,
+        execution_scheduler=SQLiteWorkScheduler(scheduler.database_path),
+        stream_run_id=stream_run_id,
+    )
+    with sqlite3.connect(scheduler.database_path) as connection:
+        after = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "capture_authority_receipts",
+                "stream_plans",
+                "expected_windows",
+                "stream_work_plans",
+                "work_items",
+            )
+        )
+
+    assert second.source_content_sha256 == first.source_content_sha256
+    assert second.admitted_context == first.admitted_context
+    assert after == before
+
+
+def test_sealed_spool_export_advances_while_eos_is_finalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = write_six_camera_mcap(tmp_path / "six-camera.mcap")
+    authorization = authorize_mcap_mapping(
+        _write_mapping(tmp_path / "mapping.json"),
+        allow_unapproved_profile=True,
+    )
+    export_started = Event()
+    eos_finalized = Event()
+    export_service = mcap_source_module.RegisteredSixCameraVideoExportService
+    original_export = export_service.export_staged_local
+    original_finalize_eos = DurableStreamWindowScheduler.finalize_eos
+
+    def observed_export(
+        service: object,
+        request: object,
+        producer: object,
+    ) -> object:
+        export_started.set()
+        assert eos_finalized.wait(timeout=5)
+        return original_export(service, request, producer)  # type: ignore[arg-type]
+
+    def observed_finalize_eos(
+        scheduler: DurableStreamWindowScheduler,
+        inputs: object,
+    ) -> object:
+        assert export_started.wait(timeout=5)
+        result = original_finalize_eos(scheduler, inputs)  # type: ignore[arg-type]
+        eos_finalized.set()
+        return result
+
+    monkeypatch.setattr(export_service, "export_staged_local", observed_export)
+    monkeypatch.setattr(
+        DurableStreamWindowScheduler,
+        "finalize_eos",
+        observed_finalize_eos,
+    )
+
+    bundle = load_canonical_mcap_source(
+        source,
+        authorization=authorization,
+        state_dir=tmp_path / "media-state",
+        expected_source_sha256=SIX_CAMERA_MCAP_SHA256,
+        clock=lambda: datetime(2026, 7, 20, tzinfo=UTC),
+        execution_scheduler=SQLiteWorkScheduler(tmp_path / "work.sqlite3"),
+        stream_run_id="00000000-0000-0000-0000-000000000322",
+    )
+
+    assert bundle.source_content_sha256 == SIX_CAMERA_MCAP_SHA256
+    assert export_started.is_set()
+    assert eos_finalized.is_set()
 
 
 def test_runtime_observation_preserves_canonical_source_facts(tmp_path: Path) -> None:
@@ -450,9 +594,44 @@ def test_real_mcap_command_commits_and_exactly_replays(tmp_path: Path) -> None:
     assert committed is not None
     assert tuple(reference.role for reference in committed.evidence_references) == (
         PrimaryCompletionEvidenceRole.MEDIA_QUALITY_REPORT,
+        PrimaryCompletionEvidenceRole.STREAM_RECORDING_RESULT,
         PrimaryCompletionEvidenceRole.SUPPLEMENTAL_QA_EVIDENCE,
     )
+    stream_recording_reference = next(
+        reference
+        for reference in committed.evidence_references
+        if reference.role is PrimaryCompletionEvidenceRole.STREAM_RECORDING_RESULT
+    )
+    assert stream_recording_reference.schema_ref.schema_id == (
+        "https://schemas.robata.dev/local-stream-recording-result"
+    )
+    assert stream_recording_reference.schema_ref.version == "4.0.0"
     assert all(reference.byte_count > 0 for reference in committed.evidence_references)
+    with sqlite3.connect(state_dir / "work-scheduler.sqlite3") as connection:
+        expected_count = connection.execute("SELECT COUNT(*) FROM expected_windows").fetchone()[0]
+        result_count = connection.execute("SELECT COUNT(*) FROM stream_window_results").fetchone()[
+            0
+        ]
+        finalization_count = connection.execute(
+            "SELECT COUNT(*) FROM recording_finalizations"
+        ).fetchone()[0]
+        outbox_count, delivered_count = connection.execute(
+            """
+            SELECT COUNT(*), COUNT(delivered_at)
+            FROM stream_delivery_outbox
+            """
+        ).fetchone()
+    with sqlite3.connect(state_dir / "stream-outbox-sink.sqlite3") as connection:
+        sink_count = connection.execute(
+            "SELECT COUNT(*) FROM delivered_outbox_messages"
+        ).fetchone()[0]
+    assert expected_count > 0
+    assert result_count == expected_count
+    assert finalization_count == 1
+    assert outbox_count == expected_count + 1
+    assert delivered_count == outbox_count
+    assert sink_count == outbox_count
+    assert not tuple(state_dir.rglob("*.h264.spool"))
 
 
 def test_recovered_mcap_completion_rejects_tampered_quality_report(
@@ -503,6 +682,39 @@ def test_recovered_mcap_completion_rejects_tampered_quality_report(
     assert reconciliation_calls == ["outbox"]
 
     reports[0].write_bytes(report_bytes)
+    committed = SQLitePrimaryCompletionRepository(
+        state_dir / "primary-completion.sqlite3",
+        registry=SchemaRegistry(),
+    ).get(first.run_id)
+    assert committed is not None
+    stream_reference = next(
+        reference
+        for reference in committed.evidence_references
+        if reference.role is PrimaryCompletionEvidenceRole.STREAM_RECORDING_RESULT
+    )
+    stream_artifact_path = (
+        state_dir
+        / "stream-artifacts"
+        / stream_reference.exact_bytes_sha256[:2]
+        / f"{stream_reference.exact_bytes_sha256}.json"
+    )
+    stream_artifact_bytes = stream_artifact_path.read_bytes()
+    stream_artifact_path.write_bytes(stream_artifact_bytes + b"\n")
+
+    with pytest.raises(CanonicalLocalCompositionError) as caught_stream_artifact:
+        run_local_canonical_mcap(
+            source,
+            mapping,
+            state_dir,
+            run_key=run_key,
+            allow_unapproved_profile=True,
+        )
+
+    assert (
+        caught_stream_artifact.value.code is CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
+    )
+    assert "stream artifact bytes do not match" in str(caught_stream_artifact.value)
+    stream_artifact_path.write_bytes(stream_artifact_bytes)
     assert first.supplemental_qa_evidence is not None
     selected = next(
         outcome.selected_artifact

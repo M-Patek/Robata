@@ -8,6 +8,7 @@ import robata.application as application
 import robata.contracts as contracts
 import robata.ports as ports
 import robata.runtime as runtime
+import robata.runtime.local_streaming_benchmark as virtual_streaming_benchmark
 
 
 def test_removed_legacy_analysis_modules_are_not_importable() -> None:
@@ -81,3 +82,15 @@ def test_live_sources_do_not_reference_removed_legacy_namespaces() -> None:
         for source_path in live_root.rglob("*.py"):
             source = source_path.read_text(encoding="utf-8")
             assert all(namespace not in source for namespace in forbidden), source_path
+
+
+def test_virtual_streaming_estimator_does_not_export_wp6_authority_names() -> None:
+    removed_authority_names = {
+        "LOCAL_STREAMING_QUALIFICATION_REPORT_VERSION",
+        "LocalStreamingQualificationReport",
+        "evaluate_local_streaming_qualification",
+        "local_streaming_qualification_report_projection",
+    }
+
+    assert removed_authority_names.isdisjoint(virtual_streaming_benchmark.__all__)
+    assert all(not hasattr(virtual_streaming_benchmark, name) for name in removed_authority_names)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urljoin
@@ -29,6 +30,7 @@ from robata.contracts.hashing import (
 )
 from robata.contracts.logical_nodes import OpaqueUuid, Rfc3339Timestamp
 from robata.inference.adapter import (
+    BatchVisionModelAdapter,
     JsonSchemaRef,
     PackageInput,
     VisionInferenceFailure,
@@ -56,6 +58,7 @@ NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON = "FIRST_SCHEMA_VALID_SUCCESS"
 Clock = Callable[[], datetime]
+VisionInferenceOutcome = VisionInferenceSuccess | VisionInferenceFailure
 
 
 class InferenceOrchestrationError(RuntimeError):
@@ -72,6 +75,148 @@ class CapabilityValidationError(InferenceOrchestrationError):
 
 class InferenceLedgerError(InferenceOrchestrationError):
     """Raised when append-only inference records conflict."""
+
+
+class InferenceBatchDispatchError(InferenceOrchestrationError):
+    """One adapter batch violated its all-or-nothing dispatch contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchCompatibilityKey:
+    provider: str
+    model_name: str
+    model_version: str
+    task: VisionTask
+    model_policy_version: str
+    output_schema_sha256: str
+    timeout_ms: int
+    input_shape: tuple[tuple[str, str, int, int], ...]
+
+
+@dataclass(slots=True)
+class _QueuedBatchRequest:
+    request: VisionInferenceRequest
+    future: asyncio.Future[VisionInferenceOutcome]
+    enqueued_at: float
+
+
+def _batch_compatibility_key(request: VisionInferenceRequest) -> _BatchCompatibilityKey:
+    plan = request.input_plan
+    if plan is None:
+        input_shape = tuple(("package", item.role, 0, 0) for item in request.package_inputs)
+    else:
+        items = plan.rendered_items
+        if request.input_plan_part_ordinal is not None:
+            part = plan.call_plan.parts[request.input_plan_part_ordinal]
+            items = items[part.start_item_ordinal : part.end_item_ordinal_exclusive]
+        input_shape = tuple(
+            (
+                item.artifact.media_type,
+                item.artifact.encoding,
+                item.artifact.width,
+                item.artifact.height,
+            )
+            for item in items
+        )
+    return _BatchCompatibilityKey(
+        provider=request.provider,
+        model_name=request.model_name,
+        model_version=request.model_version,
+        task=request.task,
+        model_policy_version=request.model_policy_version,
+        output_schema_sha256=request.output_schema.sha256,
+        timeout_ms=request.timeout_ms,
+        input_shape=input_shape,
+    )
+
+
+class _BoundedMicrobatchDispatcher:
+    """Coalesce only compatible concurrent requests into bounded adapter calls."""
+
+    def __init__(self, *, max_batch_size: int, max_queue_delay_ms: int) -> None:
+        self._max_batch_size = max_batch_size
+        self._max_queue_delay_seconds = max_queue_delay_ms / 1000
+        self._queues: dict[tuple[int, _BatchCompatibilityKey], list[_QueuedBatchRequest]] = {}
+        self._timers: dict[tuple[int, _BatchCompatibilityKey], asyncio.Task[None]] = {}
+        self._flush_tasks: set[asyncio.Task[None]] = set()
+
+    async def dispatch(
+        self,
+        adapter: VisionModelAdapter,
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceOutcome:
+        key = (id(adapter), _batch_compatibility_key(request))
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[VisionInferenceOutcome] = loop.create_future()
+        queued = _QueuedBatchRequest(
+            request=request,
+            future=future,
+            enqueued_at=loop.time(),
+        )
+        bucket = self._queues.setdefault(key, [])
+        bucket.append(queued)
+        if len(bucket) == self._max_batch_size:
+            self._start_flush(key, adapter)
+        elif len(bucket) == 1:
+            self._timers[key] = asyncio.create_task(self._flush_after_delay(key, adapter))
+        return await future
+
+    async def _flush_after_delay(
+        self,
+        key: tuple[int, _BatchCompatibilityKey],
+        adapter: VisionModelAdapter,
+    ) -> None:
+        await asyncio.sleep(self._max_queue_delay_seconds)
+        self._start_flush(key, adapter)
+
+    def _start_flush(
+        self,
+        key: tuple[int, _BatchCompatibilityKey],
+        adapter: VisionModelAdapter,
+    ) -> None:
+        bucket = tuple(self._queues.pop(key, ()))
+        timer = self._timers.pop(key, None)
+        current = asyncio.current_task()
+        if timer is not None and timer is not current:
+            timer.cancel()
+        if bucket:
+            task = asyncio.create_task(self._flush(adapter, bucket))
+            self._flush_tasks.add(task)
+            task.add_done_callback(self._flush_tasks.discard)
+
+    async def _flush(
+        self,
+        adapter: VisionModelAdapter,
+        bucket: tuple[_QueuedBatchRequest, ...],
+    ) -> None:
+        active = tuple(item for item in bucket if not item.future.cancelled())
+        if not active:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = min(item.enqueued_at + item.request.timeout_ms / 1000 for item in active)
+        try:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError("adapter batch expired while awaiting dispatch")
+            batch_adapter = cast(BatchVisionModelAdapter, adapter)
+            async with asyncio.timeout(remaining):
+                returned = await batch_adapter.infer_batch(tuple(item.request for item in active))
+            outcomes = tuple(returned)
+            if len(outcomes) != len(active) or any(
+                not isinstance(outcome, (VisionInferenceSuccess, VisionInferenceFailure))
+                for outcome in outcomes
+            ):
+                raise InferenceBatchDispatchError(
+                    "adapter batch must return one ordered outcome per request"
+                )
+        except BaseException as exc:
+            for item in active:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+        for item, outcome in zip(active, outcomes, strict=True):
+            if not item.future.done():
+                item.future.set_result(outcome)
 
 
 class InferencePolicy(StrictModel):
@@ -163,6 +308,18 @@ class InferenceLedger(Protocol):
         ...
 
 
+class AtomicInferenceLedger(InferenceLedger, Protocol):
+    """Optional ledger extension for one successful terminal/selection commit."""
+
+    def append_terminal_and_selection(
+        self,
+        terminal: ModelInference,
+        selection: InferenceAttemptSelection,
+    ) -> tuple[ModelInference, InferenceAttemptSelection]:
+        """Atomically append or replay a selected successful terminal."""
+        ...
+
+
 class InferenceExecutionGate(Protocol):
     """Dependency-injected quota/concurrency/deadline gate."""
 
@@ -220,6 +377,37 @@ class InMemoryInferenceLedger:
         self, logical_invocation_id: str, policy_version: str
     ) -> InferenceAttemptSelection | None:
         return self._selections.get((logical_invocation_id, policy_version))
+
+    def append_terminal_and_selection(
+        self,
+        terminal: ModelInference,
+        selection: InferenceAttemptSelection,
+    ) -> tuple[ModelInference, InferenceAttemptSelection]:
+        existing_terminal = self._terminals.get(terminal.inference_id)
+        if existing_terminal is not None and existing_terminal != terminal:
+            raise InferenceLedgerError(f"conflicting terminal attempt: {terminal.inference_id}")
+        if self.get_intent(terminal.inference_id) is None:
+            raise InferenceLedgerError("terminal attempt requires a persisted intent")
+        if (
+            selection.inference_id != terminal.inference_id
+            or selection.logical_invocation_id != terminal.logical_invocation_id
+            or terminal.status is not InferenceStatus.SUCCEEDED
+            or terminal.shadow
+            or not terminal.output_valid
+        ):
+            raise InferenceLedgerError("atomic selection requires its successful primary terminal")
+        key = (selection.logical_invocation_id, selection.policy_version)
+        existing_selection = self._selections.get(key)
+        if existing_selection is not None and existing_selection != selection:
+            raise InferenceLedgerError(
+                "logical invocation already has a different selected attempt"
+            )
+        self._terminals[terminal.inference_id] = existing_terminal or terminal
+        self._selections[key] = existing_selection or selection
+        return (
+            existing_terminal or terminal,
+            existing_selection or selection,
+        )
 
     def list_intents(self) -> tuple[InferenceIntent, ...]:
         return tuple(self._intents.values())
@@ -471,8 +659,22 @@ class InferenceOrchestrator:
         schema_artifacts: Mapping[str, bytes | bytearray | memoryview] | None = None,
         ledger: InferenceLedger | None = None,
         execution_gate: InferenceExecutionGate | None = None,
+        max_batch_size: int = 1,
+        max_batch_queue_delay_ms: int = 0,
         clock: Clock | None = None,
     ) -> None:
+        if (
+            isinstance(max_batch_size, bool)
+            or not isinstance(max_batch_size, int)
+            or not 1 <= max_batch_size <= 256
+        ):
+            raise ValueError("max_batch_size must be between one and 256")
+        if (
+            isinstance(max_batch_queue_delay_ms, bool)
+            or not isinstance(max_batch_queue_delay_ms, int)
+            or not 0 <= max_batch_queue_delay_ms <= 1_000
+        ):
+            raise ValueError("max_batch_queue_delay_ms must be between zero and 1000")
         self._adapters = dict(adapters or {})
         self._policies = dict(task_policies or {})
         self._schema_documents = {
@@ -486,8 +688,27 @@ class InferenceOrchestrator:
         self._exact_schema_registry: Registry[Any] | None = None
         self._ledger = ledger or InMemoryInferenceLedger()
         self._execution_gate = execution_gate or _NoopExecutionGate()
+        self._batch_dispatcher = (
+            _BoundedMicrobatchDispatcher(
+                max_batch_size=max_batch_size,
+                max_queue_delay_ms=max_batch_queue_delay_ms,
+            )
+            if max_batch_size > 1
+            else None
+        )
         self._clock = clock or _utc_now
         self._compiled_schemas: dict[str, _CompiledSchema] = {}
+
+    async def _dispatch_adapter(
+        self,
+        adapter: VisionModelAdapter,
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceOutcome:
+        batch_infer = getattr(adapter, "infer_batch", None)
+        if self._batch_dispatcher is not None and callable(batch_infer):
+            return await self._batch_dispatcher.dispatch(adapter, request)
+        async with asyncio.timeout(request.timeout_ms / 1000):
+            return await adapter.infer(request)
 
     @property
     def ledger(self) -> InferenceLedger:
@@ -1206,8 +1427,52 @@ class InferenceOrchestrator:
     def _persist_terminal(
         self, inference: ModelInference, *, selection_policy_version: str
     ) -> ModelInference:
+        if (
+            inference.shadow
+            or inference.status is not InferenceStatus.SUCCEEDED
+            or not inference.output_valid
+        ):
+            return self._ledger.append_terminal(inference)
+        existing = self._ledger.get_selection(
+            inference.logical_invocation_id,
+            selection_policy_version,
+        )
+        if existing is not None:
+            stored = self._ledger.append_terminal(inference)
+            self._select_success(stored, policy_version=selection_policy_version)
+            return stored
+        selected_at = _timestamp(self._clock)
+        selection_digest = inference_attempt_selection_digest(
+            logical_invocation_id=inference.logical_invocation_id,
+            policy_version=selection_policy_version,
+        )
+        selection = InferenceAttemptSelection(
+            schema_version="1.0",
+            selection_id=_stable_uuid("inference-selection", selection_digest),
+            inference_id=inference.inference_id,
+            logical_invocation_id=inference.logical_invocation_id,
+            policy_version=selection_policy_version,
+            selection_reason=_FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON,
+            selection_decision_logical_key=inference_attempt_selection_logical_key(
+                logical_invocation_id=inference.logical_invocation_id,
+                policy_version=selection_policy_version,
+            ),
+            selected_at=selected_at,
+        )
+        atomic_append = getattr(self._ledger, "append_terminal_and_selection", None)
+        if callable(atomic_append):
+            atomic_ledger = cast(AtomicInferenceLedger, self._ledger)
+            stored, stored_selection = atomic_ledger.append_terminal_and_selection(
+                inference,
+                selection,
+            )
+            if stored_selection != selection:
+                raise InferenceLedgerError("atomic terminal selection replay changed the selection")
+            return stored
         stored = self._ledger.append_terminal(inference)
-        self._select_success(stored, policy_version=selection_policy_version)
+        persisted_selection = self._ledger.append_selection(selection)
+        if persisted_selection != selection:
+            raise InferenceLedgerError("persisted attempt selection changed content")
         return stored
 
     def _local_failure_terminal(
@@ -1591,8 +1856,7 @@ class InferenceOrchestrator:
             )
 
         try:
-            async with asyncio.timeout(policy.timeout_ms / 1000):
-                outcome = await adapter.infer(request)
+            outcome = await self._dispatch_adapter(adapter, request)
         except asyncio.CancelledError:
             cancelled = self._local_failure_terminal(
                 intent=persisted_intent,
@@ -1865,8 +2129,10 @@ class InferenceOrchestrator:
 
 
 __all__ = [
+    "AtomicInferenceLedger",
     "CapabilityValidationError",
     "InMemoryInferenceLedger",
+    "InferenceBatchDispatchError",
     "InferenceExecutionGate",
     "InferenceIntent",
     "InferenceLedger",

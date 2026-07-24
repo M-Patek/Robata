@@ -279,6 +279,7 @@ class PrimaryCompletionEvidenceRole(StrEnum):
     """Closed local roles whose exact evidence is bound by completion."""
 
     MEDIA_QUALITY_REPORT = "MEDIA_QUALITY_REPORT"
+    STREAM_RECORDING_RESULT = "STREAM_RECORDING_RESULT"
     SUPPLEMENTAL_QA_EVIDENCE = "SUPPLEMENTAL_QA_EVIDENCE"
 
 

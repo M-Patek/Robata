@@ -111,6 +111,7 @@ class DurableSinglePassVideoProducer:
         planning_sink: SinglePassPlanningSink | None = None,
         preflight: McapPreflight | None = None,
         planner_policy_factory: Callable[[int], BoundedMediaPolicy] | None = None,
+        planner_source_scope_digest: str | None = None,
         tee: McapSinglePassH264Tee | None = None,
         exporter: PyAvH264Mp4Exporter | None = None,
     ) -> None:
@@ -124,17 +125,17 @@ class DurableSinglePassVideoProducer:
                 or preflight.message_indexes_complete
                 or planner_policy_factory is None
                 or final_end_ns is not None
+                or planner_source_scope_digest is None
             ):
                 raise ValueError(
                     "deferred planner policy requires an incomplete-index preflight, "
-                    "a policy factory, and no provisional final_end_ns"
+                    "a policy factory, a planner source scope, and no provisional final_end_ns"
                 )
             resolved_final_end: int | None = None
+            resolved_planner_scope = planner_source_scope_digest
         else:
             if preflight is not None and not preflight.message_indexes_complete:
-                raise ValueError(
-                    "incomplete-index preflight requires deferred planner policy"
-                )
+                raise ValueError("incomplete-index preflight requires deferred planner policy")
             resolved_final_end = (
                 inspection.last_message_time_ns + 1
                 if final_end_ns is None and inspection.last_message_time_ns is not None
@@ -146,8 +147,13 @@ class DurableSinglePassVideoProducer:
                 )
             if resolved_final_end <= planner_policy.source_origin_ns:
                 raise ValueError("final_end_ns must be after the planner source origin")
-            if planner_policy.source_scope_digest != inspection.source_sha256:
-                raise ValueError("planner source scope differs from the inspected source")
+            resolved_planner_scope = (
+                planner_policy.source_scope_digest
+                if planner_source_scope_digest is None
+                else planner_source_scope_digest
+            )
+            if planner_policy.source_scope_digest != resolved_planner_scope:
+                raise ValueError("planner policy differs from the declared planner source scope")
         self._inspection = inspection
         self._channels = channels
         self._planner_policy = planner_policy
@@ -158,15 +164,19 @@ class DurableSinglePassVideoProducer:
         self._planning_sink = planning_sink
         self._preflight = preflight
         self._planner_policy_factory = planner_policy_factory
+        self._planner_source_scope_digest = resolved_planner_scope
         self._tee = tee or McapSinglePassH264Tee()
         self._exporter = exporter or PyAvH264Mp4Exporter()
         self._last_facts: SinglePassVideoProductionFacts | None = None
-        self._prepared: tuple[
-            H264SpoolSetFacts,
-            BoundedSinglePassMediaPlanner,
-            SinglePassTraversalResult,
-            bool,
-        ] | None = None
+        self._prepared: (
+            tuple[
+                H264SpoolSetFacts,
+                BoundedSinglePassMediaPlanner,
+                SinglePassTraversalResult,
+                bool,
+            ]
+            | None
+        ) = None
 
     def __call__(self, staging_directory: Path, /) -> StagedSixCameraVideoExport:
         facts = self.produce(staging_directory)
@@ -206,6 +216,26 @@ class DurableSinglePassVideoProducer:
         """Capture or recover the accepted spool set without exporting it twice."""
 
         return self._prepare()[0]
+
+    def release_exported_spool_set(self) -> None:
+        """Release spools after the caller has verified the registered publication."""
+
+        if self._last_facts is None and self._prepared is None:
+            raise SinglePassVideoProductionError(
+                "cannot release spool set before source preparation"
+            )
+        directory = self._spool_directory.resolve()
+        parent = self._spool_directory.parent.resolve()
+        if directory.parent != parent or directory == parent:
+            raise SinglePassVideoProductionError("spool directory is outside its owner")
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise SinglePassVideoProductionError(
+                f"cannot release exported spool set: {error}"
+            ) from error
 
     def _prepare(
         self,
@@ -250,6 +280,18 @@ class DurableSinglePassVideoProducer:
     def max_parallel_exports(self) -> int:
         return self._max_parallel_exports
 
+    @property
+    def planner_finish(self) -> PlannerFinish:
+        if self._prepared is None:
+            raise RuntimeError("planner finish is available only after prepare")
+        return _required_planner_finish(self._prepared[2])
+
+    @property
+    def planner_policy(self) -> BoundedMediaPolicy:
+        if self._prepared is None:
+            raise RuntimeError("planner policy is available only after prepare")
+        return _required_policy(self._planner_policy)
+
     def _capture_fresh_spool_set(
         self,
     ) -> tuple[
@@ -277,6 +319,10 @@ class DurableSinglePassVideoProducer:
                     "bootstrap planner factory is unavailable or was already used"
                 )
             policy = self._planner_policy_factory(source_origin_ns)
+            if policy.source_scope_digest != self._planner_source_scope_digest:
+                raise SinglePassVideoProductionError(
+                    "bootstrap planner policy differs from the declared planner source scope"
+                )
             created = BoundedSinglePassMediaPlanner(policy)
             bootstrap_planners.append(created)
             return created
@@ -299,9 +345,8 @@ class DurableSinglePassVideoProducer:
                 final_end_ns=self._final_end_ns,
                 preflight=self._preflight,
                 expected_source_sha256=self._inspection.source_sha256,
-                bootstrap_planner_factory=(
-                    create_bootstrap_planner if planner is None else None
-                ),
+                planner_source_scope_digest=self._planner_source_scope_digest,
+                bootstrap_planner_factory=(create_bootstrap_planner if planner is None else None),
             )
             spool_facts = SixCameraMap[H264SpoolFacts].model_validate(
                 {camera_id: branches[camera_id].facts for camera_id in CAMERA_IDS},
@@ -456,9 +501,7 @@ class DurableSinglePassVideoProducer:
             ),
             "final_end_ns": str(traversal.final_end_ns),
             "planner_policy": _policy_document(_required_policy(self._planner_policy)),
-            "planner_policy_sha256": _policy_sha256(
-                _required_policy(self._planner_policy)
-            ),
+            "planner_policy_sha256": _policy_sha256(_required_policy(self._planner_policy)),
             "planning_mode": traversal.planning_mode,
             "preflight_message_indexes_complete": (
                 self._preflight.message_indexes_complete
@@ -510,12 +553,8 @@ class DurableSinglePassVideoProducer:
             document.get("preflight_message_indexes_complete"),
             "preflight_message_indexes_complete",
         )
-        if (
-            preflight_message_indexes_complete
-            and planning_mode != PLANNING_MODE_LIVE_INDEXED
-        ) or (
-            not preflight_message_indexes_complete
-            and planning_mode == PLANNING_MODE_LIVE_INDEXED
+        if (preflight_message_indexes_complete and planning_mode != PLANNING_MODE_LIVE_INDEXED) or (
+            not preflight_message_indexes_complete and planning_mode == PLANNING_MODE_LIVE_INDEXED
         ):
             raise SinglePassVideoProductionError(
                 "spool-set planning mode differs from its preflight capability"
@@ -878,13 +917,9 @@ def _inspection_document(inspection: McapInspection) -> dict[str, object]:
             {
                 "channel_id": channel.channel_id,
                 "codec": channel.codec,
-                "first_message_time_ns": _optional_integer_document(
-                    channel.first_message_time_ns
-                ),
+                "first_message_time_ns": _optional_integer_document(channel.first_message_time_ns),
                 "frame_id": channel.frame_id,
-                "last_message_time_ns": _optional_integer_document(
-                    channel.last_message_time_ns
-                ),
+                "last_message_time_ns": _optional_integer_document(channel.last_message_time_ns),
                 "message_count": channel.message_count,
                 "message_encoding": channel.message_encoding,
                 "monotonic": channel.monotonic,
@@ -895,9 +930,7 @@ def _inspection_document(inspection: McapInspection) -> dict[str, object]:
             }
             for channel in inspection.channels
         ],
-        "first_message_time_ns": _optional_integer_document(
-            inspection.first_message_time_ns
-        ),
+        "first_message_time_ns": _optional_integer_document(inspection.first_message_time_ns),
         "header_library": inspection.header_library,
         "header_profile": inspection.header_profile,
         "last_message_time_ns": _optional_integer_document(inspection.last_message_time_ns),

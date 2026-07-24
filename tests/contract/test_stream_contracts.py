@@ -274,12 +274,16 @@ def test_full_chain_matches_checked_in_vector() -> None:
     assert {
         "plan_key": expected_plan.plan_key,
         "plan_digest": expected_plan.plan_digest,
+        "plan_id": expected_plan.plan_id,
     } == vector["plan"]
     assert {
         "declaration_semantic_sha256": declaration.declaration_semantic_sha256,
         "append_chain_sha256": declaration.append_chain_sha256,
     } == vector["declaration"]
-    assert {"seal_semantic_sha256": seal.seal_semantic_sha256} == vector["seal"]
+    assert {
+        "seal_semantic_sha256": seal.seal_semantic_sha256,
+        "ordered_expected_member_root_sha256": seal.ordered_expected_member_root_sha256,
+    } == vector["seal"]
     assert {
         "terminal_member_semantic_sha256": closure.members[0].member_semantic_sha256,
         "terminal_member_root": closure.terminal_member_root,

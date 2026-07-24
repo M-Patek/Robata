@@ -1,0 +1,436 @@
+{
+  "$defs": {
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "LocalStreamOutputDecision": {
+      "enum": [
+        "ADMITTED",
+        "NO_EVENTS",
+        "ABSTAINED"
+      ],
+      "type": "string"
+    },
+    "LocalStreamQaCameraReference": {
+      "additionalProperties": false,
+      "description": "One exact camera member of the canonical six-camera QA closure.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "camera_id",
+        "semantic_sha256"
+      ],
+      "title": "LocalStreamQaCameraReference",
+      "type": "object"
+    },
+    "LocalStreamSemanticIntervalReference": {
+      "additionalProperties": false,
+      "description": "Run-independent semantic object assigned to every overlapping stream window.",
+      "properties": {
+        "interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "kind": {
+          "$ref": "#/$defs/LocalStreamSemanticKind"
+        },
+        "logical_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Logical Key",
+          "type": "string"
+        },
+        "semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "logical_key",
+        "semantic_sha256",
+        "interval"
+      ],
+      "title": "LocalStreamSemanticIntervalReference",
+      "type": "object"
+    },
+    "LocalStreamSemanticKind": {
+      "enum": [
+        "EVENT_PROPOSAL",
+        "CANDIDATE",
+        "ACTION",
+        "BOUNDARY",
+        "HYPOTHESIS"
+      ],
+      "type": "string"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "TerminalOutcome": {
+      "description": "Terminal outcomes retained by stream closure, including failures.",
+      "enum": [
+        "SUCCEEDED",
+        "SKIPPED_POLICY",
+        "SKIPPED_NOT_NEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+        "QUARANTINED",
+        "LATE_INPUT",
+        "INCOMPLETE",
+        "ABSTAINED",
+        "NO_EVENTS",
+        "INVALIDATED"
+      ],
+      "title": "TerminalOutcome",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v2/local-stream-recording-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Recording truth rebuilt from content-addressed window semantic evidence.",
+  "properties": {
+    "action_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamSemanticIntervalReference"
+      },
+      "title": "Action References",
+      "type": "array"
+    },
+    "boundary_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Boundary Closure Semantic Sha256",
+      "type": "string"
+    },
+    "boundary_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamSemanticIntervalReference"
+      },
+      "title": "Boundary References",
+      "type": "array"
+    },
+    "candidate_reduction_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Candidate Reduction Semantic Sha256",
+      "type": "string"
+    },
+    "candidate_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamSemanticIntervalReference"
+      },
+      "title": "Candidate References",
+      "type": "array"
+    },
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "cross_window_duplicate_reference_count": {
+      "title": "Cross Window Duplicate Reference Count",
+      "type": "integer"
+    },
+    "event_proposal_result_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Event Proposal Result Semantic Sha256",
+      "type": "string"
+    },
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "expected_plan_seal_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Expected Plan Seal Semantic Sha256",
+      "type": "string"
+    },
+    "final_recording_identity": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Recording Identity",
+      "type": "string"
+    },
+    "hypothesis_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamSemanticIntervalReference"
+      },
+      "title": "Hypothesis References",
+      "type": "array"
+    },
+    "ordered_window_result_semantic_sha256_values": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Ordered Window Result Semantic Sha256 Values",
+      "type": "array"
+    },
+    "ordered_window_semantic_evidence_refs": {
+      "items": {
+        "$ref": "#/$defs/StreamArtifactRef"
+      },
+      "title": "Ordered Window Semantic Evidence Refs",
+      "type": "array"
+    },
+    "ordered_window_semantic_evidence_sha256_values": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Ordered Window Semantic Evidence Sha256 Values",
+      "type": "array"
+    },
+    "ordered_window_terminal_outcomes": {
+      "items": {
+        "$ref": "#/$defs/TerminalOutcome"
+      },
+      "title": "Ordered Window Terminal Outcomes",
+      "type": "array"
+    },
+    "output_decision": {
+      "$ref": "#/$defs/LocalStreamOutputDecision"
+    },
+    "output_decision_semantic_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Output Decision Semantic Sha256"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "proposal_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamSemanticIntervalReference"
+      },
+      "title": "Proposal References",
+      "type": "array"
+    },
+    "provisional_fusion_semantic_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Provisional Fusion Semantic Sha256"
+    },
+    "qa_camera_references": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamQaCameraReference"
+      },
+      "title": "Qa Camera References",
+      "type": "array"
+    },
+    "recording_finalization_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Finalization Semantic Sha256",
+      "type": "string"
+    },
+    "recording_result_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Recording Result Key",
+      "type": "string"
+    },
+    "recording_result_projection_version": {
+      "const": "local-stream-recording-result-semantic-v2",
+      "default": "local-stream-recording-result-semantic-v2",
+      "title": "Recording Result Projection Version",
+      "type": "string"
+    },
+    "recording_result_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Result Semantic Sha256",
+      "type": "string"
+    },
+    "reduction_policy_version": {
+      "const": "local-conformance-stream-recording-reduction-v2",
+      "default": "local-conformance-stream-recording-reduction-v2",
+      "title": "Reduction Policy Version",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "six_camera_qa_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Six Camera Qa Semantic Sha256",
+      "type": "string"
+    },
+    "window_terminal_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Terminal Closure Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "evidence_class",
+    "production_eligible",
+    "recording_result_projection_version",
+    "reduction_policy_version",
+    "capture_scope_digest",
+    "plan_key",
+    "expected_plan_seal_semantic_sha256",
+    "window_terminal_closure_semantic_sha256",
+    "recording_finalization_semantic_sha256",
+    "final_recording_identity",
+    "ordered_window_result_semantic_sha256_values",
+    "ordered_window_terminal_outcomes",
+    "ordered_window_semantic_evidence_refs",
+    "ordered_window_semantic_evidence_sha256_values",
+    "six_camera_qa_semantic_sha256",
+    "qa_camera_references",
+    "event_proposal_result_semantic_sha256",
+    "proposal_references",
+    "candidate_reduction_semantic_sha256",
+    "candidate_references",
+    "provisional_fusion_semantic_sha256",
+    "action_references",
+    "boundary_closure_semantic_sha256",
+    "boundary_references",
+    "output_decision",
+    "output_decision_semantic_sha256",
+    "hypothesis_references",
+    "cross_window_duplicate_reference_count",
+    "recording_result_key",
+    "recording_result_semantic_sha256"
+  ],
+  "title": "LocalStreamRecordingResultV2",
+  "type": "object"
+}

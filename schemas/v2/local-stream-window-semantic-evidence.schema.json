@@ -1,0 +1,254 @@
+{
+  "$defs": {
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v2/local-stream-window-semantic-evidence.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Window-local semantic availability derived before EOS.",
+  "properties": {
+    "causal_policy_version": {
+      "const": "local-conformance-window-causal-executor-v1",
+      "default": "local-conformance-window-causal-executor-v1",
+      "title": "Causal Policy Version",
+      "type": "string"
+    },
+    "effective_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "expected_ordinal": {
+      "minimum": 0,
+      "title": "Expected Ordinal",
+      "type": "integer"
+    },
+    "input_plan_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Plan Semantic Sha256",
+      "type": "string"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "plan_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Semantic Sha256",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "projection_version": {
+      "const": "local-stream-window-semantic-evidence-v2",
+      "default": "local-stream-window-semantic-evidence-v2",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "proposal_interval": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "proposal_label": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Proposal Label"
+    },
+    "proposal_semantic_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Proposal Semantic Sha256"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Semantic Sha256",
+      "type": "string"
+    },
+    "semantic_status": {
+      "enum": [
+        "PROPOSED",
+        "NO_EVENTS",
+        "ABSTAINED"
+      ],
+      "title": "Semantic Status",
+      "type": "string"
+    },
+    "six_camera_slot_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Six Camera Slot Closure Semantic Sha256",
+      "type": "string"
+    },
+    "window_inference_plan_ref": {
+      "$ref": "#/$defs/StreamArtifactRef"
+    },
+    "window_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Window Key",
+      "type": "string"
+    },
+    "window_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "evidence_class",
+    "production_eligible",
+    "projection_version",
+    "causal_policy_version",
+    "plan_key",
+    "plan_semantic_sha256",
+    "window_inference_plan_ref",
+    "expected_ordinal",
+    "window_key",
+    "window_semantic_sha256",
+    "effective_interval",
+    "input_plan_semantic_sha256",
+    "six_camera_slot_closure_semantic_sha256",
+    "semantic_status",
+    "proposal_label",
+    "proposal_interval",
+    "proposal_semantic_sha256",
+    "semantic_sha256"
+  ],
+  "title": "LocalStreamWindowSemanticEvidenceV2",
+  "type": "object"
+}

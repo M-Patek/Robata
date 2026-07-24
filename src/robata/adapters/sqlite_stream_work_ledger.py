@@ -70,6 +70,13 @@ _EXTENSION_SCHEMA_STATEMENTS = (
     ON stream_work_plans(plan_key, expected_ordinal, role_order)
     """,
 )
+_ADDITIVE_INDEX_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS stream_work_pending_terminal
+    ON stream_work_plans(plan_key, work_item_id)
+    WHERE pending_terminal_json IS NOT NULL
+    """,
+)
 
 
 class SQLiteStreamWorkLedgerError(RuntimeError):
@@ -116,6 +123,30 @@ class StoredStreamWorkPlan:
     pending_terminal_json: bytes | None = None
     pending_lease_epoch: int | None = None
     pending_fencing_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredStreamWorkExecution:
+    """One bounded stream-plan row joined to its execution state."""
+
+    work: StoredStreamWorkPlan
+    execution_state: str
+    execution_created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredStreamBacklog:
+    """SQL-side aggregate used by the streaming hot path."""
+
+    state_counts: tuple[tuple[str, int], ...]
+    active_backlog: int
+    oldest_active_created_at: str | None
+    declared_window_count: int
+    expected_plan_sealed: bool
+    terminal_member_count: int
+    export_manifest_sha256: str | None
+    export_member_count: int | None
+    finalization_published: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +226,13 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="get_plan", operation=operation)
 
+    def plans(self) -> tuple[StoredStreamPlan, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[StoredStreamPlan, ...]:
+            rows = connection.execute("SELECT * FROM stream_plans ORDER BY plan_key").fetchall()
+            return tuple(_plan_from_row(row) for row in rows)
+
+        return self._run(write=False, operation_name="plans", operation=operation)
+
     def append_window(
         self,
         *,
@@ -216,10 +254,6 @@ class SQLiteStreamWorkLedger:
             ).fetchone()
             if plan is None:
                 raise SQLiteStreamWorkLedgerError("expected plan is not registered")
-            if plan["planner_eos_sha256"] is not None or plan["seal_json"] is not None:
-                raise SQLiteStreamWorkLedgerConflict(
-                    "cannot append a window after planner EOS"
-                )
             existing = connection.execute(
                 """
                 SELECT * FROM expected_windows WHERE plan_key = ? AND ordinal = ?
@@ -239,6 +273,8 @@ class SQLiteStreamWorkLedger:
                     expected=work_plans,
                 )
                 return False
+            if plan["planner_eos_sha256"] is not None or plan["seal_json"] is not None:
+                raise SQLiteStreamWorkLedgerConflict("cannot append a new window after planner EOS")
             count = cast(
                 int,
                 connection.execute(
@@ -279,6 +315,66 @@ class SQLiteStreamWorkLedger:
             return tuple(_window_from_row(row) for row in rows)
 
         return self._run(write=False, operation_name="windows", operation=operation)
+
+    def window_count(self, plan_key: str) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM expected_windows WHERE plan_key = ?",
+                (plan_key,),
+            ).fetchone()
+            if row is None:
+                raise SQLiteStreamWorkLedgerError("window count query returned no row")
+            return _int(row, "count")
+
+        return self._run(write=False, operation_name="window_count", operation=operation)
+
+    def window_at(self, plan_key: str, ordinal: int) -> StoredExpectedWindow | None:
+        def operation(connection: sqlite3.Connection) -> StoredExpectedWindow | None:
+            row = connection.execute(
+                """
+                SELECT * FROM expected_windows WHERE plan_key = ? AND ordinal = ?
+                """,
+                (plan_key, ordinal),
+            ).fetchone()
+            return None if row is None else _window_from_row(row)
+
+        return self._run(write=False, operation_name="window_at", operation=operation)
+
+    def terminal_member_at(self, plan_key: str, ordinal: int) -> bytes | None:
+        def operation(connection: sqlite3.Connection) -> bytes | None:
+            row = connection.execute(
+                """
+                SELECT terminal_member_json FROM expected_windows
+                WHERE plan_key = ? AND ordinal = ?
+                """,
+                (plan_key, ordinal),
+            ).fetchone()
+            return None if row is None else _optional_bytes(row, "terminal_member_json")
+
+        return self._run(
+            write=False,
+            operation_name="terminal_member_at",
+            operation=operation,
+        )
+
+    def terminal_member_count(self, plan_key: str) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM expected_windows
+                WHERE plan_key = ? AND terminal_member_json IS NOT NULL
+                """,
+                (plan_key,),
+            ).fetchone()
+            if row is None:
+                raise SQLiteStreamWorkLedgerError("terminal member count query returned no row")
+            return _int(row, "count")
+
+        return self._run(
+            write=False,
+            operation_name="terminal_member_count",
+            operation=operation,
+        )
 
     def set_planner_eos(self, plan_key: str, finish_sha256: str) -> None:
         def operation(connection: sqlite3.Connection) -> None:
@@ -454,6 +550,211 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="work_plans", operation=operation)
 
+    def work_plans_for_ordinal(
+        self,
+        plan_key: str,
+        ordinal: int,
+    ) -> tuple[StoredStreamWorkPlan, ...]:
+        def operation(connection: sqlite3.Connection) -> tuple[StoredStreamWorkPlan, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM stream_work_plans
+                WHERE plan_key = ? AND expected_ordinal = ?
+                ORDER BY role_order, work_item_id
+                """,
+                (plan_key, ordinal),
+            ).fetchall()
+            return tuple(_work_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="work_plans_for_ordinal",
+            operation=operation,
+        )
+
+    def bounded_execution_scope(
+        self,
+        *,
+        plan_key: str,
+        max_active: int,
+        terminal_states: Sequence[str],
+        finalization_stage: str,
+    ) -> tuple[StoredStreamWorkExecution, ...]:
+        """Return bounded active work plus its direct upstream evidence rows."""
+
+        if isinstance(max_active, bool) or max_active <= 0:
+            raise ValueError("max_active must be positive")
+        checked_terminal_states = tuple(terminal_states)
+        if not checked_terminal_states:
+            raise ValueError("terminal_states must not be empty")
+        placeholders = ", ".join("?" for _state in checked_terminal_states)
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[StoredStreamWorkExecution, ...]:
+            rows = connection.execute(
+                f"""
+                WITH active(work_item_id) AS (
+                    SELECT stream.work_item_id
+                    FROM stream_work_plans AS stream
+                    JOIN work_items AS execution
+                      ON execution.work_item_id = stream.work_item_id
+                    WHERE stream.plan_key = ?
+                      AND stream.publication_state = 'PUBLISHED'
+                      AND stream.stage <> ?
+                      AND execution.state NOT IN ({placeholders})
+                    ORDER BY
+                      COALESCE(stream.expected_ordinal, 2147483647),
+                      stream.role_order,
+                      stream.work_item_id
+                    LIMIT ?
+                ),
+                scoped(work_item_id) AS (
+                    SELECT work_item_id FROM active
+                    UNION
+                    SELECT dependency.upstream_work_item_id
+                    FROM work_dependencies AS dependency
+                    JOIN active
+                      ON active.work_item_id = dependency.downstream_work_item_id
+                )
+                SELECT
+                    stream.*,
+                    execution.state AS execution_state,
+                    execution.created_at AS execution_created_at
+                FROM scoped
+                JOIN stream_work_plans AS stream
+                  ON stream.work_item_id = scoped.work_item_id
+                JOIN work_items AS execution
+                  ON execution.work_item_id = scoped.work_item_id
+                WHERE stream.plan_key = ?
+                ORDER BY
+                  COALESCE(stream.expected_ordinal, 2147483647),
+                  stream.role_order,
+                  stream.work_item_id
+                """,
+                (
+                    plan_key,
+                    finalization_stage,
+                    *checked_terminal_states,
+                    max_active,
+                    plan_key,
+                ),
+            ).fetchall()
+            return tuple(_work_execution_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="bounded_execution_scope",
+            operation=operation,
+        )
+
+    def backlog_projection(
+        self,
+        *,
+        plan_key: str,
+        terminal_states: Sequence[str],
+        finalization_stage: str,
+    ) -> StoredStreamBacklog:
+        """Aggregate one graph without deserializing its immutable history."""
+
+        checked_terminal_states = frozenset(terminal_states)
+        if not checked_terminal_states:
+            raise ValueError("terminal_states must not be empty")
+
+        def operation(connection: sqlite3.Connection) -> StoredStreamBacklog:
+            metadata = connection.execute(
+                """
+                SELECT
+                    plan.seal_json,
+                    plan.export_manifest_sha256,
+                    plan.export_member_count,
+                    COUNT(window.ordinal) AS declared_window_count,
+                    COUNT(window.terminal_member_json) AS terminal_member_count
+                FROM stream_plans AS plan
+                LEFT JOIN expected_windows AS window
+                  ON window.plan_key = plan.plan_key
+                WHERE plan.plan_key = ?
+                GROUP BY plan.plan_key
+                """,
+                (plan_key,),
+            ).fetchone()
+            if metadata is None:
+                raise SQLiteStreamWorkLedgerError("expected plan is not registered")
+            groups = connection.execute(
+                """
+                SELECT
+                    stream.publication_state,
+                    execution.state AS execution_state,
+                    COUNT(*) AS state_count,
+                    MIN(
+                        COALESCE(
+                            execution.created_at,
+                            json_extract(stream.plan_json, '$.created_at')
+                        )
+                    ) AS oldest_created_at
+                FROM stream_work_plans AS stream
+                LEFT JOIN work_items AS execution
+                  ON execution.work_item_id = stream.work_item_id
+                WHERE stream.plan_key = ?
+                GROUP BY stream.publication_state, execution.state
+                """,
+                (plan_key,),
+            ).fetchall()
+            finalization = connection.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM stream_work_plans
+                    WHERE plan_key = ? AND stage = ?
+                      AND publication_state <> 'GATED'
+                ) AS published
+                """,
+                (plan_key, finalization_stage),
+            ).fetchone()
+            if finalization is None:
+                raise SQLiteStreamWorkLedgerError("finalization query returned no row")
+
+            counts: dict[str, int] = {}
+            active_backlog = 0
+            oldest_active: str | None = None
+            for row in groups:
+                publication_state = _text(row, "publication_state")
+                execution_state = _optional_text(row, "execution_state")
+                state_count = _int(row, "state_count")
+                if publication_state == "GATED":
+                    state_key = "GATED"
+                elif execution_state is None:
+                    raise SQLiteStreamWorkLedgerError(
+                        "published stream work lacks its execution projection"
+                    )
+                else:
+                    state_key = execution_state
+                counts[state_key] = counts.get(state_key, 0) + state_count
+                if publication_state == "GATED" or execution_state not in checked_terminal_states:
+                    active_backlog += state_count
+                    created_at = _optional_text(row, "oldest_created_at")
+                    if created_at is not None and (
+                        oldest_active is None or created_at < oldest_active
+                    ):
+                        oldest_active = created_at
+
+            return StoredStreamBacklog(
+                state_counts=tuple(sorted(counts.items())),
+                active_backlog=active_backlog,
+                oldest_active_created_at=oldest_active,
+                declared_window_count=_int(metadata, "declared_window_count"),
+                expected_plan_sealed=_optional_bytes(metadata, "seal_json") is not None,
+                terminal_member_count=_int(metadata, "terminal_member_count"),
+                export_manifest_sha256=_optional_text(metadata, "export_manifest_sha256"),
+                export_member_count=_optional_int(metadata, "export_member_count"),
+                finalization_published=bool(_int(finalization, "published")),
+            )
+
+        return self._run(
+            write=False,
+            operation_name="backlog_projection",
+            operation=operation,
+        )
+
     def get_work(self, work_item_id: str) -> StoredStreamWorkPlan:
         def operation(connection: sqlite3.Connection) -> StoredStreamWorkPlan:
             row = connection.execute(
@@ -551,19 +852,41 @@ class SQLiteStreamWorkLedger:
             operation=operation,
         )
 
-    def pending_work_item_ids(self) -> tuple[str, ...]:
+    def pending_work_item_ids(self, plan_key: str) -> tuple[str, ...]:
         def operation(connection: sqlite3.Connection) -> tuple[str, ...]:
             rows = connection.execute(
                 """
                 SELECT work_item_id FROM stream_work_plans
-                WHERE pending_terminal_json IS NOT NULL ORDER BY work_item_id
-                """
+                WHERE plan_key = ? AND pending_terminal_json IS NOT NULL
+                ORDER BY work_item_id
+                """,
+                (plan_key,),
             ).fetchall()
             return tuple(_text(row, "work_item_id") for row in rows)
 
         return self._run(
             write=False,
             operation_name="pending_work_item_ids",
+            operation=operation,
+        )
+
+    def pending_work_rows(self, plan_key: str) -> tuple[StoredStreamWorkPlan, ...]:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[StoredStreamWorkPlan, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM stream_work_plans
+                WHERE plan_key = ? AND pending_terminal_json IS NOT NULL
+                ORDER BY work_item_id
+                """,
+                (plan_key,),
+            ).fetchall()
+            return tuple(_work_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="pending_work_rows",
             operation=operation,
         )
 
@@ -685,14 +1008,16 @@ class SQLiteStreamWorkLedger:
                     """,
                     (_EXTENSION_NAME, _EXTENSION_SCHEMA_VERSION),
                 )
-                return
-            version = _int(metadata, "schema_version")
-            if version != _EXTENSION_SCHEMA_VERSION:
-                raise SQLiteStreamWorkLedgerError(
-                    "stream extension belongs to another schema version"
-                )
-            if existing_objects != _EXTENSION_OBJECT_NAMES:
-                raise SQLiteStreamWorkLedgerError("stream extension schema inventory changed")
+            else:
+                version = _int(metadata, "schema_version")
+                if version != _EXTENSION_SCHEMA_VERSION:
+                    raise SQLiteStreamWorkLedgerError(
+                        "stream extension belongs to another schema version"
+                    )
+                if existing_objects != _EXTENSION_OBJECT_NAMES:
+                    raise SQLiteStreamWorkLedgerError("stream extension schema inventory changed")
+            for statement in _ADDITIVE_INDEX_STATEMENTS:
+                connection.execute(statement)
 
         self._run(
             write=True,
@@ -819,6 +1144,14 @@ def _work_from_row(row: sqlite3.Row) -> StoredStreamWorkPlan:
     )
 
 
+def _work_execution_from_row(row: sqlite3.Row) -> StoredStreamWorkExecution:
+    return StoredStreamWorkExecution(
+        work=_work_from_row(row),
+        execution_state=_text(row, "execution_state"),
+        execution_created_at=_text(row, "execution_created_at"),
+    )
+
+
 def _bytes(row: sqlite3.Row, field: str) -> bytes:
     value: object = row[field]
     if not isinstance(value, bytes):
@@ -867,6 +1200,8 @@ __all__ = [
     "SQLiteStreamWorkLedgerConflict",
     "SQLiteStreamWorkLedgerError",
     "StoredExpectedWindow",
+    "StoredStreamBacklog",
     "StoredStreamPlan",
+    "StoredStreamWorkExecution",
     "StoredStreamWorkPlan",
 ]

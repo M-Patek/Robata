@@ -182,7 +182,8 @@ def test_one_reader_traversal_feeds_six_ordered_spools_and_bounded_planner(
         for camera_id in CAMERA_IDS
     }
     source_sha256 = sha256(source_bytes).hexdigest()
-    planner = _planner(source_sha256)
+    planner_scope = "d" * 64
+    planner = _planner(planner_scope)
 
     result = McapSinglePassH264Tee().traverse(
         source,
@@ -192,6 +193,7 @@ def test_one_reader_traversal_feeds_six_ordered_spools_and_bounded_planner(
         final_end_ns=1_000_000_000,
         preflight=_preflight(source, source_bytes),
         expected_source_sha256=source_sha256,
+        planner_source_scope_digest=planner_scope,
     )
 
     assert reader_calls == 1
@@ -252,6 +254,7 @@ def test_branch_failure_aborts_every_spool_without_sealing(
             _planner(sha256(source_bytes).hexdigest()),
             spool_branches,
             preflight=_preflight(source, source_bytes),
+            expected_source_sha256=sha256(source_bytes).hexdigest(),
         )
 
     assert all(branch._stream.closed for branch in spool_branches.values())

@@ -185,6 +185,7 @@ def test_success_writes_atomic_fresh_report_from_fake_canonical_call(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     manifest = _manifest()
+    (tmp_path / "source.mcap").write_bytes(b"fixture source")
     output = tmp_path / "reports" / "profile.json"
     output.parent.mkdir()
     output.write_bytes(b"old report")
@@ -235,6 +236,7 @@ def test_canonical_error_still_publishes_structured_report(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     manifest = _manifest()
+    (tmp_path / "source.mcap").write_bytes(b"fixture source")
     output = tmp_path / "profile.json"
 
     def run_failed(**kwargs: object) -> CanonicalLocalRunReceipt:

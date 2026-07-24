@@ -214,9 +214,7 @@ class McapInspectionAccumulator:
             or inspection.first_message_time_ns != self._preflight.first_message_time_ns
             or inspection.last_message_time_ns != self._preflight.last_message_time_ns
             or tuple(_identity_count_channel(channel) for channel in inspection.channels)
-            != tuple(
-                _identity_count_channel(channel) for channel in self._preflight.channels
-            )
+            != tuple(_identity_count_channel(channel) for channel in self._preflight.channels)
             or (
                 self._preflight.message_indexes_complete
                 and tuple(_indexed_channel(channel) for channel in inspection.channels)

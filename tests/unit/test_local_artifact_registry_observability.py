@@ -19,6 +19,7 @@ from robata.contracts.artifacts import (
 )
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.ports.artifact_registry import ArtifactRegistryError, ArtifactRegistryErrorCode
+from robata.runtime.canonical_profile import snapshot_state_tree
 from robata.runtime.observability import RuntimeProfileRecorder
 
 _CREATED_AT = "2026-07-22T12:00:00Z"
@@ -250,6 +251,61 @@ def test_observes_publication_reads_and_actual_commit_failure_rollback(
         == {}
     )
     assert sum(span.name == "sqlite.artifact_registry.transaction" for span in runtime.spans) == 4
+
+
+def test_explicit_raw_source_hardlink_avoids_a_second_physical_owner(
+    tmp_path: Path,
+) -> None:
+    registry = LocalArtifactRegistry(
+        tmp_path / "artifact-registry",
+        hardlink_artifact_types=frozenset({ArtifactType.RAW_MCAP}),
+    )
+    snapshot, manifest_artifact_id, blobs, source = _publication_fixture(registry)
+    source_path = tmp_path / "source.mcap"
+    source_path.write_bytes(blobs[source.artifact_id])
+    mixed_sources = dict(blobs)
+    mixed_sources[source.artifact_id] = source_path
+
+    registry.publish_derivation(
+        snapshot=snapshot,
+        logical_key="hardlinked-source",
+        manifest_artifact_id=manifest_artifact_id,
+        blob_sources=mixed_sources,
+    )
+
+    assert source_path.samefile(registry.resolve_blob(source.artifact_id))
+
+
+def test_raw_source_hardlink_fallback_remains_counted_as_unique_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = LocalArtifactRegistry(
+        tmp_path / "state" / "artifact-registry",
+        hardlink_artifact_types=frozenset({ArtifactType.RAW_MCAP}),
+    )
+    snapshot, manifest_artifact_id, blobs, source = _publication_fixture(registry)
+    source_path = tmp_path / "source.mcap"
+    source_path.write_bytes(blobs[source.artifact_id])
+    mixed_sources = dict(blobs)
+    mixed_sources[source.artifact_id] = source_path
+    monkeypatch.setattr(registry, "_put_verified_hardlink", lambda *_args: False)
+
+    registry.publish_derivation(
+        snapshot=snapshot,
+        logical_key="copied-source-fallback",
+        manifest_artifact_id=manifest_artifact_id,
+        blob_sources=mixed_sources,
+    )
+
+    registered = registry.resolve_blob(source.artifact_id)
+    assert not source_path.samefile(registered)
+    accounting = snapshot_state_tree(
+        tmp_path / "state",
+        externally_owned_paths=(source_path,),
+    )
+    assert accounting.unique_byte_count is not None
+    assert accounting.unique_byte_count >= source.bytes
 
 
 def test_business_failure_is_observed_as_rollback_not_commit_failure(

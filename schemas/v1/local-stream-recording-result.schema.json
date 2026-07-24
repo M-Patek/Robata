@@ -1,0 +1,324 @@
+{
+  "$defs": {
+    "InferenceStatus": {
+      "description": "Terminal inference attempt status.",
+      "enum": [
+        "SUCCEEDED",
+        "FAILED",
+        "TIMEOUT",
+        "CANCELLED",
+        "INVALID_OUTPUT"
+      ],
+      "title": "InferenceStatus",
+      "type": "string"
+    },
+    "LocalStreamOutputDecision": {
+      "enum": [
+        "ADMITTED",
+        "NO_EVENTS",
+        "ABSTAINED"
+      ],
+      "type": "string"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "StreamInferenceTerminalReference": {
+      "additionalProperties": false,
+      "description": "Selected terminal lineage retained by an incremental window result.",
+      "properties": {
+        "artifact_ref": {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        "inference_attempt_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Inference Attempt Id",
+          "type": "string"
+        },
+        "inference_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Inference Semantic Sha256",
+          "type": "string"
+        },
+        "input_plan_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Plan Semantic Sha256",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/StreamPurpose"
+        },
+        "status": {
+          "$ref": "#/$defs/InferenceStatus"
+        },
+        "stream_inference_logical_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Stream Inference Logical Id",
+          "type": "string"
+        },
+        "terminal_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Terminal Semantic Sha256",
+          "type": "string"
+        },
+        "window_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Window Key",
+          "type": "string"
+        },
+        "window_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Window Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "window_key",
+        "window_semantic_sha256",
+        "purpose",
+        "inference_semantic_sha256",
+        "stream_inference_logical_id",
+        "inference_attempt_id",
+        "input_plan_semantic_sha256",
+        "status",
+        "terminal_semantic_sha256",
+        "artifact_ref"
+      ],
+      "title": "StreamInferenceTerminalReference",
+      "type": "object"
+    },
+    "StreamPurpose": {
+      "description": "Provider-neutral purposes used in window and inference identity.",
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT"
+      ],
+      "title": "StreamPurpose",
+      "type": "string"
+    },
+    "TerminalOutcome": {
+      "description": "Terminal outcomes retained by stream closure, including failures.",
+      "enum": [
+        "SUCCEEDED",
+        "SKIPPED_POLICY",
+        "SKIPPED_NOT_NEEDED",
+        "FAILED",
+        "CANCELLED",
+        "EXPIRED",
+        "QUARANTINED",
+        "LATE_INPUT",
+        "INCOMPLETE",
+        "ABSTAINED",
+        "NO_EVENTS",
+        "INVALIDATED"
+      ],
+      "title": "TerminalOutcome",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/local-stream-recording-result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Non-production recording result derived from one sealed stream history.",
+  "properties": {
+    "accepted_terminals": {
+      "items": {
+        "$ref": "#/$defs/StreamInferenceTerminalReference"
+      },
+      "title": "Accepted Terminals",
+      "type": "array"
+    },
+    "capture_scope_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Capture Scope Digest",
+      "type": "string"
+    },
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "expected_plan_seal_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Expected Plan Seal Semantic Sha256",
+      "type": "string"
+    },
+    "final_recording_identity": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Final Recording Identity",
+      "type": "string"
+    },
+    "ordered_window_result_semantic_sha256_values": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Ordered Window Result Semantic Sha256 Values",
+      "type": "array"
+    },
+    "ordered_window_terminal_outcomes": {
+      "items": {
+        "$ref": "#/$defs/TerminalOutcome"
+      },
+      "title": "Ordered Window Terminal Outcomes",
+      "type": "array"
+    },
+    "output_decision": {
+      "$ref": "#/$defs/LocalStreamOutputDecision"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "recording_finalization_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Finalization Semantic Sha256",
+      "type": "string"
+    },
+    "recording_result_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Recording Result Key",
+      "type": "string"
+    },
+    "recording_result_projection_version": {
+      "default": "local-stream-recording-result-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Recording Result Projection Version",
+      "type": "string"
+    },
+    "recording_result_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Recording Result Semantic Sha256",
+      "type": "string"
+    },
+    "reduction_policy_version": {
+      "default": "local-conformance-stream-recording-reduction-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Reduction Policy Version",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "window_terminal_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Terminal Closure Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "evidence_class",
+    "production_eligible",
+    "recording_result_projection_version",
+    "reduction_policy_version",
+    "capture_scope_digest",
+    "plan_key",
+    "expected_plan_seal_semantic_sha256",
+    "window_terminal_closure_semantic_sha256",
+    "recording_finalization_semantic_sha256",
+    "final_recording_identity",
+    "ordered_window_result_semantic_sha256_values",
+    "ordered_window_terminal_outcomes",
+    "accepted_terminals",
+    "output_decision",
+    "recording_result_key",
+    "recording_result_semantic_sha256"
+  ],
+  "title": "LocalStreamRecordingResult",
+  "type": "object"
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -33,6 +35,9 @@ from robata.adapters.pyav_mp4_exporter import (
     EXPORTER_VERSION,
     PyAvH264Mp4Exporter,
 )
+from robata.adapters.sqlite_capture_authority import SQLiteLocalCaptureAuthority
+from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
+from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
 from robata.admission.context import AdmissionContextResolver, AdmittedRecordingContextV2
 from robata.admission.ledger import (
     AlignmentAdmissionOutcome,
@@ -42,6 +47,14 @@ from robata.admission.ledger import (
 )
 from robata.application.canonical.bounded_media import (
     BoundedMediaPolicy,
+    PlannerEmission,
+    PlannerFinish,
+)
+from robata.application.canonical.local_stream_finalization import (
+    LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
+    LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
+    LocalConformanceStreamFinalizer,
+    LocalStreamFinalizationSchemaRefs,
 )
 from robata.application.canonical.media_quality import (
     FrameQualityObservation,
@@ -53,7 +66,19 @@ from robata.application.canonical.media_quality import (
 )
 from robata.application.canonical.single_pass_video import (
     DurableSinglePassVideoProducer,
+    H264SpoolSetFacts,
     read_sealed_mcap_inspection,
+)
+from robata.application.canonical.stream_recording_reduction import (
+    LOCAL_STREAM_RECORDING_RESULT_SCHEMA_ID,
+    LOCAL_STREAM_RECORDING_RESULT_V4_SCHEMA_VERSION,
+)
+from robata.application.canonical.stream_scheduler import (
+    DEFAULT_STREAM_BACKPRESSURE_CONFIG,
+    STREAM_WINDOW_DAG_POLICY_VERSION,
+    DurableStreamWindowScheduler,
+    EosSealInputs,
+    StreamSchedulerSchemaRefs,
 )
 from robata.application.registered_video_export import (
     PublishedRegisteredVideoExport,
@@ -96,6 +121,7 @@ from robata.contracts.alignment import (
     AlignmentStatus,
     CanonicalOrigin,
 )
+from robata.contracts.artifacts import ArtifactType
 from robata.contracts.cameras import CAMERA_IDS, CameraId, SixCameraMap
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import (
@@ -104,12 +130,67 @@ from robata.contracts.hashing import (
     recording_identity,
     semantic_sha256,
 )
+from robata.contracts.local_stream_causal import (
+    LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_ID,
+    LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_VERSION,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_ID,
+    LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_VERSION,
+)
 from robata.contracts.mcap import MCAPReadyRecording
 from robata.contracts.sampling_plan import FrameBudget, OverflowPolicy, SamplingPlan
-from robata.contracts.schema_registry import SchemaRegistry
+from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
+from robata.contracts.stream_common import (
+    AuthorityBinding,
+    ChannelBinding,
+    StreamPolicyBinding,
+    StreamPurpose,
+)
+from robata.contracts.stream_finalization import (
+    RECORDING_FINALIZATION_SCHEMA_ID,
+    RECORDING_FINALIZATION_SCHEMA_VERSION,
+    WINDOW_TERMINAL_CLOSURE_SCHEMA_ID,
+    WINDOW_TERMINAL_CLOSURE_SCHEMA_VERSION,
+    WINDOW_TERMINAL_MEMBER_SCHEMA_ID,
+    WINDOW_TERMINAL_MEMBER_SCHEMA_VERSION,
+)
+from robata.contracts.stream_inference import (
+    STREAM_ACCEPTED_CALL_SCHEMA_ID,
+    STREAM_ACCEPTED_CALL_SCHEMA_VERSION,
+    STREAM_INFERENCE_INTENT_SCHEMA_ID,
+    STREAM_INFERENCE_INTENT_SCHEMA_VERSION,
+    STREAM_INFERENCE_TERMINAL_SCHEMA_ID,
+    STREAM_INFERENCE_TERMINAL_SCHEMA_VERSION,
+    STREAM_WINDOW_RESULT_SCHEMA_ID,
+    STREAM_WINDOW_RESULT_SCHEMA_VERSION,
+)
+from robata.contracts.stream_planning import (
+    EXPECTED_WINDOW_DECLARATION_SCHEMA_ID,
+    EXPECTED_WINDOW_DECLARATION_SCHEMA_VERSION,
+    EXPECTED_WINDOW_PLAN_SCHEMA_ID,
+    EXPECTED_WINDOW_PLAN_SCHEMA_VERSION,
+    EXPECTED_WINDOW_SEAL_SCHEMA_ID,
+    EXPECTED_WINDOW_SEAL_SCHEMA_VERSION,
+    STREAM_WORK_PLAN_SCHEMA_ID,
+    STREAM_WORK_PLAN_SCHEMA_VERSION,
+    create_expected_window_plan,
+)
+from robata.contracts.stream_source import (
+    PRE_EOS_CAPTURE_SCHEMA_ID,
+    PRE_EOS_CAPTURE_SCHEMA_VERSION,
+    PreEosCaptureSubject,
+)
+from robata.contracts.stream_window import (
+    INCREMENTAL_WINDOW_SCHEMA_ID,
+    INCREMENTAL_WINDOW_SCHEMA_VERSION,
+    STREAM_INFERENCE_ATTEMPT_SCHEMA_ID,
+    STREAM_INFERENCE_ATTEMPT_SCHEMA_VERSION,
+    STREAM_INFERENCE_SCHEMA_ID,
+    STREAM_INFERENCE_SCHEMA_VERSION,
+)
 from robata.contracts.video_export import VideoExporterMode
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
 from robata.ports.ingestion import ChannelInspection, McapInspection
+from robata.queue.outbox import OutboxRetryPolicy
 from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 from robata.sampling.grid import FrameCandidate, SamplingGrid, SamplingRate, SelectionStatus
 from robata.sampling.materializer import (
@@ -129,7 +210,46 @@ MCAP_PNG_EXTRACTOR_VERSION = "canonical-mcap-png-320-v1"
 MCAP_PNG_MAX_WIDTH: Final = 320
 MCAP_PRE_EOS_POLICY_VERSION: Final = "canonical-mcap-pre-eos-v1"
 MCAP_PRE_EOS_CLOCK_POLICY_VERSION: Final = "canonical-mcap-log-time-clock-v1"
+MCAP_CAPTURE_AUTHORITY_ID: Final = "local-mcap-capture-authority"
+MCAP_CAPTURE_ASSIGNMENT_POLICY_VERSION: Final = "local-mcap-capture-assignment-v1"
+MCAP_EXPECTED_PLAN_PLANNER_VERSION: Final = "bounded-single-pass-media-planner-v1"
+MCAP_WATERMARK_POLICY_VERSION: Final = "canonical-mcap-watermark-v1"
+MCAP_LATENESS_POLICY_VERSION: Final = "canonical-mcap-lateness-v1"
+MCAP_IDLE_SOURCE_POLICY_VERSION: Final = "canonical-mcap-idle-source-v1"
 MCAP_SPOOL_EXPORT_WORKERS: Final = 6
+MCAP_INCREMENTAL_DRAIN_BATCH_SIZE: Final = 256
+
+
+@dataclass(slots=True)
+class _IncrementalLocalStreamPlanningSink:
+    """Persist planner output and keep provider-neutral window work bounded."""
+
+    scheduler: DurableStreamWindowScheduler
+    executor: LocalConformanceStreamFinalizer
+    runtime_observer: RuntimeObserver | None
+
+    def append_emission(self, emission: PlannerEmission) -> None:
+        self.scheduler.append_emission(emission)
+        if not emission.windows:
+            return
+        completed = self.executor.drain_ready(max_items=max(1, len(emission.windows) * 5))
+        runtime_increment(
+            self.runtime_observer,
+            "stream.incremental.executed_work",
+            completed,
+        )
+
+    def seal(self, finish: PlannerFinish) -> None:
+        self.scheduler.seal(finish)
+        while completed := self.executor.drain_ready(max_items=MCAP_INCREMENTAL_DRAIN_BATCH_SIZE):
+            runtime_increment(
+                self.runtime_observer,
+                "stream.incremental.executed_work",
+                completed,
+            )
+
+
+MCAP_FRAME_MATERIALIZATION_WORKERS: Final = 6
 
 
 class CanonicalMcapSourceError(ValueError):
@@ -280,6 +400,9 @@ def load_canonical_mcap_source(
     schema_registry: SchemaRegistry | None = None,
     clock: Callable[[], datetime] | None = None,
     runtime_observer: RuntimeObserver | None = None,
+    execution_scheduler: SQLiteWorkScheduler | None = None,
+    stream_run_id: str | None = None,
+    stream_artifact_root: Path | None = None,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
 
@@ -289,6 +412,8 @@ def load_canonical_mcap_source(
                 raise TypeError("max_duration_ns must be an integer or None")
             if max_duration_ns <= 0:
                 raise ValueError("max_duration_ns must be positive")
+        if (execution_scheduler is None) != (stream_run_id is None):
+            raise ValueError("execution_scheduler and stream_run_id must be configured together")
         return _load_canonical_mcap_source(
             Path(source),
             authorization=authorization,
@@ -298,6 +423,11 @@ def load_canonical_mcap_source(
             schema_registry=schema_registry or SchemaRegistry(),
             clock=clock or (lambda: datetime.now(tz=UTC)),
             runtime_observer=runtime_observer,
+            execution_scheduler=execution_scheduler,
+            stream_run_id=stream_run_id,
+            stream_artifact_root=(
+                None if stream_artifact_root is None else Path(stream_artifact_root)
+            ),
         )
     except CanonicalMcapSourceError:
         raise
@@ -315,6 +445,9 @@ def _load_canonical_mcap_source(
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
     runtime_observer: RuntimeObserver | None,
+    execution_scheduler: SQLiteWorkScheduler | None,
+    stream_run_id: str | None,
+    stream_artifact_root: Path | None,
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
     stage_attributes = {"camera_count": len(CAMERA_IDS)}
@@ -347,6 +480,9 @@ def _load_canonical_mcap_source(
             clock=clock,
             runtime_observer=runtime_observer,
             preflight=preflight,
+            execution_scheduler=execution_scheduler,
+            stream_run_id=stream_run_id,
+            stream_artifact_root=stream_artifact_root,
         )
         publication = prepared_publication.publication
         inspection = prepared_publication.inspection
@@ -566,6 +702,9 @@ def _export_registered_videos(
     clock: Callable[[], datetime],
     runtime_observer: RuntimeObserver | None,
     preflight: McapPreflight | None,
+    execution_scheduler: SQLiteWorkScheduler | None,
+    stream_run_id: str | None,
+    stream_artifact_root: Path | None,
 ) -> _PreparedVideoPublication:
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
@@ -585,10 +724,94 @@ def _export_registered_videos(
         LocalArtifactRegistry(
             state_dir / "artifact-registry",
             runtime_observer=runtime_observer,
+            hardlink_artifact_types=frozenset({ArtifactType.RAW_MCAP}),
         ),
         schema_registry,
         clock=clock,
     )
+    planner_source_scope_digest = inspection.source_sha256
+    stream_scheduler: DurableStreamWindowScheduler | None = None
+    planning_sink: _IncrementalLocalStreamPlanningSink | None = None
+    capture_subject: PreEosCaptureSubject | None = None
+    if execution_scheduler is not None:
+        if stream_run_id is None:
+            raise CanonicalMcapSourceError("stream scheduler run identity is absent")
+        capture_subject, stream_scheduler = _create_mcap_stream_scheduler(
+            execution_scheduler=execution_scheduler,
+            stream_run_id=stream_run_id,
+            channels=channels,
+            authorization=authorization,
+            schema_registry=schema_registry,
+            clock=clock,
+        )
+        planner_source_scope_digest = capture_subject.capture_scope_digest
+        planning_sink = _IncrementalLocalStreamPlanningSink(
+            scheduler=stream_scheduler,
+            executor=LocalConformanceStreamFinalizer(
+                scheduler=stream_scheduler,
+                delivery_authority=SQLiteStreamDeliveryAuthority(
+                    execution_scheduler,
+                    retry_policy=OutboxRetryPolicy(
+                        version="local-stream-delivery-retry-v1",
+                        max_attempts=3,
+                        base_delay_seconds=1,
+                        max_delay_seconds=30,
+                    ),
+                    clock=clock,
+                ),
+                artifact_root=stream_artifact_root or state_dir / "stream-artifacts",
+                schema_refs=LocalStreamFinalizationSchemaRefs(
+                    local_work_receipt=schema_registry.resolve_version(
+                        LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
+                        LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
+                    ).ref,
+                    stream_window_result=schema_registry.resolve_version(
+                        STREAM_WINDOW_RESULT_SCHEMA_ID,
+                        STREAM_WINDOW_RESULT_SCHEMA_VERSION,
+                    ).ref,
+                    recording_finalization=schema_registry.resolve_version(
+                        RECORDING_FINALIZATION_SCHEMA_ID,
+                        RECORDING_FINALIZATION_SCHEMA_VERSION,
+                    ).ref,
+                    stream_recording_result=schema_registry.resolve_version(
+                        LOCAL_STREAM_RECORDING_RESULT_SCHEMA_ID,
+                        LOCAL_STREAM_RECORDING_RESULT_V4_SCHEMA_VERSION,
+                    ).ref,
+                    window_inference_plan=schema_registry.resolve_version(
+                        LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_ID,
+                        LOCAL_STREAM_WINDOW_INFERENCE_PLAN_SCHEMA_VERSION,
+                    ).ref,
+                    window_semantic_evidence_v2=schema_registry.resolve_version(
+                        LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_ID,
+                        LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_V2_SCHEMA_VERSION,
+                    ).ref,
+                    stream_inference_identity=schema_registry.resolve_version(
+                        STREAM_INFERENCE_SCHEMA_ID,
+                        STREAM_INFERENCE_SCHEMA_VERSION,
+                    ).ref,
+                    stream_inference_attempt=schema_registry.resolve_version(
+                        STREAM_INFERENCE_ATTEMPT_SCHEMA_ID,
+                        STREAM_INFERENCE_ATTEMPT_SCHEMA_VERSION,
+                    ).ref,
+                    stream_inference_intent=schema_registry.resolve_version(
+                        STREAM_INFERENCE_INTENT_SCHEMA_ID,
+                        STREAM_INFERENCE_INTENT_SCHEMA_VERSION,
+                    ).ref,
+                    stream_accepted_call=schema_registry.resolve_version(
+                        STREAM_ACCEPTED_CALL_SCHEMA_ID,
+                        STREAM_ACCEPTED_CALL_SCHEMA_VERSION,
+                    ).ref,
+                    stream_inference_terminal=schema_registry.resolve_version(
+                        STREAM_INFERENCE_TERMINAL_SCHEMA_ID,
+                        STREAM_INFERENCE_TERMINAL_SCHEMA_VERSION,
+                    ).ref,
+                ),
+                window_purpose=StreamPurpose.EVENT_PROPOSAL,
+                recover_graph_before_execute=False,
+                clock=clock,
+            ),
+            runtime_observer=runtime_observer,
+        )
     planner_policy_factory: Callable[[int], BoundedMediaPolicy] | None = None
     if preflight is not None and not preflight.message_indexes_complete:
         planner_policy = None
@@ -598,7 +821,7 @@ def _export_registered_videos(
             source_origin_ns: int,
         ) -> BoundedMediaPolicy:
             return _pre_eos_media_policy(
-                inspection=inspection,
+                source_scope_digest=planner_source_scope_digest,
                 authorization=authorization,
                 source_origin_ns=source_origin_ns,
             )
@@ -606,7 +829,7 @@ def _export_registered_videos(
     else:
         source_origin_ns, source_end_ns = _mapped_source_bounds(channels)
         planner_policy = _pre_eos_media_policy(
-            inspection=inspection,
+            source_scope_digest=planner_source_scope_digest,
             authorization=authorization,
             source_origin_ns=source_origin_ns,
         )
@@ -619,6 +842,8 @@ def _export_registered_videos(
         max_parallel_exports=MCAP_SPOOL_EXPORT_WORKERS,
         preflight=preflight,
         planner_policy_factory=planner_policy_factory,
+        planner_source_scope_digest=planner_source_scope_digest,
+        planning_sink=planning_sink,
         exporter=exporter,
     )
     spool_set = producer.prepare()
@@ -646,8 +871,40 @@ def _export_registered_videos(
         mapping_profile_digest=authorization.semantic_sha256,
         exporter=descriptor,
     )
+    # The sealed spools are the durable hand-off: export may advance independently
+    # while EOS facts are sealed, and joins only at the fixed-six export barrier.
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="robata-registered-video-export",
+    ) as export_executor:
+        export_context = copy_context()
+        publication_future = export_executor.submit(
+            export_context.run,
+            service.export_staged_local,
+            request,
+            producer,
+        )
+        if stream_scheduler is not None:
+            assert capture_subject is not None
+            stream_scheduler.finalize_eos(
+                _mcap_eos_inputs(
+                    capture_subject=capture_subject,
+                    spool_set=spool_set,
+                    planner_policy=producer.planner_policy,
+                    planner_finish=producer.planner_finish,
+                    final_channels=final_channels,
+                    final_inspection=final_inspection,
+                )
+            )
+        publication = publication_future.result()
+    if stream_scheduler is not None:
+        stream_scheduler.mark_export_barrier_complete(
+            export_manifest_semantic_sha256=publication.manifest.semantic_content_sha256,
+            completed_member_count=len(publication.manifest.cameras),
+        )
+    producer.release_exported_spool_set()
     return _PreparedVideoPublication(
-        publication=service.export_staged_local(request, producer),
+        publication=publication,
         inspection=final_inspection,
         channels=final_channels,
     )
@@ -655,26 +912,351 @@ def _export_registered_videos(
 
 def _pre_eos_media_policy(
     *,
-    inspection: McapInspection,
+    source_scope_digest: str,
     authorization: AuthorizedMcapMapping,
     source_origin_ns: int,
 ) -> BoundedMediaPolicy:
-    clock_policy_sha256 = semantic_sha256(
-        {
-            "clock_policy_version": MCAP_PRE_EOS_CLOCK_POLICY_VERSION,
-            "source_clock": "MCAP_LOG_TIME_NS",
-            "pre_alignment_transform": "IDENTITY",
-            "source_origin_policy": "MINIMUM_MAPPED_FIRST_LOG_TIME",
-        }
-    )
+    clock_policy_sha256 = _pre_eos_clock_policy_sha256()
     return BoundedMediaPolicy(
-        source_scope_digest=inspection.source_sha256,
+        source_scope_digest=source_scope_digest,
         mapping_semantic_sha256=authorization.semantic_sha256,
         alignment_semantic_sha256=clock_policy_sha256,
         source_origin_ns=source_origin_ns,
         segmentation_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-segmentation",
         window_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-window",
         quality_policy_version=f"{MCAP_PRE_EOS_POLICY_VERSION}-quality",
+    )
+
+
+def _create_mcap_stream_scheduler(
+    *,
+    execution_scheduler: SQLiteWorkScheduler,
+    stream_run_id: str,
+    channels: SixCameraMap[ChannelInspection],
+    authorization: AuthorizedMcapMapping,
+    schema_registry: SchemaRegistry,
+    clock: Callable[[], datetime],
+) -> tuple[PreEosCaptureSubject, DurableStreamWindowScheduler]:
+    clock_policy_sha256 = _pre_eos_clock_policy_sha256()
+    mapping_authority = AuthorityBinding(
+        authority_id=f"local-mcap-mapping:{authorization.profile.profile_id}",
+        authority_epoch=1,
+        policy_version=authorization.profile.version,
+        initial_binding_semantic_sha256=authorization.semantic_sha256,
+    )
+    clock_authority = AuthorityBinding(
+        authority_id="local-mcap-log-time",
+        authority_epoch=1,
+        policy_version=MCAP_PRE_EOS_CLOCK_POLICY_VERSION,
+        initial_binding_semantic_sha256=clock_policy_sha256,
+    )
+    capture = SQLiteLocalCaptureAuthority(
+        execution_scheduler,
+        capture_authority_id=MCAP_CAPTURE_AUTHORITY_ID,
+        capture_authority_epoch=1,
+        capture_assignment_policy_version=MCAP_CAPTURE_ASSIGNMENT_POLICY_VERSION,
+    ).issue(
+        stream_run_id,
+        schema_registry.resolve_version(
+            PRE_EOS_CAPTURE_SCHEMA_ID,
+            PRE_EOS_CAPTURE_SCHEMA_VERSION,
+        ).ref,
+        _mcap_channel_bindings(
+            channels=channels,
+            mapping_semantic_sha256=authorization.semantic_sha256,
+        ),
+        mapping_authority,
+        clock_authority,
+    )
+    policy = _pre_eos_media_policy(
+        source_scope_digest=capture.capture_scope_digest,
+        authorization=authorization,
+        source_origin_ns=0,
+    )
+    expected_plan = create_expected_window_plan(
+        schema_ref=schema_registry.resolve_version(
+            EXPECTED_WINDOW_PLAN_SCHEMA_ID,
+            EXPECTED_WINDOW_PLAN_SCHEMA_VERSION,
+        ).ref,
+        capture_scope_digest=capture.capture_scope_digest,
+        segmentation_policy=_stream_policy_binding(
+            policy.segmentation_policy_version,
+            {
+                "projection_version": "canonical-mcap-segmentation-policy-semantic-v1",
+                "segment_duration_ns": policy.segment_duration_ns,
+                "compressed_member_policy": "APPEND_ONLY_H264_SPOOL_RANGE",
+            },
+        ),
+        window_policy=_stream_policy_binding(
+            policy.window_policy_version,
+            {
+                "projection_version": "canonical-mcap-window-policy-semantic-v1",
+                "window_width_ns": policy.window_width_ns,
+                "window_hop_ns": policy.window_hop_ns,
+                "window_purpose": policy.window_purpose.value,
+                "quality_policy_version": policy.quality_policy_version,
+                "quality_period_ns": policy.quality_period_ns,
+                "quality_target_phase_ns": policy.quality_target_phase_ns,
+                "quality_selection_tolerance_ns": policy.quality_selection_tolerance_ns,
+            },
+        ),
+        watermark_policy=_stream_policy_binding(
+            MCAP_WATERMARK_POLICY_VERSION,
+            {
+                "projection_version": "canonical-mcap-watermark-policy-semantic-v1",
+                "allowed_lateness_ns": policy.allowed_lateness_ns,
+                "source": "MINIMUM_SIX_CAMERA_LATEST_ALIGNED_TIMESTAMP",
+                "eos_closes_partial_window": True,
+            },
+        ),
+        lateness_policy=_stream_policy_binding(
+            MCAP_LATENESS_POLICY_VERSION,
+            {
+                "projection_version": "canonical-mcap-lateness-policy-semantic-v1",
+                "allowed_lateness_ns": policy.allowed_lateness_ns,
+                "late_input_outcome": "EXPLICIT_LATE",
+            },
+        ),
+        idle_source_policy=_stream_policy_binding(
+            MCAP_IDLE_SOURCE_POLICY_VERSION,
+            {
+                "projection_version": "canonical-mcap-idle-source-policy-semantic-v1",
+                "offline_source_policy": "EOS_CLOSES_ALL_SIX_SLOTS",
+            },
+        ),
+        planner_version=MCAP_EXPECTED_PLAN_PLANNER_VERSION,
+    )
+    schema_refs = _stream_scheduler_schema_refs(schema_registry)
+    dag_config_semantic_sha256 = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-stream-dag-config-semantic-v2",
+            "stream_window_dag_policy_version": STREAM_WINDOW_DAG_POLICY_VERSION,
+            "backpressure_config": DEFAULT_STREAM_BACKPRESSURE_CONFIG,
+            "ordered_stages": [
+                "WINDOW",
+                "QA_COARSE",
+                "QA_DENSE",
+                "EVENT_PROPOSAL",
+                "WINDOW_REDUCTION",
+                "FINALIZATION",
+            ],
+        }
+    )
+    return capture, DurableStreamWindowScheduler(
+        database_path=execution_scheduler.database_path,
+        execution_scheduler=execution_scheduler,
+        expected_plan=expected_plan,
+        source_subject=capture.reference(),
+        stream_run_id=stream_run_id,
+        schema_refs=schema_refs,
+        dag_config_semantic_sha256=dag_config_semantic_sha256,
+        clock=clock,
+    )
+
+
+def _mcap_channel_bindings(
+    *,
+    channels: SixCameraMap[ChannelInspection],
+    mapping_semantic_sha256: str,
+) -> tuple[ChannelBinding, ...]:
+    return tuple(
+        ChannelBinding(
+            camera_id=camera_id,
+            source_channel_id=f"mcap-channel:{channels[camera_id].channel_id}",
+            source_channel_epoch=1,
+            channel_binding_semantic_sha256=semantic_sha256(
+                {
+                    "projection_version": "canonical-mcap-channel-binding-semantic-v1",
+                    "camera_id": camera_id.value,
+                    "channel_id": channels[camera_id].channel_id,
+                    "topic": channels[camera_id].topic,
+                    "schema_name": channels[camera_id].schema_name,
+                    "schema_encoding": channels[camera_id].schema_encoding,
+                    "schema_content_sha256": channels[camera_id].schema_content_sha256,
+                    "message_encoding": channels[camera_id].message_encoding,
+                    "mapping_semantic_sha256": mapping_semantic_sha256,
+                }
+            ),
+        )
+        for camera_id in CAMERA_IDS
+    )
+
+
+def _stream_policy_binding(
+    version: str,
+    semantic_projection: Mapping[str, object],
+) -> StreamPolicyBinding:
+    return StreamPolicyBinding(
+        version=version,
+        semantic_sha256=semantic_sha256(semantic_projection),
+    )
+
+
+def _stream_scheduler_schema_refs(
+    schema_registry: SchemaRegistry,
+) -> StreamSchedulerSchemaRefs:
+    def resolve(schema_id: str, version: str) -> SchemaRef:
+        return schema_registry.resolve_version(schema_id, version).ref
+
+    return StreamSchedulerSchemaRefs(
+        incremental_window=resolve(
+            INCREMENTAL_WINDOW_SCHEMA_ID,
+            INCREMENTAL_WINDOW_SCHEMA_VERSION,
+        ),
+        expected_declaration=resolve(
+            EXPECTED_WINDOW_DECLARATION_SCHEMA_ID,
+            EXPECTED_WINDOW_DECLARATION_SCHEMA_VERSION,
+        ),
+        expected_plan_seal=resolve(
+            EXPECTED_WINDOW_SEAL_SCHEMA_ID,
+            EXPECTED_WINDOW_SEAL_SCHEMA_VERSION,
+        ),
+        stream_work_plan=resolve(
+            STREAM_WORK_PLAN_SCHEMA_ID,
+            STREAM_WORK_PLAN_SCHEMA_VERSION,
+        ),
+        terminal_member=resolve(
+            WINDOW_TERMINAL_MEMBER_SCHEMA_ID,
+            WINDOW_TERMINAL_MEMBER_SCHEMA_VERSION,
+        ),
+        terminal_closure=resolve(
+            WINDOW_TERMINAL_CLOSURE_SCHEMA_ID,
+            WINDOW_TERMINAL_CLOSURE_SCHEMA_VERSION,
+        ),
+    )
+
+
+def _mcap_eos_inputs(
+    *,
+    capture_subject: PreEosCaptureSubject,
+    spool_set: H264SpoolSetFacts,
+    planner_policy: BoundedMediaPolicy,
+    planner_finish: PlannerFinish,
+    final_channels: SixCameraMap[ChannelInspection],
+    final_inspection: McapInspection,
+) -> EosSealInputs:
+    if (
+        spool_set.source_sha256 != final_inspection.source_sha256
+        or spool_set.source_size_bytes != final_inspection.source_size_bytes
+        or spool_set.source_message_count != final_inspection.message_count
+    ):
+        raise CanonicalMcapSourceError(
+            "EOS scheduler facts differ from the accepted source and spool set"
+        )
+    facts_by_camera = {fact.camera_id: fact for fact in planner_finish.facts}
+    if set(facts_by_camera) != set(CAMERA_IDS):
+        raise CanonicalMcapSourceError("planner EOS facts do not cover all six cameras")
+    eos_source_receipt = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-eos-source-receipt-semantic-v1",
+            "capture_scope_digest": capture_subject.capture_scope_digest,
+            "source_sha256": spool_set.source_sha256,
+            "source_size_bytes": str(spool_set.source_size_bytes),
+            "source_message_count": str(spool_set.source_message_count),
+            "ordered_spools": [
+                {
+                    "camera_id": camera_id.value,
+                    "packet_count": str(spool_set.spools[camera_id].packet_count),
+                    "size_bytes": str(spool_set.spools[camera_id].size_bytes),
+                    "sha256": spool_set.spools[camera_id].sha256,
+                }
+                for camera_id in CAMERA_IDS
+            ],
+        }
+    )
+    final_timeline = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-final-timeline-semantic-v1",
+            "capture_scope_digest": capture_subject.capture_scope_digest,
+            "source_origin_ns": str(planner_policy.source_origin_ns),
+            "final_end_ns": str(spool_set.final_end_ns),
+            "ordered_camera_timelines": [
+                {
+                    "camera_id": camera_id.value,
+                    "packet_count": str(facts_by_camera[camera_id].packet_count),
+                    "first_timestamp_ns": (
+                        None
+                        if facts_by_camera[camera_id].first_timestamp_ns is None
+                        else str(facts_by_camera[camera_id].first_timestamp_ns)
+                    ),
+                    "last_timestamp_ns": (
+                        None
+                        if facts_by_camera[camera_id].last_timestamp_ns is None
+                        else str(facts_by_camera[camera_id].last_timestamp_ns)
+                    ),
+                    "first_sequence": (
+                        None
+                        if facts_by_camera[camera_id].first_sequence is None
+                        else str(facts_by_camera[camera_id].first_sequence)
+                    ),
+                    "last_sequence": (
+                        None
+                        if facts_by_camera[camera_id].last_sequence is None
+                        else str(facts_by_camera[camera_id].last_sequence)
+                    ),
+                }
+                for camera_id in CAMERA_IDS
+            ],
+        }
+    )
+    channel_health = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-six-channel-health-semantic-v1",
+            "ordered_channels": [
+                {
+                    "camera_id": camera_id.value,
+                    "channel_id": str(final_channels[camera_id].channel_id),
+                    "message_count": str(final_channels[camera_id].message_count),
+                    "monotonic": final_channels[camera_id].monotonic,
+                    "sequence_gap_count": str(facts_by_camera[camera_id].sequence_gap_count),
+                    "payload_bytes": str(facts_by_camera[camera_id].payload_bytes),
+                }
+                for camera_id in CAMERA_IDS
+            ],
+        }
+    )
+    mapping_closure = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-final-mapping-closure-semantic-v1",
+            "capture_scope_digest": capture_subject.capture_scope_digest,
+            "mapping_semantic_sha256": planner_policy.mapping_semantic_sha256,
+            "ordered_channel_bindings": [
+                {
+                    "camera_id": camera_id.value,
+                    "channel_id": str(final_channels[camera_id].channel_id),
+                    "topic": final_channels[camera_id].topic,
+                    "schema_content_sha256": (final_channels[camera_id].schema_content_sha256),
+                }
+                for camera_id in CAMERA_IDS
+            ],
+        }
+    )
+    clock_closure = semantic_sha256(
+        {
+            "projection_version": "canonical-mcap-final-clock-closure-semantic-v1",
+            "capture_scope_digest": capture_subject.capture_scope_digest,
+            "clock_policy_semantic_sha256": planner_policy.alignment_semantic_sha256,
+            "final_timeline_semantic_sha256": final_timeline,
+        }
+    )
+    return EosSealInputs(
+        eos_source_receipt_semantic_sha256=eos_source_receipt,
+        final_source_timeline_semantic_sha256=final_timeline,
+        final_duration_ns=spool_set.final_end_ns - planner_policy.source_origin_ns,
+        ordered_six_channel_health_closure_sha256=channel_health,
+        mapping_closure_semantic_sha256=mapping_closure,
+        clock_or_alignment_closure_semantic_sha256=clock_closure,
+    )
+
+
+def _pre_eos_clock_policy_sha256() -> str:
+    return semantic_sha256(
+        {
+            "clock_policy_version": MCAP_PRE_EOS_CLOCK_POLICY_VERSION,
+            "source_clock": "MCAP_LOG_TIME_NS",
+            "pre_alignment_transform": "IDENTITY",
+            "source_origin_policy": "MINIMUM_MAPPED_FIRST_LOG_TIME",
+        }
     )
 
 
@@ -1154,6 +1736,7 @@ def _materialize_selected_frames(
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
     quality_observations: dict[CameraId, tuple[FrameQualityObservation, ...]] = {}
     grid = SamplingGrid(grid_origin_ns=0, rate=SamplingRate(2, 1))
+    selected_frames: dict[CameraId, dict[int, IndexedSourceFrame]] = {}
     for camera_id in CAMERA_IDS:
         source_frames = frame_index.cameras[camera_id].frames
         frames_by_locator = {
@@ -1183,15 +1766,27 @@ def _materialize_selected_frames(
             if isinstance(packet_index, bool) or not isinstance(packet_index, int):
                 raise CanonicalMcapSourceError("canonical packet locator is not an integer")
             selected_by_index[packet_index] = source_frame
-        quality_observations[camera_id] = _decode_selected_camera_frames(
-            camera_id=camera_id,
-            ledger=ledgers[camera_id],
-            quality_timings=quality_timings[camera_id],
-            selected_by_index=selected_by_index,
-            output_root=output_root,
-            artifacts=artifacts,
-            stop_after_selected=stop_after_selected,
-        )
+        selected_frames[camera_id] = selected_by_index
+    with ThreadPoolExecutor(
+        max_workers=min(MCAP_FRAME_MATERIALIZATION_WORKERS, len(CAMERA_IDS)),
+        thread_name_prefix="robata-frame-materializer",
+    ) as pool:
+        futures = {
+            camera_id: pool.submit(
+                _decode_selected_camera_frames,
+                camera_id=camera_id,
+                ledger=ledgers[camera_id],
+                quality_timings=quality_timings[camera_id],
+                selected_by_index=selected_frames[camera_id],
+                output_root=output_root,
+                stop_after_selected=stop_after_selected,
+            )
+            for camera_id in CAMERA_IDS
+        }
+        for camera_id in CAMERA_IDS:
+            camera_artifacts, observations = futures[camera_id].result()
+            artifacts.update(camera_artifacts)
+            quality_observations[camera_id] = observations
     return artifacts, quality_observations
 
 
@@ -1202,13 +1797,15 @@ def _decode_selected_camera_frames(
     quality_timings: tuple[FrameTimingEvidence, ...],
     selected_by_index: Mapping[int, IndexedSourceFrame],
     output_root: Path,
-    artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     stop_after_selected: bool = False,
-) -> tuple[FrameQualityObservation, ...]:
+) -> tuple[
+    dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
+    tuple[FrameQualityObservation, ...],
+]:
     if not isinstance(stop_after_selected, bool):
         raise TypeError("stop_after_selected must be a boolean")
     if stop_after_selected and not selected_by_index:
-        return ()
+        return {}, ()
     if len(quality_timings) != len(ledger.rows):
         raise CanonicalMcapSourceError(
             f"{camera_id.value} quality timing differs from its verified timestamp sidecar"
@@ -1216,6 +1813,7 @@ def _decode_selected_camera_frames(
 
     decoded_count = 0
     rendered_indexes: set[int] = set()
+    artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
     observations: list[FrameQualityObservation] = []
     analyzer = LocalFrameQualityAnalyzer(camera_id)
     last_required_index = max(selected_by_index) if stop_after_selected else None
@@ -1264,7 +1862,7 @@ def _decode_selected_camera_frames(
         raise CanonicalMcapSourceError(
             f"{camera_id.value} did not materialize every selected source frame"
         )
-    return tuple(observations)
+    return artifacts, tuple(observations)
 
 
 def _materialize_verified_source_frame(

@@ -1,0 +1,260 @@
+{
+  "$defs": {
+    "LocalStreamStageEvidenceReference": {
+      "additionalProperties": false,
+      "description": "One exact upstream terminal receipt selected by a causal plan.",
+      "properties": {
+        "evidence_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Semantic Sha256",
+          "type": "string"
+        },
+        "stage": {
+          "$ref": "#/$defs/StreamStage"
+        },
+        "terminal_evidence_ref": {
+          "$ref": "#/$defs/StreamArtifactRef"
+        },
+        "work_logical_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Work Logical Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "work_logical_key",
+        "terminal_evidence_ref",
+        "evidence_semantic_sha256"
+      ],
+      "title": "LocalStreamStageEvidenceReference",
+      "type": "object"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamArtifactRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable evidence reference used by terminal closure.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_count": {
+          "minimum": 1,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Exact Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_ref": {
+          "$ref": "#/$defs/SchemaRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "exact_sha256",
+        "byte_count",
+        "media_type",
+        "schema_ref"
+      ],
+      "title": "StreamArtifactRef",
+      "type": "object"
+    },
+    "StreamStage": {
+      "description": "Execution stages for stream work, independent of provider names.",
+      "enum": [
+        "SEGMENT",
+        "WINDOW",
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT",
+        "WINDOW_REDUCTION",
+        "FINALIZATION"
+      ],
+      "title": "StreamStage",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/local-stream-window-inference-plan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A deterministic local input plan assembled before a window result.",
+  "properties": {
+    "causal_policy_version": {
+      "const": "local-conformance-window-causal-executor-v1",
+      "default": "local-conformance-window-causal-executor-v1",
+      "title": "Causal Policy Version",
+      "type": "string"
+    },
+    "effective_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "expected_ordinal": {
+      "minimum": 0,
+      "title": "Expected Ordinal",
+      "type": "integer"
+    },
+    "inference_plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Inference Plan Key",
+      "type": "string"
+    },
+    "input_plan_id": {
+      "title": "Input Plan Id",
+      "type": "string"
+    },
+    "input_plan_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Plan Semantic Sha256",
+      "type": "string"
+    },
+    "ordered_upstream_stage_evidence": {
+      "items": {
+        "$ref": "#/$defs/LocalStreamStageEvidenceReference"
+      },
+      "title": "Ordered Upstream Stage Evidence",
+      "type": "array"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "plan_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Semantic Sha256",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "projection_version": {
+      "const": "local-stream-window-inference-plan-semantic-v1",
+      "default": "local-stream-window-inference-plan-semantic-v1",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "six_camera_slot_closure_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Six Camera Slot Closure Semantic Sha256",
+      "type": "string"
+    },
+    "window_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Window Key",
+      "type": "string"
+    },
+    "window_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "evidence_class",
+    "production_eligible",
+    "projection_version",
+    "causal_policy_version",
+    "plan_key",
+    "expected_ordinal",
+    "window_key",
+    "window_semantic_sha256",
+    "effective_interval",
+    "input_plan_semantic_sha256",
+    "six_camera_slot_closure_semantic_sha256",
+    "ordered_upstream_stage_evidence",
+    "inference_plan_key",
+    "input_plan_id",
+    "plan_semantic_sha256"
+  ],
+  "title": "LocalStreamWindowInferencePlan",
+  "type": "object"
+}

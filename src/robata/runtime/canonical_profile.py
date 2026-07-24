@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import sqlite3
+import stat
 import subprocess
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -574,6 +575,7 @@ def snapshot_state_tree(
     state_root: Path,
     *,
     excluded_paths: Iterable[Path] = (),
+    externally_owned_paths: Iterable[Path] = (),
 ) -> StateTreeSnapshot:
     """Snapshot local state bytes and application rows without writing SQLite state."""
 
@@ -586,8 +588,26 @@ def snapshot_state_tree(
     counts = {file_class: [0, 0] for file_class in _STATE_FILE_CLASS_ORDER}
     files: list[tuple[str, Path, StateFileClass, int]] = []
     identities: dict[tuple[int, int], int] = {}
+    state_unique_identities: set[tuple[int, int]] = set()
     file_identity_available = True
     unique_byte_count = 0
+    for external_path in externally_owned_paths:
+        path = Path(external_path)
+        try:
+            identity_stat = path.lstat()
+        except OSError as error:
+            raise CanonicalProfileError(
+                f"cannot inspect externally owned file '{path}': {error}"
+            ) from error
+        if path.is_symlink() or not stat.S_ISREG(identity_stat.st_mode):
+            raise CanonicalProfileError(
+                f"externally owned path must be a regular non-symlink file: {path}"
+            )
+        identity = (identity_stat.st_dev, identity_stat.st_ino)
+        if identity_stat.st_ino == 0:
+            file_identity_available = False
+        else:
+            identities[identity] = identity_stat.st_size
     if root.exists():
         for path in root.rglob("*"):
             resolved = path.resolve()
@@ -615,6 +635,7 @@ def snapshot_state_tree(
                     file_identity_available = False
                 elif identity not in identities:
                     identities[identity] = byte_count
+                    state_unique_identities.add(identity)
                     unique_byte_count += byte_count
                 elif identities[identity] != byte_count:
                     raise CanonicalProfileError(
@@ -643,15 +664,13 @@ def snapshot_state_tree(
         classes=classes,
         sqlite_databases=database_snapshots,
         file_identity_status=("AVAILABLE" if file_identity_available else "NOT_AVAILABLE"),
-        unique_file_count=(len(identities) if file_identity_available else None),
+        unique_file_count=(len(state_unique_identities) if file_identity_available else None),
         unique_byte_count=(unique_byte_count if file_identity_available else None),
         hardlink_duplicate_path_count=(
-            len(files) - len(identities) if file_identity_available else None
+            len(files) - len(state_unique_identities) if file_identity_available else None
         ),
         hardlink_duplicate_path_bytes=(
-            sum(item[3] for item in files) - unique_byte_count
-            if file_identity_available
-            else None
+            sum(item[3] for item in files) - unique_byte_count if file_identity_available else None
         ),
     )
 

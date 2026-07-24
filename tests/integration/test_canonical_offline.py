@@ -3078,20 +3078,24 @@ def test_persisted_inference_evidence_conflict_is_a_structured_failure(
 ) -> None:
     harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
 
-    def reject_parsed_claim(_artifact: object) -> object:
+    def reject_accepted_lineage(
+        _parsed_claim: object,
+        _selected_output: object,
+        _enriched_output: object,
+    ) -> object:
         raise InferenceLedgerError("injected parsed evidence conflict")
 
     monkeypatch.setattr(
         harness.pipeline.evidence_store,
-        "append_parsed_claim",
-        reject_parsed_claim,
+        "append_accepted_lineage",
+        reject_accepted_lineage,
     )
 
     result = _run(harness)
 
     assert result.status is CanonicalOfflineRunStatus.INVALID_OUTPUT
     assert result.error is not None
-    assert result.error.stage.value == "PARSING"
+    assert result.error.stage.value == "ENRICHMENT"
     assert result.error.code == "INFERENCE_EVIDENCE_CONFLICT"
     assert "injected parsed evidence conflict" in result.error.detail
     assert result.identity_result is None

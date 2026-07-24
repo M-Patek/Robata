@@ -1,0 +1,189 @@
+{
+  "$defs": {
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamStage": {
+      "description": "Execution stages for stream work, independent of provider names.",
+      "enum": [
+        "SEGMENT",
+        "WINDOW",
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT",
+        "WINDOW_REDUCTION",
+        "FINALIZATION"
+      ],
+      "title": "StreamStage",
+      "type": "string"
+    },
+    "StreamSubjectType": {
+      "description": "Typed semantic subjects that can appear in the pre-EOS graph.",
+      "enum": [
+        "PRE_EOS_CAPTURE",
+        "STREAM_SEGMENT",
+        "INCREMENTAL_WINDOW",
+        "STREAM_INFERENCE",
+        "WINDOW_RESULT",
+        "STREAM_WORK",
+        "EXPECTED_WINDOW_PLAN",
+        "EXPECTED_WINDOW_DECLARATION",
+        "EXPECTED_WINDOW_PLAN_SEAL",
+        "WINDOW_TERMINAL_CLOSURE",
+        "RECORDING_FINALIZATION"
+      ],
+      "title": "StreamSubjectType",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/local-stream-work-receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Exact non-production evidence emitted for one local stream-work item.",
+  "properties": {
+    "config_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Config Semantic Sha256",
+      "type": "string"
+    },
+    "evidence_class": {
+      "const": "LOCAL_CONFORMANCE",
+      "default": "LOCAL_CONFORMANCE",
+      "title": "Evidence Class",
+      "type": "string"
+    },
+    "executor_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Executor Policy Version",
+      "type": "string"
+    },
+    "input_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Semantic Sha256",
+      "type": "string"
+    },
+    "model_version": {
+      "const": "local-stream-work-receipt-v1",
+      "default": "local-stream-work-receipt-v1",
+      "title": "Model Version",
+      "type": "string"
+    },
+    "ordered_upstream_terminal_exact_sha256_values": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Ordered Upstream Terminal Exact Sha256 Values",
+      "type": "array"
+    },
+    "plan_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "production_eligible": {
+      "const": false,
+      "default": false,
+      "title": "Production Eligible",
+      "type": "boolean"
+    },
+    "result": {
+      "enum": [
+        "ABSTAINED_NO_PROVIDER",
+        "LOCAL_CONFORMANCE_STAGE_COMPLETE"
+      ],
+      "title": "Result",
+      "type": "string"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "stage": {
+      "$ref": "#/$defs/StreamStage"
+    },
+    "subject_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Subject Key",
+      "type": "string"
+    },
+    "subject_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Subject Semantic Sha256",
+      "type": "string"
+    },
+    "subject_type": {
+      "$ref": "#/$defs/StreamSubjectType"
+    },
+    "work_item_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Work Item Id",
+      "type": "string"
+    },
+    "work_logical_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Work Logical Key",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_ref",
+    "executor_policy_version",
+    "plan_key",
+    "work_item_id",
+    "work_logical_key",
+    "stage",
+    "subject_type",
+    "subject_key",
+    "subject_semantic_sha256",
+    "input_semantic_sha256",
+    "config_semantic_sha256",
+    "ordered_upstream_terminal_exact_sha256_values",
+    "result"
+  ],
+  "title": "LocalStreamWorkReceipt",
+  "type": "object"
+}

@@ -138,13 +138,22 @@ class LocalArtifactRegistry:
         root: Path,
         *,
         runtime_observer: RuntimeObserver | None = None,
+        hardlink_artifact_types: frozenset[ArtifactType] = frozenset(),
     ) -> None:
         if not isinstance(root, Path):
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INVALID_REQUEST,
                 "registry root must be a pathlib.Path",
             )
+        if not isinstance(hardlink_artifact_types, frozenset) or any(
+            not isinstance(value, ArtifactType) for value in hardlink_artifact_types
+        ):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INVALID_REQUEST,
+                "hardlink_artifact_types must be a frozenset of ArtifactType values",
+            )
         self._runtime_observer = runtime_observer
+        self._hardlink_artifact_types = hardlink_artifact_types
         try:
             if root.is_symlink():
                 raise ArtifactRegistryError(
@@ -924,6 +933,12 @@ class LocalArtifactRegistry:
                     f"blob shard must not be a symlink: {shard}",
                 )
             shard.mkdir(parents=True, exist_ok=True)
+            if (
+                isinstance(source, Path)
+                and entry.artifact_type in self._hardlink_artifact_types
+                and self._put_verified_hardlink(entry, source, destination, shard)
+            ):
+                return
             descriptor, temp_name = tempfile.mkstemp(prefix=".put-", dir=shard)
             temp_path = Path(temp_name)
             try:
@@ -983,6 +998,48 @@ class LocalArtifactRegistry:
                 ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot store blob for artifact {entry.artifact_id}: {error}",
             ) from error
+
+    def _put_verified_hardlink(
+        self,
+        entry: ArtifactRegistryEntry,
+        source: Path,
+        destination: Path,
+        shard: Path,
+    ) -> bool:
+        self._verify_blob_file(
+            source,
+            expected_sha256=entry.sha256,
+            expected_bytes=entry.bytes,
+            error_code=ArtifactRegistryErrorCode.BLOB_DIGEST_MISMATCH,
+        )
+        if destination.exists() or destination.is_symlink():
+            self._verify_blob_file(
+                destination,
+                expected_sha256=entry.sha256,
+                expected_bytes=entry.bytes,
+                error_code=ArtifactRegistryErrorCode.BLOB_CONFLICT,
+            )
+            return True
+        try:
+            os.link(source, destination)
+        except FileExistsError:
+            self._verify_blob_file(
+                destination,
+                expected_sha256=entry.sha256,
+                expected_bytes=entry.bytes,
+                error_code=ArtifactRegistryErrorCode.BLOB_CONFLICT,
+            )
+        except OSError:
+            return False
+        self._verify_blob_file(
+            destination,
+            expected_sha256=entry.sha256,
+            expected_bytes=entry.bytes,
+            error_code=ArtifactRegistryErrorCode.BLOB_CONFLICT,
+        )
+        _fsync_file(destination)
+        _fsync_directory(shard)
+        return True
 
     def _write_blob_temp(
         self,

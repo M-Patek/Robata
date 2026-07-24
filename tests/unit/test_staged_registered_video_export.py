@@ -268,26 +268,29 @@ def _write_camera_artifacts(
     video_path = staging_directory / f"{camera_id.value}.mp4"
     sidecar_path = staging_directory / f"{camera_id.value}.timestamps.jsonl"
     video_bytes = f"fixture-mp4:{camera_id.value}".encode()
-    sidecar_bytes = canonical_json_bytes(
-        CameraVideoTimestampRow(
-            schema_version="1.0",
-            export_profile_id=request.exporter.export_profile_id,
-            export_profile_version=request.exporter.profile_version,
-            camera_id=camera_id,
-            packet_index=0,
-            source_sequence=0,
-            source_log_time_ns=source_ns,
-            source_publish_time_ns=source_ns,
-            embedded_header_time_ns=source_ns,
-            relative_pts_ns=0,
-            relative_dts_ns=0,
-            duration_ns=_TAIL_NS,
-            time_base_numerator=1,
-            time_base_denominator=1_000_000_000,
-            is_keyframe=True,
-            duration_is_estimated=True,
+    sidecar_bytes = (
+        canonical_json_bytes(
+            CameraVideoTimestampRow(
+                schema_version="1.0",
+                export_profile_id=request.exporter.export_profile_id,
+                export_profile_version=request.exporter.profile_version,
+                camera_id=camera_id,
+                packet_index=0,
+                source_sequence=0,
+                source_log_time_ns=source_ns,
+                source_publish_time_ns=source_ns,
+                embedded_header_time_ns=source_ns,
+                relative_pts_ns=0,
+                relative_dts_ns=0,
+                duration_ns=_TAIL_NS,
+                time_base_numerator=1,
+                time_base_denominator=1_000_000_000,
+                is_keyframe=True,
+                duration_is_estimated=True,
+            )
         )
-    ) + b"\n"
+        + b"\n"
+    )
     video_path.write_bytes(video_bytes)
     sidecar_path.write_bytes(sidecar_bytes)
     return ExportedCameraVideoFacts(

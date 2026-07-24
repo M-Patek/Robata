@@ -206,9 +206,8 @@ class McapSinglePassH264Tee:
         final_end_ns: int | None = None,
         preflight: McapPreflight | None = None,
         expected_source_sha256: str | None = None,
-        bootstrap_planner_factory: (
-            Callable[[int], BoundedSinglePassMediaPlanner] | None
-        ) = None,
+        planner_source_scope_digest: str | None = None,
+        bootstrap_planner_factory: (Callable[[int], BoundedSinglePassMediaPlanner] | None) = None,
     ) -> SinglePassTraversalResult:
         source = Path(source)
         if not source.is_file():
@@ -226,28 +225,29 @@ class McapSinglePassH264Tee:
                 "live planner and bootstrap planner factory are mutually exclusive"
             )
         if planner is None and bootstrap_planner_factory is None and planning_sink is not None:
-            raise SinglePassMcapError(
-                "planning sink requires a live planner during MCAP traversal"
-            )
+            raise SinglePassMcapError("planning sink requires a live planner during MCAP traversal")
         resolved_preflight = preflight or OfficialMcapInspector(
             validate_crcs=self._validate_crcs
         ).preflight(source)
         if resolved_preflight.source.resolve() != source.resolve():
             raise SinglePassMcapError("MCAP preflight source differs from the traversal source")
-        if (
-            bootstrap_planner_factory is not None
-            and resolved_preflight.message_indexes_complete
-        ):
+        if bootstrap_planner_factory is not None and resolved_preflight.message_indexes_complete:
             raise SinglePassMcapError(
                 "bootstrap planning requires an incomplete-index MCAP preflight"
             )
-        resolved_expected_digest = expected_source_sha256 or (
-            planner.policy.source_scope_digest if planner is not None else None
-        )
-        if resolved_expected_digest is None:
-            raise SinglePassMcapError(
-                "capture-only traversal requires an expected source digest"
-            )
+        if expected_source_sha256 is None:
+            raise SinglePassMcapError("capture-only traversal requires an expected source digest")
+        resolved_expected_digest = expected_source_sha256
+        resolved_planner_scope = planner_source_scope_digest
+        if planner is not None:
+            if resolved_planner_scope is None:
+                resolved_planner_scope = planner.policy.source_scope_digest
+            elif planner.policy.source_scope_digest != resolved_planner_scope:
+                raise SinglePassMcapError(
+                    "live planner policy differs from the declared planner source scope"
+                )
+        elif bootstrap_planner_factory is not None and resolved_planner_scope is None:
+            raise SinglePassMcapError("bootstrap planning requires a planner source scope digest")
         inspection_accumulator = McapInspectionAccumulator(
             resolved_preflight,
             expected_source_sha256=resolved_expected_digest,
@@ -286,9 +286,7 @@ class McapSinglePassH264Tee:
                         )
                     decoder = decoder_factory.decoder_for(channel.message_encoding, schema)
                     if decoder is None:
-                        raise SinglePassMcapError(
-                            "mapped camera channel has no protobuf decoder"
-                        )
+                        raise SinglePassMcapError("mapped camera channel has no protobuf decoder")
                     decoded = decoder(message.data)
                     inspection_accumulator.observe(
                         schema,
@@ -348,10 +346,10 @@ class McapSinglePassH264Tee:
                                 if (
                                     active_planner.policy.source_origin_ns != source_origin_ns
                                     or active_planner.policy.source_scope_digest
-                                    != resolved_expected_digest
+                                    != resolved_planner_scope
                                 ):
                                     raise SinglePassMcapError(
-                                        "bootstrap planner policy differs from source identity"
+                                        "bootstrap planner policy differs from planning identity"
                                     )
                                 for buffered in bootstrap_envelopes:
                                     buffered_emission = active_planner.push(buffered.packet)
@@ -386,11 +384,7 @@ class McapSinglePassH264Tee:
             if max_aligned_ns is None:
                 raise SinglePassMcapError("MCAP contains no messages for the six mapped channels")
             resolved_end_ns = max_aligned_ns + 1 if final_end_ns is None else final_end_ns
-            finish = (
-                active_planner.finish(resolved_end_ns)
-                if active_planner is not None
-                else None
-            )
+            finish = active_planner.finish(resolved_end_ns) if active_planner is not None else None
             if planning_sink is not None and finish is not None:
                 planning_sink.seal(finish)
             for camera_id in CAMERA_IDS:

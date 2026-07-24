@@ -161,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_before = snapshot_state_tree(
             args.state_dir,
             excluded_paths=(output,),
+            externally_owned_paths=(args.source,),
         )
     except CanonicalProfileError as error:
         _write_json(
@@ -200,6 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_after = snapshot_state_tree(
             args.state_dir,
             excluded_paths=(output,),
+            externally_owned_paths=(args.source,),
         )
         work_queue_after = snapshot_work_queue(args.state_dir)
         persisted_recording_ns, persisted_requested_ns = discover_canonical_profile_durations(

@@ -1,6 +1,122 @@
 {
   "fixture_version": "stream-identity-chain-v1",
+  "canonicalization": "RFC8785",
   "digest_seed": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "input": {
+    "schema_ref": {
+      "schema_id": "https://schemas.robata.dev/x",
+      "version": "1.0.0",
+      "artifact_id": "00000000-0000-0000-0000-000000000001",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "interval": {
+      "start_ns": 0,
+      "end_ns": 2000000000
+    },
+    "capture": {
+      "capture_authority_id": "capture-authority",
+      "capture_authority_epoch": 1,
+      "capture_assignment_policy_version": "assign-v1",
+      "acquisition_id": "acq-001",
+      "acquisition_epoch": 1,
+      "channel_bindings": [
+        {"camera_id": "cam_01", "source_channel_id": "ch1", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"camera_id": "cam_02", "source_channel_id": "ch2", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"camera_id": "cam_03", "source_channel_id": "ch3", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"camera_id": "cam_04", "source_channel_id": "ch4", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"camera_id": "cam_05", "source_channel_id": "ch5", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"camera_id": "cam_06", "source_channel_id": "ch6", "source_channel_epoch": 1, "channel_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+      ],
+      "mapping_authority": {
+        "authority_id": "authority-map-clock",
+        "authority_epoch": 1,
+        "policy_version": "v1",
+        "initial_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "clock_authority": {
+        "authority_id": "authority-map-clock",
+        "authority_epoch": 1,
+        "policy_version": "v1",
+        "initial_binding_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "segment": {
+      "ordered_packet_or_sequence_closure": ["seq-1", "seq-2"],
+      "exact_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mapping_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "clock_or_alignment_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "segmentation_policy_version": "segment-v1"
+    },
+    "window": {
+      "purpose": "QA_COARSE",
+      "mapping_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "clock_or_alignment_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_subject_key_or_none": null,
+      "refinement_role_or_none": null,
+      "refinement_generation": 0,
+      "window_policy_version": "window-v1"
+    },
+    "plan": {
+      "segmentation_policy_binding": {"version": "v1", "semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "window_policy_binding": {"version": "v1", "semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "watermark_policy_binding": {"version": "v1", "semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "lateness_policy_binding": {"version": "v1", "semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "idle_source_policy_binding": {"version": "v1", "semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "planner_version": "planner-v1"
+    },
+    "declaration": {
+      "ordinal": 0,
+      "watermark_source_facts_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "previous_append_chain_sha256": null
+    },
+    "seal": {
+      "eos_source_receipt_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "final_source_timeline_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "final_duration_ns": 2000000000,
+      "ordered_six_channel_health_closure_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mapping_closure_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "clock_or_alignment_closure_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "inference": {
+      "purpose": "QA_COARSE",
+      "input_plan_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "attempt_number": 1
+    },
+    "work": {
+      "stream_run_id": "00000000-0000-0000-0000-000000000002",
+      "stage": "QA_COARSE",
+      "ordered_dependency_projections": [],
+      "input_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "config_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "created_at": "2026-01-01T00:00:00Z"
+    },
+    "terminal": {
+      "terminal_outcome": "FAILED",
+      "terminal_policy_version": "terminal-v1",
+      "evidence": {
+        "artifact_id": "00000000-0000-0000-0000-000000000002",
+        "exact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "byte_count": 1,
+        "media_type": "application/json"
+      }
+    },
+    "finalization": {
+      "final_source_subject_type": "RECORDING",
+      "final_source_subject_id": "00000000-0000-0000-0000-000000000004",
+      "final_source_exact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "final_recording_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "final_duration_ns": 2000000000,
+      "final_mapping_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "final_alignment_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "export_manifest_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "subject_mapping": {
+        "incremental_subject_type": "INCREMENTAL_WINDOW",
+        "final_subject_type": "WINDOW",
+        "final_subject_key": "window-final:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "final_subject_semantic_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
   "capture": {
     "capture_scope_digest": "ba4c1ab9dd51ef64a406b24864869943e9b19b8d89e381e71c85bb6008297b36",
     "capture_scope_key": "pre-eos-capture-v1:ba4c1ab9dd51ef64a406b24864869943e9b19b8d89e381e71c85bb6008297b36",
@@ -35,14 +151,16 @@
   },
   "plan": {
     "plan_key": "expected-window-plan-v1:6924d58876901307954e9b57db3e80588e8aa22af36a1e28116e15b4d097f0c6",
-    "plan_digest": "6924d58876901307954e9b57db3e80588e8aa22af36a1e28116e15b4d097f0c6"
+    "plan_digest": "6924d58876901307954e9b57db3e80588e8aa22af36a1e28116e15b4d097f0c6",
+    "plan_id": "44eba5a1-8cdf-5ba5-80c5-60cd5201a050"
   },
   "declaration": {
     "declaration_semantic_sha256": "8d56c4719e69949b0a63ff815b130c6c1aec3d98fb78aab309abb626e08084ce",
     "append_chain_sha256": "3a6fecb036ec4779cc8bac5a8c258e444bfa6b77c0db73852cb46feb412020f3"
   },
   "seal": {
-    "seal_semantic_sha256": "ad2740cd9acdbe2a72e857ea88717c8e2930ed6a54ce1426c09c4201740d3869"
+    "seal_semantic_sha256": "ad2740cd9acdbe2a72e857ea88717c8e2930ed6a54ce1426c09c4201740d3869",
+    "ordered_expected_member_root_sha256": "5a4bdb3728b57e93e365f164d897d6abb7a99b034358ed6ad24b31350ed43394"
   },
   "closure": {
     "terminal_member_semantic_sha256": "d56f7feca5ae8528d1a67deca28387c56eda1b409b482d79448798e0a7443d64",

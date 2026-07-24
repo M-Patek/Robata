@@ -6,7 +6,6 @@ from typing import cast
 import pytest
 
 from robata.contracts.pipeline import CandidateEvent, TemporalVisualPackage
-from robata.contracts.qa import QAClassifier
 from robata.event_pipeline.candidate import CandidateEventManager
 from robata.event_pipeline.evidence import ActionEvidenceExtractor
 from robata.event_pipeline.proposer import (
@@ -29,7 +28,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
         )
     )
     candidate_manager = CandidateEventManager()
-    classifier = QAClassifier()
     evidence = ActionEvidenceExtractor()
 
     return (
@@ -59,10 +57,6 @@ def _unimplemented_calls() -> tuple[tuple[str, Callable[[], object]], ...]:
                 candidate,
                 cast(TemporalVisualPackage, object()),
             ),
-        ),
-        (
-            "QAClassifier.assess",
-            lambda: classifier.assess("recording", 1.0),
         ),
     )
 

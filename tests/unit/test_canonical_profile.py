@@ -327,6 +327,30 @@ def test_state_snapshot_counts_hardlinked_view_bytes_once(tmp_path: Path) -> Non
     assert reconciliation.artifact_bytes.unique_state_bytes == len(b"one physical payload")
 
 
+def test_state_snapshot_excludes_hardlink_owned_by_source_authority(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mcap"
+    source.write_bytes(b"source authority owns these bytes")
+    state = tmp_path / "state"
+    registry_blob = state / "artifact-registry" / "blobs" / "sha256" / "aa" / ("a" * 64)
+    registry_blob.parent.mkdir(parents=True)
+    os.link(source, registry_blob)
+    derived = state / "derived.json"
+    derived.write_bytes(b"derived")
+
+    snapshot = snapshot_state_tree(
+        state,
+        externally_owned_paths=(source,),
+    )
+
+    assert snapshot.file_count == 2
+    assert snapshot.unique_file_count == 1
+    assert snapshot.unique_byte_count == len(b"derived")
+    assert snapshot.hardlink_duplicate_path_count == 1
+    assert snapshot.hardlink_duplicate_path_bytes == source.stat().st_size
+
+
 def test_duration_discovery_selects_matching_source_and_half_open_interval(
     tmp_path: Path,
 ) -> None:

@@ -1148,10 +1148,13 @@ def test_hot_reads_defer_registered_schema_validation_to_full_audit(
         ledger.get_raw_artifact(evidence.parsed.raw_response.artifact_id)
         == evidence.parsed.raw_response
     )
-    assert ledger.get_selection(
-        evidence.selection.logical_invocation_id,
-        evidence.selection.policy_version,
-    ) == evidence.selection
+    assert (
+        ledger.get_selection(
+            evidence.selection.logical_invocation_id,
+            evidence.selection.policy_version,
+        )
+        == evidence.selection
+    )
     assert ledger.get_parsed_claim(evidence.parsed.artifact_id) == evidence.parsed
     assert ledger.get_selected_output(evidence.selected.selection_id) == evidence.selected
     assert ledger.get_enriched_output(evidence.enriched.artifact_id) == evidence.enriched

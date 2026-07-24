@@ -939,6 +939,107 @@ All throughput reports show recording-hours and camera-video-hours separately an
 skipped, late, pending, and abstained denominators. The two unresolved 500-hour interpretations in
 the execution-spec overlay remain separate scenarios.
 
+### 11.1 Local causal implementation checkpoint, 2026-07-23
+
+The current local-composition v21 candidate has internally connected:
+
+- stable pre-EOS capture scope, append-before-child planning, EOS seal, durable window DAG, export
+  barrier, terminal closure, and restart recovery;
+- bounded six-camera media work and bounded same-layer inference call parts;
+- one accepted-call parsed/selected/enriched evidence transaction;
+- one local atomic window-result/work-terminal/outbox transaction, idempotent relay, recording
+  finalization, recovered reconciliation, primary completion, and nonblocking review;
+- a causal per-window chain in which the ordered `WINDOW`, `QA_COARSE`, `QA_DENSE`, and
+  `EVENT_PROPOSAL` receipts bind one inference plan, which binds semantic evidence V2, stream
+  inference/attempt identity, intent, accepted call, terminal, and finally W1; and
+- one atomic transaction for that plan -> S2 -> identity/attempt/intent/call/terminal -> W1 chain,
+  work terminal, membership, and incremental outbox, followed by EOS recording result V4.
+
+The catalog contains 74 exact-pinned schemas. The atomically registered additions include
+`local-stream-window-inference-plan@1.0.0`,
+`local-stream-window-semantic-evidence@2.0.0`, `stream-inference@1.0.0`,
+`stream-inference-attempt@1.0.0`, and recording results V3/V4. V3 remains frozen and replayable.
+V4 was added instead of mutating V3 because a real epoch-nanosecond timeline origin can exceed the
+RFC 8785 safe JSON integer range; V4 represents it as a canonical decimal-string nanosecond value.
+
+The complete 40.890455-second checked-in source produced the following dirty-candidate evidence:
+
+| Measure | Initial instrumented path | v19 checkpoint | v21 historical | Causal/RR4 current | WP6 gate |
+|---|---:|---:|---:|---:|---|
+| Fresh elapsed | 711.105 s | 182.181 s | 152.255 s | 118.750 s | <= 204.452 s, PASS |
+| Fresh RTF | 17.390 | 4.455 | 3.729 | 2.908 | <= 5.000, PASS |
+| Nonterminal backlog at EOS | not used | 0 | 0 | 0 | no growth, PASS |
+| Required unique state/source bytes | 3.500 | 1.509 | 1.507 | 1.518 | <= 2.000, PASS |
+
+The historical v21 profile remains evidence that the pre-causal shape passed the provisional fresh
+limit. The current event-driven causal/RR4 fresh profile used all 40.833513 seconds of the canonical
+requested interval from the 40.890455-second checked-in source. It completed in 118.750322 seconds,
+RTF 2.908158, with 16 deterministic fixture calls, zero network calls, and zero nonterminal
+backlog. Required unique state was 197,748,696 bytes, ratio 1.517596 against the 130,303,923-byte
+source; total logical path bytes were 457,718,289. Both provisional fresh structural gates pass.
+Report SHA-256 is `cf16f31eb94d88f2ff659b3c7573bce4b98296e7f5dc0fda84a2da19b1c77e2a`, bound to manifest
+`ae156c4108409db6e605dc46c289f17ec87b102143690139a3300efd80a6cb32`.
+
+The immediately preceding causal diagnostic took 237.936801 seconds, RTF 5.826998, and exposed
+that packet emission was repeatedly entering the scheduler despite no pending W1 work. Two focused
+changes closed that regression: declarations are loaded only when pending W1 exists, and empty-
+window packet emissions skip scheduler drain. On this source, `bounded_execution_scope` fell from
+7,359 to 42 and observer spans fell from 27,195 to 5,242 without weakening causal validation.
+
+Exact optimized replay completed in 16.245338 seconds, RTF 0.397843, with zero fixture or network
+calls, zero state-byte and file-count growth, zero backlog, outbox `DELIVERED`, and review
+`ALREADY_ENQUEUED`. It preserved the exact run, recording, command, completion, event, revision,
+and outbox identities from fresh execution. Replay report SHA-256 is
+`00d6b3314a28bbbc67a9e236fdfe482223c3cd5edc1cf0531e395ced37f14e87`; fresh and replay both bind
+manifest `ae156c4108409db6e605dc46c289f17ec87b102143690139a3300efd80a6cb32`.
+
+The transaction reduction came from removing per-window full-graph recovery, retaining pending
+state during one executor pass, using bounded SQL execution scopes, and allowing the composition
+root to declare its graph already recovered. The long-run fix also made expiry maintenance use
+indexed due ranges, removed redundant global reconciliation before exact start/succeed transitions,
+made terminal observation ordinal-based, reused one batched finalization snapshot, and grouped EOS
+storage verification by window ordinal. These changes preserve stale-fence rejection, hard-expiry
+recovery, dependency progression, exact replay, and the fenced completion transaction. H.264
+recovery spools are retained through export registration, validation, and the export-barrier commit,
+then released.
+
+The first 30-minute actual local mock smoke was intentionally retained as failure evidence. It
+completed 1,800 windows and 9,001 work items without backlog growth, but took 1,435.300 seconds:
+capacity was 1.254 recording-seconds/second and p95 latency was 8.559 seconds. Report
+`e9dddea18d4a61f22b32905930ac9c52c15433e7305e11736ae6c4fa87df53e3` therefore failed both
+the 1.86 capacity floor and five-second p95 target.
+
+After the measured history-scan fixes, the historical pre-causal shape completed in 723.051
+seconds with capacity 2.489 and passed. The current causal/RR4 30-minute generated-event-time run
+completed in 832.395273 seconds. Capacity was 2.162434 recording-seconds/second and
+p50/p95/p99/max latency was 2.612297/3.907938/4.886956/8.009325 seconds. Six deterministic
+retryable failures were injected and recovered, all 1,800 windows and 9,001 work items completed,
+active backlog reached zero before EOS and remained zero, and `wp6_actual_smoke_gate_met=true`.
+Report `018e94aeb3db7ce54ccf7b30236e8259eb4f0be58ab4cee5fb6605a08494e747` binds run manifest
+`545d856735929a020d49bd6c6d79c1666887040698a9896ccdf965d8a0688e83` and benchmark manifest
+`242a9700d33025b934e61d34f3b21a36a414bfb005076258a65e899b7d6ef839`. Under the provisional
+planning arithmetic it requires 18 six-camera groups for 500 recording-hours/day and three groups
+for 500 aggregate camera-video-hours/day, within the pinned 24- and four-group scenarios.
+
+Before the two performance-only hot-loop changes, mutually exclusive suite groups covered all
+1,136 then-collected tests: 1,133 passed and 3 skipped. The current tree collects 1,137 tests; its
+one additional empty-emission regression passed, but no redundant second full 1,137-test run is
+claimed. Post-optimization verification also passed the 89-test focused causal/schema/runtime set,
+the 12-test MCAP integration set, and the 40-test focused Schema-contract set; these focused counts
+may overlap and are not summed. Ruff whole-tree check
+passed, Ruff format reported 318 files already formatted, strict Mypy passed across 189 source
+files, and the Schema verifier accepted all 74 pinned documents with zero registered upcaster
+artifact sets.
+
+This is dirty-working-tree, Windows, SQLite `synchronous=NORMAL`, fixture/mock-provider,
+`LOCAL_CONFORMANCE` evidence. It remains `NOT_MEASURED` and
+`NOT_PRODUCTION_QUALIFIED`. Per-append full backlog aggregation and history-derived window counts
+remain the next scale optimization, not a blocker for this 30-minute local gate. Real model,
+governed policies/corpus, production stores/broker, representative burst/failover/long-soak,
+physical retention/deletion execution, and protected Schema-baseline approval remain the external
+qualification set in Section 10. The optimized fresh path now passes its candidate-local RTF and
+state gates without weakening the causal or authoritative boundaries.
+
 ## 12. Official research references
 
 - [NVIDIA DeepStream architecture](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Overview.html)

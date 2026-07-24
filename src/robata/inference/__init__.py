@@ -5,6 +5,7 @@ and 11 (GPT shadow path).
 """
 
 from robata.inference.adapter import (
+    BatchVisionModelAdapter,
     JsonSchemaRef,
     NormalizedOutputEnvelope,
     PackageInput,
@@ -126,7 +127,9 @@ from robata.inference.offline_fixture import (
     StrictProviderClaimParser,
 )
 from robata.inference.orchestrator import (
+    AtomicInferenceLedger,
     CapabilityValidationError,
+    InferenceBatchDispatchError,
     InferenceExecutionGate,
     InferenceIntent,
     InferenceLedger,
@@ -167,6 +170,8 @@ __all__ = [
     "RUNPOD_REQUEST_CONTRACT_VERSION",
     "RUNPOD_RESPONSE_CONTRACT_VERSION",
     "ApplicableProviderLimits",
+    "AtomicInferenceLedger",
+    "BatchVisionModelAdapter",
     "CallPartSpec",
     "CapabilitySnapshot",
     "CapabilityValidationError",
@@ -188,6 +193,7 @@ __all__ = [
     "InMemoryInferenceLedger",
     "InMemoryRawProviderBytesStore",
     "InferenceAttemptSelection",
+    "InferenceBatchDispatchError",
     "InferenceCallBarrierConflictError",
     "InferenceCallBarrierCoordinator",
     "InferenceCallBarrierDefinition",

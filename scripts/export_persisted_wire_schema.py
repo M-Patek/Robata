@@ -27,6 +27,48 @@ class WireSchemaSpec:
 
 
 WIRE_SCHEMAS = {
+    "local-stream-window-inference-plan": WireSchemaSpec(
+        module="robata.contracts.local_stream_causal",
+        model="LocalStreamWindowInferencePlan",
+        document_id=(
+            "https://schemas.robata.dev/v1/local-stream-window-inference-plan.schema.json"
+        ),
+        title="LocalStreamWindowInferencePlan",
+    ),
+    "local-stream-window-semantic-evidence-v2": WireSchemaSpec(
+        module="robata.contracts.local_stream_causal",
+        model="LocalStreamWindowSemanticEvidenceV2",
+        document_id=(
+            "https://schemas.robata.dev/v2/local-stream-window-semantic-evidence.schema.json"
+        ),
+        title="LocalStreamWindowSemanticEvidenceV2",
+    ),
+    "local-stream-window-semantic-evidence": WireSchemaSpec(
+        module="robata.application.canonical.stream_recording_reduction",
+        model="LocalStreamWindowSemanticEvidence",
+        document_id=(
+            "https://schemas.robata.dev/v1/local-stream-window-semantic-evidence.schema.json"
+        ),
+        title="LocalStreamWindowSemanticEvidence",
+    ),
+    "local-stream-recording-result-v2": WireSchemaSpec(
+        module="robata.application.canonical.stream_recording_reduction",
+        model="LocalStreamRecordingResultV2",
+        document_id=("https://schemas.robata.dev/v2/local-stream-recording-result.schema.json"),
+        title="LocalStreamRecordingResultV2",
+    ),
+    "local-stream-recording-result-v3": WireSchemaSpec(
+        module="robata.application.canonical.stream_recording_reduction",
+        model="LocalStreamRecordingResultV3",
+        document_id=("https://schemas.robata.dev/v3/local-stream-recording-result.schema.json"),
+        title="LocalStreamRecordingResultV3",
+    ),
+    "local-stream-recording-result-v4": WireSchemaSpec(
+        module="robata.application.canonical.stream_recording_reduction",
+        model="LocalStreamRecordingResultV4",
+        document_id=("https://schemas.robata.dev/v4/local-stream-recording-result.schema.json"),
+        title="LocalStreamRecordingResultV4",
+    ),
     "pre-eos-capture-subject": WireSchemaSpec(
         module="robata.contracts.stream_source",
         model="PreEosCaptureSubject",
@@ -44,6 +86,18 @@ WIRE_SCHEMAS = {
         model="IncrementalWindow",
         document_id="https://schemas.robata.dev/v1/incremental-window.schema.json",
         title="IncrementalWindow",
+    ),
+    "stream-inference": WireSchemaSpec(
+        module="robata.contracts.stream_window",
+        model="StreamInferenceLogicalIdentity",
+        document_id="https://schemas.robata.dev/v1/stream-inference.schema.json",
+        title="StreamInferenceLogicalIdentity",
+    ),
+    "stream-inference-attempt": WireSchemaSpec(
+        module="robata.contracts.stream_window",
+        model="StreamInferenceAttemptIdentity",
+        document_id="https://schemas.robata.dev/v1/stream-inference-attempt.schema.json",
+        title="StreamInferenceAttemptIdentity",
     ),
     "stream-inference-intent": WireSchemaSpec(
         module="robata.contracts.stream_inference",
@@ -116,6 +170,12 @@ WIRE_SCHEMAS = {
         model="RecordingFinalizationMap",
         document_id="https://schemas.robata.dev/v1/recording-finalization-map.schema.json",
         title="RecordingFinalizationMap",
+    ),
+    "local-stream-recording-result": WireSchemaSpec(
+        module="robata.application.canonical.stream_recording_reduction",
+        model="LocalStreamRecordingResult",
+        document_id=("https://schemas.robata.dev/v1/local-stream-recording-result.schema.json"),
+        title="LocalStreamRecordingResult",
     ),
     "artifact-registry-entry-v3": WireSchemaSpec(
         module="robata.contracts.artifacts_v3",

@@ -25,8 +25,10 @@ from robata.application.canonical.bounded_media import (
     WindowMember,
 )
 from robata.application.canonical.stream_scheduler import (
+    DEFAULT_STREAM_BACKPRESSURE_CONFIG,
     DurableStreamWindowScheduler,
     EosSealInputs,
+    StreamBackpressureThrottle,
     StreamSchedulerCompositionError,
     StreamSchedulerSchemaRefs,
 )
@@ -44,6 +46,7 @@ from robata.contracts.stream_common import (
 )
 from robata.contracts.stream_planning import create_expected_window_plan
 from robata.contracts.stream_source import PreEosCaptureSubject, create_pre_eos_capture_subject
+from robata.queue.backpressure import BackpressureConfig, PressureClass
 from robata.queue.models import WorkItemState
 from robata.queue.stage import DependencyCriticality
 from robata.queue.stream_models import (
@@ -187,6 +190,7 @@ def _composition(
     planner_version: str = "planner-v1",
     stream_run_id: int = 60,
     database_path: Path | None = None,
+    backpressure_config: BackpressureConfig | None = None,
 ) -> DurableStreamWindowScheduler:
     policy = StreamPolicyBinding(version="policy-v1", semantic_sha256=_digest(50))
     plan = create_expected_window_plan(
@@ -207,6 +211,11 @@ def _composition(
         stream_run_id=_uuid(stream_run_id),
         schema_refs=_schema_refs(),
         dag_config_semantic_sha256=_digest(61),
+        backpressure_config=(
+            DEFAULT_STREAM_BACKPRESSURE_CONFIG
+            if backpressure_config is None
+            else backpressure_config
+        ),
         clock=lambda: _NOW,
         boundary_observer=observer,
     )
@@ -284,8 +293,6 @@ def _complete_window_chain(
             StreamStage.QA_COARSE,
             StreamStage.QA_DENSE,
             StreamStage.EVENT_PROPOSAL,
-            StreamStage.ACTION_DENSE,
-            StreamStage.BOUNDARY_REFINEMENT,
             StreamStage.WINDOW_REDUCTION,
         )
     ):
@@ -321,9 +328,53 @@ def test_declaration_is_durable_before_child_projection_and_restart_recovers(
 
     reopened = _composition(tmp_path, capture=capture, scheduler=execution)
     assert len(reopened.declarations()) == 1
-    assert len(reopened.work_plans()) == 7
+    assert len(reopened.work_plans()) == 5
     assert execution.get(root_id).state is WorkItemState.READY
     assert reopened.append_window(_window(capture, 0)) == reopened.declarations()[0]
+
+
+def test_backpressure_throttles_only_new_windows_and_recovers_same_policy(
+    tmp_path: Path,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    policy = BackpressureConfig(
+        version="test-stream-pressure-v1",
+        queue_depth_threshold=0,
+        oldest_age_threshold_ms=60_000,
+        backlog_slope_threshold=100.0,
+    )
+    composition = _composition(
+        tmp_path,
+        capture=capture,
+        scheduler=execution,
+        backpressure_config=policy,
+    )
+
+    first = composition.append_window(_window(capture, 0))
+    pressure = composition.backpressure_snapshot()
+    assert pressure.decision.pressure_class is PressureClass.THROTTLED
+    assert pressure.decision.signals == ("QUEUE_DEPTH",)
+    assert pressure.decision.shedding_actions == ("THROTTLE_LEDGER",)
+
+    with pytest.raises(StreamBackpressureThrottle) as caught:
+        composition.append_window(_window(capture, 1))
+    assert caught.value.decision.policy_version == policy.version
+    assert composition.declarations() == (first,)
+    assert len(composition.work_plans()) == 5
+
+    recovered = DurableStreamWindowScheduler.recover_registered(
+        execution_scheduler=execution,
+        stream_run_id=_uuid(60),
+        clock=lambda: _NOW,
+    )[0]
+    assert recovered.backpressure_snapshot().decision.pressure_class is PressureClass.THROTTLED
+    assert recovered.append_window(_window(capture, 0)) == first
+
+    _complete_window_chain(recovered)
+    assert recovered.backpressure_snapshot().decision.pressure_class is PressureClass.NORMAL
+    recovered.append_window(_window(capture, 1))
+    assert len(recovered.declarations()) == 2
 
 
 def test_composition_requires_scheduler_authority_database_path(tmp_path: Path) -> None:
@@ -362,9 +413,11 @@ def test_append_is_rejected_after_planner_eos(tmp_path: Path) -> None:
     capture = _capture()
     execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
     composition = _composition(tmp_path, capture=capture, scheduler=execution)
-    composition.append_window(_window(capture, 0))
+    first = _window(capture, 0)
+    composition.append_window(first)
     composition.seal(_finish())
 
+    assert composition.append_window(first) == composition.declarations()[0]
     with pytest.raises(SQLiteStreamWorkLedgerConflict, match="planner EOS"):
         composition.append_window(_window(capture, 1))
     assert len(composition.declarations()) == 1
@@ -603,27 +656,50 @@ def test_terminal_execution_crash_is_reconciled_without_redispatch(tmp_path: Pat
     _complete(composition, StreamStage.QA_COARSE, base_seconds=3)
     _complete(composition, StreamStage.QA_DENSE, base_seconds=6)
     _complete(composition, StreamStage.EVENT_PROPOSAL, base_seconds=9)
-    _complete(composition, StreamStage.ACTION_DENSE, base_seconds=12)
-    _complete(composition, StreamStage.BOUNDARY_REFINEMENT, base_seconds=15)
     armed = True
     reduction = _plan_for(composition, StreamStage.WINDOW_REDUCTION)
     claim = composition.claim(
-        "worker", 30, work_item_id=reduction.work_item_id, now=_NOW + timedelta(seconds=18)
+        "worker", 30, work_item_id=reduction.work_item_id, now=_NOW + timedelta(seconds=12)
     )
     assert claim is not None
-    composition.start(claim.lease, now=_NOW + timedelta(seconds=19))
+    composition.start(claim.lease, now=_NOW + timedelta(seconds=13))
     with pytest.raises(RuntimeError, match="execution commit"):
         composition.complete(
             claim.lease,
-            _terminal_evidence(21, _NOW + timedelta(seconds=20)),
-            now=_NOW + timedelta(seconds=20),
+            _terminal_evidence(21, _NOW + timedelta(seconds=14)),
+            now=_NOW + timedelta(seconds=14),
         )
     assert execution.get(reduction.work_item_id).state is WorkItemState.SUCCEEDED
+
+    with sqlite3.connect(execution.database_path) as connection:
+        connection.execute("DROP INDEX stream_work_pending_terminal")
 
     reopened = _composition(tmp_path, capture=capture, scheduler=execution)
     assert reopened.get(reduction.work_item_id).state is StreamWorkItemState.SUCCEEDED
     assert len(reopened.terminal_members()) == 1
+    assert reopened.terminal_member_count() == 1
+    assert reopened.terminal_member_at(0) == reopened.terminal_members()[0]
+    assert reopened.terminal_member_at(1) is None
     assert len(execution.list_attempts(reduction.work_item_id)) == 1
+
+    with sqlite3.connect(execution.database_path) as connection:
+        index_sql = connection.execute(
+            """
+            SELECT sql FROM sqlite_schema
+            WHERE type = 'index' AND name = 'stream_work_pending_terminal'
+            """
+        ).fetchone()
+        query_plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT work_item_id FROM stream_work_plans
+            WHERE plan_key = ? AND pending_terminal_json IS NOT NULL
+            ORDER BY work_item_id
+            """,
+            (reopened.plan_key,),
+        ).fetchall()
+    assert index_sql is not None and "WHERE pending_terminal_json IS NOT NULL" in index_sql[0]
+    assert any("stream_work_pending_terminal" in row[3] for row in query_plan)
 
 
 def test_startup_audit_rejects_work_row_column_drift(tmp_path: Path) -> None:
@@ -721,8 +797,6 @@ def test_full_window_dag_has_deadlines_and_governed_skip_releases_downstream(
         StreamStage.QA_COARSE,
         StreamStage.QA_DENSE,
         StreamStage.EVENT_PROPOSAL,
-        StreamStage.ACTION_DENSE,
-        StreamStage.BOUNDARY_REFINEMENT,
         StreamStage.WINDOW_REDUCTION,
     )
     assert all(plan.sla_deadline_at is not None for plan in plans)
@@ -746,8 +820,6 @@ def test_full_window_dag_has_deadlines_and_governed_skip_releases_downstream(
             StreamStage.QA_COARSE,
             StreamStage.QA_DENSE,
             StreamStage.EVENT_PROPOSAL,
-            StreamStage.ACTION_DENSE,
-            StreamStage.BOUNDARY_REFINEMENT,
         )
     }
     assert all(

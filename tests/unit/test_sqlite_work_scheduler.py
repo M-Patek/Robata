@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from sqlite3 import Row, connect
 from threading import Barrier as ThreadBarrier
 
 import pytest
@@ -15,6 +16,7 @@ from robata.adapters.sqlite_work_scheduler import (
 from robata.queue.models import (
     WorkAttemptOutcome,
     WorkDependency,
+    WorkItem,
     WorkItemPlan,
     WorkItemState,
     WorkItemSubjectType,
@@ -139,6 +141,44 @@ def test_dependency_stays_planned_until_required_upstream_succeeds(
     assert scheduler.get(downstream.work_item_id).state is WorkItemState.READY
 
 
+def test_start_and_succeed_avoid_pretransition_reconcile_and_progress_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    upstream = _plan(20)
+    downstream = _plan(21)
+    scheduler.plan(upstream)
+    scheduler.plan(
+        downstream,
+        (
+            WorkDependency(
+                dependency_id=_uuid(320),
+                downstream_work_item_id=downstream.work_item_id,
+                upstream_work_item_id=upstream.work_item_id,
+            ),
+        ),
+    )
+
+    claim = scheduler.claim(
+        "worker-a",
+        30,
+        work_item_id=upstream.work_item_id,
+        now=_BASE,
+    )
+    assert claim is not None
+
+    def reject_pretransition_reconcile(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("lease transitions must not run a pretransition reconcile")
+
+    monkeypatch.setattr(scheduler, "reconcile", reject_pretransition_reconcile)
+
+    scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+    scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=2))
+
+    assert scheduler.get(downstream.work_item_id).state is WorkItemState.READY
+
+
 def test_required_dependency_failure_cascades_without_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -215,8 +255,9 @@ def test_reopen_recovers_expired_lease_and_rejects_stale_fence(
     )
 
 
-def test_stale_commit_persists_lease_recovery_without_explicit_sweep(
+def test_stale_commit_persists_lease_recovery_without_global_sweep(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduler = _scheduler(tmp_path)
     plan = _plan(12)
@@ -224,6 +265,11 @@ def test_stale_commit_persists_lease_recovery_without_explicit_sweep(
     claim = scheduler.claim("worker-old", 2, now=_BASE)
     assert claim is not None
     scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+
+    def reject_pretransition_reconcile(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("lease transitions must not run a pretransition reconcile")
+
+    monkeypatch.setattr(scheduler, "reconcile", reject_pretransition_reconcile)
 
     with pytest.raises(WorkFenceError):
         scheduler.succeed(
@@ -234,6 +280,29 @@ def test_stale_commit_persists_lease_recovery_without_explicit_sweep(
     recovered = scheduler.get(plan.work_item_id)
     assert recovered.state is WorkItemState.READY
     assert scheduler.list_attempts(plan.work_item_id)[0].outcome is (WorkAttemptOutcome.ABANDONED)
+
+
+def test_exact_succeed_persists_hard_expiry_without_global_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    plan = _plan(23, execution_expiry_at=_BASE + timedelta(seconds=2))
+    scheduler.plan(plan)
+    claim = scheduler.claim("worker", 30, now=_BASE)
+    assert claim is not None
+    scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+
+    def reject_pretransition_reconcile(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("lease transitions must not run a pretransition reconcile")
+
+    monkeypatch.setattr(scheduler, "reconcile", reject_pretransition_reconcile)
+
+    with pytest.raises(WorkFenceError):
+        scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=2))
+
+    assert scheduler.get(plan.work_item_id).state is WorkItemState.EXPIRED
+    assert scheduler.list_attempts(plan.work_item_id)[0].outcome is WorkAttemptOutcome.EXPIRED
 
 
 def test_retry_wait_exhaustion_and_soft_sla_do_not_fake_expiry(
@@ -299,6 +368,95 @@ def test_hard_expiry_fences_running_attempt(tmp_path: Path) -> None:
     assert scheduler.list_attempts(plan.work_item_id)[0].outcome is (WorkAttemptOutcome.EXPIRED)
     with pytest.raises(WorkFenceError):
         scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=3))
+
+
+def test_reconcile_materializes_only_due_deadlines_and_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    due_deadline = _plan(43, execution_expiry_at=_BASE + timedelta(seconds=2))
+    future_deadlines = tuple(
+        _plan(value, execution_expiry_at=_BASE + timedelta(hours=1)) for value in range(44, 52)
+    )
+    due_lease = _plan(52)
+    future_leases = tuple(_plan(value) for value in range(53, 61))
+    for plan in (due_deadline, *future_deadlines, due_lease, *future_leases):
+        scheduler.plan(plan)
+
+    due_claim = scheduler.claim(
+        "due-worker",
+        2,
+        work_item_id=due_lease.work_item_id,
+        now=_BASE,
+    )
+    assert due_claim is not None
+    scheduler.start(due_claim.lease, now=_BASE + timedelta(seconds=1))
+    for index, plan in enumerate(future_leases):
+        claim = scheduler.claim(
+            f"future-worker-{index}",
+            3600,
+            work_item_id=plan.work_item_id,
+            now=_BASE,
+        )
+        assert claim is not None
+        scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+
+    observed: list[str] = []
+    original_item_from_row = scheduler._item_from_row
+
+    def observe_item(row: Row) -> WorkItem:
+        item = original_item_from_row(row)
+        observed.append(item.work_item_id)
+        return item
+
+    monkeypatch.setattr(scheduler, "_item_from_row", observe_item)
+
+    assert scheduler.reconcile(now=_BASE + timedelta(seconds=2)) == 2
+    assert len(observed) == 2
+    assert set(observed) == {due_deadline.work_item_id, due_lease.work_item_id}
+
+
+def test_due_maintenance_queries_use_range_indexes(tmp_path: Path) -> None:
+    scheduler = _scheduler(tmp_path)
+    with connect(scheduler.database_path) as connection:
+        expiry_plan = tuple(
+            row[3]
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM work_items
+                WHERE completed_at IS NULL
+                  AND execution_expiry_at IS NOT NULL
+                  AND execution_expiry_at <= ?
+                ORDER BY execution_expiry_at, work_item_id
+                """,
+                (_timestamp(_BASE),),
+            )
+        )
+        lease_plan = tuple(
+            row[3]
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM work_items
+                WHERE lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                  AND state IN (?, ?)
+                ORDER BY state, lease_expires_at, work_item_id
+                """,
+                (
+                    _timestamp(_BASE),
+                    WorkItemState.LEASED.value,
+                    WorkItemState.RUNNING.value,
+                ),
+            )
+        )
+
+    assert any("work_items_due_expiry" in detail for detail in expiry_plan)
+    assert any("work_items_due_lease" in detail for detail in lease_plan)
+    assert all("SCAN work_items" not in detail for detail in (*expiry_plan, *lease_plan))
+    assert all("USE TEMP B-TREE" not in detail for detail in (*expiry_plan, *lease_plan))
 
 
 def test_cancel_skip_and_invalidate_are_explicit_terminal_states(

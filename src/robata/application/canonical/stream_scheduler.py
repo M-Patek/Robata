@@ -6,15 +6,14 @@ sent to the local scheduler. The projection is not stream Wire evidence.
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 from uuid import UUID, uuid5
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from robata.adapters.sqlite_stream_work_ledger import (
     NewStreamWorkPlan,
@@ -56,7 +55,14 @@ from robata.contracts.stream_planning import (
     create_stream_work_item_plan,
 )
 from robata.contracts.stream_window import IncrementalWindow
+from robata.queue.backpressure import (
+    AdmissionDecision,
+    BackpressureConfig,
+    BackpressureController,
+    QueueMetrics,
+)
 from robata.queue.models import (
+    TERMINAL_WORK_STATES,
     WorkDependency,
     WorkItem,
     WorkItemPlan,
@@ -74,9 +80,9 @@ from robata.queue.stream_models import (
 )
 
 INTERNAL_STREAM_EXECUTION_PROJECTION_VERSION: Final = "internal-stream-execution-projection-v1"
-STREAM_WINDOW_DAG_POLICY_VERSION: Final = "stream-window-dag-v2"
+STREAM_WINDOW_DAG_POLICY_VERSION: Final = "stream-window-dag-v4"
 WATERMARK_SOURCE_FACTS_PROJECTION_VERSION: Final = "bounded-watermark-source-facts-v1"
-PLANNER_EOS_PROJECTION_VERSION: Final = "bounded-planner-eos-v1"
+PLANNER_EOS_PROJECTION_VERSION: Final = "bounded-planner-eos-v2"
 
 _INTERNAL_EXECUTION_NAMESPACE: Final = UUID("d13666a6-112f-5ab7-9f70-240de5557fe1")
 _INTERNAL_DEPENDENCY_NAMESPACE: Final = UUID("67d7e565-bc31-55e1-9168-57331a0c6eb3")
@@ -89,8 +95,6 @@ _WINDOW_DAG_TOPOLOGY: Final = (
         StreamStage.EVENT_PROPOSAL,
         (StreamStage.QA_COARSE, StreamStage.QA_DENSE),
     ),
-    (StreamStage.ACTION_DENSE, (StreamStage.EVENT_PROPOSAL,)),
-    (StreamStage.BOUNDARY_REFINEMENT, (StreamStage.ACTION_DENSE,)),
     (
         StreamStage.WINDOW_REDUCTION,
         (
@@ -98,8 +102,6 @@ _WINDOW_DAG_TOPOLOGY: Final = (
             StreamStage.QA_COARSE,
             StreamStage.QA_DENSE,
             StreamStage.EVENT_PROPOSAL,
-            StreamStage.ACTION_DENSE,
-            StreamStage.BOUNDARY_REFINEMENT,
         ),
     ),
 )
@@ -108,6 +110,12 @@ _WINDOW_DAG_STAGES: Final = tuple(stage for stage, _dependencies in _WINDOW_DAG_
 # Local-conformance scheduling budgets. They are operational fields rather than
 # logical-identity inputs and remain explicitly unqualified for production SLOs.
 _LOCAL_STAGE_SLA_STEP_SECONDS: Final = 5 * 60
+DEFAULT_STREAM_BACKPRESSURE_CONFIG: Final = BackpressureConfig(
+    version="local-stream-backpressure-v1",
+    queue_depth_threshold=256,
+    oldest_age_threshold_ms=30_000,
+    backlog_slope_threshold=128.0,
+)
 
 _STAGE_EXECUTION_PROJECTION: Final = {
     StreamStage.SEGMENT: Stage.MCAP_INGEST,
@@ -149,6 +157,14 @@ class StreamSchedulerCompositionError(RuntimeError):
     """The stream graph conflicts with its exact replay or execution state."""
 
 
+class StreamBackpressureThrottle(StreamSchedulerCompositionError):
+    """A new window was durably retained upstream but cannot enter this DAG yet."""
+
+    def __init__(self, decision: AdmissionDecision) -> None:
+        self.decision = decision
+        super().__init__(decision.reason or "stream window admission is throttled")
+
+
 @dataclass(frozen=True, slots=True)
 class StreamSchedulerSchemaRefs:
     """Pins for the already-registered WP1 contract family."""
@@ -159,6 +175,28 @@ class StreamSchedulerSchemaRefs:
     stream_work_plan: SchemaRef
     terminal_member: SchemaRef
     terminal_closure: SchemaRef
+
+
+class _StoredSchedulerSchemaRefs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    incremental_window: SchemaRef
+    expected_declaration: SchemaRef
+    expected_plan_seal: SchemaRef
+    stream_work_plan: SchemaRef
+    terminal_member: SchemaRef
+    terminal_closure: SchemaRef
+
+
+class _StoredSchedulerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: str
+    stream_run_id: str
+    dag_config_semantic_sha256: str
+    terminal_policy_version: str
+    backpressure_config: BackpressureConfig
+    schema_refs: _StoredSchedulerSchemaRefs
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +240,27 @@ class StreamBacklogSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamBackpressureSnapshot:
+    """One explicit operational decision over the current durable backlog."""
+
+    metrics: QueueMetrics
+    decision: AdmissionDecision
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDrainWorkSnapshot:
+    """Bounded execution row and direct evidence used by one drain call."""
+
+    plan: StreamWorkItemPlan
+    execution_state: WorkItemState
+    terminal_evidence: StreamTerminalEvidence | None
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.execution_state in TERMINAL_WORK_STATES
+
+
+@dataclass(frozen=True, slots=True)
 class StreamExportBarrierSnapshot:
     """Local fixed-six export barrier pointing at the governed manifest."""
 
@@ -232,6 +291,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         schema_refs: StreamSchedulerSchemaRefs,
         dag_config_semantic_sha256: str,
         terminal_policy_version: str = "stream-terminal-policy-v1",
+        backpressure_config: BackpressureConfig = DEFAULT_STREAM_BACKPRESSURE_CONFIG,
         clock: Callable[[], datetime] | None = None,
         boundary_observer: Callable[[str], None] | None = None,
     ) -> None:
@@ -255,6 +315,12 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         if not isinstance(terminal_policy_version, str) or not terminal_policy_version:
             raise ValueError("terminal_policy_version must be non-empty")
         self._terminal_policy_version = terminal_policy_version
+        self._backpressure_config = _strict_model(
+            backpressure_config,
+            BackpressureConfig,
+            "backpressure_config",
+        )
+        self._backpressure = BackpressureController(self._backpressure_config)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._boundary_observer = boundary_observer
         if self._expected_plan.capture_scope_digest != self._source_subject.capture_scope_digest:
@@ -262,6 +328,57 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         self._register_plan()
         self._verify_storage()
         self.recover()
+
+    @classmethod
+    def recover_registered(
+        cls,
+        *,
+        execution_scheduler: SQLiteWorkScheduler,
+        stream_run_id: str,
+        clock: Callable[[], datetime] | None = None,
+        boundary_observer: Callable[[str], None] | None = None,
+    ) -> tuple[Self, ...]:
+        """Reconstruct every exact persisted graph owned by one canonical run."""
+
+        checked_run_id = _require_uuid(stream_run_id, "stream_run_id")
+        ledger = SQLiteStreamWorkLedger(execution_scheduler)
+        recovered: list[Self] = []
+        for stored in ledger.plans():
+            config = _parse_exact(
+                stored.composition_config_json,
+                _StoredSchedulerConfig,
+                "stream scheduler composition config",
+            )
+            if config.stream_run_id != checked_run_id:
+                continue
+            if config.version != STREAM_WINDOW_DAG_POLICY_VERSION:
+                raise StreamSchedulerCompositionError(
+                    "persisted stream scheduler policy version is unsupported"
+                )
+            recovered.append(
+                cls(
+                    database_path=execution_scheduler.database_path,
+                    execution_scheduler=execution_scheduler,
+                    expected_plan=_parse_exact(
+                        stored.plan_json,
+                        ExpectedWindowPlan,
+                        "expected window plan",
+                    ),
+                    source_subject=_parse_exact(
+                        stored.source_subject_json,
+                        PreEosCaptureSubjectRef,
+                        "pre-EOS source subject",
+                    ),
+                    stream_run_id=checked_run_id,
+                    schema_refs=_schema_refs_from_stored(config.schema_refs),
+                    dag_config_semantic_sha256=config.dag_config_semantic_sha256,
+                    terminal_policy_version=config.terminal_policy_version,
+                    backpressure_config=config.backpressure_config,
+                    clock=clock,
+                    boundary_observer=boundary_observer,
+                )
+            )
+        return tuple(recovered)
 
     @property
     def database_path(self) -> Path:
@@ -287,15 +404,30 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         if window.capture_scope_digest != self._expected_plan.capture_scope_digest:
             raise StreamSchedulerCompositionError("window belongs to another capture scope")
         wire_window = window.to_incremental_window(self._schema_refs.incremental_window)
-        stored_windows = self._ledger.windows(self.plan_key)
-        if window.ordinal > len(stored_windows):
+        stored_window_count = self._ledger.window_count(self.plan_key)
+        if window.ordinal > stored_window_count:
             raise StreamSchedulerCompositionError(
                 "expected windows must be appended in contiguous planner order"
             )
+        existing = (
+            self._ledger.window_at(self.plan_key, window.ordinal)
+            if window.ordinal < stored_window_count
+            else None
+        )
+        if existing is None:
+            pressure = self.backpressure_snapshot()
+            if not pressure.decision.admitted:
+                self._observe("window_admission_throttled")
+                raise StreamBackpressureThrottle(pressure.decision)
         previous_chain = None
         if window.ordinal > 0:
+            previous_row = self._ledger.window_at(self.plan_key, window.ordinal - 1)
+            if previous_row is None:
+                raise StreamSchedulerCompositionError(
+                    "expected windows must preserve contiguous predecessor state"
+                )
             previous = _parse_exact(
-                stored_windows[window.ordinal - 1].declaration_json,
+                previous_row.declaration_json,
                 ExpectedWindowDeclaration,
                 "previous declaration",
             )
@@ -312,8 +444,8 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             watermark_source_facts_sha256=_watermark_source_facts_sha256(window),
             previous_append_chain_sha256=previous_chain,
         )
-        existing = stored_windows[window.ordinal] if window.ordinal < len(stored_windows) else None
         created_at: str | None = None
+        companion_rows: tuple[StoredStreamWorkPlan, ...] = ()
         if existing is not None:
             stored_declaration = _parse_exact(
                 existing.declaration_json,
@@ -329,10 +461,9 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 raise StreamSchedulerCompositionError(
                     "expected-window replay changed declaration source facts"
                 )
-            companion_rows = tuple(
-                row
-                for row in self._ledger.work_plans(self.plan_key)
-                if row.expected_ordinal == window.ordinal
+            companion_rows = self._ledger.work_plans_for_ordinal(
+                self.plan_key,
+                window.ordinal,
             )
             if len(companion_rows) != len(_WINDOW_DAG_STAGES):
                 raise StreamSchedulerCompositionError(
@@ -364,7 +495,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         )
         if inserted:
             self._observe("expected_declaration_durable")
-        self.recover()
+        self._publish_work_rows(new_work if inserted else companion_rows)
         if existing is not None:
             self._verify_existing_window_member(existing, new_work[-1].work_item_id)
             return stored_declaration
@@ -509,17 +640,34 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         """Reconcile terminals and replay scheduler projections idempotently."""
 
         accepted = self._recover_terminal_acceptances()
+        return accepted + self._publish_work_rows(self._ledger.work_plans(self.plan_key))
+
+    def _publish_work_rows(
+        self,
+        rows: Sequence[NewStreamWorkPlan | StoredStreamWorkPlan],
+    ) -> int:
+        parsed = tuple(
+            (
+                _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan"),
+                row.publication_state,
+            )
+            for row in rows
+        )
+        plans_by_key = {plan.work_logical_key: plan for plan, _state in parsed}
         published = 0
-        for plan, publication_state in self._stored_work_plans_with_state():
+        for plan, publication_state in parsed:
             if publication_state == "GATED":
                 continue
-            projected, dependencies = self._internal_execution_projection(plan)
+            projected, dependencies = self._internal_execution_projection(
+                plan,
+                plans_by_key=plans_by_key,
+            )
             self._execution_scheduler.plan(projected, dependencies)
             self._observe("internal_execution_projected")
             if publication_state != "PUBLISHED":
                 self._ledger.mark_published(plan.work_item_id)
                 published += 1
-        return accepted + published
+        return published
 
     def claim(
         self,
@@ -528,12 +676,13 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         *,
         work_item_id: str | None = None,
         now: datetime | None = None,
+        recover_graph: bool = True,
     ) -> StreamWorkLeaseClaim | None:
         """Claim only work owned by this graph and return a typed lease."""
 
         checked_now = self._checked_now(now)
-        self.recover()
-        self._execution_scheduler.reconcile(now=checked_now)
+        if recover_graph:
+            self.recover()
         candidates: tuple[str, ...]
         if work_item_id is not None:
             self._stored_work_plan(work_item_id, require_published=True)
@@ -555,8 +704,13 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 now=checked_now,
             )
             if claim is not None:
+                plan = self._stored_work_plan(candidate, require_published=True)
                 return StreamWorkLeaseClaim(
-                    work_item=self._stream_item(claim.work_item),
+                    work_item=self._stream_item_from(
+                        plan,
+                        claim.work_item,
+                        evidence=None,
+                    ),
                     lease=_stream_lease(claim.lease),
                 )
         return None
@@ -568,11 +722,11 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         now: datetime | None = None,
     ) -> StreamWorkItem:
         checked = _strict_model(lease, StreamWorkLease, "lease")
-        self._stored_work_plan(checked.work_item_id, require_published=True)
+        plan = self._stored_work_plan(checked.work_item_id, require_published=True)
         item = self._execution_scheduler.start(
             _execution_lease(checked), now=self._checked_now(now)
         )
-        return self._stream_item(item)
+        return self._stream_item_from(plan, item, evidence=None)
 
     def heartbeat(
         self,
@@ -603,7 +757,10 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         checked_evidence = _strict_model(
             terminal_evidence, StreamTerminalEvidence, "terminal_evidence"
         )
-        self._stored_work_plan(checked_lease.work_item_id, require_published=True)
+        plan = self._stored_work_plan(
+            checked_lease.work_item_id,
+            require_published=True,
+        )
         if checked_evidence.terminal_policy_version != self._terminal_policy_version:
             raise StreamSchedulerCompositionError(
                 "terminal evidence does not use the composition policy pin"
@@ -619,18 +776,74 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 raise StreamSchedulerCompositionError(
                     "terminal replay changed accepted stream evidence"
                 )
-            return self.get(checked_lease.work_item_id)
+            return self._stream_item_from(
+                plan,
+                self._execution_scheduler.get(checked_lease.work_item_id),
+                evidence=accepted,
+            )
         self._require_current_execution_lease(checked_lease, checked_now)
         self._store_pending_terminal(checked_lease, checked_evidence)
-        self._execution_scheduler.succeed(
+        execution = self._execution_scheduler.succeed(
             _execution_lease(checked_lease),
             result_reference=_terminal_result_reference(checked_evidence),
             result_sha256=checked_evidence.evidence_ref.exact_sha256,
             now=checked_now,
         )
         self._observe("execution_terminal_committed")
-        self._accept_pending_terminal(checked_lease.work_item_id)
-        return self.get(checked_lease.work_item_id)
+        self._accept_pending_terminal(
+            checked_lease.work_item_id,
+            execution=execution,
+        )
+        return self._stream_item_from(
+            plan,
+            execution,
+            evidence=checked_evidence,
+        )
+
+    def prepare_window_terminal_member(
+        self,
+        lease: StreamWorkLease,
+        terminal_evidence: StreamTerminalEvidence,
+    ) -> WindowTerminalMember:
+        """Build the exact reduction member for an external atomic commit."""
+
+        checked_lease = _strict_model(lease, StreamWorkLease, "lease")
+        checked_evidence = _strict_model(
+            terminal_evidence, StreamTerminalEvidence, "terminal_evidence"
+        )
+        if checked_evidence.terminal_policy_version != self._terminal_policy_version:
+            raise StreamSchedulerCompositionError(
+                "terminal evidence does not use the composition policy pin"
+            )
+        stored = self._ledger.get_work(checked_lease.work_item_id)
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        if plan.stage is not StreamStage.WINDOW_REDUCTION:
+            raise StreamSchedulerCompositionError(
+                "only WINDOW_REDUCTION has a window terminal member"
+            )
+        ordinal = stored.expected_ordinal
+        expected_window = (
+            None if ordinal is None else self._ledger.window_at(self.plan_key, ordinal)
+        )
+        if ordinal is None or expected_window is None:
+            raise StreamSchedulerCompositionError("window reduction lacks its expected declaration")
+        declaration = _parse_exact(
+            expected_window.declaration_json,
+            ExpectedWindowDeclaration,
+            "expected declaration",
+        )
+        return create_window_terminal_member(
+            schema_ref=self._schema_refs.terminal_member,
+            plan_key=self.plan_key,
+            expected_ordinal=ordinal,
+            window_key=declaration.window_key,
+            window_semantic_sha256=declaration.window_semantic_sha256,
+            terminal_outcome=checked_evidence.outcome,
+            terminal_work_item_id=plan.work_item_id,
+            terminal_work_logical_key=plan.work_logical_key,
+            terminal_evidence_ref=checked_evidence.evidence_ref,
+            terminal_policy_version=checked_evidence.terminal_policy_version,
+        )
 
     def get(self, work_item_id: str) -> StreamWorkItem:
         self._recover_terminal_acceptances()
@@ -650,6 +863,75 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
     def work_plans(self) -> tuple[StreamWorkItemPlan, ...]:
         return tuple(plan for plan, _state in self._stored_work_plans_with_state())
 
+    def bounded_drain_scope(self, max_items: int) -> tuple[StreamDrainWorkSnapshot, ...]:
+        """Load bounded active work and only the direct evidence it consumes."""
+
+        if isinstance(max_items, bool) or not isinstance(max_items, int):
+            raise TypeError("max_items must be an integer")
+        if max_items <= 0:
+            raise ValueError("max_items must be positive")
+        self._recover_terminal_acceptances()
+        rows = self._ledger.bounded_execution_scope(
+            plan_key=self.plan_key,
+            max_active=max_items,
+            terminal_states=tuple(sorted(state.value for state in TERMINAL_WORK_STATES)),
+            finalization_stage=StreamStage.FINALIZATION.value,
+        )
+        return tuple(
+            StreamDrainWorkSnapshot(
+                plan=_parse_exact(
+                    row.work.plan_json,
+                    StreamWorkItemPlan,
+                    "bounded stream work plan",
+                ),
+                execution_state=WorkItemState(row.execution_state),
+                terminal_evidence=(
+                    None
+                    if row.work.terminal_evidence_json is None
+                    else _parse_exact(
+                        row.work.terminal_evidence_json,
+                        StreamTerminalEvidence,
+                        "bounded stream terminal evidence",
+                    )
+                ),
+            )
+            for row in rows
+        )
+
+    def work_items(self, *, recover_graph: bool = True) -> tuple[StreamWorkItem, ...]:
+        """Read this graph's published work from batched authority snapshots."""
+
+        if recover_graph:
+            self.recover()
+        else:
+            self._recover_terminal_acceptances()
+        rows = self._ledger.work_plans(self.plan_key)
+        executions = {
+            item.work_item_id: item
+            for item in self._execution_scheduler.items_for_run(self._stream_run_id)
+        }
+        snapshots: list[StreamWorkItem] = []
+        for row in rows:
+            if row.publication_state != "PUBLISHED":
+                continue
+            execution = executions.get(row.work_item_id)
+            if execution is None:
+                raise StreamSchedulerCompositionError(
+                    "published stream work lacks its execution projection"
+                )
+            plan = _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan")
+            evidence = (
+                None
+                if row.terminal_evidence_json is None
+                else _parse_exact(
+                    row.terminal_evidence_json,
+                    StreamTerminalEvidence,
+                    "stream terminal evidence",
+                )
+            )
+            snapshots.append(self._stream_item_from(plan, execution, evidence=evidence))
+        return tuple(snapshots)
+
     def terminal_members(self) -> tuple[WindowTerminalMember, ...]:
         return tuple(
             _parse_exact(
@@ -660,6 +942,24 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             for row in self._ledger.windows(self.plan_key)
             if row.terminal_member_json is not None
         )
+
+    def terminal_member_at(self, ordinal: int) -> WindowTerminalMember | None:
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise TypeError("ordinal must be an integer")
+        if ordinal < 0:
+            raise ValueError("ordinal must be non-negative")
+        raw = self._ledger.terminal_member_at(self.plan_key, ordinal)
+        if raw is None:
+            return None
+        member = _parse_exact(raw, WindowTerminalMember, "window terminal member")
+        if member.expected_ordinal != ordinal:
+            raise StreamSchedulerCompositionError(
+                "window terminal member disagrees with its durable ordinal"
+            )
+        return member
+
+    def terminal_member_count(self) -> int:
+        return self._ledger.terminal_member_count(self.plan_key)
 
     def expected_plan_seal(self) -> ExpectedWindowPlanSeal | None:
         raw = self._ledger.get_plan(self.plan_key).seal_json
@@ -690,40 +990,74 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
 
         checked_now = self._checked_now(now)
         self._recover_terminal_acceptances()
-        counts: Counter[str] = Counter()
-        active_created: list[datetime] = []
-        finalization_published = False
-        for plan, publication_state in self._stored_work_plans_with_state():
-            if publication_state == "GATED":
-                counts["GATED"] += 1
-                active_created.append(_parse_timestamp(plan.created_at))
-                continue
-            item = self._execution_scheduler.get(plan.work_item_id)
-            counts[item.state.value] += 1
-            if item.state not in {
-                WorkItemState.SUCCEEDED,
-                WorkItemState.FAILED_PERMANENT,
-                WorkItemState.SKIPPED_POLICY,
-                WorkItemState.SKIPPED_NOT_NEEDED,
-                WorkItemState.CANCELLED,
-                WorkItemState.EXPIRED,
-                WorkItemState.INVALIDATED,
-            }:
-                active_created.append(_parse_timestamp(plan.created_at))
-            if plan.stage is StreamStage.FINALIZATION and publication_state == "PUBLISHED":
-                finalization_published = True
-        oldest = None
-        if active_created:
-            oldest = max(0.0, (checked_now - min(active_created)).total_seconds())
+        projection = self._ledger.backlog_projection(
+            plan_key=self.plan_key,
+            terminal_states=tuple(sorted(state.value for state in TERMINAL_WORK_STATES)),
+            finalization_stage=StreamStage.FINALIZATION.value,
+        )
+        oldest = (
+            None
+            if projection.oldest_active_created_at is None
+            else max(
+                0.0,
+                (
+                    checked_now - _parse_timestamp(projection.oldest_active_created_at)
+                ).total_seconds(),
+            )
+        )
+        export_barrier = StreamExportBarrierSnapshot(
+            expected_member_count=len(CAMERA_IDS),
+            completed_member_count=(
+                0 if projection.export_member_count is None else projection.export_member_count
+            ),
+            export_manifest_semantic_sha256=projection.export_manifest_sha256,
+        )
         return StreamBacklogSnapshot(
-            state_counts=tuple(sorted(counts.items())),
-            active_backlog=len(active_created),
+            state_counts=projection.state_counts,
+            active_backlog=projection.active_backlog,
             oldest_active_age_seconds=oldest,
-            declared_window_count=len(self.declarations()),
-            expected_plan_sealed=self.expected_plan_seal() is not None,
-            terminal_member_count=len(self.terminal_members()),
-            export_barrier_complete=self.export_barrier().complete,
-            finalization_published=finalization_published,
+            declared_window_count=projection.declared_window_count,
+            expected_plan_sealed=projection.expected_plan_sealed,
+            terminal_member_count=projection.terminal_member_count,
+            export_barrier_complete=export_barrier.complete,
+            finalization_published=projection.finalization_published,
+        )
+
+    def backpressure_snapshot(
+        self,
+        *,
+        now: datetime | None = None,
+        metrics: QueueMetrics | None = None,
+    ) -> StreamBackpressureSnapshot:
+        """Classify current pressure without mutating work or execution state."""
+
+        if metrics is None:
+            backlog = self.backlog(now=now)
+            oldest_age_ms = (
+                0
+                if backlog.oldest_active_age_seconds is None
+                else max(0, int(backlog.oldest_active_age_seconds * 1_000))
+            )
+            depth_limit = self._backpressure_config.queue_depth_threshold
+            metrics = QueueMetrics(
+                depth=backlog.active_backlog,
+                oldest_age_ms=oldest_age_ms,
+                arrival_rate=0.0,
+                service_rate=0.0,
+                backlog_slope=0.0,
+                provider_quota=0,
+                worker_utilization=(
+                    0.0 if depth_limit == 0 else backlog.active_backlog / depth_limit
+                ),
+            )
+        else:
+            metrics = _strict_model(metrics, QueueMetrics, "metrics")
+        return StreamBackpressureSnapshot(
+            metrics=metrics,
+            decision=self._backpressure.should_admit(
+                _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
+                metrics,
+            ),
         )
 
     def _window_work_plans(
@@ -776,9 +1110,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 ordered_dependencies=dependencies,
                 sla_deadline_at=_format_timestamp(
                     authority_created
-                    + timedelta(
-                        seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (stage_index + 1)
-                    )
+                    + timedelta(seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (stage_index + 1))
                 ),
                 created_at=authority_created_at,
             )
@@ -838,15 +1170,16 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             priority=100,
             sla_deadline_at=_format_timestamp(
                 authority_created
-                + timedelta(
-                    seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (len(_WINDOW_DAG_STAGES) + 1)
-                )
+                + timedelta(seconds=_LOCAL_STAGE_SLA_STEP_SECONDS * (len(_WINDOW_DAG_STAGES) + 1))
             ),
             created_at=authority_created_at,
         )
 
     def _internal_execution_projection(
-        self, plan: StreamWorkItemPlan
+        self,
+        plan: StreamWorkItemPlan,
+        *,
+        plans_by_key: Mapping[str, StreamWorkItemPlan] | None = None,
     ) -> tuple[WorkItemPlan, tuple[WorkDependency, ...]]:
         """Project to V1 execution state without creating stream Wire data."""
 
@@ -886,7 +1219,13 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         )
         dependencies: list[WorkDependency] = []
         for dependency in plan.ordered_dependencies:
-            upstream = self._stored_work_plan_by_key(dependency.upstream_work_logical_key)
+            upstream = (
+                None
+                if plans_by_key is None
+                else plans_by_key.get(dependency.upstream_work_logical_key)
+            )
+            if upstream is None:
+                upstream = self._stored_work_plan_by_key(dependency.upstream_work_logical_key)
             dependency_id = str(
                 uuid5(
                     _INTERNAL_DEPENDENCY_NAMESPACE,
@@ -913,6 +1252,15 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
     def _stream_item(self, execution: WorkItem) -> StreamWorkItem:
         plan = self._stored_work_plan(execution.work_item_id, require_published=False)
         evidence = self._accepted_evidence(execution.work_item_id)
+        return self._stream_item_from(plan, execution, evidence=evidence)
+
+    def _stream_item_from(
+        self,
+        plan: StreamWorkItemPlan,
+        execution: WorkItem,
+        *,
+        evidence: StreamTerminalEvidence | None,
+    ) -> StreamWorkItem:
         state: StreamWorkItemState
         if evidence is not None:
             if execution.state is not WorkItemState.SUCCEEDED:
@@ -973,24 +1321,38 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
 
     def _recover_terminal_acceptances(self) -> int:
         accepted = 0
-        for work_item_id in self._ledger.pending_work_item_ids():
-            execution = self._execution_scheduler.get(work_item_id)
+        for stored in self._ledger.pending_work_rows(self.plan_key):
+            execution = self._execution_scheduler.get(stored.work_item_id)
             if execution.state is not WorkItemState.SUCCEEDED:
                 continue
-            self._accept_pending_terminal(work_item_id)
+            self._accept_pending_terminal(
+                stored.work_item_id,
+                stored=stored,
+                execution=execution,
+            )
             accepted += 1
         return accepted
 
-    def _accept_pending_terminal(self, work_item_id: str) -> None:
-        execution = self._execution_scheduler.get(work_item_id)
+    def _accept_pending_terminal(
+        self,
+        work_item_id: str,
+        *,
+        stored: StoredStreamWorkPlan | None = None,
+        execution: WorkItem | None = None,
+    ) -> None:
+        execution = self._execution_scheduler.get(work_item_id) if execution is None else execution
         if execution.state is not WorkItemState.SUCCEEDED:
             raise StreamSchedulerCompositionError(
                 "execution projection is not committed for terminal acceptance"
             )
-        stored = self._ledger.get_work(work_item_id)
-        if stored.terminal_evidence_json is not None:
+        work_row = self._ledger.get_work(work_item_id) if stored is None else stored
+        if work_row.work_item_id != work_item_id or work_row.plan_key != self.plan_key:
+            raise StreamSchedulerCompositionError(
+                "pending terminal work belongs to another stream graph"
+            )
+        if work_row.terminal_evidence_json is not None:
             return
-        pending_raw = stored.pending_terminal_json
+        pending_raw = work_row.pending_terminal_json
         if pending_raw is None:
             raise StreamSchedulerCompositionError("committed work lacks pending terminal fact")
         evidence = _parse_exact(pending_raw, StreamTerminalEvidence, "pending terminal evidence")
@@ -1001,19 +1363,19 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             raise StreamSchedulerCompositionError(
                 "execution result does not bind to pending terminal evidence"
             )
-        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        plan = _parse_exact(work_row.plan_json, StreamWorkItemPlan, "stream work plan")
         terminal_member_raw: bytes | None = None
-        ordinal = stored.expected_ordinal
+        ordinal = work_row.expected_ordinal
         if plan.stage is StreamStage.WINDOW_REDUCTION:
             if ordinal is None:
                 raise StreamSchedulerCompositionError(
                     "window reduction is missing expected ordinal"
                 )
-            windows = self._ledger.windows(self.plan_key)
-            if ordinal >= len(windows) or windows[ordinal].ordinal != ordinal:
+            window = self._ledger.window_at(self.plan_key, ordinal)
+            if window is None:
                 raise StreamSchedulerCompositionError("window reduction lacks expected declaration")
             declaration = _parse_exact(
-                windows[ordinal].declaration_json,
+                window.declaration_json,
                 ExpectedWindowDeclaration,
                 "expected declaration",
             )
@@ -1132,6 +1494,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 "stream_run_id": self._stream_run_id,
                 "dag_config_semantic_sha256": self._dag_config_semantic_sha256,
                 "terminal_policy_version": self._terminal_policy_version,
+                "backpressure_config": self._backpressure_config,
                 "schema_refs": {
                     "incremental_window": self._schema_refs.incremental_window,
                     "expected_declaration": self._schema_refs.expected_declaration,
@@ -1175,7 +1538,9 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             )
         work_rows = self._ledger.work_plans(self.plan_key)
         parsed_work: dict[str, StreamWorkItemPlan] = {}
+        work_rows_by_ordinal: dict[int | None, list[StoredStreamWorkPlan]] = {}
         for work_row in work_rows:
+            work_rows_by_ordinal.setdefault(work_row.expected_ordinal, []).append(work_row)
             work_plan = _parse_exact(work_row.plan_json, StreamWorkItemPlan, "stream work plan")
             if (
                 work_row.work_item_id != work_plan.work_item_id
@@ -1258,9 +1623,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             previous_chain = declaration.append_chain_sha256
             declarations.append(declaration)
 
-            companions = tuple(
-                row for row in work_rows if row.expected_ordinal == window_row.ordinal
-            )
+            companions = tuple(work_rows_by_ordinal.get(window_row.ordinal, ()))
             if len(companions) != len(_WINDOW_DAG_STAGES):
                 raise StreamSchedulerCompositionError(
                     "expected window lacks its exact canonical DAG"
@@ -1294,7 +1657,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             )
 
         declarations_tuple = tuple(declarations)
-        finalization_rows = tuple(row for row in work_rows if row.expected_ordinal is None)
+        finalization_rows = tuple(work_rows_by_ordinal.get(None, ()))
         seal: ExpectedWindowPlanSeal | None = None
         if stored_plan.seal_json is None:
             if finalization_rows:
@@ -1451,9 +1814,9 @@ def _planner_finish_sha256(finish: PlannerFinish) -> str:
             "quality_targets": [
                 {
                     "camera_id": target.camera_id.value,
-                    "bucket_ordinal": target.bucket_ordinal,
+                    "bucket_ordinal": str(target.bucket_ordinal),
                     "requested_target_ns": str(target.requested_target_ns),
-                    "packet_traversal_index": target.packet.traversal_index,
+                    "packet_traversal_index": str(target.packet.traversal_index),
                     "packet_payload_sha256": target.packet.payload_sha256,
                     "policy_version": target.policy_version,
                 }
@@ -1463,13 +1826,21 @@ def _planner_finish_sha256(finish: PlannerFinish) -> str:
             "camera_facts": [
                 {
                     "camera_id": fact.camera_id.value,
-                    "packet_count": fact.packet_count,
-                    "payload_bytes": fact.payload_bytes,
-                    "first_timestamp_ns": fact.first_timestamp_ns,
-                    "last_timestamp_ns": fact.last_timestamp_ns,
-                    "first_sequence": fact.first_sequence,
-                    "last_sequence": fact.last_sequence,
-                    "sequence_gap_count": fact.sequence_gap_count,
+                    "packet_count": str(fact.packet_count),
+                    "payload_bytes": str(fact.payload_bytes),
+                    "first_timestamp_ns": (
+                        None if fact.first_timestamp_ns is None else str(fact.first_timestamp_ns)
+                    ),
+                    "last_timestamp_ns": (
+                        None if fact.last_timestamp_ns is None else str(fact.last_timestamp_ns)
+                    ),
+                    "first_sequence": (
+                        None if fact.first_sequence is None else str(fact.first_sequence)
+                    ),
+                    "last_sequence": (
+                        None if fact.last_sequence is None else str(fact.last_sequence)
+                    ),
+                    "sequence_gap_count": str(fact.sequence_gap_count),
                 }
                 for fact in finish.facts
             ],
@@ -1538,6 +1909,19 @@ def _parse_exact[T: BaseModel](payload: bytes, model_type: type[T], label: str) 
     return value
 
 
+def _schema_refs_from_stored(
+    value: _StoredSchedulerSchemaRefs,
+) -> StreamSchedulerSchemaRefs:
+    return StreamSchedulerSchemaRefs(
+        incremental_window=value.incremental_window,
+        expected_declaration=value.expected_declaration,
+        expected_plan_seal=value.expected_plan_seal,
+        stream_work_plan=value.stream_work_plan,
+        terminal_member=value.terminal_member,
+        terminal_closure=value.terminal_closure,
+    )
+
+
 def _require_uuid(value: str, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a UUID string")
@@ -1573,6 +1957,7 @@ def _format_timestamp(value: datetime) -> str:
 
 
 __all__ = [
+    "DEFAULT_STREAM_BACKPRESSURE_CONFIG",
     "INTERNAL_STREAM_EXECUTION_PROJECTION_VERSION",
     "PLANNER_EOS_PROJECTION_VERSION",
     "STREAM_WINDOW_DAG_POLICY_VERSION",
@@ -1580,6 +1965,9 @@ __all__ = [
     "DurableStreamWindowScheduler",
     "EosSealInputs",
     "StreamBacklogSnapshot",
+    "StreamBackpressureSnapshot",
+    "StreamBackpressureThrottle",
+    "StreamDrainWorkSnapshot",
     "StreamExportBarrierSnapshot",
     "StreamSchedulerCompositionError",
     "StreamSchedulerSchemaRefs",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from typing import cast
 
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.boundary_windows import (
@@ -130,6 +131,7 @@ from robata.event_pipeline.provisional_fusion import (
     ProvisionalPhysicalActionFuser,
 )
 from robata.inference.adapter import (
+    BatchVisionModelAdapter,
     JsonSchemaRef,
     PackageInput,
     VisionInferenceFailure,
@@ -361,6 +363,42 @@ class _CountingVisionModelAdapter:
         return outcome
 
 
+class _CountingBatchVisionModelAdapter(_CountingVisionModelAdapter):
+    """Preserve provider dispatch metrics for a native batch-capable adapter."""
+
+    async def infer_batch(
+        self,
+        requests: tuple[VisionInferenceRequest, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        batch_delegate = cast(BatchVisionModelAdapter, self._delegate)
+        self._infer_calls += len(requests)
+        attributes: dict[str, str | int] = {
+            "provider": self.provider,
+            "batch_size": len(requests),
+        }
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_batch_dispatches",
+            attributes=attributes,
+        )
+        with runtime_span(
+            self._runtime_observer,
+            "inference.provider_batch_dispatch",
+            attributes,
+        ):
+            outcomes = await batch_delegate.infer_batch(requests)
+        for outcome in outcomes:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.provider_outcomes",
+                attributes={
+                    "provider": self.provider,
+                    "outcome": type(outcome).__name__,
+                },
+            )
+        return outcomes
+
+
 class CanonicalOfflinePipeline:
     """Run the canonical post-admission path through provider-neutral ports."""
 
@@ -386,6 +424,9 @@ class CanonicalOfflinePipeline:
         evidence_store: InferenceEvidenceStore | None = None,
         barrier_storage: BarrierStorage | None = None,
         call_barrier_storage: InferenceCallBarrierStorage | None = None,
+        max_concurrent_call_parts: int = 1,
+        max_inference_batch_size: int = 8,
+        max_inference_batch_queue_delay_ms: int = 5,
         clock: Callable[[], datetime] | None = None,
         runtime_observer: RuntimeObserver | None = None,
     ) -> None:
@@ -448,14 +489,34 @@ class CanonicalOfflinePipeline:
                 )
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
+        if (
+            isinstance(max_concurrent_call_parts, bool)
+            or not isinstance(max_concurrent_call_parts, int)
+            or not 1 <= max_concurrent_call_parts <= 64
+        ):
+            raise ValueError("max_concurrent_call_parts must be between one and 64")
+        if (
+            isinstance(max_inference_batch_size, bool)
+            or not isinstance(max_inference_batch_size, int)
+            or not 1 <= max_inference_batch_size <= 256
+        ):
+            raise ValueError("max_inference_batch_size must be between one and 256")
+        if (
+            isinstance(max_inference_batch_queue_delay_ms, bool)
+            or not isinstance(max_inference_batch_queue_delay_ms, int)
+            or not 0 <= max_inference_batch_queue_delay_ms <= 1_000
+        ):
+            raise ValueError("max_inference_batch_queue_delay_ms must be between zero and 1000")
         self._package_builder = package_builder
         self._materializer = materializer
         self._input_preparer = input_preparer
         self._adapter = adapter
-        self._dispatch_adapter = _CountingVisionModelAdapter(
-            adapter,
-            runtime_observer=runtime_observer,
+        counting_adapter_type = (
+            _CountingBatchVisionModelAdapter
+            if callable(getattr(adapter, "infer_batch", None))
+            else _CountingVisionModelAdapter
         )
+        self._dispatch_adapter = counting_adapter_type(adapter, runtime_observer=runtime_observer)
         self._raw_store = raw_store
         self._parser = parser
         self._coarse_qa_policy = coarse_qa_policy
@@ -467,6 +528,7 @@ class CanonicalOfflinePipeline:
         self._schema_registry = schema_registry
         self._logical_node_registry = logical_node_registry
         self._execution_policy = execution_policy
+        self._max_concurrent_call_parts = max_concurrent_call_parts
         self._clock = clock or _utc_now
         self._runtime_observer = runtime_observer
         self._validate_configuration()
@@ -497,6 +559,8 @@ class CanonicalOfflinePipeline:
                 item.ref.artifact_id: item.document_bytes for item in schema_registry.entries
             },
             ledger=self._ledger,
+            max_batch_size=max_inference_batch_size,
+            max_batch_queue_delay_ms=max_inference_batch_queue_delay_ms,
             clock=self._clock,
         )
         self._barrier_storage = (
@@ -1670,7 +1734,6 @@ class CanonicalOfflinePipeline:
                     artifact_id=parsed_artifact_id,
                     created_at=artifact_created_at,
                 )
-                parsed_claims = self._evidence_store.append_parsed_claim(parsed_claims)
             if (
                 parsed_claims.artifact_id != parsed_artifact_id
                 or parsed_claims.raw_response != expected_raw
@@ -1687,7 +1750,7 @@ class CanonicalOfflinePipeline:
             expected_selected = SelectedAttemptOutput.create(parsed_claims, selection)
             selected_output = self._evidence_store.get_selected_output(selection.selection_id)
             if selected_output is None:
-                selected_output = self._evidence_store.append_selected_output(expected_selected)
+                selected_output = expected_selected
             elif selected_output != expected_selected:
                 raise InferenceEvidenceStoreError(
                     "persisted selected output differs from its selection and parsed claim"
@@ -1767,7 +1830,6 @@ class CanonicalOfflinePipeline:
                     artifact_id=enriched_artifact_id,
                     created_at=selected_terminal.completed_at,
                 )
-                enriched_output = self._evidence_store.append_enriched_output(enriched_output)
             elif (
                 enriched_output.artifact_id != enriched_artifact_id
                 or enriched_output.enrichment_logical_key
@@ -1792,6 +1854,26 @@ class CanonicalOfflinePipeline:
                 raise InferenceEvidenceStoreError(
                     "persisted enriched output differs from the current semantic lineage"
                 )
+            (
+                persisted_parsed,
+                persisted_selected,
+                persisted_enriched,
+            ) = self._evidence_store.append_accepted_lineage(
+                parsed_claims,
+                selected_output,
+                enriched_output,
+            )
+            if (
+                persisted_parsed != parsed_claims
+                or persisted_selected != selected_output
+                or persisted_enriched != enriched_output
+            ):
+                raise InferenceEvidenceStoreError(
+                    "persisted accepted lineage differs from the completed call lineage"
+                )
+            parsed_claims = persisted_parsed
+            selected_output = persisted_selected
+            enriched_output = persisted_enriched
         except (InferenceEvidenceStoreError, InferenceLedgerError) as exc:
             return (
                 parsed_claims.raw_response,
@@ -1968,6 +2050,50 @@ class CanonicalOfflinePipeline:
             error=lineage_error,
         )
 
+    async def _execute_call_plan_parts(
+        self,
+        *,
+        task: VisionTask,
+        inference_policy: InferencePolicy,
+        context: AdmittedRecordingContextV2,
+        window: CanonicalRootWindow
+        | CanonicalCandidateDenseWindow
+        | CanonicalBoundaryRefinementWindow,
+        sampling_plan: SamplingPlan,
+        package_set: TemporalPackageSet,
+        package_inputs: tuple[PackageInput, ...],
+        input_plan: InferenceInputPlan,
+        reference_catalog: ProviderReferenceCatalog,
+        dependency_config: Mapping[str, object] | None,
+    ) -> tuple[CanonicalOfflinePartResult, ...]:
+        semaphore = asyncio.Semaphore(self._max_concurrent_call_parts)
+
+        async def execute(part: InferenceCallPart) -> CanonicalOfflinePartResult:
+            async with semaphore:
+                return await self._execute_one_call_part(
+                    task=task,
+                    inference_policy=inference_policy,
+                    context=context,
+                    window=window,
+                    sampling_plan=sampling_plan,
+                    package_set=package_set,
+                    package_inputs=package_inputs,
+                    input_plan=input_plan,
+                    reference_catalog=reference_catalog,
+                    part=part,
+                    dependency_config=dependency_config,
+                )
+
+        tasks = tuple(asyncio.create_task(execute(part)) for part in input_plan.call_plan.parts)
+        try:
+            return tuple(await asyncio.gather(*tasks))
+        except BaseException:
+            for pending_task in tasks:
+                if not pending_task.done():
+                    pending_task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def _execute_coarse_qa_call_plan(
         self,
         *,
@@ -2098,10 +2224,9 @@ class CanonicalOfflinePipeline:
                 ),
             ) from exc
 
-        part_results: list[CanonicalOfflinePartResult] = []
-        for part in input_plan.call_plan.parts:
-            try:
-                result = await self._execute_one_call_part(
+        try:
+            part_results = list(
+                await self._execute_call_plan_parts(
                     task=task,
                     inference_policy=inference_policy,
                     context=context,
@@ -2111,27 +2236,26 @@ class CanonicalOfflinePipeline:
                     package_inputs=package_inputs,
                     input_plan=input_plan,
                     reference_catalog=reference_catalog,
-                    part=part,
                     dependency_config=dependency_config,
                 )
-            except asyncio.CancelledError:
-                raise
-            except (
-                InferenceOrchestrationError,
-                InferenceCallBarrierError,
-                CanonicalOfflineConfigurationError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise _QAStageError(
-                    CanonicalOfflineRunStatus.INFERENCE_FAILED,
-                    _canonical_error(
-                        CanonicalOfflineStage.INFERENCE,
-                        f"{code_prefix}_CALL_PART_EXECUTION_FAILED",
-                        exc,
-                    ),
-                ) from exc
-            part_results.append(result)
+            )
+        except asyncio.CancelledError:
+            raise
+        except (
+            InferenceOrchestrationError,
+            InferenceCallBarrierError,
+            CanonicalOfflineConfigurationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise _QAStageError(
+                CanonicalOfflineRunStatus.INFERENCE_FAILED,
+                _canonical_error(
+                    CanonicalOfflineStage.INFERENCE,
+                    f"{code_prefix}_CALL_PART_EXECUTION_FAILED",
+                    exc,
+                ),
+            ) from exc
 
         try:
             aggregate = self._call_barrier.get_aggregate_status(input_plan)
@@ -3009,38 +3133,37 @@ class CanonicalOfflinePipeline:
         final_fusion_context: CanonicalFinalFusionContext,
         dependency_config: Mapping[str, object] | None = None,
     ) -> CanonicalOfflineRunResult:
-        for part in input_plan.call_plan.parts:
-            try:
-                result = await self._execute_one_call_part(
-                    task=VisionTask.FUSION_ADJUDICATION,
-                    inference_policy=self._inference_policy,
-                    context=context,
-                    window=window,
-                    sampling_plan=sampling_plan,
-                    package_set=package_set,
-                    package_inputs=package_inputs,
-                    input_plan=input_plan,
-                    reference_catalog=reference_catalog,
-                    part=part,
-                    dependency_config=dependency_config,
-                )
-            except asyncio.CancelledError:
-                raise
-            except (
-                InferenceOrchestrationError,
-                InferenceCallBarrierError,
-                CanonicalOfflineConfigurationError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                return finish(
-                    CanonicalOfflineRunStatus.INFERENCE_FAILED,
-                    _canonical_error(
-                        CanonicalOfflineStage.INFERENCE,
-                        "CALL_PART_EXECUTION_FAILED",
-                        exc,
-                    ),
-                )
+        try:
+            results = await self._execute_call_plan_parts(
+                task=VisionTask.FUSION_ADJUDICATION,
+                inference_policy=self._inference_policy,
+                context=context,
+                window=window,
+                sampling_plan=sampling_plan,
+                package_set=package_set,
+                package_inputs=package_inputs,
+                input_plan=input_plan,
+                reference_catalog=reference_catalog,
+                dependency_config=dependency_config,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (
+            InferenceOrchestrationError,
+            InferenceCallBarrierError,
+            CanonicalOfflineConfigurationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return finish(
+                CanonicalOfflineRunStatus.INFERENCE_FAILED,
+                _canonical_error(
+                    CanonicalOfflineStage.INFERENCE,
+                    "CALL_PART_EXECUTION_FAILED",
+                    exc,
+                ),
+            )
+        for result in results:
             part_results.append(result)
             try:
                 nodes: list[tuple[LogicalNode, RunNodeRole]] = []

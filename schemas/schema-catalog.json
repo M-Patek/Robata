@@ -1344,6 +1344,216 @@
         "max_exclusive": "0.2.0"
       },
       "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-work-receipt",
+        "version": "1.0.0",
+        "artifact_id": "daab094e-9480-d3f1-175d-00ec44651bac",
+        "sha256": "afae867f3054cbf22019752d065956de0b83ca8eadcab2b609f586ee39abf34b"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/local-stream-work-receipt.schema.json",
+      "artifact_path": "v1/local-stream-work-receipt.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-work-receipt-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-recording-result",
+        "version": "1.0.0",
+        "artifact_id": "857f1826-536b-26e0-f391-de5f723927ee",
+        "sha256": "1ad52b61d3b6fd9d686bdea95399fc5e6f04423c6fd79fea92e46214a2fab97e"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/local-stream-recording-result.schema.json",
+      "artifact_path": "v1/local-stream-recording-result.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-recording-result-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-window-semantic-evidence",
+        "version": "1.0.0",
+        "artifact_id": "4839f225-5ea1-e5c6-6f32-4f555fc59873",
+        "sha256": "db896b4ec53d1bbe5b2910113d00d53ab6a6e6644ebd01624fa5c39ff4b3639b"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/local-stream-window-semantic-evidence.schema.json",
+      "artifact_path": "v1/local-stream-window-semantic-evidence.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-window-semantic-evidence-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-recording-result",
+        "version": "2.0.0",
+        "artifact_id": "5b8c1603-8fe0-fb9b-93ad-40bdba731e00",
+        "sha256": "fd011d4ddf4d0bdcb940126696a6243cd311c74a8a9037bd6b0503ae9d0befe3"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/local-stream-recording-result.schema.json",
+      "artifact_path": "v2/local-stream-recording-result.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-recording-result-semantic-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-window-inference-plan",
+        "version": "1.0.0",
+        "artifact_id": "d189b0bb-1612-6891-bfea-1cf0a2390a67",
+        "sha256": "a886a4968bad3c5c7898a3e0ff29182837cb48ca997e23d567e895a5021ccddc"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/local-stream-window-inference-plan.schema.json",
+      "artifact_path": "v1/local-stream-window-inference-plan.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-window-inference-plan-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-window-semantic-evidence",
+        "version": "2.0.0",
+        "artifact_id": "c4c8dbf1-355b-8030-aa29-dea5631d6323",
+        "sha256": "255a222041c96ed26d2e521d12f4bee9d6dadfc8bc6608de472d59d976cae5a9"
+      },
+      "wire_version": "2.0",
+      "document_id": "https://schemas.robata.dev/v2/local-stream-window-semantic-evidence.schema.json",
+      "artifact_path": "v2/local-stream-window-semantic-evidence.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-window-semantic-evidence-v2",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-recording-result",
+        "version": "3.0.0",
+        "artifact_id": "4a3bc376-b8ff-7492-96b3-6e235a2b79c3",
+        "sha256": "2248c15804a8196b16c7bb2ec092fe058e96a9f43e9d7650e573a339fce35d80"
+      },
+      "wire_version": "3.0",
+      "document_id": "https://schemas.robata.dev/v3/local-stream-recording-result.schema.json",
+      "artifact_path": "v3/local-stream-recording-result.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-recording-result-semantic-v3",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/stream-inference",
+        "version": "1.0.0",
+        "artifact_id": "a48ce646-d073-dd16-5825-ecadb798fa71",
+        "sha256": "83557516b1fbe5b9388c28f269c3cfaa3e43b256b75f297b0e867126573a68e0"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/stream-inference.schema.json",
+      "artifact_path": "v1/stream-inference.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "stream-inference-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/stream-inference-attempt",
+        "version": "1.0.0",
+        "artifact_id": "922fbcf3-3633-00a6-c457-263f8ca3a8a7",
+        "sha256": "c764298f50a36fb4eda66f2eb06502e6dd27de076b33a6b97402cb52902b0fee"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/stream-inference-attempt.schema.json",
+      "artifact_path": "v1/stream-inference-attempt.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "stream-inference-attempt-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/local-stream-recording-result",
+        "version": "4.0.0",
+        "artifact_id": "879e1446-418e-7f73-ede3-3636ada19eed",
+        "sha256": "d8bc36c17ce78ce732d583e7bb168035f23173a403adeb3b293173ffd24fe6bb"
+      },
+      "wire_version": "4.0",
+      "document_id": "https://schemas.robata.dev/v4/local-stream-recording-result.schema.json",
+      "artifact_path": "v4/local-stream-recording-result.schema.json",
+      "owner": "robata-stream",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "local-stream-recording-result-semantic-v4",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
     }
   ],
   "upcasters": []

@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "SchemaRef": {
+      "additionalProperties": false,
+      "description": "Exact immutable four-tuple required at durable consumer boundaries.",
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "schema_id": {
+          "pattern": "^https://schemas\\.robata\\.dev/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          "title": "Schema Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_id",
+        "version",
+        "artifact_id",
+        "sha256"
+      ],
+      "title": "SchemaRef",
+      "type": "object"
+    },
+    "StreamPurpose": {
+      "description": "Provider-neutral purposes used in window and inference identity.",
+      "enum": [
+        "QA_COARSE",
+        "QA_DENSE",
+        "EVENT_PROPOSAL",
+        "ACTION_DENSE",
+        "BOUNDARY_REFINEMENT"
+      ],
+      "title": "StreamPurpose",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/stream-inference.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Stable logical invocation identity; attempts are separate records.",
+  "properties": {
+    "inference_identity_policy_version": {
+      "default": "stream-inference-identity-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Inference Identity Policy Version",
+      "type": "string"
+    },
+    "inference_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Inference Key",
+      "type": "string"
+    },
+    "inference_projection_version": {
+      "default": "stream-inference-semantic-v1",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Inference Projection Version",
+      "type": "string"
+    },
+    "inference_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Inference Semantic Sha256",
+      "type": "string"
+    },
+    "input_plan_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Plan Semantic Sha256",
+      "type": "string"
+    },
+    "purpose": {
+      "$ref": "#/$defs/StreamPurpose"
+    },
+    "schema_ref": {
+      "$ref": "#/$defs/SchemaRef"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "stream_inference_logical_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Stream Inference Logical Id",
+      "type": "string"
+    },
+    "subject_type": {
+      "const": "STREAM_INFERENCE",
+      "default": "STREAM_INFERENCE",
+      "title": "Subject Type",
+      "type": "string"
+    },
+    "window_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Window Key",
+      "type": "string"
+    },
+    "window_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Window Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_ref",
+    "subject_type",
+    "stream_inference_logical_id",
+    "inference_key",
+    "inference_semantic_sha256",
+    "window_key",
+    "window_semantic_sha256",
+    "purpose",
+    "input_plan_semantic_sha256",
+    "inference_projection_version",
+    "inference_identity_policy_version"
+  ],
+  "title": "StreamInferenceLogicalIdentity",
+  "type": "object"
+}

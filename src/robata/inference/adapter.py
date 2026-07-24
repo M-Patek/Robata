@@ -303,7 +303,23 @@ class VisionModelAdapter(Protocol):
         ...
 
 
+class BatchVisionModelAdapter(VisionModelAdapter, Protocol):
+    """Optional extension for adapters that can dispatch one compatible batch.
+
+    Results must retain request order. Raising from infer_batch rejects the
+    entire dispatch; adapters must not expose a successful prefix.
+    """
+
+    async def infer_batch(
+        self,
+        requests: tuple[VisionInferenceRequest, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        """Execute one ordered, purpose-compatible provider batch."""
+        ...
+
+
 __all__ = [
+    "BatchVisionModelAdapter",
     "JsonSchemaRef",
     "NormalizedOutputEnvelope",
     "PackageInput",

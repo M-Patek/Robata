@@ -1,6 +1,6 @@
 # Current Implementation Status
 
-- Status date: 2026-07-22
+- Status date: 2026-07-23
 - Scope: live repository outside `archive/old_mvp`
 - Evidence class: local development unless a row explicitly says otherwise
 
@@ -31,7 +31,7 @@ and registered schemas remain authoritative when implementation begins.
 
 | Slice | Live state | Promotion boundary |
 |---|---|---|
-| Contract and schema kernel | Strict values, canonical JSON/SHA-256, six-camera maps, atomic single-schema, independent-schema-bundle, and evolution-bundle registration, immutability checks, logical nodes, immutable revisions, current-selection primitives, and 64 exact-pinned schemas are executable. An independent bundle publishes 1..N new `NONE` schemas atomically; an evolution bundle publishes one new target, one or more incoming upcasters, and their exact code/runtime/golden artifacts only after complete temporary registry and graph validation. Registered payloads include compact/detailed completion, output, work/barrier, event-identity outbox, review, media-quality, supplemental-QA, pre-EOS capture/segment/window, stream inference evidence, stream work, expected-window closure, finalization, and Artifact Registry V3 contracts. Compact V1 bytes remain frozen and exact-readable without an implicit upcast. | The live catalog still declares `upcasters=[]`. The evolution command proves publication mechanics only. Existing completion targets were already published with `compatibility_mode=NONE` and no predecessors, so they cannot be retrofitted without violating catalog immutability; detailed V1 also lacks facts required by later versions. A future governed chain must target new versions. Detailed-result bytes remain embedded in local SQLite rather than a production artifact store. |
+| Contract and schema kernel | Strict values, canonical JSON/SHA-256, six-camera maps, atomic single-schema, independent-schema-bundle, and evolution-bundle registration, immutability checks, logical nodes, immutable revisions, current-selection primitives, and 74 exact-pinned schemas are executable. An independent bundle publishes 1..N new `NONE` schemas atomically; an evolution bundle publishes one new target, one or more incoming upcasters, and their exact code/runtime/golden artifacts only after complete temporary registry and graph validation. Registered payloads include compact/detailed completion, output, work/barrier, event-identity outbox, review, media-quality, supplemental-QA, pre-EOS capture/segment/window, stream inference evidence, stream work, expected-window closure, local stream work receipt, the causal window inference plan, window semantic evidence V1/V2, stream inference/attempt identity, recording result V1-V4, finalization, and Artifact Registry V3 contracts. Compact V1 bytes remain frozen and exact-readable without an implicit upcast. | The live catalog still declares `upcasters=[]`. The evolution command proves publication mechanics only. Existing completion targets were already published with `compatibility_mode=NONE` and no predecessors, so they cannot be retrofitted without violating catalog immutability; detailed V1 also lacks facts required by later versions. A future governed chain must target new versions. Detailed-result bytes remain embedded in local SQLite rather than a production artifact store. |
 | Ingestion and alignment | Deterministic six-stream indexing, immutable validation/READY state transitions, exact rational transforms, reset segments, residuals, and admissibility gates are implemented behind injected ports. | No governed corpus, O-03, O-04, or Phase 0 approval; local results cannot claim Phase 1B. |
 | Media inspection and export | Live CLIs expose explicitly authorized inspection and local video export. The canonical raw-MCAP command composes the same inspector, six H.264 decoder probes, registered MP4/sidecar export, canonical frame index, selected PNG publication, and an exact-pinned local media-quality report before entering the shared canonical runner. Report replay is exact-byte and semantic-binding checked. The former fake-model analysis runner remains archived history only. | Source access must be explicitly authorized. The current mapping profile requires an explicit local-development override; its V2 evidence is local only, non-promotional, and sends no provider traffic. Deterministic luma/edge/freeze/cadence/sequence/skew observations are local evidence, not governed semantic blur or occlusion labels. |
 | Sampling and package planning | Exact rational-grid selection, deterministic frame tie/dedup behavior, materialized provider-neutral frame-budget package sets, and an exact frozen-adaptive resolver are implemented and locally verified. `AdaptiveSampler.sample()` executes injected detectors and deterministically reduces enabled triggers. Separately, the raw-MCAP canonical path freezes exact neighbor targets from its registered local media-quality report, materializes provider-neutral PNG packages, verifies selected artifact bytes, and persists deterministic supplemental QA evidence on fresh execution and revalidates it on recovery. | The generic `AdaptiveSampler` detector-trigger stream is not yet composed into canonical package planning, and local media observations are not governed adaptive triggers. Low edge energy is explicitly a proxy, not a semantic blur or occlusion decision. O-13 still owns promoted rates, padding, thresholds, adaptive triggers, and budgets. Provider-limit splitting belongs to `InferenceInputPlan`, not package mutation. |
@@ -60,7 +60,7 @@ exit or production-readiness claim.
 | 25.4 logical identities and run membership | PARTIAL | Generic logical nodes and the complete local QA/event/boundary/fusion chain use run-independent projections and append-only memberships. Retry/run changes preserve logical keys, and proposal replay tests prove exact manifest bytes remain audit facts rather than semantic identity. The durable scheduler supports explicit `INVALIDATED` terminal state. | Canonical invalidation propagation and governed successor rebuild policy are not yet wired to the scheduler. |
 | 25.5 immutable revisions and current selection | PARTIAL | Generic immutable node revisions, append-only selection decisions, current-selection compare-and-swap, rebuild, and local verification are implemented. Deterministic local ActionEvent genesis revisions, selections, current projections, and identity current-revision references are applied with identity/completion/outbox facts in one local aggregate transaction. | The governed production ActionEvent contract and REUSED successor-selection policy remain absent; generic revision `ELIGIBLE` means locally selectable, not production-qualified. |
 | 25.6 validation, READY, and separate ledgers | PARTIAL | V2 validation/READY/alignment contracts and local source/alignment ledger reconciliation exist behind injected ports and reject insufficient V1 evidence. The raw canonical bridge derives exact source/schema, six-stream decoder-probe, registered-media, frame-index, and alignment facts from an explicitly mapped real MCAP before resolving V2 admission. | The exercised mapping and development admission/alignment policies are unapproved. Governed O-03/O-04 decisions, production stores, independent promoted ledger reconciliation, and Phase 0 approval are absent. |
-| 25.7 exact schema references and evolution | PARTIAL | Atomic single-schema, 1..N independent-schema bundle, and one-target/1..N-incoming-upcaster evolution publication are executable. Publication stages exact schema/code/runtime/golden artifacts as applicable, validates the complete temporary registry and upcaster graph, and makes catalog replacement the commit point with marker-based recovery. Exact digest verification, published-entry immutability, deterministic upcasting, and golden-vector enforcement are tested. The 64-entry catalog includes exact-pinned output, work/barrier, outbox, review, media-quality, supplemental-QA, pre-EOS capture/segment/window, stream inference evidence, stream work, expected-window closure, finalization, and Artifact Registry V3 contracts. | The live catalog still has no domain upcaster (`upcasters=[]`). Supplemental V1 remains byte-frozen and corrected V2 was published separately; both declare `compatibility_mode=NONE`, so no migration edge is implied. Bundle publication is mechanism evidence, not approved business transformation semantics. Existing completion versions likewise cannot be retrofitted without mutating published governance metadata. |
+| 25.7 exact schema references and evolution | PARTIAL | Atomic single-schema, 1..N independent-schema bundle, and one-target/1..N-incoming-upcaster evolution publication are executable. Publication stages exact schema/code/runtime/golden artifacts as applicable, validates the complete temporary registry and upcaster graph, and makes catalog replacement the commit point with marker-based recovery. Exact digest verification, published-entry immutability, deterministic upcasting, and golden-vector enforcement are tested. The 74-entry catalog includes exact-pinned output, work/barrier, outbox, review, media-quality, supplemental-QA, pre-EOS capture/segment/window, stream inference evidence, stream work, expected-window closure, the causal window plan and V2 evidence, stream inference/attempt identity, recording result V1-V4, finalization, and Artifact Registry V3 contracts. | The live catalog still has no domain upcaster (`upcasters=[]`). Supplemental V1 remains byte-frozen and corrected V2 was published separately; both declare `compatibility_mode=NONE`, so no migration edge is implied. Bundle publication is mechanism evidence, not approved business transformation semantics. Existing completion versions likewise cannot be retrofitted without mutating published governance metadata. |
 | 25.8 nonblocking human review | PARTIAL | Versioned nonblocking routing covers the five Section 25.8 triggers. The canonical local receipt routes only after primary completion; media-quality flags route the report through `QA_DEGRADATION`. In the verified no-quality-flag real-source flow, fresh work is `ENQUEUED` and exact replay is `ALREADY_ENQUEUED`. An early `NO_EVENTS` completion without an output decision routes the primary-completion subject for review sampling. A routing exception remains observable without replacing primary truth. Immutable review tasks, annotations/adjudications, optional revision/selection references, priority/SLA ordering, lease/fence, expired reclaim, exact replay/conflict, reopen history, and independently visible pending/overdue state are executable in a local SQLite queue. | The selected local routing policy is unapproved and non-promotional. Governed O-10/O-11/O-12 routing and blocking policies, named reviewers and service owner, real capacity, backlog/latency evidence, escalation operations, review-to-authored-revision/selection composition, and SLA ownership remain absent. |
 | 25.9 recording-scoped serialized identity | PARTIAL | The one-command local path obtains a recording snapshot, prepares identity side-effect-free, and applies it with run completion, ActionEvent genesis, and outbox under one generation/fence CAS transaction. `EventIdentityOutboxRecord` retains its original domain shape where it is embedded in frozen completion detail; SQLite persistence and publication project it to the exact-pinned `EventIdentityOutboxWireRecord`. Exact replay creates no duplicate business result or outbox. Primary-completion command v2 also binds ordered media-quality and supplemental-QA evidence references when present. The command relays committed and recovered-completion outbox rows with local at-least-once delivery, retry, acknowledgement, exact-byte idempotency, stale-fence rejection, and DLQ state; recovery performs this authoritative reconciliation before validating receipt-side evidence, and delivery failure is observable but does not revoke primary completion. | This is local conformance evidence, not the O-14 production authority. A selected production broker, authenticated delivery, operator-owned reconciliation/DLQ procedures, monitoring, retention, filesystem power-loss guarantees including parent-directory `fsync`, and governed merge/split/REUSED successor behavior remain absent. |
 | 25.10 security and phase dependencies | BLOCKED | Later phases run only as local conformance slices with `production_eligible=false`. Coarse/dense QA, proposal, candidate reduction, per-candidate action evidence, provisional fusion, per-action ONSET/OFFSET boundary refinement, and exact 0/1/N final-fusion handling are runnable without provider traffic. | Phase 0 and open O-decisions still block promotion. Real providers, governed policies, and later production stages remain fail-closed rather than fabricated. |
@@ -98,7 +98,7 @@ The following are deliberately skipped rather than replaced with convenient defa
   thresholds.
 - Section 25.7 governed domain upcaster selection. Atomic publication infrastructure now accepts
   one new target plus 1..N incoming edges with exact code/runtime/golden artifacts and validates
-  the complete temporary registry and graph before the catalog commit. The 47-entry catalog
+  the complete temporary registry and graph before the catalog commit. The 74-entry catalog
   includes work-message,
   persisted-barrier, event-identity outbox, review-task, review-annotation, and review-reopen-command
   contracts, media-quality-report V1, frozen supplemental-QA-evidence V1, and corrected supplemental-QA-evidence V2 beside the standalone V2 output contracts. It still declares `upcasters=[]`: existing
@@ -140,17 +140,26 @@ owners, infrastructure facts, or operational evidence:
 
 ## Local Gate Snapshot
 
-The following facts were verified locally on 2026-07-22. They establish local mechanism
+The following facts were verified locally through 2026-07-23. They establish local mechanism
 conformance only. The full-gate results below describe the pre-commit candidate working tree;
 candidate commit identity, clean-clone release evidence, and protected-baseline immutability remain
 unverified until those gates run against the unchanged commit:
 
-- The full Python suite completed with 924 passed and 3 skipped in 1547.61 seconds.
-- `ruff check .` passed; `ruff format --check .` reported 261 files already formatted.
-- Strict Mypy passed across 166 source files.
-- Schema registry verification passed for 64 exact-pinned JSON Schema 2020-12 documents and zero
-  registered upcaster artifact sets. It includes media-quality report V1, byte-frozen supplemental
-  QA evidence V1, and corrected supplemental QA evidence V2.
+- Before the two performance-only hot-loop changes, mutually exclusive test groups covered all
+  1,136 then-collected tests: 1,133 passed, 3 skipped, and zero failed. The single-process full
+  command exceeded the tool's 20-minute execution cap without reporting a failure; the split groups
+  are the complete pre-hot-loop candidate result. The current tree collects 1,137 tests; its one
+  additional empty-emission regression passed, but no redundant second full 1,137-test run is
+  claimed.
+- Post-optimization verification passed the 89-test focused causal/schema/runtime set, the 12-test
+  MCAP integration set, and the 40-test focused Schema-contract set. These focused groups may
+  overlap, so their counts are not summed.
+- `ruff check .` passed; `ruff format --check src tests scripts` reported 318 files already
+  formatted.
+- Strict Mypy passed across 189 source files.
+- Schema registry verification passed for 74 exact-pinned JSON Schema 2020-12 documents and zero
+  registered upcaster artifact sets. It includes the causal window plan, window evidence V2,
+  stream inference and attempt identities, and recording result V3/V4.
 - Documentation link checking and `git diff --check` passed.
 - The checked-in `sample-medium.mcap` spans 40.890455 seconds, so the 180-second first-segment cap
   covered the entire recording.
@@ -168,6 +177,76 @@ unverified until those gates run against the unchanged commit:
   does not establish production or model-quality qualification.
 - Representative production capacity, long-soak, real-provider, production broker/storage, and
   protected Schema-baseline approval remain outside this local run.
+
+### 2026-07-23 causal streaming checkpoint
+
+Post-snapshot work composes the durable stream scheduler, local incremental delivery authority,
+recording finalization, recovered outbox relay, and nonblocking review into local-composition v21.
+Accepted inference lineage now persists parsed, selected, and enriched facts in one transaction,
+and same-layer call parts use a bounded concurrency limit while preserving canonical merge order.
+The current window commit is no longer a post-hoc summary. For every ordinal, one deterministic
+`local-stream-window-inference-plan@1.0.0` binds the ordered `WINDOW`, `QA_COARSE`, `QA_DENSE`, and
+`EVENT_PROPOSAL` upstream receipts. That plan produces
+`local-stream-window-semantic-evidence@2.0.0`, exact stream inference and attempt identities, an
+intent, accepted call, terminal, and then the W1 work receipt. Plan, S2, inference lineage, W1,
+work terminal, membership, and incremental outbox are committed in one SQLite transaction. EOS
+finalization rejects any ordinal without that causal row and reduces the complete ordered closure
+into recording result V4.
+
+The catalog now contains 74 exact-pinned documents. Newly atomically registered contracts include
+the causal plan, semantic evidence V2, `stream-inference@1.0.0`,
+`stream-inference-attempt@1.0.0`, `local-stream-recording-result@3.0.0`, and
+`local-stream-recording-result@4.0.0`. V3 remains immutable and replayable. V4 was added rather than
+mutating V3 because a real epoch-nanosecond timeline origin can exceed the RFC 8785 safe JSON
+integer range; V4 carries that origin as a canonical decimal-string nanosecond value.
+
+The final event-driven causal/RR4 fresh profile over the complete 40.890455-second
+`sample-medium.mcap` finished in 118.750322 seconds, RTF 2.908158, with zero nonterminal backlog,
+16 deterministic fixture calls, and zero network calls. Required unique state was 197,748,696
+bytes for 130,303,923 source bytes, ratio 1.517596; total logical path bytes were 457,718,289.
+The provisional fresh-time RTF limit of 5.0 and required-state limit of 2.0 both pass. The exact
+fresh report SHA-256 is
+`cf16f31eb94d88f2ff659b3c7573bce4b98296e7f5dc0fda84a2da19b1c77e2a`, bound to manifest
+`ae156c4108409db6e605dc46c289f17ec87b102143690139a3300efd80a6cb32`.
+
+The immediately preceding diagnostic took 237.936801 seconds, RTF 5.826998. It exposed scheduler
+drain work on packet emissions with no pending W1. The optimized path loads declarations only when
+pending W1 exists and skips scheduler drain for empty-window packet emissions. On this source,
+`bounded_execution_scope` fell from 7,359 to 42 and observer spans fell from 27,195 to 5,242.
+
+Exact optimized replay completed in 16.245338 seconds, RTF 0.397843, with zero fixture or network
+calls, zero state-byte or file-count growth, zero backlog, outbox `DELIVERED`, and review
+`ALREADY_ENQUEUED`. It preserved the exact run, recording, command, completion, event, revision,
+and outbox identities from fresh execution. The replay report SHA-256 is
+`00d6b3314a28bbbc67a9e236fdfe482223c3cd5edc1cf0531e395ced37f14e87` and carries the same
+manifest.
+
+The earlier 30-minute generated-event-time runs remain useful history: the initial run took
+1,435.300 seconds and failed the local gate; the first optimized run took 723.051 seconds with
+capacity 2.489 and passed. The current causal/RR4 run completed in 832.395273 seconds. Capacity was
+2.162434 recording-seconds per wall-second; p50/p95/p99/max incremental latency was
+2.612297/3.907938/4.886956/8.009325 seconds. Six deterministic retryable failures were injected and
+recovered, all 1,800 windows and 9,001 work items completed, active backlog fell to zero before EOS
+and remained zero, and `wp6_actual_smoke_gate_met=true`. Its report SHA-256 is
+`018e94aeb3db7ce54ccf7b30236e8259eb4f0be58ab4cee5fb6605a08494e747`, run-manifest SHA-256 is
+`545d856735929a020d49bd6c6d79c1666887040698a9896ccdf965d8a0688e83`, and benchmark-manifest
+SHA-256 is `242a9700d33025b934e61d34f3b21a36a414bfb005076258a65e899b7d6ef839`. Provisional planning
+requires 18 six-camera groups for 500 recording-hours/day or three groups for 500 aggregate
+camera-video-hours/day, within the pinned 24- and four-group scenarios.
+
+The complete 21-item product QA vocabulary, evidence-safe four-field `ClipMark` projection,
+interval-union effective duration, and local retained disposition are implemented separately from
+the generic detector taxonomy. Cross-recording evidence is retained rather than forced into one
+recording interval. This layer has no production QA Schema and always states
+`production_eligible=false` and `delete_source=false`.
+
+All of these results remain dirty-working-tree `LOCAL_CONFORMANCE`, mock/fixture-provider,
+SQLite-`NORMAL` evidence. They are not a protected candidate baseline or production capacity/model
+qualification. Real model, governed policy/corpus, production broker/storage, representative
+burst/failover/long-soak, physical retention/deletion execution, and protected candidate Schema
+baseline/release approval remain external. The optimized real-MCAP fresh and exact-replay paths now
+pass their candidate-local structural gates without weakening the causal or authoritative
+boundaries.
 
 SQLAlchemy/Redis/provider adapters are not silently emulated as production infrastructure.
 Missing optional dependencies fail closed. No implementation may turn a local fake score,
@@ -225,7 +304,7 @@ The local output proof, output decision, and event-hypothesis payloads are exact
 contracts; their registered validator requires the schema quartet out of band so the already
 published completion-detail V4 nesting remains byte-for-byte unchanged. V1 payloads fail closed.
 The canonical run binding remains `canonical-offline-v5`;
-execution-policy semantic projection v3, fusion projector policy v2, local composition v18,
+execution-policy semantic projection v3, fusion projector policy v2, local composition v21,
 raw-MCAP source-binding policy v5, primary-completion command projection v2, and runtime-policy
 projection v8 prevent recovery under earlier incompatible policy namespaces.
 
