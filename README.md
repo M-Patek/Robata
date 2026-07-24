@@ -36,20 +36,20 @@ Robata implements a deterministic, replayable streaming architecture for process
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                    Window DAG Pipeline                      │
-│  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐    │
-│  │  Window │ → │ QA      │ → │ Event   │ → │ Reduc-  │    │
-│  │         │   │ Coarse  │   │ Proposal│   │ tion    │    │
-│  └─────────┘   └─────────┘   └─────────┘   └─────────┘    │
-│       ↓            ↓              ↓             ↓          │
-│  ┌─────────┐   ┌─────────┐                    ┌─────────┐ │
-│  │ QA      │   │ QA      │                    │ Final-  │ │
-│  │ Dense   │   │ Dense   │                    │ ization │ │
-│  └─────────┘   └─────────┘                    └─────────┘ │
+│  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐      │
+│  │  Window │ → │ QA      │ → │ Event   │ → │ Reduc-  │      │
+│  │         │   │ Coarse  │   │ Proposal│   │ tion    │      │
+│  └─────────┘   └─────────┘   └─────────┘   └─────────┘      │
+│       ↓            ↓              ↓             ↓           │
+│  ┌─────────┐   ┌─────────┐                    ┌─────────┐   │
+│  │ QA      │   │ QA      │                    │ Final-  │   │
+│  │ Dense   │   │ Dense   │                    │ ization │   │
+│  └─────────┘   └─────────┘                    └─────────┘   │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                  Evidence & Persistence                     │
-│  Stream Inference Evidence → Terminal Member → Recording   │
+│  Stream Inference Evidence → Terminal Member → Recording    │
 │  Result V4 + Outbox Relay + Review Queue                    │
 └─────────────────────────────────────────────────────────────┘
 ```
