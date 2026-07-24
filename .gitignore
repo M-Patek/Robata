@@ -1,3 +1,11 @@
+# Documentation and specs (local only, not in remote)
+docs/
+archive/
+ARCHITECTURE_DESIGN_V1.md
+IMPLEMENTATION_PLAN.md
+large_scale_6camera_video_agent_execution_spec.md
+REQUIREMENTS.md
+
 # Python
 __pycache__/
 *.py[cod]
