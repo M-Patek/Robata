@@ -29,29 +29,54 @@ Robata implements a deterministic, replayable streaming architecture for process
 ### Core Components
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Stream Ingestion                        │
-│  Single-pass MCAP → Segment Manifest → Window Declaration   │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    Window DAG Pipeline                      │
-│  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐      │
-│  │  Window │ → │ QA      │ → │ Event   │ → │ Reduc-  │      │
-│  │         │   │ Coarse  │   │ Proposal│   │ tion    │      │
-│  └─────────┘   └─────────┘   └─────────┘   └─────────┘      │
-│       ↓            ↓              ↓             ↓           │
-│  ┌─────────┐   ┌─────────┐                    ┌─────────┐   │
-│  │ QA      │   │ QA      │                    │ Final-  │   │
-│  │ Dense   │   │ Dense   │                    │ ization │   │
-│  └─────────┘   └─────────┘                    └─────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                  Evidence & Persistence                     │
-│  Stream Inference Evidence → Terminal Member → Recording    │
-│  Result V4 + Outbox Relay + Review Queue                    │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       Stream Ingestion                          │
+│    Single-pass MCAP → Segment Manifest → Window Declaration     │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      Window DAG Pipeline                        │
+│                                                                 │
+│   ┌─────────┐     ┌─────────┐     ┌─────────┐                  │
+│   │ Window  │────→│QA_COARSE│────→│QA_DENSE │────────┐         │
+│   └─────────┘     └─────────┘     └─────────┘        │         │
+│        │                              │              │         │
+│        │                              └────────┐     │         │
+│        │                                       ↓     ↓         │
+│        │                              ┌───────────────────┐    │
+│        │                              │   EVENT_PROPOSAL  │    │
+│        │                              └─────────┬─────────┘    │
+│        │                                        │              │
+│        └────────────────────────────────────────┘              │
+│                                                 ↓              │
+│                                      ┌───────────────────┐     │
+│                                      │ WINDOW_REDUCTION  │─────┼──→ Terminal
+│                                      └───────────────────┘     │     Member
+│                                                 │              │
+│   After EOS + Export Barrier Complete:          ↓              │
+│                                      ┌───────────────────┐     │
+│                                      │    FINALIZATION   │─────┼──→ Recording
+│                                      └───────────────────┘     │     V4
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Evidence & Persistence                       │
+│                                                                 │
+│   ┌──────────────────┐    ┌──────────────────┐                 │
+│   │  Work Scheduler  │    │ Inference Ledger │                 │
+│   │  (SQLite + DAG)  │    │ (Content-addressed)              │
+│   └──────────────────┘    └──────────────────┘                 │
+│            │                       │                            │
+│            └───────────┬───────────┘                            │
+│                        ↓                                        │
+│            ┌───────────────────────┐                            │
+│            │  Terminal Closure     │                            │
+│            │  (Deterministic ID)   │                            │
+│            └───────────────────────┘                            │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Decisions
@@ -59,10 +84,58 @@ Robata implements a deterministic, replayable streaming architecture for process
 | Aspect | Decision | Rationale |
 |--------|----------|-----------|
 | **Window Model** | Fixed 2s windows, 1s hop | Bounded latency, incremental output |
-| **DAG Topology** | 7-stage pipeline with backpressure | Flow control, resource limiting |
+| **DAG Topology** | 5+1 stage pipeline with explicit dependencies | Deterministic partial order, replay safety |
 | **State Recovery** | Checkpoint at window boundary | Resume from last terminal, no re-dispatch |
 | **Evidence Storage** | SQLite + content-addressed blobs | Local durability, exact replay |
 | **Schema Governance** | 74 pinned schemas, atomic registration | Wire compatibility, evolution safety |
+| **Lease Fencing** | Epoch + token per work item | Prevents split-brain in recovery |
+
+### Determinism and Replay
+
+The pipeline guarantees exact replay through the following mechanisms:
+
+**Content-Addressed Inputs**
+- Every window carries `window_semantic_sha256` computed from ordered six-camera segments
+- Work items include `input_semantic_sha256` covering window hash + upstream dependencies
+- Config SHA-256 pins the DAG topology and policy versions
+
+**Dependency Tracking**
+```
+QA_COARSE: depends on WINDOW
+QA_DENSE:  depends on QA_COARSE
+EVENT_PROPOSAL: depends on [QA_COARSE, QA_DENSE]
+WINDOW_REDUCTION: depends on [WINDOW, QA_COARSE, QA_DENSE, EVENT_PROPOSAL]
+FINALIZATION: depends on all WINDOW_REDUCTION terminals
+```
+
+**Terminal Evidence Acceptance**
+- Worker completes work → stores `pending_terminal_json` with lease fence
+- Execution scheduler commits SUCCEEDED state
+- Stream scheduler accepts terminal → binds `terminal_member_json`
+- Two-phase commit ensures exactly-once terminal semantics
+
+### Backpressure and Flow Control
+
+Admission control prevents unbounded queue growth:
+
+| Threshold | Trigger | Action |
+|-----------|---------|--------|
+| queue_depth > 256 | Too many windows in flight | Reject new window declarations |
+| oldest_age > 30s | Stalled work detected | Signal upstream throttle |
+| backlog_slope > 128 | Arrivals exceed throughput | Trigger admission denial |
+
+Backpressure propagates upstream: window declaration rejected → planner retains watermark → source ingestion pauses.
+
+### Causal Consistency (RR4)
+
+Window reduction produces causally consistent output through dependency ordering:
+
+1. **QA_COARSE** and **QA_DENSE** run independently once inputs ready
+2. **EVENT_PROPOSAL** waits for both QA stages (join semantics)
+3. **WINDOW_REDUCTION** aggregates all 4 upstream stages
+4. No window N+1 reduction begins before window N reduction completes (monotonic chain)
+
+This ensures `recording_v4` output maintains stream temporal order without cross-window anomalies.
 
 ### Execution Guarantees
 
@@ -213,6 +286,51 @@ python scripts/check_schema_immutability.py --baseline-ref $SCHEMA_BASELINE_REF
 - Published `(schema_id, version)` immutable
 - `compatibility_mode=NONE` (no retroactive chains)
 - 74 schemas registered, `upcasters=[]`
+
+**Schema Categories**
+
+| Category | Count | Purpose |
+|----------|-------|---------|
+| Stream contracts | 12 | Window declaration, work plans, terminal closure |
+| QA inference | 18 | Coarse, dense, supplemental evidence |
+| Event extraction | 22 | Candidate, proposal, boundary refinement |
+| Persistence | 15 | Recording V4, outbox, evidence chain |
+| Internal | 7 | Scheduler state, backpressure metrics |
+
+## Storage Architecture
+
+### SQLite Schema (Stream Work Ledger)
+
+```sql
+-- Expected window plan with EOS seal
+stream_work_plan(plan_key, plan_json, seal_json, terminal_closure_json, ...)
+
+-- Per-window declarations with chain SHA-256
+expected_window(plan_key, ordinal, declaration_json, window_json, terminal_member_json)
+
+-- Work items with publication state
+stream_work_item(work_item_id, plan_key, stage, expected_ordinal, 
+                 publication_state, terminal_evidence_json, pending_terminal_json)
+```
+
+### Content-Addressed Blobs
+
+Artifacts stored by SHA-256 digest:
+- Inference responses (QA results, event proposals)
+- Terminal evidence (JSON with schema refs)
+- Source segments (MCAP chunks)
+
+Lookup: `semantic_sha256 → filesystem path or object storage URI`
+
+### Recovery Procedure
+
+1. Load all `stream_work_plan` rows for run_id
+2. Verify contiguous window ordinals (0..N)
+3. Replay internal execution projections to work scheduler
+4. Reconcile pending terminals with execution state
+5. Resume from earliest non-terminal work item
+
+Recovery is idempotent: re-running on already-completed graph produces no changes.
 
 ---
 
