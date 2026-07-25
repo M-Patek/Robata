@@ -23,6 +23,7 @@ from robata.application.canonical.action_event_revision import (
 )
 from robata.application.canonical.primary_completion import (
     CommittedPrimaryCompletion,
+    PreparedPrimaryCompletionCommand,
     PrimaryCompletionCommand,
     PrimaryCompletionCommitResult,
     PrimaryCompletionError,
@@ -570,7 +571,45 @@ class SQLitePrimaryCompletionRepository:
             connection.close()
 
     def commit(self, command: PrimaryCompletionCommand) -> PrimaryCompletionCommitResult:
-        checked = self._validate_command(command)
+        """Strict public completion boundary for arbitrary command objects."""
+
+        with runtime_span(self._runtime_observer, "completion.commit.validate", {"mode": "strict"}):
+            checked = self._validate_command(command)
+        return self._commit_checked(checked)
+
+    def commit_prepared(
+        self,
+        prepared: PreparedPrimaryCompletionCommand,
+    ) -> PrimaryCompletionCommitResult:
+        """Commit bytes produced by the adjacent canonical composition.
+
+        This process-local capability deliberately bypasses only the redundant
+        full Pydantic/schema revalidation performed by :meth:`commit`; the same
+        aggregate transaction, identity fences, outbox writes, and recovery path
+        remain authoritative.
+        """
+
+        if not isinstance(prepared, PreparedPrimaryCompletionCommand):
+            raise TypeError("prepared must be PreparedPrimaryCompletionCommand")
+        if not prepared.is_canonical_preparation:
+            raise PrimaryCompletionError(
+                PrimaryCompletionErrorCode.INVALID_COMMAND,
+                "prepared completion command lacks canonical preparation provenance",
+            )
+        with runtime_span(
+            self._runtime_observer,
+            "completion.commit.validate",
+            {"mode": "prepared"},
+        ):
+            checked = prepared.command
+        return self._commit_checked(checked, prepared=prepared)
+
+    def _commit_checked(
+        self,
+        checked: PrimaryCompletionCommand,
+        *,
+        prepared: PreparedPrimaryCompletionCommand | None = None,
+    ) -> PrimaryCompletionCommitResult:
         connection = self._connect()
         commit_attempted = False
         try:
@@ -613,24 +652,50 @@ class SQLitePrimaryCompletionRepository:
                         "processing run is no longer the expected RUNNING binding",
                     )
 
-                identity_result = self._apply_identity_and_publications(connection, checked)
-                detail_bytes = canonical_json_bytes(checked.detail)
-                self._insert_or_verify_detail(connection, checked, detail_bytes)
+                with runtime_span(self._runtime_observer, "completion.commit.identity"):
+                    identity_result = self._apply_identity_and_publications(connection, checked)
+                detail_bytes = (
+                    prepared.detail_bytes
+                    if prepared is not None
+                    else canonical_json_bytes(checked.detail)
+                )
+                detail_exact_bytes_sha256 = (
+                    prepared.detail_exact_bytes_sha256
+                    if prepared is not None
+                    else exact_bytes_sha256(detail_bytes)
+                )
+                with runtime_span(self._runtime_observer, "completion.commit.detail"):
+                    self._insert_or_verify_detail(
+                        connection,
+                        checked,
+                        detail_bytes,
+                        payload_exact_bytes_sha256=detail_exact_bytes_sha256,
+                    )
                 self._after_staged_facts(connection, checked)
                 outbox = identity_result.outbox if identity_result is not None else ()
-                committed = CommittedPrimaryCompletion(
-                    schema_version="1.0",
-                    command_sha256=checked.command_sha256,
-                    processing_run=checked.detail.processing_run,
-                    completion=checked.completion,
-                    detail=checked.detail,
-                    identity_result=identity_result,
-                    action_event_publications=checked.detail.action_event_publications,
-                    outbox=outbox,
-                    evidence_references=checked.evidence_references,
-                )
-                command_bytes = canonical_json_bytes(checked)
-                committed_bytes = canonical_json_bytes(committed)
+                with runtime_span(self._runtime_observer, "completion.commit.serialize"):
+                    committed = CommittedPrimaryCompletion(
+                        schema_version="1.0",
+                        command_sha256=checked.command_sha256,
+                        processing_run=checked.detail.processing_run,
+                        completion=checked.completion,
+                        detail=checked.detail,
+                        identity_result=identity_result,
+                        action_event_publications=checked.detail.action_event_publications,
+                        outbox=outbox,
+                        evidence_references=checked.evidence_references,
+                    )
+                    command_bytes = (
+                        prepared.command_bytes
+                        if prepared is not None
+                        else canonical_json_bytes(checked)
+                    )
+                    command_exact_bytes_sha256 = (
+                        prepared.command_exact_bytes_sha256
+                        if prepared is not None
+                        else exact_bytes_sha256(command_bytes)
+                    )
+                    committed_bytes = canonical_json_bytes(committed)
                 connection.execute(
                     """
                     INSERT INTO primary_completions (
@@ -643,50 +708,62 @@ class SQLitePrimaryCompletionRepository:
                         checked.detail.run_id,
                         checked.command_sha256,
                         sqlite3.Binary(command_bytes),
-                        exact_bytes_sha256(command_bytes),
+                        command_exact_bytes_sha256,
                         sqlite3.Binary(committed_bytes),
                         exact_bytes_sha256(committed_bytes),
                         checked.completion.detailed_result.artifact_id,
                     ),
                 )
-                for ordinal, item in enumerate(outbox):
-                    self._insert_outbox(
-                        connection,
-                        checked.detail.run_id,
-                        ordinal,
-                        item,
-                    )
+                with runtime_span(self._runtime_observer, "completion.commit.outbox"):
+                    for ordinal, item in enumerate(outbox):
+                        self._insert_outbox(
+                            connection,
+                            checked.detail.run_id,
+                            ordinal,
+                            item,
+                        )
 
-                terminal_bytes = canonical_json_bytes(checked.detail.processing_run)
-                updated = connection.execute(
-                    """
-                    UPDATE primary_runs
-                    SET primary_status = ?, completed_at = ?, run_version = 1,
-                        command_sha256 = ?, run_json = ?, run_json_sha256 = ?
-                    WHERE run_id = ? AND primary_status = 'RUNNING'
-                        AND run_version = 0 AND command_sha256 IS NULL
-                    """,
-                    (
-                        checked.detail.status,
-                        checked.detail.processing_run.completed_at,
-                        checked.command_sha256,
-                        sqlite3.Binary(terminal_bytes),
-                        exact_bytes_sha256(terminal_bytes),
-                        checked.detail.run_id,
-                    ),
-                )
-                if updated.rowcount != 1:
-                    raise PrimaryCompletionError(
-                        PrimaryCompletionErrorCode.STALE_RUN,
-                        "processing run completion compare-and-swap did not match",
+                with runtime_span(self._runtime_observer, "completion.commit.run_close"):
+                    terminal_bytes = (
+                        prepared.processing_run_bytes
+                        if prepared is not None
+                        else canonical_json_bytes(checked.detail.processing_run)
                     )
+                    terminal_exact_bytes_sha256 = (
+                        prepared.processing_run_exact_bytes_sha256
+                        if prepared is not None
+                        else exact_bytes_sha256(terminal_bytes)
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE primary_runs
+                        SET primary_status = ?, completed_at = ?, run_version = 1,
+                            command_sha256 = ?, run_json = ?, run_json_sha256 = ?
+                        WHERE run_id = ? AND primary_status = 'RUNNING'
+                            AND run_version = 0 AND command_sha256 IS NULL
+                        """,
+                        (
+                            checked.detail.status,
+                            checked.detail.processing_run.completed_at,
+                            checked.command_sha256,
+                            sqlite3.Binary(terminal_bytes),
+                            terminal_exact_bytes_sha256,
+                            checked.detail.run_id,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise PrimaryCompletionError(
+                            PrimaryCompletionErrorCode.STALE_RUN,
+                            "processing run completion compare-and-swap did not match",
+                        )
 
                 commit_attempted = True
-                self._commit_observed(
-                    connection,
-                    attributes,
-                    use_commit_hook=True,
-                )
+                with runtime_span(self._runtime_observer, "completion.commit.authoritative"):
+                    self._commit_observed(
+                        connection,
+                        attributes,
+                        use_commit_hook=True,
+                    )
                 return PrimaryCompletionCommitResult(committed=committed, replayed=False)
         except PrimaryCompletionError:
             raise
@@ -1035,9 +1112,15 @@ class SQLitePrimaryCompletionRepository:
         connection: sqlite3.Connection,
         command: PrimaryCompletionCommand,
         payload: bytes,
+        *,
+        payload_exact_bytes_sha256: str | None = None,
     ) -> None:
         reference = command.completion.detailed_result
-        payload_digest = exact_bytes_sha256(payload)
+        payload_digest = (
+            exact_bytes_sha256(payload)
+            if payload_exact_bytes_sha256 is None
+            else payload_exact_bytes_sha256
+        )
         if payload_digest != reference.exact_bytes_sha256 or len(payload) != reference.byte_count:
             raise PrimaryCompletionError(
                 PrimaryCompletionErrorCode.INVALID_COMMAND,

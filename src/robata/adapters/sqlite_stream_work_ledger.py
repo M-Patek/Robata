@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
+from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkFenceError
 
 _EXTENSION_NAME = "stream-work-ledger"
 _EXTENSION_SCHEMA_VERSION = 1
@@ -75,6 +75,16 @@ _ADDITIVE_INDEX_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS stream_work_pending_terminal
     ON stream_work_plans(plan_key, work_item_id)
     WHERE pending_terminal_json IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS stream_work_pending_publication
+    ON stream_work_plans(plan_key, expected_ordinal, role_order, work_item_id)
+    WHERE publication_state = 'PENDING'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS stream_work_published_lookup
+    ON stream_work_plans(plan_key, work_item_id)
+    WHERE publication_state = 'PUBLISHED'
     """,
 )
 
@@ -550,6 +560,60 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="work_plans", operation=operation)
 
+    def pending_publication_work_rows(
+        self,
+        plan_key: str,
+    ) -> tuple[StoredStreamWorkPlan, ...]:
+        """Return only stream rows whose execution projection is not yet published.
+
+        This is a recovery boundary: normal append publishes the bounded batch directly,
+        while a restart can replay just the durable PENDING rows left by a crash.
+        """
+
+        def operation(connection: sqlite3.Connection) -> tuple[StoredStreamWorkPlan, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM stream_work_plans
+                WHERE plan_key = ? AND publication_state = 'PENDING'
+                ORDER BY COALESCE(expected_ordinal, 2147483647), role_order, work_item_id
+                """,
+                (plan_key,),
+            ).fetchall()
+            return tuple(_work_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="pending_publication_work_rows",
+            operation=operation,
+        )
+
+    def next_ready_work(self, plan_key: str) -> StoredStreamWorkPlan | None:
+        """Return the highest-priority published READY row for this graph only."""
+
+        def operation(connection: sqlite3.Connection) -> StoredStreamWorkPlan | None:
+            row = connection.execute(
+                """
+                SELECT stream.*
+                FROM stream_work_plans AS stream
+                JOIN work_items AS execution
+                  ON execution.work_item_id = stream.work_item_id
+                WHERE stream.plan_key = ?
+                  AND stream.publication_state = 'PUBLISHED'
+                  AND execution.state = 'READY'
+                ORDER BY
+                    execution.priority DESC,
+                    CASE WHEN execution.sla_deadline_at IS NULL THEN 1 ELSE 0 END,
+                    execution.sla_deadline_at,
+                    execution.created_at,
+                    execution.work_item_id
+                LIMIT 1
+                """,
+                (plan_key,),
+            ).fetchone()
+            return None if row is None else _work_from_row(row)
+
+        return self._run(write=False, operation_name="next_ready_work", operation=operation)
+
     def work_plans_for_ordinal(
         self,
         plan_key: str,
@@ -778,6 +842,8 @@ class SQLiteStreamWorkLedger:
         return self._run(write=False, operation_name="get_work_by_key", operation=operation)
 
     def mark_published(self, work_item_id: str) -> None:
+        """Publish one already-projected work row with legacy no-op semantics."""
+
         def operation(connection: sqlite3.Connection) -> None:
             connection.execute(
                 """
@@ -789,6 +855,50 @@ class SQLiteStreamWorkLedger:
 
         self._run(write=True, operation_name="mark_published", operation=operation)
 
+    def mark_published_many(self, work_item_ids: Sequence[str]) -> int:
+        """Atomically publish one bounded batch of projected PENDING rows.
+
+        The stream declaration remains durable before this transition. If a process
+        stops after projection but before this operation, startup recovery can replay
+        the same immutable work plans and retry this exact update safely.
+        """
+
+        if isinstance(work_item_ids, (str, bytes)) or not isinstance(work_item_ids, Sequence):
+            raise TypeError("work_item_ids must be a sequence")
+        checked_ids = tuple(work_item_ids)
+        if not checked_ids:
+            return 0
+        if any(not isinstance(value, str) or not value for value in checked_ids):
+            raise ValueError("work_item_ids must contain non-empty strings")
+        if len(set(checked_ids)) != len(checked_ids):
+            raise ValueError("work_item_ids must be unique")
+        placeholders = ", ".join("?" for _value in checked_ids)
+
+        def operation(connection: sqlite3.Connection) -> int:
+            rows = connection.execute(
+                f"""
+                SELECT work_item_id, publication_state
+                FROM stream_work_plans
+                WHERE work_item_id IN ({placeholders})
+                """,
+                checked_ids,
+            ).fetchall()
+            states = {_text(row, "work_item_id"): _text(row, "publication_state") for row in rows}
+            if set(states) != set(checked_ids):
+                raise SQLiteStreamWorkLedgerError("work publication row is absent")
+            if any(state not in {"PENDING", "PUBLISHED"} for state in states.values()):
+                raise SQLiteStreamWorkLedgerConflict("gated work cannot be published")
+            cursor = connection.execute(
+                f"""
+                UPDATE stream_work_plans SET publication_state = 'PUBLISHED'
+                WHERE work_item_id IN ({placeholders}) AND publication_state = 'PENDING'
+                """,
+                checked_ids,
+            )
+            return cursor.rowcount
+
+        return self._run(write=True, operation_name="mark_published_many", operation=operation)
+
     def store_pending_terminal(
         self,
         *,
@@ -796,8 +906,22 @@ class SQLiteStreamWorkLedger:
         payload: bytes,
         lease_epoch: int,
         fencing_token: str,
+        worker_id: str | None = None,
+        authority_now: str | None = None,
+        lease_expires_at: str | None = None,
     ) -> bool:
-        """Store one acceptance intent; return false if it was already accepted."""
+        """Store one acceptance intent; return false if it was already accepted.
+
+        When a current lease is supplied, the authority checks that fence in this same
+        transaction before recording a new intent. This retains the crash-visible intent
+        before execution terminal transition without adding a separate point-read
+        transaction on every normal completion. ``lease_expires_at`` optionally binds
+        the full capability returned by the scheduler; callers on the stream path pass
+        it so a forged expiry cannot create a pending intent.
+        """
+
+        if (worker_id is None) != (authority_now is None):
+            raise ValueError("worker_id and authority_now must be supplied together")
 
         def operation(connection: sqlite3.Connection) -> bool:
             row = connection.execute(
@@ -817,6 +941,31 @@ class SQLiteStreamWorkLedger:
                         "terminal replay changed accepted stream evidence"
                     )
                 return False
+            if worker_id is not None and authority_now is not None:
+                execution = connection.execute(
+                    """
+                    SELECT state, lease_epoch, fencing_token, leased_by, lease_expires_at
+                    FROM work_items WHERE work_item_id = ?
+                    """,
+                    (work_item_id,),
+                ).fetchone()
+                persisted_lease_expires_at = (
+                    None if execution is None else _optional_text(execution, "lease_expires_at")
+                )
+                if (
+                    execution is None
+                    or _text(execution, "state") not in {"LEASED", "RUNNING"}
+                    or _int(execution, "lease_epoch") != lease_epoch
+                    or _optional_text(execution, "fencing_token") != fencing_token
+                    or _optional_text(execution, "leased_by") != worker_id
+                    or persisted_lease_expires_at is None
+                    or (
+                        lease_expires_at is not None
+                        and persisted_lease_expires_at != lease_expires_at
+                    )
+                    or persisted_lease_expires_at <= authority_now
+                ):
+                    raise WorkFenceError("work lease is stale, expired, or inactive")
             pending = _optional_bytes(row, "pending_terminal_json")
             pending_epoch = cast(int | None, row["pending_lease_epoch"])
             pending_token = cast(str | None, row["pending_fencing_token"])

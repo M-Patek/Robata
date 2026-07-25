@@ -232,18 +232,40 @@ class LocalArtifactRegistry:
         logical_key: str,
         manifest_artifact_id: str,
         blob_sources: Mapping[str, ArtifactBlobSource],
+        trusted_artifact_ids: frozenset[str] = frozenset(),
+        verify_blobs: bool = True,
     ) -> PublishedArtifactDerivation:
-        """Put exact blobs, then publish all metadata in one SQLite transaction."""
+        """Put exact blobs, then publish all metadata in one SQLite transaction.
+
+        ``trusted_artifact_ids`` is deliberately narrow: callers may use it only for
+        files whose digest/size were verified earlier in this same private staging
+        transaction. It avoids re-reading a just-verified immutable source after it
+        has been hard-linked into the registry. Reuse and the default public path
+        remain fully content-verified.
+        """
 
         checked_key = self._validate_logical_key(logical_key)
         checked_snapshot = self._validate_snapshot(snapshot, manifest_artifact_id)
         checked_sources = self._validate_blob_sources(checked_snapshot, blob_sources)
+        checked_trusted_ids = self._validate_trusted_artifact_ids(
+            trusted_artifact_ids,
+            snapshot=checked_snapshot,
+        )
+        if not isinstance(verify_blobs, bool):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INVALID_REQUEST,
+                "verify_blobs must be a boolean",
+            )
         snapshot_bytes = canonical_json_bytes(checked_snapshot)
         snapshot_sha256 = exact_bytes_sha256(snapshot_bytes)
 
         self._assert_storage_layout()
         for entry in checked_snapshot.entries:
-            self._put_blob(entry, checked_sources[entry.artifact_id])
+            self._put_blob(
+                entry,
+                checked_sources[entry.artifact_id],
+                trusted_source=entry.artifact_id in checked_trusted_ids,
+            )
 
         reused = self._publish_transaction(
             snapshot=checked_snapshot,
@@ -252,7 +274,12 @@ class LocalArtifactRegistry:
             logical_key=checked_key,
             manifest_artifact_id=manifest_artifact_id,
         )
-        verified_snapshot = self.verify_derivation(checked_key)
+        # A competing publisher may have won this logical key; reused derivations
+        # always take the full integrity path even when the fresh hand-off was trusted.
+        verified_snapshot = self.verify_derivation(
+            checked_key,
+            verify_blobs=verify_blobs or reused,
+        )
         return PublishedArtifactDerivation(
             logical_key=checked_key,
             manifest_artifact_id=manifest_artifact_id,
@@ -464,9 +491,80 @@ class LocalArtifactRegistry:
         )
         return blob_path
 
-    def verify_derivation(self, logical_key: str) -> ArtifactRegistrySnapshot:
-        """Verify the snapshot anchor, normalized rows, typed DAG, and all blobs."""
+    def resolve_blob_unverified(self, artifact_id: str) -> Path:
+        """Resolve a just-published blob after metadata and file-shape checks only.
 
+        This is intentionally not part of the registry protocol. It is consumed only by
+        the same-process fresh-publication hand-off, after ``publish_derivation`` has
+        verified the exact source bytes and atomically linked the blob.
+        """
+
+        checked_id = self._validate_artifact_id(artifact_id)
+        self._assert_storage_layout()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT exact_sha256, byte_count
+                FROM artifacts
+                WHERE artifact_id = ?
+                """,
+                (checked_id,),
+            ).fetchone()
+            if row is None:
+                raise ArtifactRegistryError(
+                    ArtifactRegistryErrorCode.ARTIFACT_NOT_FOUND,
+                    f"artifact is not registered: {checked_id}",
+                )
+            digest = _row_text(row, "exact_sha256")
+            byte_count = _row_int(row, "byte_count")
+            if _SHA256_PATTERN.fullmatch(digest) is None or byte_count <= 0:
+                raise ArtifactRegistryError(
+                    ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                    f"artifact metadata is corrupt: {checked_id}",
+                )
+        except ArtifactRegistryError:
+            raise
+        except sqlite3.Error as error:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                f"cannot resolve artifact {checked_id}: {error}",
+            ) from error
+        finally:
+            connection.close()
+
+        blob_path = self._blob_path(digest)
+        try:
+            blob_stat = blob_path.lstat()
+        except OSError as error:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                f"cannot inspect content-addressed blob {blob_path}: {error}",
+            ) from error
+        if (
+            blob_path.is_symlink()
+            or not stat.S_ISREG(blob_stat.st_mode)
+            or blob_stat.st_size != byte_count
+        ):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                f"content-addressed blob has invalid shape: {blob_path}",
+            )
+        return blob_path
+
+    def verify_derivation(
+        self,
+        logical_key: str,
+        *,
+        verify_blobs: bool = True,
+    ) -> ArtifactRegistrySnapshot:
+        """Verify the snapshot anchor, normalized rows, typed DAG, and optional blobs."""
+
+        if not isinstance(verify_blobs, bool):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INVALID_REQUEST,
+                "verify_blobs must be a boolean",
+            )
         checked_key = self._validate_logical_key(logical_key)
         self._assert_storage_layout()
         connection = self._connect()
@@ -504,13 +602,14 @@ class LocalArtifactRegistry:
         finally:
             connection.close()
 
-        for entry in snapshot.entries:
-            self._verify_blob_file(
-                self._blob_path(entry.sha256),
-                expected_sha256=entry.sha256,
-                expected_bytes=entry.bytes,
-                error_code=ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-            )
+        if verify_blobs:
+            for entry in snapshot.entries:
+                self._verify_blob_file(
+                    self._blob_path(entry.sha256),
+                    expected_sha256=entry.sha256,
+                    expected_bytes=entry.bytes,
+                    error_code=ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                )
         return snapshot
 
     def _initialize_database(self) -> None:
@@ -879,6 +978,28 @@ class LocalArtifactRegistry:
                 + ", ".join(disconnected),
             )
 
+    def _validate_trusted_artifact_ids(
+        self,
+        trusted_artifact_ids: frozenset[str],
+        *,
+        snapshot: ArtifactRegistrySnapshot,
+    ) -> frozenset[str]:
+        if not isinstance(trusted_artifact_ids, frozenset) or any(
+            not isinstance(artifact_id, str) for artifact_id in trusted_artifact_ids
+        ):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INVALID_REQUEST,
+                "trusted_artifact_ids must be a frozen set of artifact ID strings",
+            )
+        expected_ids = {entry.artifact_id for entry in snapshot.entries}
+        unknown = sorted(trusted_artifact_ids - expected_ids)
+        if unknown:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INVALID_REQUEST,
+                "trusted artifact IDs are absent from the snapshot: " + ", ".join(unknown),
+            )
+        return trusted_artifact_ids
+
     def _validate_blob_sources(
         self,
         snapshot: ArtifactRegistrySnapshot,
@@ -923,7 +1044,13 @@ class LocalArtifactRegistry:
                 )
         return copied
 
-    def _put_blob(self, entry: ArtifactRegistryEntry, source: ArtifactBlobSource) -> None:
+    def _put_blob(
+        self,
+        entry: ArtifactRegistryEntry,
+        source: ArtifactBlobSource,
+        *,
+        trusted_source: bool = False,
+    ) -> None:
         destination = self._blob_path(entry.sha256)
         shard = destination.parent
         try:
@@ -933,6 +1060,12 @@ class LocalArtifactRegistry:
                     f"blob shard must not be a symlink: {shard}",
                 )
             shard.mkdir(parents=True, exist_ok=True)
+            if (
+                trusted_source
+                and isinstance(source, Path)
+                and self._put_trusted_hardlink(entry, source, destination, shard)
+            ):
+                return
             if (
                 isinstance(source, Path)
                 and entry.artifact_type in self._hardlink_artifact_types
@@ -998,6 +1131,49 @@ class LocalArtifactRegistry:
                 ArtifactRegistryErrorCode.STORAGE_IO_ERROR,
                 f"cannot store blob for artifact {entry.artifact_id}: {error}",
             ) from error
+
+    def _put_trusted_hardlink(
+        self,
+        entry: ArtifactRegistryEntry,
+        source: Path,
+        destination: Path,
+        shard: Path,
+    ) -> bool:
+        """Link bytes already verified by this private publication transaction."""
+
+        source_stat = source.lstat()
+        if source.is_symlink() or not stat.S_ISREG(source_stat.st_mode):
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.BLOB_SOURCE_INVALID,
+                f"blob source must be a regular non-symlink file: {source}",
+            )
+        if source_stat.st_size != entry.bytes:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.BLOB_SIZE_MISMATCH,
+                f"trusted artifact {entry.artifact_id} size changed before registration",
+            )
+        if destination.exists() or destination.is_symlink():
+            self._verify_blob_file(
+                destination,
+                expected_sha256=entry.sha256,
+                expected_bytes=entry.bytes,
+                error_code=ArtifactRegistryErrorCode.BLOB_CONFLICT,
+            )
+            return True
+        try:
+            os.link(source, destination)
+        except FileExistsError:
+            self._verify_blob_file(
+                destination,
+                expected_sha256=entry.sha256,
+                expected_bytes=entry.bytes,
+                error_code=ArtifactRegistryErrorCode.BLOB_CONFLICT,
+            )
+        except OSError:
+            return False
+        _fsync_file(destination)
+        _fsync_directory(shard)
+        return True
 
     def _put_verified_hardlink(
         self,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import cache
@@ -381,8 +382,11 @@ class SQLiteInferenceEvidenceLedger:
     One local composition root owns an instance as its single writer. Construction
     performs a complete audit and caches the typed graph; append operations validate
     candidates against that snapshot and publish copy-on-write cache updates only
-    after SQLite commits. Call `verify_integrity()` at every authoritative commit
-    boundary to audit and refresh the complete graph.
+    after SQLite commits. Call `verify_completion_seal()` at an authoritative
+    completion boundary to confirm that this incremental verification set is still
+    current. `verify_integrity()` remains the explicit full offline audit. The
+    instance owns one SQLite connection for its lifetime and serializes all access
+    to it with ``_state_lock``.
     """
 
     def __init__(
@@ -402,6 +406,13 @@ class SQLiteInferenceEvidenceLedger:
         self._state_lock = RLock()
         self._runtime_observer = runtime_observer
         self._schema_registry = schema_registry
+        # The connection is created during initialization and is intentionally kept
+        # for the lifetime of this composition root. ``check_same_thread=False`` is
+        # safe because every use is protected by ``_state_lock``.
+        self._connection: sqlite3.Connection | None = None
+        self._closed = False
+        self._cache_data_version: int | None = None
+        self._cache_validation_connection: sqlite3.Connection | None = None
         self._pins = {
             "intent": self._resolve_pin(INFERENCE_INTENT_SCHEMA_ID, _CONTRACT_VERSION),
             "terminal": self._resolve_pin(MODEL_INFERENCE_SCHEMA_ID, _CONTRACT_VERSION),
@@ -433,21 +444,88 @@ class SQLiteInferenceEvidenceLedger:
     def schema_registry(self) -> SchemaRegistry:
         return self._schema_registry
 
+    def __enter__(self) -> SQLiteInferenceEvidenceLedger:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        del exception_type, exception, traceback
+        self.close()
+
+    def close(self) -> None:
+        """Close the ledger's owned SQLite connection.
+
+        Closing is idempotent. No ordinary operation reconnects after this point;
+        callers must construct a fresh ledger to reopen durable state.
+        """
+
+        with self._state_lock:
+            connection = self._connection
+            if connection is None:
+                self._closed = True
+                return
+            self._connection = None
+            self._closed = True
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+                connection.close()
+            except sqlite3.Error as exc:
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "cannot close SQLite inference evidence ledger"
+                ) from exc
+
     def verify_integrity(self) -> None:
         """Audit and refresh the complete immutable evidence graph."""
 
-        def audit(connection: sqlite3.Connection) -> _LedgerCache:
-            self._verify_database(connection)
-            state = self._load_state(connection)
-            return self._cache_from_database(connection, state)
+        with self._state_lock:
+            for _ in range(2):
+                def audit(connection: sqlite3.Connection) -> tuple[_LedgerCache, int]:
+                    self._verify_database(connection)
+                    state = self._load_state(connection)
+                    return self._cache_from_database(connection, state), _pragma_int(
+                        connection, "data_version"
+                    )
+
+                refreshed, snapshot_data_version = self._transaction(
+                    write=False,
+                    operation_name="verify_integrity",
+                    operation=audit,
+                )
+                current_data_version = _pragma_int(
+                    self._owned_connection_locked(), "data_version"
+                )
+                if current_data_version == snapshot_data_version:
+                    self._cache = refreshed
+                    self._cache_data_version = snapshot_data_version
+                    return
+        raise SQLiteInferenceEvidenceLedgerError(
+            "inference evidence database changed while verifying integrity"
+        )
+
+    def verify_completion_seal(self) -> None:
+        """Fail closed unless this run's incrementally validated cache is current.
+
+        Every append is validated against the owned typed cache before its SQLite
+        transaction commits. A matching SQLite ``data_version`` therefore proves
+        that no other connection has committed an unverified change since that
+        cache was built. This intentionally does *not* rescan the ledger: callers
+        needing a full persisted-state audit must use :meth:`verify_integrity`.
+
+        The seal is process-local verification state, never persisted or exposed as
+        a wire contract.
+        """
 
         with self._state_lock:
-            refreshed = self._transaction(
-                write=False,
-                operation_name="verify_integrity",
-                operation=audit,
-            )
-            self._cache = refreshed
+            if not self._cache_is_current_locked():
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "incremental completion evidence seal is stale; "
+                    "full integrity verification is required before completion"
+                )
 
     def _cache_from_database(
         self,
@@ -739,6 +817,8 @@ class SQLiteInferenceEvidenceLedger:
         payload = cache.payloads.get((contract, key))
         if payload is None:
             raise _CachedDependencyMissing(f"cached {description} payload is unavailable: {key}")
+        if self._cache_validation_connection is connection:
+            return
         row = connection.execute(
             f"SELECT * FROM {table} WHERE {key_column} = ?",
             (key,),
@@ -779,6 +859,8 @@ class SQLiteInferenceEvidenceLedger:
         intent = cache.intents_by_request.get(raw.request_id)
         if intent is None:
             raise _CachedDependencyMissing("raw provider bytes require a cached inference intent")
+        if self._cache_validation_connection is connection:
+            return
         row = connection.execute(
             "SELECT * FROM raw_provider_responses WHERE artifact_id = ?",
             (raw.artifact_id,),
@@ -892,16 +974,98 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def _reload_cache_locked(self) -> None:
-        def reload_cache(connection: sqlite3.Connection) -> _LedgerCache:
-            self._verify_database(connection)
-            state = self._load_state(connection)
-            return self._cache_from_database(connection, state)
+        """Refresh the typed cache from one stable SQLite read snapshot."""
 
-        self._cache = self._transaction(
-            write=False,
-            operation_name="reload_cache",
-            operation=reload_cache,
+        for _ in range(2):
+            def reload_cache(connection: sqlite3.Connection) -> tuple[_LedgerCache, int]:
+                self._verify_database(connection)
+                state = self._load_state(connection)
+                return self._cache_from_database(connection, state), _pragma_int(
+                    connection, "data_version"
+                )
+
+            refreshed, snapshot_data_version = self._transaction(
+                write=False,
+                operation_name="reload_cache",
+                operation=reload_cache,
+            )
+            current_data_version = _pragma_int(
+                self._owned_connection_locked(), "data_version"
+            )
+            if current_data_version == snapshot_data_version:
+                self._cache = refreshed
+                self._cache_data_version = snapshot_data_version
+                return
+        raise SQLiteInferenceEvidenceLedgerError(
+            "inference evidence database changed while refreshing the local cache"
         )
+
+    def _cache_data_version_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+    ) -> int:
+        if cache is not self._cache or self._cache_data_version is None:
+            raise _CachedDependencyMissing("inference evidence cache is unavailable")
+        data_version = _pragma_int(connection, "data_version")
+        if data_version != self._cache_data_version:
+            raise _CachedDependencyMissing("inference evidence cache is stale")
+        return data_version
+
+    @contextmanager
+    def _validated_cache_scope(self, connection: sqlite3.Connection) -> Iterator[None]:
+        if self._cache_validation_connection is not None:
+            raise AssertionError("inference evidence cache validation scope is already active")
+        self._cache_validation_connection = connection
+        try:
+            yield
+        finally:
+            self._cache_validation_connection = None
+
+    def _cache_is_current_locked(self) -> bool:
+        expected_data_version = self._cache_data_version
+        return (
+            expected_data_version is not None
+            and _pragma_int(self._owned_connection_locked(), "data_version")
+            == expected_data_version
+        )
+
+    def _cached_read(
+        self,
+        *,
+        operation_name: str,
+        cached: Callable[[_LedgerCache], _ResultT],
+        database: Callable[[sqlite3.Connection], _ResultT],
+    ) -> _ResultT:
+        """Return the typed cache only while SQLite reports no external commit.
+
+        A changed ``data_version`` deliberately falls back to the prior targeted
+        database reader instead of refreshing the entire cache. This preserves
+        targeted tamper detection: an unrelated bad row does not mask validation
+        of the row the caller requested.
+        """
+
+        with self._state_lock:
+            if self._cache_is_current_locked():
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.inference_evidence.cache_reads",
+                    attributes={"operation": operation_name},
+                )
+                # Contract models are frozen only at their top level; nested
+                # mappings/lists can still be mutated by a caller. Never leak an
+                # object owned by the in-memory cache.
+                return deepcopy(cached(self._cache))
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.inference_evidence.cache_read_misses",
+                attributes={"operation": operation_name},
+            )
+            return self._transaction(
+                write=False,
+                operation_name=operation_name,
+                operation=database,
+            )
 
     def _cached_write(
         self,
@@ -920,10 +1084,15 @@ class SQLiteInferenceEvidenceLedger:
                     def execute_with_cache(
                         connection: sqlite3.Connection,
                         cached: _LedgerCache = cache,
-                    ) -> tuple[_ResultT, _LedgerCache]:
-                        return operation(connection, cached)
+                    ) -> tuple[_ResultT, _LedgerCache, int]:
+                        cache_data_version = self._cache_data_version_in_transaction(
+                            connection, cached
+                        )
+                        with self._validated_cache_scope(connection):
+                            result, committed_cache = operation(connection, cached)
+                        return result, committed_cache, cache_data_version
 
-                    result, committed_cache = self._transaction(
+                    result, committed_cache, snapshot_data_version = self._transaction(
                         write=True,
                         operation_name=operation_name,
                         operation=execute_with_cache,
@@ -938,7 +1107,14 @@ class SQLiteInferenceEvidenceLedger:
                         raise
                     self._reload_cache_locked()
                     continue
-                self._cache = committed_cache
+                current_data_version = _pragma_int(
+                    self._owned_connection_locked(), "data_version"
+                )
+                if current_data_version != snapshot_data_version:
+                    self._reload_cache_locked()
+                else:
+                    self._cache = committed_cache
+                    self._cache_data_version = snapshot_data_version
                 return result
         raise AssertionError("cached write retry loop did not return")
 
@@ -1008,10 +1184,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_intent(self, inference_id: str) -> InferenceIntent | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_intent",
-            operation=lambda connection: self._intent_by_inference_id(connection, inference_id),
+            cached=lambda cache: cache.state.intents.get(inference_id),
+            database=lambda connection: self._intent_by_inference_id(connection, inference_id),
         )
 
     def append(
@@ -1122,10 +1298,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get(self, artifact_id: str) -> StoredRawProviderBytes:
-        record = self._transaction(
-            write=False,
+        record = self._cached_read(
             operation_name="get_raw_provider_response",
-            operation=lambda connection: self._raw_by_artifact_id(connection, artifact_id),
+            cached=lambda cache: cache.state.raw.get(artifact_id),
+            database=lambda connection: self._raw_by_artifact_id(connection, artifact_id),
         )
         if record is None:
             raise RawProviderBytesNotFoundError(artifact_id)
@@ -1140,10 +1316,13 @@ class SQLiteInferenceEvidenceLedger:
                 ).fetchall()
             )
 
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="list_raw_provider_responses",
-            operation=load,
+            cached=lambda cache: tuple(
+                cache.state.raw[artifact_id]
+                for artifact_id in sorted(cache.state.raw)
+            ),
+            database=load,
         )
 
     def _append_cached_terminal(
@@ -1266,10 +1445,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_terminal(self, inference_id: str) -> ModelInference | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_terminal",
-            operation=lambda connection: self._terminal_by_inference_id(connection, inference_id),
+            cached=lambda cache: cache.state.terminals.get(inference_id),
+            database=lambda connection: self._terminal_by_inference_id(connection, inference_id),
         )
 
     def _append_cached_selection(
@@ -1382,6 +1561,25 @@ class SQLiteInferenceEvidenceLedger:
                 checked_terminal,
                 terminal_payload,
             )
+            if checked_selection.inference_id != stored_terminal.inference_id:
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "selection does not reference the candidate terminal attempt"
+                )
+            self._validate_selection(checked_selection, stored_terminal)
+            existing_selection = cache.state.selections.get(
+                (checked_selection.logical_invocation_id, checked_selection.policy_version)
+            )
+            if existing_selection is not None and existing_selection != checked_selection:
+                # A competing successful attempt must still retain its durable
+                # terminal evidence. The first valid selection is immutable, so
+                # return it instead of rolling the new terminal back on conflict.
+                self._assert_cached_model_row(
+                    connection,
+                    cache,
+                    "selection",
+                    existing_selection.selection_id,
+                )
+                return (stored_terminal, existing_selection), cache
             stored_selection, cache = self._append_cached_selection(
                 connection,
                 cache,
@@ -1398,10 +1596,12 @@ class SQLiteInferenceEvidenceLedger:
     def get_selection(
         self, logical_invocation_id: str, policy_version: str
     ) -> InferenceAttemptSelection | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_selection",
-            operation=lambda connection: self._selection_by_logical_key(
+            cached=lambda cache: cache.state.selections.get(
+                (logical_invocation_id, policy_version)
+            ),
+            database=lambda connection: self._selection_by_logical_key(
                 connection, logical_invocation_id, policy_version
             ),
         )
@@ -1441,10 +1641,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_raw_artifact(self, artifact_id: str) -> RawProviderResponseArtifact | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_raw_artifact",
-            operation=lambda connection: self._raw_artifact_by_id(connection, artifact_id),
+            cached=lambda cache: cache.state.raw_artifacts.get(artifact_id),
+            database=lambda connection: self._raw_artifact_by_id(connection, artifact_id),
         )
 
     def _append_cached_parsed_claim(
@@ -1546,10 +1746,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_parsed_claim(self, artifact_id: str) -> ParsedProviderClaimArtifact | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_parsed_claim",
-            operation=lambda connection: self._parsed_by_artifact_id(connection, artifact_id),
+            cached=lambda cache: cache.state.parsed.get(artifact_id),
+            database=lambda connection: self._parsed_by_artifact_id(connection, artifact_id),
         )
 
     def _append_cached_selected_output(
@@ -1645,10 +1845,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_selected_output(self, selection_id: str) -> SelectedAttemptOutput | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_selected_output",
-            operation=lambda connection: self._selected_by_selection_id(connection, selection_id),
+            cached=lambda cache: cache.state.selected.get(selection_id),
+            database=lambda connection: self._selected_by_selection_id(connection, selection_id),
         )
 
     def _append_cached_enriched_output(
@@ -1801,10 +2001,10 @@ class SQLiteInferenceEvidenceLedger:
         )
 
     def get_enriched_output(self, artifact_id: str) -> OrchestratorEnrichedOutput | None:
-        return self._transaction(
-            write=False,
+        return self._cached_read(
             operation_name="get_enriched_output",
-            operation=lambda connection: self._enriched_by_artifact_id(connection, artifact_id),
+            cached=lambda cache: cache.state.enriched.get(artifact_id),
+            database=lambda connection: self._enriched_by_artifact_id(connection, artifact_id),
         )
 
     def _resolve_pin(self, schema_id: str, version: str) -> SchemaRef:
@@ -1991,7 +2191,13 @@ class SQLiteInferenceEvidenceLedger:
                     raise SQLiteInferenceEvidenceLedgerError(
                         "inference evidence database has an unexpected application identity"
                     )
-            _enable_wal_mode(connection)
+            journal = connection.execute("PRAGMA journal_mode").fetchone()
+            if journal is None or not isinstance(journal[0], str):
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "inference evidence database did not report a journal mode"
+                )
+            if journal[0].lower() != "wal":
+                _enable_wal_mode(connection)
 
             with self._observed_transaction_scope(
                 connection,
@@ -2026,6 +2232,9 @@ class SQLiteInferenceEvidenceLedger:
             if initialized_cache is None:
                 raise AssertionError("database initialization did not build a typed cache")
             self._cache = initialized_cache
+            self._cache_data_version = _pragma_int(connection, "data_version")
+            self._connection = connection
+            connection = None
         except SQLiteInferenceEvidenceLedgerError:
             if connection is not None:
                 _rollback_quietly(connection)
@@ -2063,6 +2272,7 @@ class SQLiteInferenceEvidenceLedger:
                 self._database_path,
                 timeout=_BUSY_TIMEOUT_MS / 1000,
                 isolation_level=None,
+                check_same_thread=False,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
@@ -2087,6 +2297,18 @@ class SQLiteInferenceEvidenceLedger:
                 f"cannot open SQLite inference evidence ledger: {exc}"
             ) from exc
 
+    def _owned_connection_locked(self) -> sqlite3.Connection:
+        connection = self._connection
+        if self._closed or connection is None:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "SQLite inference evidence ledger is closed"
+            )
+        if self._database_path.is_symlink():
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"inference evidence database became a symlink: {self._database_path}"
+            )
+        return connection
+
     def _transaction(
         self,
         *,
@@ -2094,11 +2316,12 @@ class SQLiteInferenceEvidenceLedger:
         operation_name: str,
         operation: Callable[[sqlite3.Connection], _ResultT],
     ) -> _ResultT:
-        return self._transaction_unobserved(
-            write=write,
-            operation_name=operation_name,
-            operation=operation,
-        )
+        with self._state_lock:
+            return self._transaction_unobserved(
+                write=write,
+                operation_name=operation_name,
+                operation=operation,
+            )
 
     def _transaction_unobserved(
         self,
@@ -2107,7 +2330,7 @@ class SQLiteInferenceEvidenceLedger:
         operation_name: str,
         operation: Callable[[sqlite3.Connection], _ResultT],
     ) -> _ResultT:
-        connection = self._connect()
+        connection = self._owned_connection_locked()
         attributes: dict[str, RuntimeAttributeValue] = {
             "operation": operation_name,
             "write": write,
@@ -2136,8 +2359,6 @@ class SQLiteInferenceEvidenceLedger:
             raise SQLiteInferenceEvidenceLedgerError(
                 f"inference evidence transaction failed: {exc}"
             ) from exc
-        finally:
-            connection.close()
 
     @contextmanager
     def _observed_transaction_scope(

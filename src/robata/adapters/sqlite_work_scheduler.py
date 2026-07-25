@@ -144,6 +144,29 @@ _INDEX_STATEMENTS = (
     ON work_items(run_id, state, work_item_id)
     """,
     """
+    CREATE INDEX IF NOT EXISTS work_items_run_dispatch_order
+    ON work_items(
+        run_id,
+        state,
+        priority DESC,
+        CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
+        sla_deadline_at,
+        created_at,
+        work_item_id
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS work_items_dispatch_order
+    ON work_items(
+        state,
+        priority DESC,
+        CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
+        sla_deadline_at,
+        created_at,
+        work_item_id
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS work_dependencies_downstream
     ON work_dependencies(downstream_work_item_id, upstream_work_item_id)
     """,
@@ -230,111 +253,186 @@ class SQLiteWorkScheduler:
         checked_dependencies = tuple(
             _require_model(value, WorkDependency, "dependency") for value in dependencies
         )
-        for dependency in checked_dependencies:
-            if dependency.downstream_work_item_id != checked_plan.work_item_id:
-                raise WorkConflictError("dependency downstream id does not match the plan")
-        if len({value.dependency_id for value in checked_dependencies}) != len(
-            checked_dependencies
-        ):
-            raise WorkConflictError("dependency ids must be unique")
-        if len({value.upstream_work_item_id for value in checked_dependencies}) != len(
-            checked_dependencies
-        ):
-            raise WorkConflictError("upstream dependencies must be unique")
+        self._validate_plan_dependencies(checked_plan, checked_dependencies)
 
-        def operation(connection: sqlite3.Connection) -> WorkItem:
-            rows = connection.execute(
-                """
-                SELECT * FROM work_items
-                WHERE work_item_id = ? OR work_logical_key = ?
-                ORDER BY work_item_id
-                """,
-                (checked_plan.work_item_id, checked_plan.work_logical_key),
-            ).fetchall()
-            expected_dependencies = tuple(
-                sorted(checked_dependencies, key=lambda value: value.dependency_id)
-            )
-            if rows:
-                if len(rows) != 1:
-                    raise WorkConflictError("work id and logical key identify different rows")
-                existing = self._item_from_row(rows[0])
-                if (
-                    existing.work_item_id != checked_plan.work_item_id
-                    or existing.work_logical_key != checked_plan.work_logical_key
-                    or not _plan_matches(existing, checked_plan)
-                    or self._dependencies(connection, existing.work_item_id)
-                    != expected_dependencies
-                ):
-                    raise WorkConflictError("work-plan replay conflicts with persisted policy")
-                return existing
+        return self._transaction(
+            write=True,
+            operation_name="plan",
+            operation=lambda connection: self._plan_in_transaction(
+                connection,
+                checked_plan,
+                checked_dependencies,
+                refresh_readiness=True,
+            ),
+        )
 
-            for dependency in checked_dependencies:
-                upstream = connection.execute(
-                    "SELECT run_id FROM work_items WHERE work_item_id = ?",
-                    (dependency.upstream_work_item_id,),
-                ).fetchone()
-                if upstream is None:
-                    raise WorkConflictError("every upstream dependency must already be planned")
-                if _row_text(upstream, "run_id") != checked_plan.run_id:
-                    raise WorkConflictError("dependencies cannot cross processing runs")
+    def plan_many(
+        self,
+        plans: Sequence[tuple[WorkItemPlan, Sequence[WorkDependency]]],
+    ) -> tuple[WorkItem, ...]:
+        """Persist one topologically ordered work batch in one authority transaction.
 
-            created_at = _normalize_timestamp(checked_plan.created_at)
-            connection.execute(
-                """
-                INSERT INTO work_items (
-                    schema_version, work_item_id, work_logical_key, run_id, mcap_id,
-                    stage, subject_type, subject_id, input_digest, config_digest,
-                    priority, sla_deadline_at, execution_expiry_at, max_attempts,
-                    trace_id, created_at, state, cancel_requested, lease_epoch,
-                    fencing_token, leased_by, lease_expires_at, attempt,
-                    retry_not_before_at, terminal_reason_code, terminal_reason_detail,
-                    result_reference, result_sha256, completed_at, updated_at, row_version
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL,
-                    NULL, NULL, NULL, ?, 0
-                )
-                """,
-                (
-                    checked_plan.schema_version,
-                    checked_plan.work_item_id,
-                    checked_plan.work_logical_key,
-                    checked_plan.run_id,
-                    checked_plan.mcap_id,
-                    checked_plan.stage.value,
-                    checked_plan.subject_type.value,
-                    checked_plan.subject_id,
-                    checked_plan.input_digest,
-                    checked_plan.config_digest,
-                    checked_plan.priority,
-                    _normalize_optional_timestamp(checked_plan.sla_deadline_at),
-                    _normalize_optional_timestamp(checked_plan.execution_expiry_at),
-                    checked_plan.max_attempts,
-                    checked_plan.trace_id,
-                    created_at,
-                    WorkItemState.PLANNED.value,
-                    created_at,
+        The operation retains the exact-replay checks of :meth:`plan`. A caller can
+        retry a partially published stream batch after a crash without turning a
+        duplicate delivery into another execution item. Dependencies may refer to
+        an earlier member of ``plans`` or an item already in the authority ledger.
+        """
+
+        if isinstance(plans, (str, bytes)) or not isinstance(plans, Sequence):
+            raise TypeError("plans must be a sequence of plan/dependency pairs")
+        checked: tuple[tuple[WorkItemPlan, tuple[WorkDependency, ...]], ...] = tuple(
+            (
+                _require_model(plan, WorkItemPlan, "plan"),
+                tuple(
+                    _require_model(value, WorkDependency, "dependency")
+                    for value in dependencies
                 ),
             )
-            for dependency in checked_dependencies:
-                connection.execute(
-                    """
-                    INSERT INTO work_dependencies (
-                        dependency_id, downstream_work_item_id,
-                        upstream_work_item_id, criticality
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        dependency.dependency_id,
-                        dependency.downstream_work_item_id,
-                        dependency.upstream_work_item_id,
-                        dependency.criticality.value,
-                    ),
-                )
-            self._refresh_planned(connection, _parse_timestamp(created_at))
-            return self._load_item(connection, checked_plan.work_item_id)
+            for plan, dependencies in plans
+        )
+        if not checked:
+            return ()
+        for checked_plan, checked_dependencies in checked:
+            self._validate_plan_dependencies(checked_plan, checked_dependencies)
 
-        return self._transaction(write=True, operation_name="plan", operation=operation)
+        def operation(connection: sqlite3.Connection) -> tuple[WorkItem, ...]:
+            for checked_plan, checked_dependencies in checked:
+                self._plan_in_transaction(
+                    connection,
+                    checked_plan,
+                    checked_dependencies,
+                    refresh_readiness=False,
+                )
+            # Readiness is an execution projection, not an independent durable fact.
+            # Derive it only for this bounded batch instead of scanning every pending
+            # item already owned by older windows.
+            self._refresh_planned_for_work_ids(
+                connection,
+                max(_parse_timestamp(plan.created_at) for plan, _dependencies in checked),
+                tuple(plan.work_item_id for plan, _dependencies in checked),
+            )
+            return tuple(
+                self._load_item(connection, checked_plan.work_item_id)
+                for checked_plan, _dependencies in checked
+            )
+
+        return self._transaction(write=True, operation_name="plan_many", operation=operation)
+
+    def _validate_plan_dependencies(
+        self,
+        plan: WorkItemPlan,
+        dependencies: Sequence[WorkDependency],
+    ) -> None:
+        for dependency in dependencies:
+            if dependency.downstream_work_item_id != plan.work_item_id:
+                raise WorkConflictError("dependency downstream id does not match the plan")
+        if len({value.dependency_id for value in dependencies}) != len(dependencies):
+            raise WorkConflictError("dependency ids must be unique")
+        if len({value.upstream_work_item_id for value in dependencies}) != len(dependencies):
+            raise WorkConflictError("upstream dependencies must be unique")
+
+    def _plan_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        plan: WorkItemPlan,
+        dependencies: Sequence[WorkDependency],
+        *,
+        refresh_readiness: bool,
+    ) -> WorkItem:
+        """Apply one validated immutable plan inside an authority transaction."""
+
+        rows = connection.execute(
+            """
+            SELECT * FROM work_items
+            WHERE work_item_id = ? OR work_logical_key = ?
+            ORDER BY work_item_id
+            """,
+            (plan.work_item_id, plan.work_logical_key),
+        ).fetchall()
+        expected_dependencies = tuple(sorted(dependencies, key=lambda value: value.dependency_id))
+        if rows:
+            if len(rows) != 1:
+                raise WorkConflictError("work id and logical key identify different rows")
+            existing = self._item_from_row(rows[0])
+            if (
+                existing.work_item_id != plan.work_item_id
+                or existing.work_logical_key != plan.work_logical_key
+                or not _plan_matches(existing, plan)
+                or self._dependencies(connection, existing.work_item_id) != expected_dependencies
+            ):
+                raise WorkConflictError("work-plan replay conflicts with persisted policy")
+            return existing
+
+        for dependency in dependencies:
+            upstream = connection.execute(
+                "SELECT run_id FROM work_items WHERE work_item_id = ?",
+                (dependency.upstream_work_item_id,),
+            ).fetchone()
+            if upstream is None:
+                raise WorkConflictError("every upstream dependency must already be planned")
+            if _row_text(upstream, "run_id") != plan.run_id:
+                raise WorkConflictError("dependencies cannot cross processing runs")
+
+        created_at = _normalize_timestamp(plan.created_at)
+        connection.execute(
+            """
+            INSERT INTO work_items (
+                schema_version, work_item_id, work_logical_key, run_id, mcap_id,
+                stage, subject_type, subject_id, input_digest, config_digest,
+                priority, sla_deadline_at, execution_expiry_at, max_attempts,
+                trace_id, created_at, state, cancel_requested, lease_epoch,
+                fencing_token, leased_by, lease_expires_at, attempt,
+                retry_not_before_at, terminal_reason_code, terminal_reason_detail,
+                result_reference, result_sha256, completed_at, updated_at, row_version
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL,
+                NULL, NULL, NULL, ?, 0
+            )
+            """,
+            (
+                plan.schema_version,
+                plan.work_item_id,
+                plan.work_logical_key,
+                plan.run_id,
+                plan.mcap_id,
+                plan.stage.value,
+                plan.subject_type.value,
+                plan.subject_id,
+                plan.input_digest,
+                plan.config_digest,
+                plan.priority,
+                _normalize_optional_timestamp(plan.sla_deadline_at),
+                _normalize_optional_timestamp(plan.execution_expiry_at),
+                plan.max_attempts,
+                plan.trace_id,
+                created_at,
+                WorkItemState.PLANNED.value,
+                created_at,
+            ),
+        )
+        for dependency in dependencies:
+            connection.execute(
+                """
+                INSERT INTO work_dependencies (
+                    dependency_id, downstream_work_item_id,
+                    upstream_work_item_id, criticality
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    dependency.dependency_id,
+                    dependency.downstream_work_item_id,
+                    dependency.upstream_work_item_id,
+                    dependency.criticality.value,
+                ),
+            )
+        if refresh_readiness:
+            self._refresh_planned_for_work_ids(
+                connection,
+                _parse_timestamp(created_at),
+                (plan.work_item_id,),
+            )
+        return self._load_item(connection, plan.work_item_id)
 
     def get(self, work_item_id: str) -> WorkItem:
         """Read one snapshot without implicitly advancing wall-clock time."""
@@ -360,6 +458,41 @@ class SQLiteWorkScheduler:
         return self._transaction(
             write=False,
             operation_name="items_for_run",
+            operation=operation,
+        )
+
+    def ready_for_run(self, run_id: str, *, limit: int) -> tuple[WorkItem, ...]:
+        """Return a bounded priority-ordered READY slice for one run.
+
+        Queue recovery uses this scoped projection instead of loading every
+        durable row in a long recording merely to refill a finite ingress
+        buffer.  The matching additive index also preserves the scheduler's
+        normal dispatch order.
+        """
+
+        checked_run_id = _nonempty(run_id, "run_id")
+        checked_limit = _positive_int(limit, "limit")
+
+        def operation(connection: sqlite3.Connection) -> tuple[WorkItem, ...]:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_items
+                WHERE run_id = ? AND state = ?
+                ORDER BY
+                    priority DESC,
+                    CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
+                    sla_deadline_at,
+                    created_at,
+                    work_item_id
+                LIMIT ?
+                """,
+                (checked_run_id, WorkItemState.READY.value, checked_limit),
+            ).fetchall()
+            return tuple(self._item_from_row(row) for row in rows)
+
+        return self._transaction(
+            write=False,
+            operation_name="ready_for_run",
             operation=operation,
         )
 
@@ -395,7 +528,11 @@ class SQLiteWorkScheduler:
         return self._transaction(
             write=True,
             operation_name="reconcile",
-            operation=lambda connection: self._maintain(connection, checked_now),
+            operation=lambda connection: self._maintain(
+                connection,
+                checked_now,
+                refresh_all_planned=True,
+            ),
         )
 
     def claim(
@@ -408,6 +545,49 @@ class SQLiteWorkScheduler:
     ) -> WorkLeaseClaim | None:
         """Atomically claim the highest-priority READY item or one exact item."""
 
+        return self._claim(
+            worker_id,
+            lease_duration_seconds,
+            work_item_id=work_item_id,
+            now=now,
+            start_immediately=False,
+            operation_name="claim",
+        )
+
+    def claim_and_start(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int,
+        *,
+        work_item_id: str | None = None,
+        now: datetime | None = None,
+    ) -> WorkLeaseClaim | None:
+        """Claim and start one READY item in one fenced authority transaction.
+
+        This is appropriate for a same-process executor that begins work immediately.
+        Distributed workers can retain the separate :meth:`claim` / :meth:`start`
+        handshake while preserving the same lease and attempt semantics.
+        """
+
+        return self._claim(
+            worker_id,
+            lease_duration_seconds,
+            work_item_id=work_item_id,
+            now=now,
+            start_immediately=True,
+            operation_name="claim_and_start",
+        )
+
+    def _claim(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int,
+        *,
+        work_item_id: str | None,
+        now: datetime | None,
+        start_immediately: bool,
+        operation_name: str,
+    ) -> WorkLeaseClaim | None:
         checked_worker = _nonempty(worker_id, "worker_id")
         duration = _positive_int(lease_duration_seconds, "lease_duration_seconds")
         checked_work_item_id = (
@@ -415,12 +595,35 @@ class SQLiteWorkScheduler:
         )
         checked_now = _checked_now(now)
 
-        def operation(connection: sqlite3.Connection) -> WorkLeaseClaim | None:
-            self._maintain(connection, checked_now)
+        return self._transaction(
+            write=True,
+            operation_name=operation_name,
+            operation=lambda connection: self._claim_in_transaction(
+                connection,
+                worker_id=checked_worker,
+                lease_duration_seconds=duration,
+                work_item_id=checked_work_item_id,
+                now=checked_now,
+                start_immediately=start_immediately,
+            ),
+        )
+
+    def _claim_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        worker_id: str,
+        lease_duration_seconds: int,
+        work_item_id: str | None,
+        now: datetime,
+        start_immediately: bool,
+    ) -> WorkLeaseClaim | None:
+        self._maintain(connection, now)
+        if work_item_id is None:
             row = connection.execute(
                 """
                 SELECT * FROM work_items
-                WHERE state = ? AND (? IS NULL OR work_item_id = ?)
+                WHERE state = ?
                 ORDER BY
                     priority DESC,
                     CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
@@ -429,73 +632,78 @@ class SQLiteWorkScheduler:
                     work_item_id
                 LIMIT 1
                 """,
-                (
-                    WorkItemState.READY.value,
-                    checked_work_item_id,
-                    checked_work_item_id,
-                ),
+                (WorkItemState.READY.value,),
             ).fetchone()
-            if row is None:
-                return None
-            work_item_id = _row_text(row, "work_item_id")
-            row_version = _row_int(row, "row_version")
-            lease_epoch = _row_int(row, "lease_epoch") + 1
-            attempt = _row_int(row, "attempt") + 1
-            fencing_token = str(uuid4())
-            timestamp = _format_timestamp(checked_now)
-            lease_expires_at = _format_timestamp(checked_now + timedelta(seconds=duration))
-            cursor = connection.execute(
+        else:
+            # An exact graph-owned claim is a primary-key lookup, not a ready-queue scan.
+            row = connection.execute(
                 """
-                UPDATE work_items
-                SET state = ?, lease_epoch = ?, fencing_token = ?, leased_by = ?,
-                    lease_expires_at = ?, attempt = ?, updated_at = ?,
-                    row_version = row_version + 1
-                WHERE work_item_id = ? AND state = ? AND row_version = ?
+                SELECT * FROM work_items
+                WHERE work_item_id = ? AND state = ?
                 """,
-                (
-                    WorkItemState.LEASED.value,
-                    lease_epoch,
-                    fencing_token,
-                    checked_worker,
-                    lease_expires_at,
-                    attempt,
-                    timestamp,
-                    work_item_id,
-                    WorkItemState.READY.value,
-                    row_version,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise WorkStorageError("atomic work claim lost its compare-and-swap")
-            connection.execute(
-                """
-                INSERT INTO work_attempts (
-                    work_item_id, attempt_number, lease_epoch, fencing_token,
-                    worker_id, claimed_at, started_at, completed_at, outcome,
-                    error_code, error_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)
-                """,
-                (
-                    work_item_id,
-                    attempt,
-                    lease_epoch,
-                    fencing_token,
-                    checked_worker,
-                    timestamp,
-                    WorkAttemptOutcome.ACTIVE.value,
-                ),
-            )
-            item = self._load_item(connection, work_item_id)
-            lease = WorkLease(
-                work_item_id=work_item_id,
-                worker_id=checked_worker,
-                lease_epoch=lease_epoch,
-                fencing_token=fencing_token,
-                lease_expires_at=lease_expires_at,
-            )
-            return WorkLeaseClaim(work_item=item, lease=lease)
-
-        return self._transaction(write=True, operation_name="claim", operation=operation)
+                (work_item_id, WorkItemState.READY.value),
+            ).fetchone()
+        if row is None:
+            return None
+        claimed_work_item_id = _row_text(row, "work_item_id")
+        row_version = _row_int(row, "row_version")
+        lease_epoch = _row_int(row, "lease_epoch") + 1
+        attempt = _row_int(row, "attempt") + 1
+        fencing_token = str(uuid4())
+        timestamp = _format_timestamp(now)
+        lease_expires_at = _format_timestamp(now + timedelta(seconds=lease_duration_seconds))
+        next_state = WorkItemState.RUNNING if start_immediately else WorkItemState.LEASED
+        cursor = connection.execute(
+            """
+            UPDATE work_items
+            SET state = ?, lease_epoch = ?, fencing_token = ?, leased_by = ?,
+                lease_expires_at = ?, attempt = ?, updated_at = ?,
+                row_version = row_version + 1
+            WHERE work_item_id = ? AND state = ? AND row_version = ?
+            """,
+            (
+                next_state.value,
+                lease_epoch,
+                fencing_token,
+                worker_id,
+                lease_expires_at,
+                attempt,
+                timestamp,
+                claimed_work_item_id,
+                WorkItemState.READY.value,
+                row_version,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise WorkStorageError("atomic work claim lost its compare-and-swap")
+        connection.execute(
+            """
+            INSERT INTO work_attempts (
+                work_item_id, attempt_number, lease_epoch, fencing_token,
+                worker_id, claimed_at, started_at, completed_at, outcome,
+                error_code, error_detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)
+            """,
+            (
+                claimed_work_item_id,
+                attempt,
+                lease_epoch,
+                fencing_token,
+                worker_id,
+                timestamp,
+                timestamp if start_immediately else None,
+                WorkAttemptOutcome.ACTIVE.value,
+            ),
+        )
+        item = self._load_item(connection, claimed_work_item_id)
+        lease = WorkLease(
+            work_item_id=claimed_work_item_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            fencing_token=fencing_token,
+            lease_expires_at=lease_expires_at,
+        )
+        return WorkLeaseClaim(work_item=item, lease=lease)
 
     def start(self, lease: WorkLease, *, now: datetime | None = None) -> WorkItem:
         """Move an exact live claim from LEASED to RUNNING."""
@@ -635,6 +843,11 @@ class SQLiteWorkScheduler:
                 result_reference=result_reference,
                 result_sha256=result_sha256,
             )
+            self._refresh_downstream_for_upstreams(
+                connection,
+                checked_now,
+                (item.work_item_id,),
+            )
             self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
 
@@ -715,6 +928,11 @@ class SQLiteWorkScheduler:
                     checked_now,
                     reason_code=checked_code,
                     reason_detail=checked_detail,
+                )
+                self._refresh_downstream_for_upstreams(
+                    connection,
+                    checked_now,
+                    (item.work_item_id,),
                 )
                 self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
@@ -829,6 +1047,11 @@ class SQLiteWorkScheduler:
                 reason_detail=checked_detail,
                 cancel_requested=cancel_requested,
             )
+            self._refresh_downstream_for_upstreams(
+                connection,
+                checked_now,
+                (item.work_item_id,),
+            )
             self._maintain(connection, checked_now)
             return self._load_item(connection, work_item_id)
 
@@ -838,7 +1061,15 @@ class SQLiteWorkScheduler:
             operation=operation,
         )
 
-    def _maintain(self, connection: sqlite3.Connection, now: datetime) -> int:
+    def _maintain(
+        self,
+        connection: sqlite3.Connection,
+        now: datetime,
+        *,
+        refresh_all_planned: bool = False,
+    ) -> int:
+        """Advance indexed due state; reserve full planned scans for reconciliation."""
+
         changed = self._expire_hard_deadlines(connection, now)
         changed += self._recover_expired_leases(connection, now)
         timestamp = _format_timestamp(now)
@@ -857,7 +1088,11 @@ class SQLiteWorkScheduler:
             ),
         )
         changed += cursor.rowcount
-        changed += self._refresh_planned(connection, now)
+        # A restart/reconciliation must repair any historical partial projection. On
+        # ordinary claim/terminal traffic, direct predecessor transitions below keep
+        # readiness current without repeatedly walking every older PLANNED row.
+        if refresh_all_planned or changed:
+            changed += self._refresh_planned(connection, now)
         return changed
 
     def _reconcile_exact_due_state(self, work_item_id: str, now: datetime) -> int:
@@ -875,7 +1110,11 @@ class SQLiteWorkScheduler:
             if changed:
                 item = self._load_item(connection, work_item_id)
                 if item.state in TERMINAL_WORK_STATES:
-                    changed += self._refresh_planned(connection, now)
+                    changed += self._refresh_downstream_for_upstreams(
+                        connection,
+                        now,
+                        (work_item_id,),
+                    )
             return changed
 
         return self._transaction(
@@ -1022,76 +1261,146 @@ class SQLiteWorkScheduler:
             changed += 1
         return changed
 
-    def _refresh_planned(
+    def _refresh_downstream_for_upstreams(
         self,
         connection: sqlite3.Connection,
         now: datetime,
+        upstream_work_item_ids: Sequence[str],
     ) -> int:
-        changed = 0
-        while True:
-            pass_changed = 0
+        """Re-evaluate only direct downstream work made eligible by a transition."""
+
+        candidates: list[str] = []
+        for work_item_id in upstream_work_item_ids:
             rows = connection.execute(
                 """
-                SELECT * FROM work_items
+                SELECT downstream_work_item_id
+                FROM work_dependencies
+                WHERE upstream_work_item_id = ?
+                ORDER BY downstream_work_item_id
+                """,
+                (work_item_id,),
+            ).fetchall()
+            candidates.extend(_row_text(row, "downstream_work_item_id") for row in rows)
+        return self._refresh_planned_for_work_ids(connection, now, candidates)
+
+    def _refresh_planned_for_work_ids(
+        self,
+        connection: sqlite3.Connection,
+        now: datetime,
+        work_item_ids: Sequence[str],
+    ) -> int:
+        """Advance a bounded set of PLANNED rows and any failure cascade it creates."""
+
+        pending = list(dict.fromkeys(work_item_ids))
+        queued = set(pending)
+        changed = 0
+        while pending:
+            work_item_id = pending.pop(0)
+            queued.discard(work_item_id)
+            transition = self._advance_planned_item(connection, work_item_id, now)
+            if transition is None:
+                continue
+            changed += 1
+            if transition not in TERMINAL_WORK_STATES:
+                continue
+            rows = connection.execute(
+                """
+                SELECT downstream_work_item_id
+                FROM work_dependencies
+                WHERE upstream_work_item_id = ?
+                ORDER BY downstream_work_item_id
+                """,
+                (work_item_id,),
+            ).fetchall()
+            for row in rows:
+                downstream_id = _row_text(row, "downstream_work_item_id")
+                if downstream_id not in queued:
+                    pending.append(downstream_id)
+                    queued.add(downstream_id)
+        return changed
+
+    def _refresh_planned(self, connection: sqlite3.Connection, now: datetime) -> int:
+        """Repair every PLANNED row during explicit reconciliation only."""
+
+        changed = 0
+        while True:
+            rows = connection.execute(
+                """
+                SELECT work_item_id FROM work_items
                 WHERE state = ? ORDER BY created_at, work_item_id
                 """,
                 (WorkItemState.PLANNED.value,),
             ).fetchall()
-            for row in rows:
-                item = self._item_from_row(row)
-                dependency_rows = connection.execute(
-                    """
-                    SELECT d.criticality, upstream.state
-                    FROM work_dependencies AS d
-                    JOIN work_items AS upstream
-                      ON upstream.work_item_id = d.upstream_work_item_id
-                    WHERE d.downstream_work_item_id = ?
-                    ORDER BY d.dependency_id
-                    """,
-                    (item.work_item_id,),
-                ).fetchall()
-                if any(
-                    WorkItemState(_row_text(value, "state")) not in TERMINAL_WORK_STATES
-                    for value in dependency_rows
-                ):
-                    continue
-                required_failure = any(
-                    DependencyCriticality(_row_text(value, "criticality"))
-                    is DependencyCriticality.REQUIRED
-                    and WorkItemState(_row_text(value, "state")) not in SUCCESSFUL_DEPENDENCY_STATES
-                    for value in dependency_rows
+            pass_changed = sum(
+                self._advance_planned_item(
+                    connection,
+                    _row_text(row, "work_item_id"),
+                    now,
                 )
-                if required_failure:
-                    self._set_terminal(
-                        connection,
-                        item,
-                        WorkItemState.FAILED_PERMANENT,
-                        now,
-                        reason_code="REQUIRED_DEPENDENCY_FAILED",
-                        reason_detail=None,
-                    )
-                else:
-                    cursor = connection.execute(
-                        """
-                        UPDATE work_items
-                        SET state = ?, updated_at = ?, row_version = row_version + 1
-                        WHERE work_item_id = ? AND state = ?
-                        """,
-                        (
-                            WorkItemState.READY.value,
-                            _format_timestamp(now),
-                            item.work_item_id,
-                            WorkItemState.PLANNED.value,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise WorkStorageError(
-                            "planned readiness transition lost its compare-and-swap"
-                        )
-                pass_changed += 1
+                is not None
+                for row in rows
+            )
             changed += pass_changed
             if pass_changed == 0:
                 return changed
+
+    def _advance_planned_item(
+        self,
+        connection: sqlite3.Connection,
+        work_item_id: str,
+        now: datetime,
+    ) -> WorkItemState | None:
+        item = self._load_item(connection, work_item_id)
+        if item.state is not WorkItemState.PLANNED:
+            return None
+        dependency_rows = connection.execute(
+            """
+            SELECT d.criticality, upstream.state
+            FROM work_dependencies AS d
+            JOIN work_items AS upstream
+              ON upstream.work_item_id = d.upstream_work_item_id
+            WHERE d.downstream_work_item_id = ?
+            ORDER BY d.dependency_id
+            """,
+            (item.work_item_id,),
+        ).fetchall()
+        if any(
+            WorkItemState(_row_text(value, "state")) not in TERMINAL_WORK_STATES
+            for value in dependency_rows
+        ):
+            return None
+        required_failure = any(
+            DependencyCriticality(_row_text(value, "criticality"))
+            is DependencyCriticality.REQUIRED
+            and WorkItemState(_row_text(value, "state")) not in SUCCESSFUL_DEPENDENCY_STATES
+            for value in dependency_rows
+        )
+        if required_failure:
+            self._set_terminal(
+                connection,
+                item,
+                WorkItemState.FAILED_PERMANENT,
+                now,
+                reason_code="REQUIRED_DEPENDENCY_FAILED",
+                reason_detail=None,
+            )
+            return WorkItemState.FAILED_PERMANENT
+        cursor = connection.execute(
+            """
+            UPDATE work_items
+            SET state = ?, updated_at = ?, row_version = row_version + 1
+            WHERE work_item_id = ? AND state = ?
+            """,
+            (
+                WorkItemState.READY.value,
+                _format_timestamp(now),
+                item.work_item_id,
+                WorkItemState.PLANNED.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise WorkStorageError("planned readiness transition lost its compare-and-swap")
+        return WorkItemState.READY
 
     def _require_lease(
         self,
@@ -1106,6 +1415,12 @@ class SQLiteWorkScheduler:
             or item.fencing_token != lease.fencing_token
             or item.leased_by != lease.worker_id
             or item.lease_expires_at is None
+            # The expiry is part of the opaque capability returned by claim. Bind
+            # it to the persisted row as well as checking the authority clock; a
+            # caller must not be able to forge a different expiry around the same
+            # epoch/token pair.
+            or _parse_timestamp(item.lease_expires_at)
+            != _parse_timestamp(lease.lease_expires_at)
             or _parse_timestamp(item.lease_expires_at) <= now
             or (
                 item.execution_expiry_at is not None

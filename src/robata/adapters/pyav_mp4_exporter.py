@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
@@ -32,6 +32,8 @@ from robata.ports import (
     VideoExportErrorCode,
 )
 from robata.tempfiles import make_temp_file
+
+DecodedFrameObserver = Callable[[H264PacketEnvelope, Any, int], None]
 
 _NANOSECOND_TIME_BASE = Fraction(1, 1_000_000_000)
 _TAIL_DURATION_POLICY = "MEDIAN_POSITIVE_INTERVAL"
@@ -207,7 +209,7 @@ def _annex_b_nal_types(payload: bytes) -> tuple[int, ...]:
     return tuple(nal_types)
 
 
-def _is_independent_bootstrap(nal_types: tuple[int, ...]) -> bool:
+def is_independent_h264_bootstrap(nal_types: tuple[int, ...]) -> bool:
     try:
         idr_index = nal_types.index(5)
     except ValueError:
@@ -297,11 +299,20 @@ class PyAvH264Mp4Exporter:
         channel: ChannelInspection,
         video_path: Path,
         sidecar_path: Path,
+        *,
+        decoded_frame_observer: DecodedFrameObserver | None = None,
+        validate_output: bool = True,
     ) -> PyAvH264RemuxSession:
         """Create one branch-compatible remux session for an ordered camera stream."""
 
         video_path = Path(video_path)
         sidecar_path = Path(sidecar_path)
+        if decoded_frame_observer is not None and not callable(decoded_frame_observer):
+            raise TypeError("decoded_frame_observer must be callable or None")
+        if not isinstance(validate_output, bool):
+            raise TypeError("validate_output must be a boolean")
+        if not validate_output and decoded_frame_observer is None:
+            raise ValueError("validate_output=False requires a decoded_frame_observer")
         self._validate_incremental_request(camera_id, channel, video_path, sidecar_path)
         video_temp: Path | None = None
         sidecar_temp: Path | None = None
@@ -320,6 +331,8 @@ class PyAvH264Mp4Exporter:
                 video_temp=video_temp,
                 sidecar_temp=sidecar_temp,
                 interval_temp=interval_temp,
+                decoded_frame_observer=decoded_frame_observer,
+                validate_output=validate_output,
             )
             return session
         except VideoExportError:
@@ -484,11 +497,11 @@ class PyAvH264Mp4Exporter:
         )
 
     @staticmethod
-    def _decode_without_reordering(
+    def _decode_frame_without_reordering(
         decoder: Any,
         unit: _AccessUnit,
         relative_pts_ns: int,
-    ) -> tuple[int, int]:
+    ) -> Any:
         packet = av.Packet(unit.payload)
         packet.pts = relative_pts_ns
         packet.dts = relative_pts_ns
@@ -523,7 +536,7 @@ class PyAvH264Mp4Exporter:
                 VideoExportErrorCode.FRAME_REORDERING_UNSUPPORTED,
                 "decoded frame timestamp differs from its source access unit",
             )
-        return frame.width, frame.height
+        return frame
 
     @staticmethod
     def _mux_and_record(
@@ -806,6 +819,8 @@ class PyAvH264RemuxSession:
         video_temp: Path,
         sidecar_temp: Path,
         interval_temp: Path,
+        decoded_frame_observer: DecodedFrameObserver | None,
+        validate_output: bool,
     ) -> None:
         self._exporter = exporter
         self.camera_id = camera_id
@@ -815,6 +830,8 @@ class PyAvH264RemuxSession:
         self._video_temp = video_temp
         self._sidecar_temp = sidecar_temp
         self._interval_temp = interval_temp
+        self._decoded_frame_observer = decoded_frame_observer
+        self._validate_output = validate_output
         self._decoder = av.CodecContext.create("h264", "r")
         self._sidecar_stream: BinaryIO | None = sidecar_temp.open("wb")
         self._interval_spool: _Int64IntervalSpool | None = _Int64IntervalSpool(interval_temp)
@@ -881,7 +898,8 @@ class PyAvH264RemuxSession:
                     source_sequence=packet.source_sequence,
                     payload=packet.payload,
                     nal_types=envelope.nal_types,
-                )
+                ),
+                envelope=envelope,
             )
         except VideoExportError:
             self.abort()
@@ -899,7 +917,12 @@ class PyAvH264RemuxSession:
                 f"incremental camera-video remux failed: {type(exc).__name__}: {exc}",
             ) from exc
 
-    def _append_unit(self, unit: _AccessUnit) -> None:
+    def _append_unit(
+        self,
+        unit: _AccessUnit,
+        *,
+        envelope: H264PacketEnvelope | None = None,
+    ) -> None:
         self._ensure_open()
         self._source_count += 1
         log_time_ns = unit.log_time_ns
@@ -918,7 +941,7 @@ class PyAvH264RemuxSession:
         self._source_last_ns = log_time_ns
 
         if self._bootstrap_time_ns is None:
-            if not _is_independent_bootstrap(unit.nal_types):
+            if not is_independent_h264_bootstrap(unit.nal_types):
                 self._leading_count += 1
                 self._leading_first_ns = (
                     self._leading_first_ns if self._leading_first_ns is not None else log_time_ns
@@ -928,11 +951,13 @@ class PyAvH264RemuxSession:
             self._bootstrap_time_ns = log_time_ns
 
         relative_pts_ns = log_time_ns - self._bootstrap_time_ns
-        frame_width, frame_height = self._exporter._decode_without_reordering(
+        frame = self._exporter._decode_frame_without_reordering(
             self._decoder,
             unit,
             relative_pts_ns,
         )
+        frame_width, frame_height = frame.width, frame.height
+        decoded_frame_index = self._decoded_frame_count
         self._decoded_frame_count += 1
         if self._width is None:
             self._width, self._height = frame_width, frame_height
@@ -941,6 +966,8 @@ class PyAvH264RemuxSession:
                 VideoExportErrorCode.DECODE_VALIDATION_FAILED,
                 "decoded camera dimensions change within one export",
             )
+        if envelope is not None and self._decoded_frame_observer is not None:
+            self._decoded_frame_observer(envelope, frame, decoded_frame_index)
 
         if self._previous is not None:
             duration_ns = unit.log_time_ns - self._previous.log_time_ns
@@ -985,10 +1012,14 @@ class PyAvH264RemuxSession:
             self._exporter._safe_unlink(self._interval_temp)
             self._close_sidecar()
             self._close_output(trailer_required=True)
-            decoded_frames = self._exporter._validate_exported_mp4(
-                self._video_temp,
-                self._sidecar_temp,
-                temporary,
+            decoded_frames = (
+                self._exporter._validate_exported_mp4(
+                    self._video_temp,
+                    self._sidecar_temp,
+                    temporary,
+                )
+                if self._validate_output
+                else temporary.decoded_frame_count
             )
             if decoded_frames != temporary.decoded_frame_count:
                 raise VideoExportError(

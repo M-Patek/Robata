@@ -7,6 +7,10 @@ from robata.adapters.local_artifact_registry import (
     deterministic_local_artifact_id,
 )
 from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
+from robata.adapters.nvdec_backend import NvdecBackendUnavailableError, NvdecFallbackReason
+from robata.adapters.nvdec_frame_materializer import NvdecFrameMaterializer
+from robata.adapters.nvdec_video_export import NvdecH264Mp4Exporter
+from robata.adapters.redis_outbox import RedisIdempotentOutboxSink
 from robata.adapters.sqlite_barrier import SQLiteBarrierStorage, SQLiteBarrierStorageError
 from robata.adapters.sqlite_capture_authority import (
     SQLiteCaptureAuthority,
@@ -90,12 +94,17 @@ __all__ = [
     "InMemoryTaskQueue",
     "LocalArtifactRegistry",
     "LocalLogicalNodeRegistry",
+    "NvdecBackendUnavailableError",
+    "NvdecFallbackReason",
+    "NvdecFrameMaterializer",
+    "NvdecH264Mp4Exporter",
     "OfficialMcapInspector",
     "ParallelPyAvFrameMaterializer",
     "ParallelSixCameraVideoExportService",
     "PyAvFrameMaterializer",
     "PyAvH264DecoderProbe",
     "PyAvH264Mp4Exporter",
+    "RedisIdempotentOutboxSink",
     "SQLiteBarrierStorage",
     "SQLiteBarrierStorageError",
     "SQLiteCaptureAuthority",

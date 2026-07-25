@@ -228,15 +228,43 @@ def _load_camera_ledger(
     view: Path,
     manifest: CameraVideoExportManifestV2,
     record: CameraVideoExportRecordV2,
+    *,
+    verify_video_digest: bool = True,
 ) -> _CameraLedger:
     camera_id = record.camera_id
     video_path = view / f"{camera_id.value}.mp4"
-    video_size, video_sha256 = _hash_regular_file(video_path)
-    if video_size != record.video_artifact.bytes or video_sha256 != record.video_artifact.sha256:
+    if not isinstance(verify_video_digest, bool):
         _fail(
-            FrameMaterializationErrorCode.INVALID_VIDEO_VIEW,
-            f"{camera_id.value} MP4 size or digest differs from its manifest summary",
+            FrameMaterializationErrorCode.INVALID_REQUEST,
+            "verify_video_digest must be a boolean",
         )
+    if verify_video_digest:
+        video_size, video_sha256 = _hash_regular_file(video_path)
+        if (
+            video_size != record.video_artifact.bytes
+            or video_sha256 != record.video_artifact.sha256
+        ):
+            _fail(
+                FrameMaterializationErrorCode.INVALID_VIDEO_VIEW,
+                f"{camera_id.value} MP4 size or digest differs from its manifest summary",
+            )
+    else:
+        try:
+            video_stat = video_path.lstat()
+        except OSError as error:
+            _fail(
+                FrameMaterializationErrorCode.INVALID_VIDEO_VIEW,
+                f"{camera_id.value} MP4 cannot be inspected: {error}",
+            )
+        if (
+            video_path.is_symlink()
+            or not video_path.is_file()
+            or video_stat.st_size != record.video_artifact.bytes
+        ):
+            _fail(
+                FrameMaterializationErrorCode.INVALID_VIDEO_VIEW,
+                f"{camera_id.value} MP4 shape differs from its manifest summary",
+            )
 
     sidecar_path = view / f"{camera_id.value}.timestamps.jsonl"
     sidecar_bytes = _read_regular_file(sidecar_path)
