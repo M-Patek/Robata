@@ -44,6 +44,11 @@ from robata.benchmark.models import (
     DataSplit,
     StratificationDimension,
 )
+from robata.benchmark.pareto import (
+    LocalSamplingDenseParetoReport,
+    LocalSamplingDensePolicyObservation,
+    build_local_sampling_dense_pareto_report,
+)
 from robata.benchmark.promotion import (
     BenchmarkResults,
     GateCategory,
@@ -52,6 +57,22 @@ from robata.benchmark.promotion import (
     PromotionEvaluator,
     PromotionGate,
     PromotionGateRegistry,
+)
+from robata.benchmark.provider_qualification import (
+    ProviderAdapterTerminalWorkload,
+    ProviderGpuMeasurement,
+    ProviderLatencyPercentiles,
+    ProviderQualificationCollector,
+    ProviderQualificationRunContext,
+    ProviderRuntimeTelemetry,
+    ProviderSaturationPoint,
+    ProviderTimingSample,
+    TwoH100ProviderConfiguration,
+    TwoH100ProviderQualificationReport,
+    TwoH100Topology,
+    TwoH100TopologyComparison,
+    compare_two_h100_topologies,
+    run_provider_saturation_point,
 )
 from robata.benchmark.splits import (
     DataSplitResult,
@@ -93,6 +114,8 @@ __all__ = [
     "GroundTruthAnnotation",
     "InterAnnotatorAgreement",
     "Interval",
+    "LocalSamplingDenseParetoReport",
+    "LocalSamplingDensePolicyObservation",
     "McNemarResult",
     "MeasurementStatus",
     "MetricsCalculator",
@@ -101,6 +124,14 @@ __all__ = [
     "PromotionEvaluator",
     "PromotionGate",
     "PromotionGateRegistry",
+    "ProviderAdapterTerminalWorkload",
+    "ProviderGpuMeasurement",
+    "ProviderLatencyPercentiles",
+    "ProviderQualificationCollector",
+    "ProviderQualificationRunContext",
+    "ProviderRuntimeTelemetry",
+    "ProviderSaturationPoint",
+    "ProviderTimingSample",
     "QAExperiment",
     "QAIssueAnnotation",
     "QAMetrics",
@@ -111,6 +142,13 @@ __all__ = [
     "SplitRecord",
     "StatisticalAnalyzer",
     "StratificationDimension",
+    "TwoH100ProviderConfiguration",
+    "TwoH100ProviderQualificationReport",
+    "TwoH100Topology",
+    "TwoH100TopologyComparison",
     "benchmark_evidence_context_projection",
     "benchmark_metric_policy_projection",
+    "build_local_sampling_dense_pareto_report",
+    "compare_two_h100_topologies",
+    "run_provider_saturation_point",
 ]

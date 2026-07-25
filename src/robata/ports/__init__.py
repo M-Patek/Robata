@@ -7,6 +7,7 @@ from robata.ports.artifact_registry import (
     ArtifactRegistryErrorCode,
     PublishedArtifactDerivation,
 )
+from robata.ports.decoded_frame import DecodedFrameView
 from robata.ports.frame_materialization import (
     FrameMaterializationError,
     FrameMaterializationErrorCode,
@@ -78,6 +79,7 @@ __all__ = [
     "CameraVideoExporter",
     "ChannelInspection",
     "DecodeFailure",
+    "DecodedFrameView",
     "DecoderProbe",
     "DecoderProbeResult",
     "EnqueuedReviewTask",
