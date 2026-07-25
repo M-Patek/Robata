@@ -7,7 +7,7 @@ sent to the local scheduler. The projection is not stream Wire evidence.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, Self
@@ -303,6 +303,10 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             raise ValueError("stream composition and execution scheduler must share database_path")
         self._ledger = SQLiteStreamWorkLedger(execution_scheduler)
         self._execution_scheduler = execution_scheduler
+        # Immutable work-plan rows are safe to retain after publication. The authority
+        # remains the source of lifecycle state; this cache only avoids re-reading the
+        # same graph metadata between a bounded scope and its exact claim.
+        self._work_row_cache: dict[str, StoredStreamWorkPlan] = {}
         self._expected_plan = _strict_model(expected_plan, ExpectedWindowPlan, "expected_plan")
         self._source_subject = _strict_model(
             source_subject, PreEosCaptureSubjectRef, "source_subject"
@@ -637,37 +641,37 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         return closure
 
     def recover(self) -> int:
-        """Reconcile terminals and replay scheduler projections idempotently."""
+        """Reconcile crash intents and replay only un-published work projections."""
 
         accepted = self._recover_terminal_acceptances()
-        return accepted + self._publish_work_rows(self._ledger.work_plans(self.plan_key))
+        return accepted + self._publish_work_rows(
+            self._ledger.pending_publication_work_rows(self.plan_key)
+        )
 
     def _publish_work_rows(
         self,
         rows: Sequence[NewStreamWorkPlan | StoredStreamWorkPlan],
     ) -> int:
+        """Project one bounded PENDING batch, then atomically expose it for execution."""
+
+        pending = tuple(row for row in rows if row.publication_state == "PENDING")
+        if not pending:
+            return 0
         parsed = tuple(
-            (
-                _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan"),
-                row.publication_state,
-            )
-            for row in rows
+            _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan") for row in pending
         )
-        plans_by_key = {plan.work_logical_key: plan for plan, _state in parsed}
-        published = 0
-        for plan, publication_state in parsed:
-            if publication_state == "GATED":
-                continue
-            projected, dependencies = self._internal_execution_projection(
-                plan,
-                plans_by_key=plans_by_key,
-            )
-            self._execution_scheduler.plan(projected, dependencies)
+        plans_by_key = {plan.work_logical_key: plan for plan in parsed}
+        projections = tuple(
+            self._internal_execution_projection(plan, plans_by_key=plans_by_key)
+            for plan in parsed
+        )
+        self._execution_scheduler.plan_many(projections)
+        for _plan in parsed:
             self._observe("internal_execution_projected")
-            if publication_state != "PUBLISHED":
-                self._ledger.mark_published(plan.work_item_id)
-                published += 1
-        return published
+        self._ledger.mark_published_many(tuple(plan.work_item_id for plan in parsed))
+        for row in pending:
+            self._remember_published_work_row(row)
+        return len(parsed)
 
     def claim(
         self,
@@ -683,37 +687,136 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         checked_now = self._checked_now(now)
         if recover_graph:
             self.recover()
-        candidates: tuple[str, ...]
+        stored: StoredStreamWorkPlan | None
         if work_item_id is not None:
-            self._stored_work_plan(work_item_id, require_published=True)
-            candidates = (work_item_id,)
+            stored = self._cached_published_work_row(work_item_id)
+            if stored is None:
+                stored = self._stored_work_row(work_item_id, require_published=True)
         else:
-            ready: list[tuple[int, str, str]] = []
-            for plan, state in self._stored_work_plans_with_state():
-                if state != "PUBLISHED":
-                    continue
-                item = self._execution_scheduler.get(plan.work_item_id)
-                if item.state is WorkItemState.READY:
-                    ready.append((-plan.priority, plan.created_at, plan.work_item_id))
-            candidates = tuple(value[2] for value in sorted(ready))
-        for candidate in candidates:
-            claim = self._execution_scheduler.claim(
-                worker_id,
+            # Do not reconstruct the whole graph merely to find one claim candidate.
+            # SQLite selects the one READY row made visible by the latest transition.
+            stored = self._ledger.next_ready_work(self.plan_key)
+        if stored is None:
+            return None
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        claim = self._execution_scheduler.claim(
+            worker_id,
+            lease_duration_seconds,
+            work_item_id=plan.work_item_id,
+            now=checked_now,
+        )
+        if claim is None:
+            return None
+        return StreamWorkLeaseClaim(
+            work_item=self._stream_item_from(
+                plan,
+                claim.work_item,
+                evidence=None,
+            ),
+            lease=_stream_lease(claim.lease),
+        )
+
+    def claim_and_start(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int,
+        *,
+        work_item_id: str | None = None,
+        now: datetime | None = None,
+        recover_graph: bool = True,
+    ) -> StreamWorkLeaseClaim | None:
+        """Claim and start one graph-owned item for a same-process executor."""
+
+        checked_now = self._checked_now(now)
+        if recover_graph:
+            self.recover()
+        stored: StoredStreamWorkPlan | None
+        if work_item_id is not None:
+            stored = self._cached_published_work_row(work_item_id)
+            if stored is None:
+                stored = self._stored_work_row(work_item_id, require_published=True)
+        else:
+            stored = self._ledger.next_ready_work(self.plan_key)
+        if stored is None:
+            return None
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        claim = self._execution_scheduler.claim_and_start(
+            worker_id,
+            lease_duration_seconds,
+            work_item_id=plan.work_item_id,
+            now=checked_now,
+        )
+        if claim is None:
+            return None
+        return StreamWorkLeaseClaim(
+            work_item=self._stream_item_from(
+                plan,
+                claim.work_item,
+                evidence=None,
+            ),
+            lease=_stream_lease(claim.lease),
+        )
+
+    def resume_owned_active(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int,
+        *,
+        work_item_id: str,
+        now: datetime | None = None,
+    ) -> StreamWorkLeaseClaim | None:
+        """Resume one still-active lease without taking it from another worker.
+
+        This is intentionally narrower than a claim or lease-recovery operation:
+        it preserves the persisted fence and attempt and only works when the
+        authority still records ``worker_id`` as the owner.  It is used after a
+        process restart at the pre-EOS provider/terminal-acceptance boundary, so
+        a canonical evidence ledger can replay the already-persisted provider
+        terminal without scheduling a second dispatch.
+        """
+
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id must be non-empty")
+        if isinstance(lease_duration_seconds, bool) or not isinstance(
+            lease_duration_seconds, int
+        ):
+            raise TypeError("lease_duration_seconds must be an integer")
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds must be positive")
+        stored = self._stored_work_row(work_item_id, require_published=True)
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        execution = self._execution_scheduler.get(work_item_id)
+        if (
+            execution.state not in {WorkItemState.LEASED, WorkItemState.RUNNING}
+            or execution.leased_by != worker_id
+            or execution.fencing_token is None
+            or execution.lease_expires_at is None
+        ):
+            return None
+        lease = StreamWorkLease(
+            work_item_id=execution.work_item_id,
+            worker_id=worker_id,
+            lease_epoch=execution.lease_epoch,
+            fencing_token=execution.fencing_token,
+            lease_expires_at=execution.lease_expires_at,
+        )
+        checked_now = self._checked_now(now)
+        try:
+            renewed = self.heartbeat(
+                lease,
                 lease_duration_seconds,
-                work_item_id=candidate,
                 now=checked_now,
             )
-            if claim is not None:
-                plan = self._stored_work_plan(candidate, require_published=True)
-                return StreamWorkLeaseClaim(
-                    work_item=self._stream_item_from(
-                        plan,
-                        claim.work_item,
-                        evidence=None,
-                    ),
-                    lease=_stream_lease(claim.lease),
-                )
-        return None
+            execution = self.start(renewed, now=checked_now)
+        except WorkFenceError:
+            # A concurrent authority transition won the race.  Do not steal the
+            # work or create a new attempt; the ordinary scheduler path decides
+            # whether it becomes claimable later.
+            return None
+        return StreamWorkLeaseClaim(
+            work_item=self._stream_item_from(plan, execution, evidence=None),
+            lease=renewed,
+        )
 
     def start(
         self,
@@ -757,10 +860,11 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         checked_evidence = _strict_model(
             terminal_evidence, StreamTerminalEvidence, "terminal_evidence"
         )
-        plan = self._stored_work_plan(
+        stored = self._stored_work_row(
             checked_lease.work_item_id,
             require_published=True,
         )
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
         if checked_evidence.terminal_policy_version != self._terminal_policy_version:
             raise StreamSchedulerCompositionError(
                 "terminal evidence does not use the composition policy pin"
@@ -770,7 +874,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             raise StreamSchedulerCompositionError(
                 "terminal evidence cannot complete after authority time"
             )
-        accepted = self._accepted_evidence(checked_lease.work_item_id)
+        accepted = self._accepted_evidence(stored=stored)
         if accepted is not None:
             if canonical_json_bytes(accepted) != canonical_json_bytes(checked_evidence):
                 raise StreamSchedulerCompositionError(
@@ -781,8 +885,11 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 self._execution_scheduler.get(checked_lease.work_item_id),
                 evidence=accepted,
             )
-        self._require_current_execution_lease(checked_lease, checked_now)
-        self._store_pending_terminal(checked_lease, checked_evidence)
+        self._store_pending_terminal(
+            checked_lease,
+            checked_evidence,
+            authority_now=checked_now,
+        )
         execution = self._execution_scheduler.succeed(
             _execution_lease(checked_lease),
             result_reference=_terminal_result_reference(checked_evidence),
@@ -792,7 +899,9 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         self._observe("execution_terminal_committed")
         self._accept_pending_terminal(
             checked_lease.work_item_id,
+            stored=stored,
             execution=execution,
+            pending_raw=canonical_json_bytes(checked_evidence),
         )
         return self._stream_item_from(
             plan,
@@ -846,9 +955,16 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         )
 
     def get(self, work_item_id: str) -> StreamWorkItem:
-        self._recover_terminal_acceptances()
-        self._stored_work_plan(work_item_id, require_published=False)
-        return self._stream_item(self._execution_scheduler.get(work_item_id))
+        """Read one stream item without turning a normal read into graph recovery."""
+
+        stored = self._stored_work_row(work_item_id, require_published=False)
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        evidence = self._accepted_evidence(stored=stored)
+        return self._stream_item_from(
+            plan,
+            self._execution_scheduler.get(work_item_id),
+            evidence=evidence,
+        )
 
     def declarations(self) -> tuple[ExpectedWindowDeclaration, ...]:
         return tuple(
@@ -870,41 +986,41 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             raise TypeError("max_items must be an integer")
         if max_items <= 0:
             raise ValueError("max_items must be positive")
-        self._recover_terminal_acceptances()
         rows = self._ledger.bounded_execution_scope(
             plan_key=self.plan_key,
             max_active=max_items,
             terminal_states=tuple(sorted(state.value for state in TERMINAL_WORK_STATES)),
             finalization_stage=StreamStage.FINALIZATION.value,
         )
-        return tuple(
-            StreamDrainWorkSnapshot(
-                plan=_parse_exact(
-                    row.work.plan_json,
-                    StreamWorkItemPlan,
-                    "bounded stream work plan",
-                ),
-                execution_state=WorkItemState(row.execution_state),
-                terminal_evidence=(
-                    None
-                    if row.work.terminal_evidence_json is None
-                    else _parse_exact(
-                        row.work.terminal_evidence_json,
-                        StreamTerminalEvidence,
-                        "bounded stream terminal evidence",
-                    )
-                ),
+        snapshots: list[StreamDrainWorkSnapshot] = []
+        for row in rows:
+            self._remember_work_row(row.work)
+            snapshots.append(
+                StreamDrainWorkSnapshot(
+                    plan=_parse_exact(
+                        row.work.plan_json,
+                        StreamWorkItemPlan,
+                        "bounded stream work plan",
+                    ),
+                    execution_state=WorkItemState(row.execution_state),
+                    terminal_evidence=(
+                        None
+                        if row.work.terminal_evidence_json is None
+                        else _parse_exact(
+                            row.work.terminal_evidence_json,
+                            StreamTerminalEvidence,
+                            "bounded stream terminal evidence",
+                        )
+                    ),
+                )
             )
-            for row in rows
-        )
+        return tuple(snapshots)
 
     def work_items(self, *, recover_graph: bool = True) -> tuple[StreamWorkItem, ...]:
         """Read this graph's published work from batched authority snapshots."""
 
         if recover_graph:
             self.recover()
-        else:
-            self._recover_terminal_acceptances()
         rows = self._ledger.work_plans(self.plan_key)
         executions = {
             item.work_item_id: item
@@ -912,6 +1028,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         }
         snapshots: list[StreamWorkItem] = []
         for row in rows:
+            self._remember_work_row(row)
             if row.publication_state != "PUBLISHED":
                 continue
             execution = executions.get(row.work_item_id)
@@ -989,7 +1106,6 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         """Return counts and oldest age without implicitly advancing state."""
 
         checked_now = self._checked_now(now)
-        self._recover_terminal_acceptances()
         projection = self._ledger.backlog_projection(
             plan_key=self.plan_key,
             terminal_states=tuple(sorted(state.value for state in TERMINAL_WORK_STATES)),
@@ -1249,9 +1365,19 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             )
         return execution, tuple(sorted(dependencies, key=lambda value: value.dependency_id))
 
-    def _stream_item(self, execution: WorkItem) -> StreamWorkItem:
-        plan = self._stored_work_plan(execution.work_item_id, require_published=False)
-        evidence = self._accepted_evidence(execution.work_item_id)
+    def _stream_item(
+        self,
+        execution: WorkItem,
+        *,
+        stored: StoredStreamWorkPlan | None = None,
+    ) -> StreamWorkItem:
+        work_row = (
+            self._stored_work_row(execution.work_item_id, require_published=False)
+            if stored is None
+            else stored
+        )
+        plan = _parse_exact(work_row.plan_json, StreamWorkItemPlan, "stream work plan")
+        evidence = self._accepted_evidence(stored=work_row)
         return self._stream_item_from(plan, execution, evidence=evidence)
 
     def _stream_item_from(
@@ -1294,30 +1420,18 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         self,
         lease: StreamWorkLease,
         evidence: StreamTerminalEvidence,
+        *,
+        authority_now: datetime,
     ) -> None:
         self._ledger.store_pending_terminal(
             work_item_id=lease.work_item_id,
             payload=canonical_json_bytes(evidence),
             lease_epoch=lease.lease_epoch,
             fencing_token=lease.fencing_token,
+            worker_id=lease.worker_id,
+            authority_now=_format_timestamp(authority_now),
+            lease_expires_at=lease.lease_expires_at,
         )
-
-    def _require_current_execution_lease(
-        self,
-        lease: StreamWorkLease,
-        authority_now: datetime,
-    ) -> None:
-        execution = self._execution_scheduler.get(lease.work_item_id)
-        if (
-            execution.state not in {WorkItemState.LEASED, WorkItemState.RUNNING}
-            or execution.work_item_id != lease.work_item_id
-            or execution.leased_by != lease.worker_id
-            or execution.lease_epoch != lease.lease_epoch
-            or execution.fencing_token != lease.fencing_token
-            or execution.lease_expires_at is None
-            or _parse_timestamp(execution.lease_expires_at) <= authority_now
-        ):
-            raise WorkFenceError("work lease is stale, expired, or inactive")
 
     def _recover_terminal_acceptances(self) -> int:
         accepted = 0
@@ -1339,6 +1453,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         *,
         stored: StoredStreamWorkPlan | None = None,
         execution: WorkItem | None = None,
+        pending_raw: bytes | None = None,
     ) -> None:
         execution = self._execution_scheduler.get(work_item_id) if execution is None else execution
         if execution.state is not WorkItemState.SUCCEEDED:
@@ -1352,10 +1467,16 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             )
         if work_row.terminal_evidence_json is not None:
             return
-        pending_raw = work_row.pending_terminal_json
-        if pending_raw is None:
+        accepted_pending_raw = (
+            work_row.pending_terminal_json if pending_raw is None else pending_raw
+        )
+        if accepted_pending_raw is None:
             raise StreamSchedulerCompositionError("committed work lacks pending terminal fact")
-        evidence = _parse_exact(pending_raw, StreamTerminalEvidence, "pending terminal evidence")
+        evidence = _parse_exact(
+            accepted_pending_raw,
+            StreamTerminalEvidence,
+            "pending terminal evidence",
+        )
         if (
             execution.result_reference != _terminal_result_reference(evidence)
             or execution.result_sha256 != evidence.evidence_ref.exact_sha256
@@ -1394,18 +1515,75 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             terminal_member_raw = canonical_json_bytes(member)
         self._ledger.accept_pending_terminal(
             work_item_id=work_item_id,
-            expected_pending_json=pending_raw,
+            expected_pending_json=accepted_pending_raw,
             terminal_member_json=terminal_member_raw,
             expected_ordinal=ordinal,
         )
 
-    def _accepted_evidence(self, work_item_id: str) -> StreamTerminalEvidence | None:
-        raw = self._ledger.get_work(work_item_id).terminal_evidence_json
+    def _accepted_evidence(
+        self,
+        work_item_id: str | None = None,
+        *,
+        stored: StoredStreamWorkPlan | None = None,
+    ) -> StreamTerminalEvidence | None:
+        if stored is None:
+            if work_item_id is None:
+                raise TypeError("work_item_id is required when stored is absent")
+            stored = self._stored_work_row(work_item_id, require_published=False)
+        raw = stored.terminal_evidence_json
         return (
             None
             if raw is None
             else _parse_exact(raw, StreamTerminalEvidence, "stream terminal evidence")
         )
+
+    def _remember_work_row(self, stored: StoredStreamWorkPlan) -> None:
+        if stored.plan_key == self.plan_key:
+            self._work_row_cache[stored.work_item_id] = stored
+
+    def _remember_published_work_row(
+        self,
+        row: NewStreamWorkPlan | StoredStreamWorkPlan,
+    ) -> None:
+        if isinstance(row, StoredStreamWorkPlan):
+            self._remember_work_row(replace(row, publication_state="PUBLISHED"))
+            return
+        self._remember_work_row(
+            StoredStreamWorkPlan(
+                work_item_id=row.work_item_id,
+                work_logical_key=row.work_logical_key,
+                plan_key=self.plan_key,
+                expected_ordinal=row.expected_ordinal,
+                role_order=row.role_order,
+                stage=row.stage,
+                plan_json=row.plan_json,
+                publication_state="PUBLISHED",
+            )
+        )
+
+    def _cached_published_work_row(self, work_item_id: str) -> StoredStreamWorkPlan | None:
+        stored = self._work_row_cache.get(work_item_id)
+        if (
+            stored is None
+            or stored.plan_key != self.plan_key
+            or stored.publication_state != "PUBLISHED"
+        ):
+            return None
+        return stored
+
+    def _stored_work_row(
+        self,
+        work_item_id: str,
+        *,
+        require_published: bool,
+    ) -> StoredStreamWorkPlan:
+        stored = self._ledger.get_work(work_item_id)
+        if stored.plan_key != self.plan_key:
+            raise StreamSchedulerCompositionError("work item belongs to another stream graph")
+        if require_published and stored.publication_state != "PUBLISHED":
+            raise StreamSchedulerCompositionError("work item is not published for execution")
+        self._remember_work_row(stored)
+        return stored
 
     def _stored_work_plan(
         self,
@@ -1413,11 +1591,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         *,
         require_published: bool,
     ) -> StreamWorkItemPlan:
-        stored = self._ledger.get_work(work_item_id)
-        if stored.plan_key != self.plan_key:
-            raise StreamSchedulerCompositionError("work item belongs to another stream graph")
-        if require_published and stored.publication_state != "PUBLISHED":
-            raise StreamSchedulerCompositionError("work item is not published for execution")
+        stored = self._stored_work_row(work_item_id, require_published=require_published)
         return _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
 
     def _stored_work_plan_by_key(self, logical_key: str) -> StreamWorkItemPlan:
@@ -1433,13 +1607,16 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
     def _stored_work_plans_with_state(
         self,
     ) -> tuple[tuple[StreamWorkItemPlan, str], ...]:
-        return tuple(
-            (
-                _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan"),
-                row.publication_state,
+        plans: list[tuple[StreamWorkItemPlan, str]] = []
+        for row in self._ledger.work_plans(self.plan_key):
+            self._remember_work_row(row)
+            plans.append(
+                (
+                    _parse_exact(row.plan_json, StreamWorkItemPlan, "stream work plan"),
+                    row.publication_state,
+                )
             )
-            for row in self._ledger.work_plans(self.plan_key)
-        )
+        return tuple(plans)
 
     def _verify_existing_window_member(
         self,

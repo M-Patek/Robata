@@ -9,6 +9,7 @@ performs no writes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Protocol, Self
 from uuid import NAMESPACE_URL, uuid5
@@ -341,6 +342,53 @@ class PrimaryCompletionCommand(StrictModel):
         return self
 
 
+_PREPARED_PRIMARY_COMPLETION_CAPABILITY = object()
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPrimaryCompletionCommand:
+    """Process-local, already-validated completion handoff.
+
+    This is deliberately not a contract model or persistence shape. It carries
+    the exact canonical bytes produced by the canonical composition directly to
+    the one local completion authority, avoiding a second full model walk before
+    the authoritative transaction. Public ``PrimaryCompletionCommand`` callers
+    continue to use the strict repository boundary.
+    """
+
+    command: PrimaryCompletionCommand
+    detail_bytes: bytes
+    detail_exact_bytes_sha256: Sha256Digest
+    command_bytes: bytes
+    command_exact_bytes_sha256: Sha256Digest
+    processing_run_bytes: bytes
+    processing_run_exact_bytes_sha256: Sha256Digest
+    _capability: object
+
+    def __post_init__(self) -> None:
+        if self._capability is not _PREPARED_PRIMARY_COMPLETION_CAPABILITY:
+            raise TypeError(
+                "PreparedPrimaryCompletionCommand must be created by the canonical preparer"
+            )
+        if not isinstance(self.command, PrimaryCompletionCommand):
+            raise TypeError("command must be PrimaryCompletionCommand")
+        if not all(
+            isinstance(value, bytes)
+            for value in (
+                self.detail_bytes,
+                self.command_bytes,
+                self.processing_run_bytes,
+            )
+        ):
+            raise TypeError("prepared primary completion bytes must be bytes")
+
+    @property
+    def is_canonical_preparation(self) -> bool:
+        """Return whether this instance was produced by this module's factory."""
+
+        return self._capability is _PREPARED_PRIMARY_COMPLETION_CAPABILITY
+
+
 class CommittedPrimaryCompletion(StrictModel):
     """Authoritative recovery view returned after the aggregate transaction."""
 
@@ -394,6 +442,11 @@ class PrimaryCompletionRepository(Protocol):
     def get(self, run_id: str) -> CommittedPrimaryCompletion | None: ...
 
     def commit(self, command: PrimaryCompletionCommand) -> PrimaryCompletionCommitResult: ...
+
+    def commit_prepared(
+        self,
+        prepared: PreparedPrimaryCompletionCommand,
+    ) -> PrimaryCompletionCommitResult: ...
 
     def list_outbox(self, recording_identity: str) -> tuple[EventIdentityOutboxRecord, ...]: ...
 
@@ -449,15 +502,15 @@ def primary_completion_command_projection(
     }
 
 
-def create_primary_completion_command(
+def _create_primary_completion_command(
     *,
     result: CanonicalOfflineRunResult,
     prepared_identities: PreparedEventIdentityBatch | None,
     action_event_publications: PreparedInitialActionEventRevisionBatch,
     evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
     registry: SchemaRegistry | None = None,
-) -> PrimaryCompletionCommand:
-    """Create and schema-validate one exact aggregate command without writes."""
+) -> tuple[PrimaryCompletionCommand, bytes]:
+    """Create a validated command and retain the detail bytes used to bind it."""
 
     if not isinstance(result, CanonicalOfflineRunResult):
         raise TypeError("result must be CanonicalOfflineRunResult")
@@ -580,7 +633,65 @@ def create_primary_completion_command(
     command_fields["command_sha256"] = semantic_sha256(
         primary_completion_command_projection(draft_command)
     )
-    return PrimaryCompletionCommand.model_validate(command_fields, strict=True)
+    command = PrimaryCompletionCommand.model_validate(command_fields, strict=True)
+    return command, detail_bytes
+
+
+def create_primary_completion_command(
+    *,
+    result: CanonicalOfflineRunResult,
+    prepared_identities: PreparedEventIdentityBatch | None,
+    action_event_publications: PreparedInitialActionEventRevisionBatch,
+    evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
+    registry: SchemaRegistry | None = None,
+) -> PrimaryCompletionCommand:
+    """Create and schema-validate one exact aggregate command without writes."""
+
+    command, _detail_bytes = _create_primary_completion_command(
+        result=result,
+        prepared_identities=prepared_identities,
+        action_event_publications=action_event_publications,
+        evidence_references=evidence_references,
+        registry=registry,
+    )
+    return command
+
+
+def prepare_primary_completion_command(
+    *,
+    result: CanonicalOfflineRunResult,
+    prepared_identities: PreparedEventIdentityBatch | None,
+    action_event_publications: PreparedInitialActionEventRevisionBatch,
+    evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
+    registry: SchemaRegistry | None = None,
+) -> PreparedPrimaryCompletionCommand:
+    """Prepare one local command for the adjacent authoritative repository.
+
+    The public factory above remains the strict external boundary. This helper is
+    used only by the same local composition that produced all typed facts, so it
+    can carry the exact bytes forward rather than rebuild them in the coordinator
+    and repository.
+    """
+
+    command, detail_bytes = _create_primary_completion_command(
+        result=result,
+        prepared_identities=prepared_identities,
+        action_event_publications=action_event_publications,
+        evidence_references=evidence_references,
+        registry=registry,
+    )
+    command_bytes = canonical_json_bytes(command)
+    processing_run_bytes = canonical_json_bytes(command.detail.processing_run)
+    return PreparedPrimaryCompletionCommand(
+        command=command,
+        detail_bytes=detail_bytes,
+        detail_exact_bytes_sha256=exact_bytes_sha256(detail_bytes),
+        command_bytes=command_bytes,
+        command_exact_bytes_sha256=exact_bytes_sha256(command_bytes),
+        processing_run_bytes=processing_run_bytes,
+        processing_run_exact_bytes_sha256=exact_bytes_sha256(processing_run_bytes),
+        _capability=_PREPARED_PRIMARY_COMPLETION_CAPABILITY,
+    )
 
 
 def _primary_completion_record_from_detail(
@@ -736,6 +847,7 @@ __all__ = [
     "CANONICAL_PRIMARY_COMPLETION_DETAIL_WIRE_VERSION",
     "CanonicalPrimaryCompletionDetail",
     "CommittedPrimaryCompletion",
+    "PreparedPrimaryCompletionCommand",
     "PrimaryCompletionCommand",
     "PrimaryCompletionCommitResult",
     "PrimaryCompletionError",
@@ -746,5 +858,6 @@ __all__ = [
     "canonical_collection_digest_root",
     "canonical_primary_completion_detail_projection",
     "create_primary_completion_command",
+    "prepare_primary_completion_command",
     "primary_completion_command_projection",
 ]

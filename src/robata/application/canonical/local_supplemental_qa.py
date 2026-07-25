@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
 
-from robata.application.canonical.mcap_source import CanonicalMcapSourceBundle
+if TYPE_CHECKING:
+    from robata.application.canonical.mcap_source import CanonicalMcapSourceBundle
+
 from robata.application.canonical.media_quality_binding import (
     derive_local_media_quality_binding_document,
 )
@@ -55,6 +57,10 @@ def build_and_publish_local_supplemental_qa_evidence(
     created_at: str,
 ) -> LocalSupplementalQaEvidence | None:
     """Build the bounded explicit-target branch before primary completion."""
+
+    # Keep JSON fixture composition independent of optional PyAV/MCAP imports.
+    # The concrete runtime check runs only on the MCAP supplemental branch.
+    from robata.application.canonical.mcap_source import CanonicalMcapSourceBundle
 
     if not isinstance(bundle, CanonicalMcapSourceBundle):
         raise TypeError("bundle must be a CanonicalMcapSourceBundle")

@@ -17,9 +17,10 @@ from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
+from robata.ports.decoded_frame import DecodedFrameView
 from robata.sampling.grid import SamplingGrid, SamplingRate
 
-LOCAL_MEDIA_QUALITY_POLICY_VERSION: Final = "local-media-quality-observation-v1"
+LOCAL_MEDIA_QUALITY_POLICY_VERSION: Final = "local-media-quality-observation-v2"
 LOCAL_NEIGHBOR_TARGET_POLICY_VERSION: Final = "local-neighbor-target-v1"
 LOCAL_MEDIA_QUALITY_REPORT_FORMAT_VERSION: Final = "local-media-quality-report-v1"
 LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_ID: Final = "https://schemas.robata.dev/media-quality-report"
@@ -253,7 +254,7 @@ class LocalMediaQualityReport:
 
 
 class LocalFrameQualityAnalyzer:
-    """Extract deterministic luma observations from decoded PyAV frames."""
+    """Extract deterministic luma observations from normalized decoded frame views."""
 
     def __init__(
         self,
@@ -263,21 +264,32 @@ class LocalFrameQualityAnalyzer:
         self._camera_id = camera_id
         self._policy = policy
         self._previous_gray: bytes | None = None
+        self._previous_dimensions: tuple[int, int] | None = None
         self._previous_timestamp_ns: int | None = None
         self._stable_start_ns: int | None = None
 
-    def observe(self, frame: Any, timing: FrameTimingEvidence) -> FrameQualityObservation:
+    def observe(
+        self,
+        frame: DecodedFrameView,
+        timing: FrameTimingEvidence,
+    ) -> FrameQualityObservation:
+        """Observe one normalized decoded view and its source-timeline evidence."""
+
+        if not isinstance(frame, DecodedFrameView):
+            raise TypeError("frame must be a DecodedFrameView")
         if timing.camera_id is not self._camera_id:
             raise ValueError("frame timing camera differs from analyzer camera")
+        if frame.timestamp_ns != timing.aligned_timestamp_ns:
+            raise ValueError("decoded frame timestamp differs from aligned timing evidence")
         if (
             self._previous_timestamp_ns is not None
             and timing.aligned_timestamp_ns <= self._previous_timestamp_ns
         ):
             raise ValueError("decoded frame timestamps must be strictly increasing")
 
-        dimensions = _gray_dimensions(frame, self._policy)
-        gray = _normalized_gray_bytes(frame, dimensions=dimensions)
-        pixel_count = len(gray)
+        dimensions = (frame.width, frame.height)
+        gray = frame.gray_pixels
+        pixel_count = frame.pixel_count
         mean_luma_milli = _rounded_ratio(sum(gray) * 1_000, pixel_count)
         black_fraction_ppm = _rounded_ratio(
             sum(value <= self._policy.black_luma_max for value in gray) * 1_000_000,
@@ -288,6 +300,8 @@ class LocalFrameQualityAnalyzer:
             pixel_count,
         )
         edge_energy_milli = _edge_energy_milli(gray, dimensions)
+        if self._previous_dimensions is not None and dimensions != self._previous_dimensions:
+            raise ValueError("decoded frame view dimensions must remain stable per analyzer")
         frame_delta_milli = (
             None
             if self._previous_gray is None
@@ -322,6 +336,7 @@ class LocalFrameQualityAnalyzer:
             self._stable_start_ns = None
 
         self._previous_gray = gray
+        self._previous_dimensions = dimensions
         self._previous_timestamp_ns = timing.aligned_timestamp_ns
         return FrameQualityObservation(
             camera_id=self._camera_id,
@@ -487,9 +502,57 @@ def plan_neighbor_targets(
     return replace(draft, semantic_sha256=semantic_sha256(_neighbor_projection(draft)))
 
 
-def _gray_dimensions(frame: Any, policy: LocalMediaQualityPolicy) -> tuple[int, int]:
-    width = min(policy.analysis_width, int(frame.width))
-    height = max(1, int(frame.height) * width // int(frame.width))
+def pyav_decoded_frame_view(
+    frame: Any,
+    *,
+    timestamp_ns: int,
+    analysis_width: int = DEFAULT_MEDIA_QUALITY_POLICY.analysis_width,
+) -> DecodedFrameView:
+    """Convert one PyAV frame to the compact grayscale view used by local detectors.
+
+    The returned bytes contain no PyAV line padding and are always row-major grayscale
+    samples. ``timestamp_ns`` is passed by the source-timeline owner so no float timestamp
+    conversion or timing approximation occurs at this boundary.
+    """
+
+    dimensions = _gray_dimensions(frame, analysis_width=analysis_width)
+    return DecodedFrameView(
+        timestamp_ns=timestamp_ns,
+        width=dimensions[0],
+        height=dimensions[1],
+        gray_pixels=_normalized_gray_bytes(frame, dimensions=dimensions),
+    )
+
+
+def decoded_frame_view_from_pyav(
+    frame: Any,
+    *,
+    timestamp_ns: int,
+    analysis_width: int = DEFAULT_MEDIA_QUALITY_POLICY.analysis_width,
+) -> DecodedFrameView:
+    """Alias with source-first naming for :func:`pyav_decoded_frame_view`."""
+
+    return pyav_decoded_frame_view(
+        frame,
+        timestamp_ns=timestamp_ns,
+        analysis_width=analysis_width,
+    )
+
+
+def _gray_dimensions(frame: Any, *, analysis_width: int) -> tuple[int, int]:
+    if isinstance(analysis_width, bool) or not isinstance(analysis_width, int):
+        raise TypeError("analysis_width must be an integer")
+    if analysis_width <= 0:
+        raise ValueError("analysis_width must be positive")
+    try:
+        source_width = int(frame.width)
+        source_height = int(frame.height)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError("frame must expose positive integer width and height") from exc
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("frame dimensions must be positive")
+    width = min(analysis_width, source_width)
+    height = max(1, source_height * width // source_width)
     return width, height
 
 
@@ -497,10 +560,14 @@ def _normalized_gray_bytes(frame: Any, *, dimensions: tuple[int, int]) -> bytes:
     width, height = dimensions
     converted = frame.reformat(width=width, height=height, format="gray")
     plane = converted.planes[0]
+    line_size = int(plane.line_size)
+    if line_size < width:
+        raise ValueError("reformatted grayscale plane line size is shorter than its width")
     raw = bytes(plane)
-    return b"".join(
-        raw[row * plane.line_size : row * plane.line_size + width] for row in range(height)
-    )
+    required_length = line_size * height
+    if len(raw) < required_length:
+        raise ValueError("reformatted grayscale plane is shorter than its declared dimensions")
+    return b"".join(raw[row * line_size : row * line_size + width] for row in range(height))
 
 
 def _rounded_ratio(numerator: int, denominator: int) -> int:
@@ -984,6 +1051,7 @@ __all__ = [
     "LOCAL_NEIGHBOR_TARGET_POLICY_VERSION",
     "CameraMediaQualityLedger",
     "CrossCameraSkewReport",
+    "DecodedFrameView",
     "FrameQualityObservation",
     "FrameTimingEvidence",
     "LocalFrameQualityAnalyzer",
@@ -996,9 +1064,11 @@ __all__ = [
     "SupplementalNeighborTarget",
     "SupplementalNeighborTargetPlan",
     "build_local_media_quality_report",
+    "decoded_frame_view_from_pyav",
     "load_registered_local_media_quality_report_document",
     "local_media_quality_report_document",
     "plan_neighbor_targets",
+    "pyav_decoded_frame_view",
     "registered_local_media_quality_report_document",
     "validate_registered_local_media_quality_report_document",
 ]

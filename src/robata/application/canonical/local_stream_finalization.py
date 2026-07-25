@@ -99,6 +99,15 @@ from robata.contracts.stream_window import (
     create_stream_inference_attempt_identity,
     create_stream_inference_identity,
 )
+from robata.inference.models import (
+    InferenceStatus as ProviderInferenceStatus,
+)
+from robata.inference.models import (
+    ModelInference as ProviderModelInference,
+)
+from robata.inference.models import (
+    VisionTask as ProviderVisionTask,
+)
 from robata.queue.stream_models import (
     TERMINAL_STREAM_WORK_STATES,
     StreamTerminalEvidence,
@@ -122,6 +131,14 @@ LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID: Final = "https://schemas.robata.dev/local-s
 LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION: Final = "1.0.0"
 LOCAL_STREAM_FINAL_MAPPING_VERSION: Final = "local-stream-final-window-mapping-v1"
 LOCAL_CONFORMANCE_EVIDENCE_CLASS: Final = "LOCAL_CONFORMANCE"
+# The pre-EOS bridge deliberately has a small surface: it only owns the three
+# existing canonical provider tasks that appear in the window DAG.  WINDOW and
+# reduction work retain their scheduler/local-reduction responsibilities.
+_PRE_EOS_PROVIDER_TASK_BY_STAGE: Final[dict[StreamStage, ProviderVisionTask]] = {
+    StreamStage.QA_COARSE: ProviderVisionTask.QA_COARSE,
+    StreamStage.QA_DENSE: ProviderVisionTask.QA_DENSE,
+    StreamStage.EVENT_PROPOSAL: ProviderVisionTask.EVENT_PROPOSAL,
+}
 _ARTIFACT_NAMESPACE: Final = uuid5(NAMESPACE_URL, "robata:local-conformance-stream-artifact-v1")
 
 
@@ -145,6 +162,11 @@ class LocalStreamFinalizationSchemaRefs:
     stream_accepted_call: SchemaRef
     stream_inference_terminal: SchemaRef
     window_semantic_evidence: SchemaRef | None = None
+    # P5 may complete a provider-neutral QA/event stage before EOS. Such a
+    # terminal is an existing ``model-inference`` artifact, not a
+    # LOCAL_CONFORMANCE receipt. Keeping this optional preserves the fast
+    # conformance-only mode and avoids changing published local-stream schemas.
+    model_inference: SchemaRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +363,9 @@ class LocalConformanceStreamFinalizer:
         worker_id: str = "local-conformance-stream-worker",
         lease_duration_seconds: int = 300,
         recover_graph_before_execute: bool = True,
+        stage_terminal_executor: (
+            Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
+        ) = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(scheduler, DurableStreamWindowScheduler):
@@ -378,6 +403,8 @@ class LocalConformanceStreamFinalizer:
             raise ValueError("lease_duration_seconds must be positive")
         if not isinstance(recover_graph_before_execute, bool):
             raise TypeError("recover_graph_before_execute must be bool")
+        if stage_terminal_executor is not None and not callable(stage_terminal_executor):
+            raise TypeError("stage_terminal_executor must be callable or None")
         self._scheduler = scheduler
         self._delivery = delivery_authority
         self._artifacts = _ExactLocalArtifactStore(Path(artifact_root))
@@ -392,6 +419,7 @@ class LocalConformanceStreamFinalizer:
         self._worker_id = worker_id
         self._lease_seconds = lease_duration_seconds
         self._recover_graph_before_execute = recover_graph_before_execute
+        self._stage_terminal_executor = stage_terminal_executor
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def execute(self) -> LocalStreamFinalizationOutcome:
@@ -502,7 +530,7 @@ class LocalConformanceStreamFinalizer:
 
         final_item = self._scheduler.get(final_plan.work_item_id)
         if final_item.state not in TERMINAL_STREAM_WORK_STATES:
-            claim = self._scheduler.claim(
+            claim = self._scheduler.claim_and_start(
                 self._worker_id,
                 self._lease_seconds,
                 work_item_id=final_plan.work_item_id,
@@ -513,7 +541,6 @@ class LocalConformanceStreamFinalizer:
                 raise LocalStreamFinalizationError(
                     "finalization gate is closed but finalization work is not claimable"
                 )
-            self._scheduler.start(claim.lease, now=self._now())
             final_item = self._scheduler.complete(
                 claim.lease,
                 StreamTerminalEvidence(
@@ -587,16 +614,31 @@ class LocalConformanceStreamFinalizer:
             for plan in tuple(pending.values()):
                 if executed >= max_items:
                     break
-                claim = self._scheduler.claim(
+                claim = self._scheduler.claim_and_start(
                     self._worker_id,
                     self._lease_seconds,
                     work_item_id=plan.work_item_id,
                     now=self._now(),
                     recover_graph=False,
                 )
+                if (
+                    claim is None
+                    and self._stage_terminal_executor is not None
+                    and plan.stage in _PRE_EOS_PROVIDER_TASK_BY_STAGE
+                ):
+                    # A provider terminal may already be durably persisted while a
+                    # process dies before the stream scheduler accepts it.  Do not
+                    # reclaim or re-dispatch the work: resume only the exact live
+                    # fence still owned by this local worker, then let the canonical
+                    # provider ledger replay its evidence through the same hook.
+                    claim = self._scheduler.resume_owned_active(
+                        self._worker_id,
+                        self._lease_seconds,
+                        work_item_id=plan.work_item_id,
+                        now=self._now(),
+                    )
                 if claim is None:
                     continue
-                self._scheduler.start(claim.lease, now=self._now())
                 prepared = self._prepare_work_completion(
                     plan,
                     plans_by_key,
@@ -659,6 +701,35 @@ class LocalConformanceStreamFinalizer:
                 plans_by_key,
                 terminal_refs_by_key,
             )
+        # The normal local path intentionally remains a deterministic mock.
+        # When a P5 provider-neutral executor is configured, however, it gets
+        # first refusal for ready QA/event work. The scheduler continues to
+        # own claims, leases, and terminal acceptance; this hook owns neither
+        # scheduling state nor QA/event reduction semantics.
+        if self._stage_terminal_executor is not None:
+            terminal = self._stage_terminal_executor(plan)
+            if terminal is not None:
+                checked_terminal = StreamTerminalEvidence.model_validate(
+                    terminal.model_dump(mode="python"), strict=True
+                )
+                if plan.stage not in _PRE_EOS_PROVIDER_TASK_BY_STAGE:
+                    raise LocalStreamFinalizationError(
+                        "provider-neutral execution is only valid for QA/event window stages"
+                    )
+                model_inference_ref = self._schema_refs.model_inference
+                if (
+                    model_inference_ref is None
+                    or checked_terminal.evidence_ref.schema_ref != model_inference_ref
+                ):
+                    raise LocalStreamFinalizationError(
+                        "provider-neutral terminal must reference the registered "
+                        "model inference artifact"
+                    )
+                if checked_terminal.terminal_policy_version != self._terminal_policy:
+                    raise LocalStreamFinalizationError(
+                        "provider-neutral terminal violates the stream terminal policy"
+                    )
+                return _PreparedStreamWorkCompletion(terminal_evidence=checked_terminal)
         receipt = self._receipt(plan, plans_by_key, terminal_refs_by_key)
         receipt_ref = self._artifacts.put(
             canonical_json_bytes(receipt), self._schema_refs.local_work_receipt
@@ -859,33 +930,63 @@ class LocalConformanceStreamFinalizer:
                 raise LocalStreamFinalizationError(
                     "causal window reduction lacks terminal upstream evidence"
                 )
-            try:
-                receipt = LocalStreamWorkReceipt.model_validate_json(
-                    self._artifacts.read(reference),
-                    strict=True,
-                )
-            except ValueError as error:
-                raise LocalStreamFinalizationError(
-                    "causal upstream evidence is not a local stream receipt"
-                ) from error
+            expected_provider_task = _PRE_EOS_PROVIDER_TASK_BY_STAGE.get(upstream_plan.stage)
             if (
-                receipt.executor_policy_version != self._mock_policy
-                or receipt.work_item_id != upstream_plan.work_item_id
-                or receipt.work_logical_key != upstream_plan.work_logical_key
-                or receipt.stage is not upstream_plan.stage
+                expected_provider_task is not None
+                and self._schema_refs.model_inference is not None
+                and reference.schema_ref == self._schema_refs.model_inference
             ):
-                raise LocalStreamFinalizationError(
-                    "causal upstream receipt conflicts with its durable work plan"
-                )
-            if receipt.stage in by_stage:
+                try:
+                    inference = ProviderModelInference.model_validate_json(
+                        self._artifacts.read(reference),
+                        strict=True,
+                    )
+                except ValueError as error:
+                    raise LocalStreamFinalizationError(
+                        "causal upstream provider evidence is not a model inference"
+                    ) from error
+                if (
+                    inference.stage is not expected_provider_task
+                    or inference.status is not ProviderInferenceStatus.SUCCEEDED
+                    or not inference.output_valid
+                ):
+                    raise LocalStreamFinalizationError(
+                        "causal upstream model inference is not a valid successful stage terminal"
+                    )
+                evidence_stage = upstream_plan.stage
+                evidence_key = upstream_plan.work_logical_key
+                evidence_sha = semantic_sha256(inference.model_dump(mode="json"))
+            else:
+                try:
+                    receipt = LocalStreamWorkReceipt.model_validate_json(
+                        self._artifacts.read(reference),
+                        strict=True,
+                    )
+                except ValueError as error:
+                    raise LocalStreamFinalizationError(
+                        "causal upstream evidence is not a local stream receipt"
+                    ) from error
+                if (
+                    receipt.executor_policy_version != self._mock_policy
+                    or receipt.work_item_id != upstream_plan.work_item_id
+                    or receipt.work_logical_key != upstream_plan.work_logical_key
+                    or receipt.stage is not upstream_plan.stage
+                ):
+                    raise LocalStreamFinalizationError(
+                        "causal upstream receipt conflicts with its durable work plan"
+                    )
+                evidence_stage = receipt.stage
+                evidence_key = receipt.work_logical_key
+                evidence_sha = semantic_sha256(receipt.model_dump(mode="json"))
+            if evidence_stage in by_stage:
                 raise LocalStreamFinalizationError(
                     "causal window reduction has duplicate upstream stages"
                 )
-            by_stage[receipt.stage] = LocalStreamStageEvidenceReference(
-                stage=receipt.stage,
-                work_logical_key=receipt.work_logical_key,
+            by_stage[evidence_stage] = LocalStreamStageEvidenceReference(
+                stage=evidence_stage,
+                work_logical_key=evidence_key,
                 terminal_evidence_ref=reference,
-                evidence_semantic_sha256=semantic_sha256(receipt.model_dump(mode="json")),
+                evidence_semantic_sha256=evidence_sha,
             )
         stages = (
             StreamStage.WINDOW,

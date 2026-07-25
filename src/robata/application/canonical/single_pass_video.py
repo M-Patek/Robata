@@ -32,7 +32,7 @@ from robata.adapters.mcap_single_pass import (
     SinglePassTraversalResult,
     iter_h264_spool,
 )
-from robata.adapters.pyav_mp4_exporter import PyAvH264Mp4Exporter
+from robata.adapters.pyav_mp4_exporter import DecodedFrameObserver, PyAvH264Mp4Exporter
 from robata.application.canonical.bounded_media import (
     ACCESS_UNIT_FRAMING_VERSION,
     BoundedMediaPolicy,
@@ -167,6 +167,7 @@ class DurableSinglePassVideoProducer:
         self._planner_source_scope_digest = resolved_planner_scope
         self._tee = tee or McapSinglePassH264Tee()
         self._exporter = exporter or PyAvH264Mp4Exporter()
+        self._decoded_frame_observer: DecodedFrameObserver | None = None
         self._last_facts: SinglePassVideoProductionFacts | None = None
         self._prepared: (
             tuple[
@@ -216,6 +217,20 @@ class DurableSinglePassVideoProducer:
         """Capture or recover the accepted spool set without exporting it twice."""
 
         return self._prepare()[0]
+
+    def set_decoded_frame_observer(
+        self,
+        observer: DecodedFrameObserver | None,
+    ) -> None:
+        """Observe validated source frames during durable spool replay."""
+
+        if observer is not None and not callable(observer):
+            raise TypeError("observer must be callable or None")
+        if self._last_facts is not None:
+            raise SinglePassVideoProductionError(
+                "cannot configure decoded-frame observer after production"
+            )
+        self._decoded_frame_observer = observer
 
     def release_exported_spool_set(self) -> None:
         """Release spools after the caller has verified the registered publication."""
@@ -780,6 +795,8 @@ class DurableSinglePassVideoProducer:
             self._channels[camera_id],
             staging_directory / f"{camera_id.value}.mp4",
             staging_directory / f"{camera_id.value}.timestamps.jsonl",
+            decoded_frame_observer=self._decoded_frame_observer,
+            validate_output=self._decoded_frame_observer is None,
         )
         observed = 0
         try:

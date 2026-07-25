@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from robata.application.canonical.primary_completion import (
     CommittedPrimaryCompletion,
+    PreparedPrimaryCompletionCommand,
     PrimaryCompletionCommand,
     PrimaryCompletionCommitResult,
     PrimaryCompletionRepository,
@@ -96,12 +97,28 @@ def canonical_action_publish_plan_from_command(
     """Derive execution-local work identity without changing domain identities."""
 
     checked = _strict_model(command, PrimaryCompletionCommand, "command")
+    return _action_publish_plan_from_checked(checked)
+
+
+def canonical_action_publish_plan_from_prepared(
+    prepared: PreparedPrimaryCompletionCommand,
+) -> WorkItemPlan:
+    """Derive work identity from a process-local prepared completion command."""
+
+    if not isinstance(prepared, PreparedPrimaryCompletionCommand):
+        raise TypeError("prepared must be PreparedPrimaryCompletionCommand")
+    if not prepared.is_canonical_preparation:
+        raise CanonicalDurableWorkError("prepared completion lacks canonical provenance")
+    return _action_publish_plan_from_checked(prepared.command)
+
+
+def _action_publish_plan_from_checked(command: PrimaryCompletionCommand) -> WorkItemPlan:
     return _action_publish_plan(
-        run_id=checked.detail.run_id,
-        mcap_id=checked.detail.mcap_id,
-        command_sha256=checked.command_sha256,
-        config_sha256=checked.detail.execution_policy_sha256,
-        created_at=checked.detail.processing_run.started_at,
+        run_id=command.detail.run_id,
+        mcap_id=command.detail.mcap_id,
+        command_sha256=command.command_sha256,
+        config_sha256=command.detail.execution_policy_sha256,
+        created_at=command.detail.processing_run.started_at,
     )
 
 
@@ -144,19 +161,44 @@ class CanonicalActionPublishWorkCoordinator:
         self,
         command: PrimaryCompletionCommand,
     ) -> PrimaryCompletionCommitResult:
-        """Commit under a live fence, then terminalize or later reconcile work."""
+        """Strictly validate and commit an arbitrary publication command."""
 
         checked = _strict_model(command, PrimaryCompletionCommand, "command")
-        existing = self._repository.get(checked.detail.run_id)
+        return self._commit_checked(
+            checked,
+            plan=_action_publish_plan_from_checked(checked),
+            commit_repository=lambda: self._repository.commit(checked),
+        )
+
+    def commit_prepared(
+        self,
+        prepared: PreparedPrimaryCompletionCommand,
+    ) -> PrimaryCompletionCommitResult:
+        """Commit a directly adjacent, already-validated local command."""
+
+        plan = canonical_action_publish_plan_from_prepared(prepared)
+        return self._commit_checked(
+            prepared.command,
+            plan=plan,
+            commit_repository=lambda: self._repository.commit_prepared(prepared),
+        )
+
+    def _commit_checked(
+        self,
+        command: PrimaryCompletionCommand,
+        *,
+        plan: WorkItemPlan,
+        commit_repository: Callable[[], PrimaryCompletionCommitResult],
+    ) -> PrimaryCompletionCommitResult:
+        existing = self._repository.get(command.detail.run_id)
         if existing is not None:
-            if existing.command_sha256 != checked.command_sha256:
+            if existing.command_sha256 != command.command_sha256:
                 raise CanonicalDurableWorkError(
                     "primary completion exists with a different publication command"
                 )
             self.reconcile(existing)
             return PrimaryCompletionCommitResult(committed=existing, replayed=True)
 
-        plan = canonical_action_publish_plan_from_command(checked)
         item = self._scheduler.plan(plan)
         if item.state is WorkItemState.SUCCEEDED:
             raise CanonicalDurableWorkError(
@@ -171,7 +213,7 @@ class CanonicalActionPublishWorkCoordinator:
             now=now,
         )
 
-        committed = self._repository.commit(checked)
+        committed = commit_repository()
         self._succeed(lease, committed.committed)
         return committed
 
@@ -341,4 +383,5 @@ __all__ = [
     "DurableWorkScheduler",
     "canonical_action_publish_plan_from_command",
     "canonical_action_publish_plan_from_committed",
+    "canonical_action_publish_plan_from_prepared",
 ]

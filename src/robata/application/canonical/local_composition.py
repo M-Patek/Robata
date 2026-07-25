@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import ValidationError
@@ -20,6 +22,7 @@ from robata.adapters.sqlite_barrier import (
     SQLiteBarrierStorageError,
 )
 from robata.adapters.sqlite_inference_evidence import (
+    MODEL_INFERENCE_SCHEMA_ID,
     SQLiteInferenceEvidenceLedger,
     SQLiteInferenceEvidenceLedgerError,
 )
@@ -72,6 +75,7 @@ from robata.application.canonical.media_quality import (
     LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_ID,
     LOCAL_MEDIA_QUALITY_REPORT_SCHEMA_VERSION,
     LOCAL_NEIGHBOR_TARGET_POLICY_VERSION,
+    LocalMediaQualityReport,
     load_registered_local_media_quality_report_document,
 )
 from robata.application.canonical.media_quality_binding import (
@@ -97,7 +101,10 @@ from robata.application.canonical.primary_completion import (
     PrimaryCompletionError,
     PrimaryCompletionEvidenceReference,
     PrimaryCompletionEvidenceRole,
-    create_primary_completion_command,
+    prepare_primary_completion_command,
+)
+from robata.application.canonical.product_qa import (
+    product_qa_context_from_media_quality_report,
 )
 from robata.application.canonical.result_validation import CanonicalOfflineRunResult
 from robata.application.canonical.runner import CanonicalOfflinePipeline
@@ -150,6 +157,7 @@ from robata.contracts.stream_inference import (
     STREAM_WINDOW_RESULT_SCHEMA_ID,
     STREAM_WINDOW_RESULT_SCHEMA_VERSION,
 )
+from robata.contracts.stream_planning import StreamWorkItemPlan
 from robata.contracts.stream_window import (
     STREAM_INFERENCE_ATTEMPT_SCHEMA_ID,
     STREAM_INFERENCE_ATTEMPT_SCHEMA_VERSION,
@@ -169,7 +177,13 @@ from robata.event_pipeline.provisional_fusion import (
     LOCAL_PROVISIONAL_FUSION_POLICY_VERSION,
     ProvisionalFusionPolicy,
 )
-from robata.inference.adapter import JsonSchemaRef, VisionInferenceRequest
+from robata.inference.adapter import (
+    JsonSchemaRef,
+    VisionInferenceFailure,
+    VisionInferenceRequest,
+    VisionInferenceSuccess,
+    VisionModelAdapter,
+)
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
     ENRICHED_OUTPUT_SCHEMA_VERSION,
@@ -214,6 +228,7 @@ from robata.qa_pipeline.supplemental_wire import (
     LocalSupplementalQaEvidence,
 )
 from robata.queue.outbox import OutboxRelay, OutboxRetryPolicy
+from robata.queue.stream_models import StreamTerminalEvidence
 from robata.runtime.observability import (
     RuntimeObserver,
     runtime_increment,
@@ -234,6 +249,10 @@ from robata.sampling.supplemental import (
     SUPPLEMENTAL_TARGET_PLAN_PROJECTION_VERSION,
 )
 
+if TYPE_CHECKING:
+    from robata.application.canonical.mcap_source import McapMediaProcessingPolicy
+
+
 LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v21"
 LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION = "canonical-local-execution-clock-v1"
 LOCAL_CANONICAL_EXECUTION_TIME = "2026-07-20T00:00:00Z"
@@ -243,12 +262,20 @@ LOCAL_CANONICAL_PARSER_VERSION = "strict-provider-claim-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY = "ordered-claims-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY_VERSION = "1.0"
 LOCAL_CANONICAL_EVENT_ALLOCATOR_VERSION = "canonical-local-event-uuid5-v1"
+# Runtime-only dispatch bounds. They deliberately stay outside the canonical
+# execution policy: compatible batch grouping must not change identity/evidence.
+LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS: Final = 6
+LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE: Final = 8
+LOCAL_CANONICAL_MAX_INFERENCE_BATCH_QUEUE_DELAY_MS: Final = 5
 LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v4"]] = (
     "canonical-local-run-receipt-v4"
 )
 LOCAL_CANONICAL_RUNTIME_DESCRIPTOR_MODEL_VERSION: Final[
     Literal["canonical-local-runtime-descriptor-v1"]
 ] = "canonical-local-runtime-descriptor-v1"
+# Kept equal to the finalizer's default, but pinned explicitly for the P5
+# factory context so pre-EOS artifacts and EOS terminal acceptance agree.
+LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION: Final = "stream-terminal-policy-v1"
 
 
 class CanonicalLocalCompositionErrorCode(StrEnum):
@@ -259,6 +286,7 @@ class CanonicalLocalCompositionErrorCode(StrEnum):
     LOCAL_STATE_FAILED = "LOCAL_STATE_FAILED"
     RUN_NOT_COMPLETABLE = "RUN_NOT_COMPLETABLE"
     COMPLETION_FAILED = "COMPLETION_FAILED"
+    BACKPRESSURE = "BACKPRESSURE"
 
 
 class CanonicalLocalCompositionError(RuntimeError):
@@ -323,6 +351,28 @@ class _LocalCanonicalRuntime:
     inference_evidence: SQLiteInferenceEvidenceLedger
 
 
+_StageTerminalExecutor = Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalPreEosExecutorContext:
+    """Runtime-only dependencies for a real provider-neutral pre-EOS executor.
+
+    The factory is deliberately responsible for deterministic conversion from a
+    ``StreamWorkItemPlan`` to canonical invocation inputs.  The stream plan does
+    not contain enough admitted package/rendered-input lineage for this
+    composition layer to safely invent those inputs.
+    """
+
+    pipeline: CanonicalOfflinePipeline
+    artifact_root: Path
+    model_inference_schema_ref: SchemaRef
+    terminal_policy_version: str
+
+
+LocalPreEosExecutorFactory = Callable[[LocalPreEosExecutorContext], _StageTerminalExecutor]
+
+
 def local_canonical_runtime_descriptor() -> LocalCanonicalRuntimeDescriptor:
     """Return the exact policy pins used by the local canonical composition."""
 
@@ -377,8 +427,81 @@ class _CanonicalSourceInputs(Protocol):
     ) -> MaterializedFrameArtifactFact | None: ...
 
 
+class LocalProviderCallDispatcher(Protocol):
+    """Runtime-only dispatch boundary shared by local recording workers.
+
+    Provider topology is injected rather than included in the canonical command,
+    run identity, or persisted result.  A dispatcher owns admission and
+    concurrency across pipeline instances, while each instance retains its own
+    recording-affine evidence ledger.
+    """
+
+    async def dispatch(
+        self,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        """Run one provider operation under the shared runtime bound."""
+
+
+class _DispatchingVisionModelAdapter:
+    """Apply a shared runtime dispatcher without changing the provider port."""
+
+    def __init__(
+        self,
+        delegate: VisionModelAdapter,
+        dispatcher: LocalProviderCallDispatcher,
+    ) -> None:
+        if not callable(getattr(delegate, "capabilities", None)) or not callable(
+            getattr(delegate, "infer", None)
+        ):
+            raise TypeError("delegate must implement VisionModelAdapter")
+        if not callable(getattr(dispatcher, "dispatch", None)):
+            raise TypeError("provider_dispatcher must implement async dispatch")
+        self._delegate = delegate
+        self._dispatcher = dispatcher
+
+    @property
+    def provider(self) -> str:
+        return self._delegate.provider
+
+    async def capabilities(self, model_name: str, model_version: str) -> ModelCapabilities:
+        outcome = await self._dispatcher.dispatch(
+            lambda: self._delegate.capabilities(model_name, model_version)
+        )
+        if not isinstance(outcome, ModelCapabilities):
+            raise TypeError("provider dispatcher returned an invalid capability result")
+        return outcome
+
+    async def infer(
+        self,
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        outcome = await self._dispatcher.dispatch(lambda: self._delegate.infer(request))
+        if not isinstance(outcome, (VisionInferenceSuccess, VisionInferenceFailure)):
+            raise TypeError("provider dispatcher returned an invalid inference result")
+        return outcome
+
+
+class _DispatchingBatchVisionModelAdapter(_DispatchingVisionModelAdapter):
+    """Preserve a delegate's native batch boundary under shared dispatch."""
+
+    async def infer_batch(
+        self,
+        requests: tuple[VisionInferenceRequest, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        infer_batch = getattr(self._delegate, "infer_batch", None)
+        if not callable(infer_batch):
+            raise TypeError("delegate does not implement infer_batch")
+        outcome = await self._dispatcher.dispatch(lambda: infer_batch(requests))
+        if not isinstance(outcome, tuple) or not all(
+            isinstance(item, (VisionInferenceSuccess, VisionInferenceFailure)) for item in outcome
+        ):
+            raise TypeError("provider dispatcher returned an invalid batch inference result")
+        return cast(tuple[VisionInferenceSuccess | VisionInferenceFailure, ...], outcome)
+
+
 _CanonicalSourceLoader = Callable[
-    [SchemaRegistry, SQLiteWorkScheduler, str],
+    [SchemaRegistry, SQLiteWorkScheduler, str, _StageTerminalExecutor | None],
     _CanonicalSourceInputs,
 ]
 _MediaQualityDocumentLoader = Callable[[SchemaRegistry], dict[str, object]]
@@ -424,12 +547,14 @@ def run_local_canonical_fixture(
     run_key: str = "primary",
     *,
     runtime_observer: RuntimeObserver | None = None,
+    provider_dispatcher: LocalProviderCallDispatcher | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a JSON source fixture."""
 
     source = _require_path(source_path, "source_path")
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
+    _require_provider_dispatcher(provider_dispatcher)
     with runtime_span(runtime_observer, "source.fixture.read_validate"):
         source_sha256, _, clock_value = _source_run_binding(source)
     source_binding_sha256 = semantic_sha256(
@@ -444,6 +569,7 @@ def run_local_canonical_fixture(
         registry: SchemaRegistry,
         _execution_scheduler: SQLiteWorkScheduler,
         _stream_run_id: str,
+        _stage_terminal_executor: _StageTerminalExecutor | None = None,
     ) -> CanonicalSourceBundle:
         return load_canonical_source_fixture(
             source,
@@ -458,6 +584,7 @@ def run_local_canonical_fixture(
         source_binding_sha256=source_binding_sha256,
         source_loader=load_source,
         runtime_observer=runtime_observer,
+        provider_dispatcher=provider_dispatcher,
     )
 
 
@@ -469,21 +596,51 @@ def run_local_canonical_mcap(
     *,
     allow_unapproved_profile: bool = False,
     max_duration_ns: int | None = None,
+    media_processing_policy: McapMediaProcessingPolicy | None = None,
     runtime_observer: RuntimeObserver | None = None,
+    provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    stage_terminal_executor: _StageTerminalExecutor | None = None,
+    pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
 ) -> CanonicalLocalRunReceipt:
-    """Run or recover the complete local canonical path from a real MCAP."""
+    """Run or recover the complete local canonical path from a real MCAP.
+
+    ``pre_eos_executor_factory`` is the P5 provider-neutral integration point.
+    It receives the constructed canonical runtime before source preparation and
+    returns the one hook used for both incremental pre-EOS work and any work
+    still pending at EOS. ``stage_terminal_executor`` remains available for
+    direct injection, but the two options are mutually exclusive.
+    """
 
     from robata.application.canonical.mcap_source import (
+        DEFAULT_MCAP_MEDIA_PROCESSING_POLICY,
         CanonicalMcapSourceBundle,
         CanonicalMcapSourceError,
+        McapMediaProcessingPolicy,
         authorize_mcap_mapping,
         load_canonical_mcap_source,
+        mcap_media_processing_policy_projection,
     )
 
     source = _require_path(source_path, "source_path")
     mapping = _require_path(mapping_config, "mapping_config")
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
+    _require_provider_dispatcher(provider_dispatcher)
+    if stage_terminal_executor is not None and not callable(stage_terminal_executor):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "stage_terminal_executor must be callable or None",
+        )
+    if pre_eos_executor_factory is not None and not callable(pre_eos_executor_factory):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "pre_eos_executor_factory must be callable or None",
+        )
+    if stage_terminal_executor is not None and pre_eos_executor_factory is not None:
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "stage_terminal_executor and pre_eos_executor_factory are mutually exclusive",
+        )
     if not isinstance(allow_unapproved_profile, bool):
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
@@ -497,6 +654,16 @@ def run_local_canonical_mcap(
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "max_duration_ns must be a positive integer or None",
+        )
+    resolved_media_processing_policy = (
+        DEFAULT_MCAP_MEDIA_PROCESSING_POLICY
+        if media_processing_policy is None
+        else media_processing_policy
+    )
+    if not isinstance(resolved_media_processing_policy, McapMediaProcessingPolicy):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "media_processing_policy must be McapMediaProcessingPolicy or None",
         )
     try:
         # Authorization must precede the first source read.
@@ -524,7 +691,7 @@ def run_local_canonical_mcap(
     ).ref
     source_binding_sha256 = semantic_sha256(
         {
-            "source_binding_policy_version": "canonical-local-mcap-source-binding-v6",
+            "source_binding_policy_version": "canonical-local-mcap-source-binding-v7",
             "source_kind": "mcap",
             "source_content_sha256": source_sha256,
             "mapping_profile_semantic_sha256": authorization.semantic_sha256,
@@ -532,6 +699,9 @@ def run_local_canonical_mcap(
                 CANONICAL_PRIMARY_COMPLETION_COMMAND_PROJECTION_VERSION
             ),
             "max_duration_ns": None if max_duration_ns is None else str(max_duration_ns),
+            "media_processing_policy": mcap_media_processing_policy_projection(
+                resolved_media_processing_policy
+            ),
             "media_quality_policy_version": LOCAL_MEDIA_QUALITY_POLICY_VERSION,
             "neighbor_target_policy_version": LOCAL_NEIGHBOR_TARGET_POLICY_VERSION,
             "media_quality_report_format_version": (LOCAL_MEDIA_QUALITY_REPORT_FORMAT_VERSION),
@@ -576,6 +746,7 @@ def run_local_canonical_mcap(
         registry: SchemaRegistry,
         execution_scheduler: SQLiteWorkScheduler,
         stream_run_id: str,
+        resolved_stage_terminal_executor: _StageTerminalExecutor | None = None,
     ) -> CanonicalMcapSourceBundle:
         try:
             return load_canonical_mcap_source(
@@ -586,10 +757,12 @@ def run_local_canonical_mcap(
                 schema_registry=registry,
                 clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
                 max_duration_ns=max_duration_ns,
+                media_processing_policy=resolved_media_processing_policy,
                 runtime_observer=runtime_observer,
                 execution_scheduler=execution_scheduler,
                 stream_run_id=stream_run_id,
                 stream_artifact_root=state_root / "stream-artifacts",
+                stage_terminal_executor=resolved_stage_terminal_executor,
             )
         except CanonicalMcapSourceError as error:
             raise CanonicalLocalCompositionError(
@@ -657,6 +830,9 @@ def run_local_canonical_mcap(
         supplemental_qa_evidence_builder=build_supplemental_qa_evidence,
         supplemental_qa_evidence_loader=load_supplemental_qa_evidence,
         runtime_observer=runtime_observer,
+        provider_dispatcher=provider_dispatcher,
+        stage_terminal_executor=stage_terminal_executor,
+        pre_eos_executor_factory=pre_eos_executor_factory,
     )
 
 
@@ -671,6 +847,9 @@ def _run_local_canonical(
     supplemental_qa_evidence_builder: _SupplementalQaEvidenceBuilder | None = None,
     supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
     runtime_observer: RuntimeObserver | None = None,
+    provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    stage_terminal_executor: _StageTerminalExecutor | None = None,
+    pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
 ) -> CanonicalLocalRunReceipt:
     with runtime_span(runtime_observer, "canonical.composition"):
         return _run_local_canonical_inner(
@@ -683,6 +862,9 @@ def _run_local_canonical(
             supplemental_qa_evidence_builder=supplemental_qa_evidence_builder,
             supplemental_qa_evidence_loader=supplemental_qa_evidence_loader,
             runtime_observer=runtime_observer,
+            provider_dispatcher=provider_dispatcher,
+            stage_terminal_executor=stage_terminal_executor,
+            pre_eos_executor_factory=pre_eos_executor_factory,
         )
 
 
@@ -697,6 +879,9 @@ def _run_local_canonical_inner(
     supplemental_qa_evidence_builder: _SupplementalQaEvidenceBuilder | None = None,
     supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
     runtime_observer: RuntimeObserver | None = None,
+    provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    stage_terminal_executor: _StageTerminalExecutor | None = None,
+    pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run the shared canonical flow after source authorization and binding."""
 
@@ -704,6 +889,21 @@ def _run_local_canonical_inner(
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "supplemental QA builder and loader must be configured together",
+        )
+    if stage_terminal_executor is not None and not callable(stage_terminal_executor):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "stage_terminal_executor must be callable or None",
+        )
+    if pre_eos_executor_factory is not None and not callable(pre_eos_executor_factory):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "pre_eos_executor_factory must be callable or None",
+        )
+    if stage_terminal_executor is not None and pre_eos_executor_factory is not None:
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "stage_terminal_executor and pre_eos_executor_factory are mutually exclusive",
         )
     started_at = LOCAL_CANONICAL_EXECUTION_TIME
     clock_value = _LOCAL_CANONICAL_EXECUTION_DATETIME
@@ -731,6 +931,29 @@ def _run_local_canonical_inner(
         runtime_policy_sha256=runtime_policy_sha256,
         run_key=run_key,
     )
+    # The persistent evidence ledger belongs to the one local composition.  Keep it
+    # alive across every stage, then close it before this invocation releases its
+    # state directory (including on a failed pipeline).
+    runtime: _LocalCanonicalRuntime | None = None
+
+    def build_runtime() -> _LocalCanonicalRuntime:
+        return _build_runtime(
+            state_root=state_root,
+            run_id=run_id,
+            registry=registry,
+            execution_policy=execution_policy,
+            coarse_qa_policy=coarse_qa_policy,
+            dense_qa_policy=dense_qa_policy,
+            event_proposal_policy=event_proposal_policy,
+            action_evidence_policy=action_evidence_policy,
+            boundary_refinement_policy=boundary_refinement_policy,
+            inference_policy=inference_policy,
+            clock_value=clock_value,
+            observed_at=started_at,
+            runtime_observer=runtime_observer,
+            provider_dispatcher=provider_dispatcher,
+        )
+
     try:
         with runtime_span(runtime_observer, "completion.storage.open"):
             state_root.mkdir(parents=True, exist_ok=True)
@@ -848,8 +1071,37 @@ def _run_local_canonical_inner(
             "canonical.execution_paths",
             attributes={"replayed": False},
         )
+        resolved_stage_terminal_executor = stage_terminal_executor
+        if pre_eos_executor_factory is not None:
+            # Source preparation incrementally drains ready windows.  Build the
+            # canonical runtime first so the real provider-neutral executor can
+            # use the same orchestrator/evidence ledger before the first window
+            # becomes eligible for pre-EOS execution.
+            with runtime_span(runtime_observer, "canonical.runtime.build"):
+                runtime = build_runtime()
+            context = LocalPreEosExecutorContext(
+                pipeline=runtime.pipeline,
+                artifact_root=state_root / "stream-artifacts",
+                model_inference_schema_ref=registry.resolve_version(
+                    MODEL_INFERENCE_SCHEMA_ID,
+                    "1.0.0",
+                ).ref,
+                terminal_policy_version=LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION,
+            )
+            with runtime_span(runtime_observer, "stream.pre_eos_executor.build"):
+                resolved_stage_terminal_executor = pre_eos_executor_factory(context)
+            if not callable(resolved_stage_terminal_executor):
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+                    "pre_eos_executor_factory must return a callable stage terminal executor",
+                )
         with runtime_span(runtime_observer, "source.prepare"):
-            bundle = source_loader(registry, work_scheduler, run_id)
+            bundle = source_loader(
+                registry,
+                work_scheduler,
+                run_id,
+                resolved_stage_terminal_executor,
+            )
         if bundle.source_content_sha256 != source_sha256:
             raise CanonicalLocalCompositionError(
                 CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
@@ -875,22 +1127,9 @@ def _run_local_canonical_inner(
                 if supplemental_qa_evidence_builder is None
                 else supplemental_qa_evidence_builder(registry, bundle)
             )
-        with runtime_span(runtime_observer, "canonical.runtime.build"):
-            runtime = _build_runtime(
-                state_root=state_root,
-                run_id=run_id,
-                registry=registry,
-                execution_policy=execution_policy,
-                coarse_qa_policy=coarse_qa_policy,
-                dense_qa_policy=dense_qa_policy,
-                event_proposal_policy=event_proposal_policy,
-                action_evidence_policy=action_evidence_policy,
-                boundary_refinement_policy=boundary_refinement_policy,
-                inference_policy=inference_policy,
-                clock_value=clock_value,
-                observed_at=started_at,
-                runtime_observer=runtime_observer,
-            )
+        if runtime is None:
+            with runtime_span(runtime_observer, "canonical.runtime.build"):
+                runtime = build_runtime()
         processing_run = CanonicalProcessingRunContext.fresh(
             run_id=run_id,
             recording_identity=bundle.admitted_context.recording_identity,
@@ -903,6 +1142,14 @@ def _run_local_canonical_inner(
             processing_run = CanonicalProcessingRunContext.resume(
                 completion_repository.begin_run(processing_run)
             )
+        source_media_quality_report = getattr(bundle, "media_quality_report", None)
+        product_qa_context = (
+            None
+            if source_media_quality_report is None
+            else product_qa_context_from_media_quality_report(
+                cast(LocalMediaQualityReport, source_media_quality_report)
+            )
+        )
         with runtime_span(runtime_observer, "inference.pipeline"):
             result = asyncio.run(
                 runtime.pipeline.run(
@@ -912,6 +1159,7 @@ def _run_local_canonical_inner(
                     sampling_plan=bundle.sampling_plan,
                     frame_index=bundle.frame_index,
                     artifact_resolver=bundle.resolve_artifact,
+                    product_qa_context=product_qa_context,
                 )
             )
         runtime_increment(
@@ -936,6 +1184,7 @@ def _run_local_canonical_inner(
                 registry=registry,
                 bundle=bundle,
                 canonical_result=result,
+                stage_terminal_executor=resolved_stage_terminal_executor,
             )
         runtime_increment(
             runtime_observer,
@@ -996,10 +1245,14 @@ def _run_local_canonical_inner(
                 prepared_identities=prepared_identities,
                 execution_policy=execution_policy,
             )
-        with runtime_span(runtime_observer, "completion.evidence.audit"):
-            runtime.inference_evidence.verify_integrity()
+        with runtime_span(
+            runtime_observer,
+            "completion.evidence.audit",
+            {"mode": "incremental"},
+        ):
+            runtime.inference_evidence.verify_completion_seal()
         with runtime_span(runtime_observer, "completion.command.serialize_validate"):
-            command = create_primary_completion_command(
+            prepared_command = prepare_primary_completion_command(
                 result=result,
                 prepared_identities=prepared_identities,
                 action_event_publications=publications,
@@ -1007,7 +1260,7 @@ def _run_local_canonical_inner(
                 registry=registry,
             )
         with runtime_span(runtime_observer, "completion.commit"):
-            commit_result = publish_work.commit(command)
+            commit_result = publish_work.commit_prepared(prepared_command)
         runtime_increment(
             runtime_observer,
             "durable_work.terminal_outcomes",
@@ -1057,6 +1310,18 @@ def _run_local_canonical_inner(
             CanonicalLocalCompositionErrorCode.RUN_NOT_COMPLETABLE,
             str(error),
         ) from error
+    finally:
+        # Do not let a close failure replace an authoritative pipeline exception.
+        active_exception = sys.exc_info()[0] is not None
+        if runtime is not None:
+            try:
+                runtime.inference_evidence.close()
+            except SQLiteInferenceEvidenceLedgerError as error:
+                if not active_exception:
+                    raise CanonicalLocalCompositionError(
+                        CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
+                        str(error),
+                    ) from error
 
 
 def _build_runtime(
@@ -1074,6 +1339,7 @@ def _build_runtime(
     clock_value: datetime,
     observed_at: str,
     runtime_observer: RuntimeObserver | None = None,
+    provider_dispatcher: LocalProviderCallDispatcher | None = None,
 ) -> _LocalCanonicalRuntime:
     """Compose runtime adapters from the exact policies bound into the run ID."""
 
@@ -1083,76 +1349,91 @@ def _build_runtime(
         raw_bytes_cas_root=state_root / "raw-provider-cas",
         runtime_observer=runtime_observer,
     )
-    barrier_storage = SQLiteBarrierStorage(
-        state_root / "runs" / run_id / "inference-call-barrier.sqlite3",
-        runtime_observer=runtime_observer,
-    )
-    parser = StrictProviderClaimParser(
-        registry,
-        parser_version=LOCAL_CANONICAL_PARSER_VERSION,
-    )
-    adapter = OfflineFixtureVisionAdapter(
-        capabilities=_capabilities(observed_at),
-        raw_store=inference_evidence,
-        parser=parser,
-        response_factory=_fixture_claim_bytes,
-    )
-    input_preparer = InputPlanPreparer(
-        InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION),
-        ProviderRenderingPolicy(
-            version="render-v1",
-            transform_policy_version="identity-v1",
-            idempotency_policy_version="idempotency-v1",
-            reduction_policy=LOCAL_CANONICAL_REDUCTION_POLICY,
-            reduction_policy_version=LOCAL_CANONICAL_REDUCTION_POLICY_VERSION,
-            input_tokens_per_item=2,
-            fixed_input_tokens_per_part=1,
-            accepted_media_types=("image/png",),
-        ),
-    )
-    pipeline = CanonicalOfflinePipeline(
-        package_builder=PackageSetBuilder(LOCAL_CANONICAL_REDUCTION_POLICY_VERSION),
-        materializer=OfflineTemporalPackageMaterializer(
-            TemporalPackageMaterializationPolicy(
-                version="materialization-v1",
-                grid_origin_ns=0,
-                selection_tolerance_ns=300_000_000,
-                tie_break_policy_version="nearest-v1",
-                dedupe_policy_version="one-source-frame-v1",
-                producer_version="offline-materializer-v1",
-                extractor_version="fixture-png-v1",
-            )
-        ),
-        input_preparer=input_preparer,
-        adapter=adapter,
-        raw_store=inference_evidence,
-        parser=parser,
-        coarse_qa_policy=coarse_qa_policy,
-        dense_qa_policy=dense_qa_policy,
-        event_proposal_policy=event_proposal_policy,
-        action_evidence_policy=action_evidence_policy,
-        boundary_refinement_policy=boundary_refinement_policy,
-        inference_policy=inference_policy,
-        schema_registry=registry,
-        logical_node_registry=LocalLogicalNodeRegistry(
-            state_root / "logical-nodes",
+    try:
+        barrier_storage = SQLiteBarrierStorage(
+            state_root / "runs" / run_id / "inference-call-barrier.sqlite3",
             runtime_observer=runtime_observer,
-        ),
-        execution_policy=execution_policy,
-        max_concurrent_call_parts=6,
-        inference_ledger=inference_evidence,
-        evidence_store=inference_evidence,
-        barrier_storage=barrier_storage,
-        call_barrier_storage=barrier_storage,
-        clock=lambda: clock_value,
-        runtime_observer=runtime_observer,
-    )
-    return _LocalCanonicalRuntime(
-        registry=registry,
-        execution_policy=execution_policy,
-        pipeline=pipeline,
-        inference_evidence=inference_evidence,
-    )
+        )
+        parser = StrictProviderClaimParser(
+            registry,
+            parser_version=LOCAL_CANONICAL_PARSER_VERSION,
+        )
+        adapter: VisionModelAdapter = OfflineFixtureVisionAdapter(
+            capabilities=_capabilities(observed_at),
+            raw_store=inference_evidence,
+            parser=parser,
+            response_factory=_fixture_claim_bytes,
+        )
+        if provider_dispatcher is not None:
+            wrapper_type = (
+                _DispatchingBatchVisionModelAdapter
+                if callable(getattr(adapter, "infer_batch", None))
+                else _DispatchingVisionModelAdapter
+            )
+            adapter = wrapper_type(adapter, provider_dispatcher)
+        input_preparer = InputPlanPreparer(
+            InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION),
+            ProviderRenderingPolicy(
+                version="render-v1",
+                transform_policy_version="identity-v1",
+                idempotency_policy_version="idempotency-v1",
+                reduction_policy=LOCAL_CANONICAL_REDUCTION_POLICY,
+                reduction_policy_version=LOCAL_CANONICAL_REDUCTION_POLICY_VERSION,
+                input_tokens_per_item=2,
+                fixed_input_tokens_per_part=1,
+                accepted_media_types=("image/png",),
+            ),
+        )
+        pipeline = CanonicalOfflinePipeline(
+            package_builder=PackageSetBuilder(LOCAL_CANONICAL_REDUCTION_POLICY_VERSION),
+            materializer=OfflineTemporalPackageMaterializer(
+                TemporalPackageMaterializationPolicy(
+                    version="materialization-v1",
+                    grid_origin_ns=0,
+                    selection_tolerance_ns=300_000_000,
+                    tie_break_policy_version="nearest-v1",
+                    dedupe_policy_version="one-source-frame-v1",
+                    producer_version="offline-materializer-v1",
+                    extractor_version="fixture-png-v1",
+                )
+            ),
+            input_preparer=input_preparer,
+            adapter=adapter,
+            raw_store=inference_evidence,
+            parser=parser,
+            coarse_qa_policy=coarse_qa_policy,
+            dense_qa_policy=dense_qa_policy,
+            event_proposal_policy=event_proposal_policy,
+            action_evidence_policy=action_evidence_policy,
+            boundary_refinement_policy=boundary_refinement_policy,
+            inference_policy=inference_policy,
+            schema_registry=registry,
+            logical_node_registry=LocalLogicalNodeRegistry(
+                state_root / "logical-nodes",
+                runtime_observer=runtime_observer,
+            ),
+            execution_policy=execution_policy,
+            max_concurrent_call_parts=LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS,
+            max_inference_batch_size=LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE,
+            max_inference_batch_queue_delay_ms=(LOCAL_CANONICAL_MAX_INFERENCE_BATCH_QUEUE_DELAY_MS),
+            inference_ledger=inference_evidence,
+            evidence_store=inference_evidence,
+            barrier_storage=barrier_storage,
+            call_barrier_storage=barrier_storage,
+            clock=lambda: clock_value,
+            runtime_observer=runtime_observer,
+        )
+        return _LocalCanonicalRuntime(
+            registry=registry,
+            execution_policy=execution_policy,
+            pipeline=pipeline,
+            inference_evidence=inference_evidence,
+        )
+    except BaseException:
+        # Construction failed before ownership could transfer to the local runtime.
+        with suppress(SQLiteInferenceEvidenceLedgerError):
+            inference_evidence.close()
+        raise
 
 
 def _local_inference_policies(
@@ -1807,6 +2088,7 @@ def _finalize_local_stream_graphs(
     registry: SchemaRegistry,
     bundle: _CanonicalSourceInputs,
     canonical_result: CanonicalOfflineRunResult,
+    stage_terminal_executor: _StageTerminalExecutor | None = None,
 ) -> tuple[LocalStreamFinalizationOutcome, ...]:
     if not schedulers:
         return ()
@@ -1859,6 +2141,14 @@ def _finalize_local_stream_graphs(
             LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_ID,
             LOCAL_STREAM_WINDOW_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
         ).ref,
+        # The source-side pre-EOS executor can already have completed typed QA/event
+        # terminals by the time this EOS coordinator is constructed.  Pin the
+        # existing inference artifact here so replay reads that evidence rather than
+        # treating it as a local-conformance receipt.
+        model_inference=registry.resolve_version(
+            MODEL_INFERENCE_SCHEMA_ID,
+            "1.0.0",
+        ).ref,
     )
     ready = bundle.admitted_context.ready_manifest
     final_recording = FinalRecordingFacts(
@@ -1882,7 +2172,9 @@ def _finalize_local_stream_graphs(
             ),
             canonical_requested_interval=bundle.requested_interval,
             window_purpose=StreamPurpose.EVENT_PROPOSAL,
+            terminal_policy_version=LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION,
             recover_graph_before_execute=False,
+            stage_terminal_executor=stage_terminal_executor,
             clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
         ).execute()
         for scheduler in schedulers
@@ -2085,6 +2377,16 @@ def _stable_uuid(namespace: str, value: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"robata:{namespace}:{value}"))
 
 
+def _require_provider_dispatcher(
+    value: LocalProviderCallDispatcher | None,
+) -> None:
+    if value is not None and not callable(getattr(value, "dispatch", None)):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "provider_dispatcher must implement async dispatch",
+        )
+
+
 def _require_path(value: Path, field: str) -> Path:
     if not isinstance(value, Path):
         raise CanonicalLocalCompositionError(
@@ -2106,9 +2408,13 @@ __all__ = [
     "LOCAL_CANONICAL_COMPOSITION_VERSION",
     "LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION",
     "LOCAL_CANONICAL_EXECUTION_TIME",
+    "LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION",
     "CanonicalLocalCompositionError",
     "CanonicalLocalCompositionErrorCode",
     "CanonicalLocalRunReceipt",
+    "LocalPreEosExecutorContext",
+    "LocalPreEosExecutorFactory",
+    "LocalProviderCallDispatcher",
     "run_local_canonical_fixture",
     "run_local_canonical_mcap",
 ]

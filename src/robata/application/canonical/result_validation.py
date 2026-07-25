@@ -50,6 +50,10 @@ from robata.application.canonical.output_admission import (
     CanonicalOutputAdmissionDecision,
     validate_final_fusion_reduction,
 )
+from robata.application.canonical.product_qa import (
+    CanonicalProductQAContext,
+    CanonicalProductQAProjector,
+)
 from robata.application.canonical.reduction import CanonicalFusionReduction
 from robata.application.canonical.runner_support import _rfc3339_datetime
 from robata.application.canonical_run_membership import (
@@ -115,6 +119,7 @@ from robata.qa_pipeline.completion import (
     QACompletionStatus,
 )
 from robata.qa_pipeline.dense import DenseQAUnitEvidence, DenseQAWorkUnit
+from robata.qa_pipeline.product import ProductQACascadeResult
 
 
 class CanonicalDenseQAExecution(StrictModel):
@@ -887,6 +892,8 @@ class CanonicalOfflineRunResult(StrictModel):
     coarse_qa_result: CoarseQAResult | None
     dense_qa_executions: tuple[CanonicalDenseQAExecution, ...] = ()
     qa_completion_result: QACompletionResult | None
+    product_qa_context: CanonicalProductQAContext | None = None
+    product_qa_result: ProductQACascadeResult | None = None
     event_proposal_result: EventProposalResult | None = None
     candidate_reduction_result: CandidateReductionResult | None = None
     action_evidence_executions: tuple[CanonicalActionEvidenceExecution, ...] = ()
@@ -1114,6 +1121,44 @@ class CanonicalOfflineRunResult(StrictModel):
                             raise ValueError(
                                 "boundary calls do not bind the exact upstream run closure"
                             )
+        product_context = self.product_qa_context
+        product_result = self.product_qa_result
+        if product_result is not None:
+            if (
+                product_context is None
+                or self.coarse_qa_result is None
+                or self.window is None
+                or self.qa_completion_result is None
+            ):
+                raise ValueError(
+                    "product QA result requires retained context, coarse QA, and completion"
+                )
+            expected_product_result = CanonicalProductQAProjector(
+                product_result.policy_version
+            ).project(
+                recording_id=self.recording_identity,
+                recording_duration_ns=self.window.recording_duration_ns,
+                coarse_result=self.coarse_qa_result,
+                qa_completion_result=self.qa_completion_result,
+                candidate_reduction_result=self.candidate_reduction_result,
+                action_evidence_results=tuple(
+                    item.evidence_result for item in self.action_evidence_executions
+                ),
+                boundary_results=tuple(
+                    item.result for item in self.boundary_refinement_executions
+                ),
+                context=product_context,
+                pipeline_incomplete=self.status not in {
+                    CanonicalOfflineRunStatus.SUCCEEDED,
+                    CanonicalOfflineRunStatus.NO_EVENTS,
+                    CanonicalOfflineRunStatus.ABSTAINED,
+                },
+                pipeline_abstained=self.status is CanonicalOfflineRunStatus.ABSTAINED,
+            )
+            if product_result != expected_product_result:
+                raise ValueError("product QA result differs from retained canonical evidence")
+        elif product_context is not None and self.qa_completion_result is not None:
+            raise ValueError("retained product QA context requires a complete local projection")
         final_fusion_context = self.final_fusion_context
         if final_fusion_context is not None:
             if (

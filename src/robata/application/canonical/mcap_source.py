@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from robata.adapters.local_artifact_registry import LocalArtifactRegistry
 from robata.adapters.mcap_inspector import McapPreflight, OfficialMcapInspector
+from robata.adapters.mcap_single_pass import H264PacketEnvelope, iter_h264_spool
 from robata.adapters.pyav_frame_materializer import (
     _CameraLedger,
     _encode_png,
@@ -34,8 +35,10 @@ from robata.adapters.pyav_mp4_exporter import (
     EXPORTER_NAME,
     EXPORTER_VERSION,
     PyAvH264Mp4Exporter,
+    is_independent_h264_bootstrap,
 )
 from robata.adapters.sqlite_capture_authority import SQLiteLocalCaptureAuthority
+from robata.adapters.sqlite_inference_evidence import MODEL_INFERENCE_SCHEMA_ID
 from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
 from robata.admission.context import AdmissionContextResolver, AdmittedRecordingContextV2
@@ -57,11 +60,14 @@ from robata.application.canonical.local_stream_finalization import (
     LocalStreamFinalizationSchemaRefs,
 )
 from robata.application.canonical.media_quality import (
+    DEFAULT_MEDIA_QUALITY_POLICY,
     FrameQualityObservation,
     FrameTimingEvidence,
     LocalFrameQualityAnalyzer,
+    LocalMediaQualityPolicy,
     LocalMediaQualityReport,
     build_local_media_quality_report,
+    pyav_decoded_frame_view,
     registered_local_media_quality_report_document,
 )
 from robata.application.canonical.single_pass_video import (
@@ -172,6 +178,7 @@ from robata.contracts.stream_planning import (
     EXPECTED_WINDOW_SEAL_SCHEMA_VERSION,
     STREAM_WORK_PLAN_SCHEMA_ID,
     STREAM_WORK_PLAN_SCHEMA_VERSION,
+    StreamWorkItemPlan,
     create_expected_window_plan,
 )
 from robata.contracts.stream_source import (
@@ -191,6 +198,7 @@ from robata.contracts.video_export import VideoExporterMode
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
 from robata.ports.ingestion import ChannelInspection, McapInspection
 from robata.queue.outbox import OutboxRetryPolicy
+from robata.queue.stream_models import StreamTerminalEvidence
 from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 from robata.sampling.grid import FrameCandidate, SamplingGrid, SamplingRate, SelectionStatus
 from robata.sampling.materializer import (
@@ -208,6 +216,11 @@ MCAP_SAMPLING_POLICY_VERSION = "canonical-development-sampling-v1"
 MCAP_RECORDING_NAMESPACE = "robata-canonical-development-mcap-v1"
 MCAP_PNG_EXTRACTOR_VERSION = "canonical-mcap-png-320-v1"
 MCAP_PNG_MAX_WIDTH: Final = 320
+MCAP_MEDIA_PROCESSING_POLICY_VERSION: Final = "canonical-mcap-media-processing-v1"
+MCAP_MEDIA_EVIDENCE_ENCODING: Final = "png"
+MCAP_BASE_SENTINEL_RATE_NUMERATOR: Final = 2
+MCAP_BASE_SENTINEL_RATE_DENOMINATOR: Final = 1
+MCAP_TARGET_SELECTION_TOLERANCE_NS: Final = 300_000_000
 MCAP_PRE_EOS_POLICY_VERSION: Final = "canonical-mcap-pre-eos-v1"
 MCAP_PRE_EOS_CLOCK_POLICY_VERSION: Final = "canonical-mcap-log-time-clock-v1"
 MCAP_CAPTURE_AUTHORITY_ID: Final = "local-mcap-capture-authority"
@@ -229,9 +242,13 @@ class _IncrementalLocalStreamPlanningSink:
     runtime_observer: RuntimeObserver | None
 
     def append_emission(self, emission: PlannerEmission) -> None:
-        self.scheduler.append_emission(emission)
         if not emission.windows:
             return
+        # The planner owns packet/timeline cursors in memory. The durable stream
+        # scheduler only owns emitted windows, so invoking it for every source
+        # packet would turn an otherwise event-driven capture path back into a
+        # message-proportional scheduling path.
+        self.scheduler.append_emission(emission)
         completed = self.executor.drain_ready(max_items=max(1, len(emission.windows) * 5))
         runtime_increment(
             self.runtime_observer,
@@ -254,6 +271,77 @@ MCAP_FRAME_MATERIALIZATION_WORKERS: Final = 6
 
 class CanonicalMcapSourceError(ValueError):
     """A raw MCAP cannot produce complete local canonical inputs."""
+
+
+@dataclass(frozen=True, slots=True)
+class McapMediaProcessingPolicy:
+    """Bounded local visual processing policy, kept outside the published wire report.
+
+    The packet/sidecar timeline remains complete and authoritative. This policy only
+    decides which decoded frames become inexpensive visual sentinels and which selected
+    frames are rendered as retained evidence. Its complete projection is bound into the
+    local source-run identity by ``local_composition``.
+    """
+
+    version: str = MCAP_MEDIA_PROCESSING_POLICY_VERSION
+    semantic_rate_numerator: int = 2
+    semantic_rate_denominator: int = 1
+    sentinel_rate_numerator: int = MCAP_BASE_SENTINEL_RATE_NUMERATOR
+    sentinel_rate_denominator: int = MCAP_BASE_SENTINEL_RATE_DENOMINATOR
+    selection_tolerance_ns: int = MCAP_TARGET_SELECTION_TOLERANCE_NS
+    sentinel_analysis_width: int = 64
+    evidence_encoding: str = MCAP_MEDIA_EVIDENCE_ENCODING
+    evidence_max_width: int = MCAP_PNG_MAX_WIDTH
+    evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, str) or not self.version:
+            raise ValueError("media processing policy version must be a non-empty string")
+        positive_fields = (
+            self.semantic_rate_numerator,
+            self.semantic_rate_denominator,
+            self.sentinel_rate_numerator,
+            self.sentinel_rate_denominator,
+            self.selection_tolerance_ns,
+            self.sentinel_analysis_width,
+            self.evidence_max_width,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in positive_fields
+        ):
+            raise ValueError("media processing policy numeric fields must be positive integers")
+        if self.evidence_encoding != MCAP_MEDIA_EVIDENCE_ENCODING:
+            raise ValueError(f"unsupported media evidence encoding: {self.evidence_encoding!r}")
+        if (
+            not isinstance(self.evidence_extractor_version, str)
+            or not self.evidence_extractor_version
+        ):
+            raise ValueError("evidence extractor version must be a non-empty string")
+
+
+DEFAULT_MCAP_MEDIA_PROCESSING_POLICY: Final = McapMediaProcessingPolicy()
+
+
+def mcap_media_processing_policy_projection(
+    policy: McapMediaProcessingPolicy,
+) -> dict[str, str | int]:
+    """Return the complete deterministic policy projection used for source identity."""
+
+    if not isinstance(policy, McapMediaProcessingPolicy):
+        raise TypeError("policy must be a McapMediaProcessingPolicy")
+    return {
+        "version": policy.version,
+        "semantic_rate_numerator": policy.semantic_rate_numerator,
+        "semantic_rate_denominator": policy.semantic_rate_denominator,
+        "sentinel_rate_numerator": policy.sentinel_rate_numerator,
+        "sentinel_rate_denominator": policy.sentinel_rate_denominator,
+        "selection_tolerance_ns": policy.selection_tolerance_ns,
+        "sentinel_analysis_width": policy.sentinel_analysis_width,
+        "evidence_encoding": policy.evidence_encoding,
+        "evidence_max_width": policy.evidence_max_width,
+        "evidence_extractor_version": policy.evidence_extractor_version,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +382,160 @@ class _PreparedVideoPublication:
     publication: PublishedRegisteredVideoExport
     inspection: McapInspection
     channels: SixCameraMap[ChannelInspection]
+    export_time_visual_results: _ExportTimeVisualResults | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedPngFact:
+    path: Path
+    sha256: str
+    bytes: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportTimeVisualObservation:
+    timing: FrameTimingEvidence
+    quality: FrameQualityObservation
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportTimeVisualCameraResult:
+    leading_access_unit_count: int
+    semantic_source_orders: frozenset[int]
+    sentinel_source_orders: frozenset[int]
+    rendered: Mapping[int, _RenderedPngFact]
+    observations: Mapping[int, _ExportTimeVisualObservation]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportTimeVisualResults:
+    cameras: Mapping[CameraId, _ExportTimeVisualCameraResult]
+
+
+@dataclass(slots=True)
+class _CameraExportVisualCollector:
+    camera_id: CameraId
+    origin_ns: int
+    leading_access_unit_count: int
+    semantic_source_orders: frozenset[int]
+    sentinel_source_orders: frozenset[int]
+    output_root: Path
+    quality_policy: LocalMediaQualityPolicy
+    evidence_max_width: int
+    evidence_extractor_version: str
+    analyzer: LocalFrameQualityAnalyzer = field(init=False)
+    rendered: dict[int, _RenderedPngFact] = field(default_factory=dict, init=False)
+    observations: dict[int, _ExportTimeVisualObservation] = field(
+        default_factory=dict,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        self.analyzer = LocalFrameQualityAnalyzer(self.camera_id, policy=self.quality_policy)
+
+    def observe(
+        self,
+        envelope: H264PacketEnvelope,
+        decoded_frame: Any,
+        exported_index: int,
+    ) -> None:
+        packet = envelope.packet
+        if packet.camera_id is not self.camera_id:
+            raise CanonicalMcapSourceError(
+                f"{self.camera_id.value} export callback camera differs from its spool"
+            )
+        expected_exported_index = packet.source_order - self.leading_access_unit_count
+        if expected_exported_index != exported_index:
+            raise CanonicalMcapSourceError(
+                f"{self.camera_id.value} export callback index differs from source order"
+            )
+        raw_order = packet.source_order
+        if raw_order in self.semantic_source_orders:
+            if raw_order in self.rendered:
+                raise CanonicalMcapSourceError(
+                    f"{self.camera_id.value} received a duplicate semantic frame callback"
+                )
+            png_bytes, width, height = _encode_png(
+                decoded_frame,
+                max_width=self.evidence_max_width,
+            )
+            digest = exact_bytes_sha256(png_bytes)
+            path = _publish_png(self.output_root, digest, png_bytes)
+            self.rendered[raw_order] = _RenderedPngFact(
+                path=path,
+                sha256=digest,
+                bytes=len(png_bytes),
+                width=width,
+                height=height,
+            )
+        if raw_order in self.sentinel_source_orders:
+            if raw_order in self.observations:
+                raise CanonicalMcapSourceError(
+                    f"{self.camera_id.value} received a duplicate sentinel frame callback"
+                )
+            timing = FrameTimingEvidence(
+                camera_id=self.camera_id,
+                packet_index=exported_index,
+                aligned_timestamp_ns=packet.source_timestamp_ns - self.origin_ns,
+                source_timestamp_ns=packet.source_timestamp_ns,
+                source_sequence=packet.source_sequence,
+            )
+            quality = self.analyzer.observe(
+                pyav_decoded_frame_view(
+                    decoded_frame,
+                    timestamp_ns=timing.aligned_timestamp_ns,
+                    analysis_width=self.quality_policy.analysis_width,
+                ),
+                timing,
+            )
+            self.observations[raw_order] = _ExportTimeVisualObservation(
+                timing=timing,
+                quality=quality,
+            )
+
+    def finish(self) -> _ExportTimeVisualCameraResult:
+        if set(self.rendered) != set(self.semantic_source_orders):
+            raise CanonicalMcapSourceError(
+                f"{self.camera_id.value} export did not render every selected semantic frame"
+            )
+        if set(self.observations) != set(self.sentinel_source_orders):
+            raise CanonicalMcapSourceError(
+                f"{self.camera_id.value} export did not observe every selected sentinel frame"
+            )
+        return _ExportTimeVisualCameraResult(
+            leading_access_unit_count=self.leading_access_unit_count,
+            semantic_source_orders=self.semantic_source_orders,
+            sentinel_source_orders=self.sentinel_source_orders,
+            rendered=MappingProxyType(dict(self.rendered)),
+            observations=MappingProxyType(dict(self.observations)),
+        )
+
+
+@dataclass(slots=True)
+class _ExportTimeVisualObserver:
+    collectors: Mapping[CameraId, _CameraExportVisualCollector]
+
+    def observe(
+        self,
+        envelope: H264PacketEnvelope,
+        decoded_frame: Any,
+        exported_index: int,
+    ) -> None:
+        collector = self.collectors.get(envelope.packet.camera_id)
+        if collector is None:
+            raise CanonicalMcapSourceError(
+                "export callback camera is not part of the canonical camera set"
+            )
+        collector.observe(envelope, decoded_frame, exported_index)
+
+    def finish(self) -> _ExportTimeVisualResults:
+        return _ExportTimeVisualResults(
+            cameras=MappingProxyType(
+                {camera_id: self.collectors[camera_id].finish() for camera_id in CAMERA_IDS}
+            )
+        )
 
 
 @dataclass(slots=True)
@@ -305,6 +547,8 @@ class _VerifiedMcapArtifactResolver:
     requested_interval: NanosecondInterval
     output_root: Path
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact]
+    evidence_max_width: int
+    evidence_extractor_version: str
     runtime_observer: RuntimeObserver | None = None
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _frames_by_id: dict[CameraId, dict[str, IndexedSourceFrame]] = field(
@@ -362,6 +606,8 @@ class _VerifiedMcapArtifactResolver:
                     ledger=self.ledgers[camera_id],
                     source_frame=canonical,
                     output_root=self.output_root,
+                    evidence_max_width=self.evidence_max_width,
+                    evidence_extractor_version=self.evidence_extractor_version,
                 )
             self.artifacts[key] = artifact
             runtime_increment(
@@ -397,12 +643,16 @@ def load_canonical_mcap_source(
     state_dir: Path,
     expected_source_sha256: str,
     max_duration_ns: int | None = None,
+    media_processing_policy: McapMediaProcessingPolicy | None = None,
     schema_registry: SchemaRegistry | None = None,
     clock: Callable[[], datetime] | None = None,
     runtime_observer: RuntimeObserver | None = None,
     execution_scheduler: SQLiteWorkScheduler | None = None,
     stream_run_id: str | None = None,
     stream_artifact_root: Path | None = None,
+    stage_terminal_executor: (
+        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
+    ) = None,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
 
@@ -414,12 +664,26 @@ def load_canonical_mcap_source(
                 raise ValueError("max_duration_ns must be positive")
         if (execution_scheduler is None) != (stream_run_id is None):
             raise ValueError("execution_scheduler and stream_run_id must be configured together")
+        if stage_terminal_executor is not None and not callable(stage_terminal_executor):
+            raise TypeError("stage_terminal_executor must be callable or None")
+        if stage_terminal_executor is not None and execution_scheduler is None:
+            raise ValueError(
+                "stage_terminal_executor requires execution_scheduler and stream_run_id"
+            )
+        resolved_media_processing_policy = (
+            DEFAULT_MCAP_MEDIA_PROCESSING_POLICY
+            if media_processing_policy is None
+            else media_processing_policy
+        )
+        if not isinstance(resolved_media_processing_policy, McapMediaProcessingPolicy):
+            raise TypeError("media_processing_policy must be a McapMediaProcessingPolicy or None")
         return _load_canonical_mcap_source(
             Path(source),
             authorization=authorization,
             state_dir=Path(state_dir),
             expected_source_sha256=expected_source_sha256,
             max_duration_ns=max_duration_ns,
+            media_processing_policy=resolved_media_processing_policy,
             schema_registry=schema_registry or SchemaRegistry(),
             clock=clock or (lambda: datetime.now(tz=UTC)),
             runtime_observer=runtime_observer,
@@ -428,6 +692,7 @@ def load_canonical_mcap_source(
             stream_artifact_root=(
                 None if stream_artifact_root is None else Path(stream_artifact_root)
             ),
+            stage_terminal_executor=stage_terminal_executor,
         )
     except CanonicalMcapSourceError:
         raise
@@ -442,12 +707,16 @@ def _load_canonical_mcap_source(
     state_dir: Path,
     expected_source_sha256: str,
     max_duration_ns: int | None,
+    media_processing_policy: McapMediaProcessingPolicy,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
     runtime_observer: RuntimeObserver | None,
     execution_scheduler: SQLiteWorkScheduler | None,
     stream_run_id: str | None,
     stream_artifact_root: Path | None,
+    stage_terminal_executor: (
+        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
+    ),
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
     stage_attributes = {"camera_count": len(CAMERA_IDS)}
@@ -475,6 +744,8 @@ def _load_canonical_mcap_source(
             state_dir=state_dir,
             inspection=inspection,
             channels=channels,
+            max_duration_ns=max_duration_ns,
+            media_processing_policy=media_processing_policy,
             authorization=authorization,
             schema_registry=schema_registry,
             clock=clock,
@@ -483,10 +754,13 @@ def _load_canonical_mcap_source(
             execution_scheduler=execution_scheduler,
             stream_run_id=stream_run_id,
             stream_artifact_root=stream_artifact_root,
+            stage_terminal_executor=stage_terminal_executor,
         )
         publication = prepared_publication.publication
         inspection = prepared_publication.inspection
         channels = prepared_publication.channels
+        export_time_visual_results = prepared_publication.export_time_visual_results
+        fresh_media_handoff = not publication.derivation_reused
     if inspection.message_count > 0:
         runtime_increment(
             runtime_observer,
@@ -507,7 +781,12 @@ def _load_canonical_mcap_source(
         view, manifest = _validate_publication(publication)
     with runtime_span(runtime_observer, "source.video.ledger_load", stage_attributes):
         ledgers = {
-            record.camera_id: _load_camera_ledger(view, manifest, record)
+            record.camera_id: _load_camera_ledger(
+                view,
+                manifest,
+                record,
+                verify_video_digest=not fresh_media_handoff,
+            )
             for record in manifest.cameras
         }
     with runtime_span(runtime_observer, "source.metadata.build", stage_attributes):
@@ -624,19 +903,51 @@ def _load_canonical_mcap_source(
     )
     frame_output_root = state_dir / "frames"
     window_limited = requested_end_ns < ready_manifest.recording.duration_ns
-    materialize_attributes = {
+    quality_policy = replace(
+        DEFAULT_MEDIA_QUALITY_POLICY,
+        analysis_width=media_processing_policy.sentinel_analysis_width,
+    )
+    materialize_attributes: dict[str, str | int | float | bool] = {
         **stage_attributes,
         "max_duration_limited": window_limited,
+        "media_processing_policy_version": media_processing_policy.version,
+        "semantic_target_rate": (
+            f"{media_processing_policy.semantic_rate_numerator}/"
+            f"{media_processing_policy.semantic_rate_denominator}"
+        ),
+        "sentinel_rate": (
+            f"{media_processing_policy.sentinel_rate_numerator}/"
+            f"{media_processing_policy.sentinel_rate_denominator}"
+        ),
+        "target_selection_tolerance_ns": media_processing_policy.selection_tolerance_ns,
+        "sentinel_analysis_width": media_processing_policy.sentinel_analysis_width,
+        "evidence_encoding": media_processing_policy.evidence_encoding,
+        "evidence_max_width": media_processing_policy.evidence_max_width,
+        "evidence_extractor_version": media_processing_policy.evidence_extractor_version,
     }
     with runtime_span(runtime_observer, "source.materialize", materialize_attributes):
-        artifacts, quality_observations = _materialize_selected_frames(
-            frame_index=frame_index,
-            ledgers=ledgers,
-            quality_timings=quality_timings,
-            requested_interval=requested_interval,
-            output_root=frame_output_root,
-            stop_after_selected=window_limited,
-        )
+        if export_time_visual_results is None:
+            artifacts, quality_observations = _materialize_selected_frames(
+                frame_index=frame_index,
+                ledgers=ledgers,
+                quality_timings=quality_timings,
+                requested_interval=requested_interval,
+                output_root=frame_output_root,
+                media_processing_policy=media_processing_policy,
+                quality_policy=quality_policy,
+                stop_after_selected=window_limited,
+            )
+        else:
+            artifacts, quality_observations = _bind_export_time_visual_results(
+                frame_index=frame_index,
+                ledgers=ledgers,
+                quality_timings=quality_timings,
+                requested_interval=requested_interval,
+                output_root=frame_output_root,
+                media_processing_policy=media_processing_policy,
+                quality_policy=quality_policy,
+                visual_results=export_time_visual_results,
+            )
     if artifacts:
         runtime_increment(
             runtime_observer,
@@ -659,6 +970,7 @@ def _load_canonical_mcap_source(
             requested_interval=requested_interval,
             timings=quality_timings,
             frame_observations=quality_observations,
+            policy=quality_policy,
         )
     with runtime_span(runtime_observer, "source.quality.publish", materialize_attributes):
         _publish_exact_state_file(
@@ -677,6 +989,8 @@ def _load_canonical_mcap_source(
         requested_interval=requested_interval,
         output_root=frame_output_root,
         artifacts=artifacts,
+        evidence_max_width=media_processing_policy.evidence_max_width,
+        evidence_extractor_version=media_processing_policy.evidence_extractor_version,
         runtime_observer=runtime_observer,
     )
     return CanonicalMcapSourceBundle(
@@ -691,12 +1005,128 @@ def _load_canonical_mcap_source(
     )
 
 
+def _build_export_time_visual_observer(
+    *,
+    spool_set: H264SpoolSetFacts,
+    final_channels: SixCameraMap[ChannelInspection],
+    origin_ns: int,
+    requested_interval: NanosecondInterval,
+    output_root: Path,
+    media_processing_policy: McapMediaProcessingPolicy,
+    quality_policy: LocalMediaQualityPolicy,
+) -> _ExportTimeVisualObserver:
+    """Preselect source orders from sealed spools before the remux workers run."""
+
+    if not isinstance(media_processing_policy, McapMediaProcessingPolicy):
+        raise TypeError("media_processing_policy must be a McapMediaProcessingPolicy")
+    if not isinstance(quality_policy, LocalMediaQualityPolicy):
+        raise TypeError("quality_policy must be a LocalMediaQualityPolicy")
+    if quality_policy.analysis_width != media_processing_policy.sentinel_analysis_width:
+        raise ValueError("quality policy width must match the media sentinel analysis width")
+    mapped_origin_ns, _ = _mapped_source_bounds(final_channels)
+    if mapped_origin_ns != origin_ns:
+        raise CanonicalMcapSourceError(
+            "export visual origin differs from the final mapped channel origin"
+        )
+    collectors: dict[CameraId, _CameraExportVisualCollector] = {}
+    semantic_rate = SamplingRate(
+        media_processing_policy.semantic_rate_numerator,
+        media_processing_policy.semantic_rate_denominator,
+    )
+    sentinel_rate = SamplingRate(
+        media_processing_policy.sentinel_rate_numerator,
+        media_processing_policy.sentinel_rate_denominator,
+    )
+    for camera_id in CAMERA_IDS:
+        spool = spool_set.spools[camera_id]
+        candidates: list[FrameCandidate] = []
+        orders_by_locator: dict[bytes, int] = {}
+        leading_count = 0
+        bootstrap_found = False
+        expected_source_order = 0
+        for envelope in iter_h264_spool(spool.path):
+            packet = envelope.packet
+            if packet.camera_id is not camera_id or packet.source_order != expected_source_order:
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} spool source order is not contiguous"
+                )
+            expected_source_order += 1
+            if not bootstrap_found:
+                if not is_independent_h264_bootstrap(envelope.nal_types):
+                    leading_count += 1
+                    continue
+                bootstrap_found = True
+            locator = canonical_json_bytes(
+                {
+                    "camera_id": camera_id.value,
+                    "source_order": packet.source_order,
+                    "source_timestamp_ns": str(packet.source_timestamp_ns),
+                }
+            )
+            if locator in orders_by_locator:
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} spool source locator is duplicated"
+                )
+            orders_by_locator[locator] = packet.source_order
+            candidates.append(
+                FrameCandidate(
+                    aligned_timestamp_ns=packet.source_timestamp_ns - origin_ns,
+                    source_timestamp_ns=packet.source_timestamp_ns,
+                    source_locator_bytes=locator,
+                    decodable=True,
+                )
+            )
+        if expected_source_order != spool.packet_count:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} spool packet count differs from its seal"
+            )
+        if not bootstrap_found:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} spool has no independent H.264 bootstrap"
+            )
+
+        def selected_orders(
+            rate: SamplingRate,
+            *,
+            candidates: list[FrameCandidate] = candidates,
+            orders_by_locator: dict[bytes, int] = orders_by_locator,
+        ) -> frozenset[int]:
+            selected: set[int] = set()
+            selections = SamplingGrid(grid_origin_ns=0, rate=rate).select_frames(
+                candidates,
+                requested_interval.start_ns,
+                requested_interval.end_ns,
+                media_processing_policy.selection_tolerance_ns,
+            )
+            for selection in selections:
+                if selection.status is not SelectionStatus.SELECTED:
+                    continue
+                assert selection.frame is not None
+                selected.add(orders_by_locator[selection.frame.source_locator_bytes])
+            return frozenset(selected)
+
+        collectors[camera_id] = _CameraExportVisualCollector(
+            camera_id=camera_id,
+            origin_ns=origin_ns,
+            leading_access_unit_count=leading_count,
+            semantic_source_orders=selected_orders(semantic_rate),
+            sentinel_source_orders=selected_orders(sentinel_rate),
+            output_root=output_root,
+            quality_policy=quality_policy,
+            evidence_max_width=media_processing_policy.evidence_max_width,
+            evidence_extractor_version=media_processing_policy.evidence_extractor_version,
+        )
+    return _ExportTimeVisualObserver(collectors=MappingProxyType(collectors))
+
+
 def _export_registered_videos(
     *,
     source: Path,
     state_dir: Path,
     inspection: McapInspection,
     channels: SixCameraMap[ChannelInspection],
+    max_duration_ns: int | None,
+    media_processing_policy: McapMediaProcessingPolicy,
     authorization: AuthorizedMcapMapping,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
@@ -705,6 +1135,9 @@ def _export_registered_videos(
     execution_scheduler: SQLiteWorkScheduler | None,
     stream_run_id: str | None,
     stream_artifact_root: Path | None,
+    stage_terminal_executor: (
+        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
+    ),
 ) -> _PreparedVideoPublication:
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
@@ -805,9 +1238,18 @@ def _export_registered_videos(
                         STREAM_INFERENCE_TERMINAL_SCHEMA_ID,
                         STREAM_INFERENCE_TERMINAL_SCHEMA_VERSION,
                     ).ref,
+                    model_inference=(
+                        schema_registry.resolve_version(
+                            MODEL_INFERENCE_SCHEMA_ID,
+                            "1.0.0",
+                        ).ref
+                        if stage_terminal_executor is not None
+                        else None
+                    ),
                 ),
                 window_purpose=StreamPurpose.EVENT_PROPOSAL,
                 recover_graph_before_execute=False,
+                stage_terminal_executor=stage_terminal_executor,
                 clock=clock,
             ),
             runtime_observer=runtime_observer,
@@ -861,6 +1303,29 @@ def _export_registered_videos(
         raise CanonicalMcapSourceError(
             "final mapped channels differ from the single-pass accepted mapping"
         )
+    source_origin_ns, source_end_ns = _mapped_source_bounds(final_channels)
+    export_requested_end_ns = source_end_ns - source_origin_ns
+    if max_duration_ns is not None:
+        export_requested_end_ns = min(export_requested_end_ns, max_duration_ns)
+    export_requested_interval = NanosecondInterval(
+        start_ns=0,
+        end_ns=export_requested_end_ns,
+    )
+    export_quality_policy = replace(
+        DEFAULT_MEDIA_QUALITY_POLICY,
+        analysis_width=media_processing_policy.sentinel_analysis_width,
+    )
+    export_time_visual_observer = _build_export_time_visual_observer(
+        spool_set=spool_set,
+        final_channels=final_channels,
+        origin_ns=source_origin_ns,
+        requested_interval=export_requested_interval,
+        output_root=state_dir / "frames",
+        media_processing_policy=media_processing_policy,
+        quality_policy=export_quality_policy,
+    )
+    producer.set_decoded_frame_observer(export_time_visual_observer.observe)
+
     request = LocalVideoExportRequest(
         source=source,
         output_directory=state_dir / "video-view",
@@ -870,6 +1335,7 @@ def _export_registered_videos(
         mapping_profile=authorization.profile,
         mapping_profile_digest=authorization.semantic_sha256,
         exporter=descriptor,
+        verify_staged_file_digests=False,
     )
     # The sealed spools are the durable hand-off: export may advance independently
     # while EOS facts are sealed, and joins only at the fixed-six export barrier.
@@ -897,6 +1363,9 @@ def _export_registered_videos(
                 )
             )
         publication = publication_future.result()
+        export_time_visual_results = (
+            None if publication.derivation_reused else export_time_visual_observer.finish()
+        )
     if stream_scheduler is not None:
         stream_scheduler.mark_export_barrier_complete(
             export_manifest_semantic_sha256=publication.manifest.semantic_content_sha256,
@@ -907,6 +1376,7 @@ def _export_registered_videos(
         publication=publication,
         inspection=final_inspection,
         channels=final_channels,
+        export_time_visual_results=export_time_visual_results,
     )
 
 
@@ -1727,46 +2197,57 @@ def _materialize_selected_frames(
     quality_timings: Mapping[CameraId, tuple[FrameTimingEvidence, ...]],
     requested_interval: NanosecondInterval,
     output_root: Path,
+    media_processing_policy: McapMediaProcessingPolicy = DEFAULT_MCAP_MEDIA_PROCESSING_POLICY,
+    quality_policy: LocalMediaQualityPolicy = DEFAULT_MEDIA_QUALITY_POLICY,
     stop_after_selected: bool = False,
 ) -> tuple[
     dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     dict[CameraId, tuple[FrameQualityObservation, ...]],
 ]:
+    """Decode each camera once for selected evidence and bounded visual sentinels.
+
+    Packet/timeline integrity is already captured in the verified sidecars and is reduced
+    independently by the quality report. This pass only creates compact grayscale views
+    at configured sentinel targets and PNG bytes at configured semantic targets; no raw
+    decoded RGB representation is retained after each frame is handled.
+    """
+
+    if not isinstance(media_processing_policy, McapMediaProcessingPolicy):
+        raise TypeError("media_processing_policy must be a McapMediaProcessingPolicy")
+    if not isinstance(quality_policy, LocalMediaQualityPolicy):
+        raise TypeError("quality_policy must be a LocalMediaQualityPolicy")
+    if quality_policy.analysis_width != media_processing_policy.sentinel_analysis_width:
+        raise ValueError("quality policy width must match the media sentinel analysis width")
+    if not isinstance(stop_after_selected, bool):
+        raise TypeError("stop_after_selected must be a boolean")
+
     output_root.mkdir(parents=True, exist_ok=True)
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
     quality_observations: dict[CameraId, tuple[FrameQualityObservation, ...]] = {}
-    grid = SamplingGrid(grid_origin_ns=0, rate=SamplingRate(2, 1))
     selected_frames: dict[CameraId, dict[int, IndexedSourceFrame]] = {}
+    sentinel_indexes: dict[CameraId, frozenset[int]] = {}
     for camera_id in CAMERA_IDS:
         source_frames = frame_index.cameras[camera_id].frames
-        frames_by_locator = {
-            canonical_json_bytes(frame.source_locator): frame for frame in source_frames
-        }
-        selections = grid.select_frames(
-            (
-                FrameCandidate(
-                    aligned_timestamp_ns=frame.alignment_projection.aligned_timestamp_ns,
-                    source_timestamp_ns=frame.source_timestamp_ns,
-                    source_locator_bytes=locator,
-                    decodable=frame.decodable,
-                )
-                for locator, frame in frames_by_locator.items()
+        selected_frames[camera_id] = _select_media_target_frames(
+            source_frames=source_frames,
+            requested_interval=requested_interval,
+            rate=SamplingRate(
+                media_processing_policy.semantic_rate_numerator,
+                media_processing_policy.semantic_rate_denominator,
             ),
-            requested_interval.start_ns,
-            requested_interval.end_ns,
-            300_000_000,
+            selection_tolerance_ns=media_processing_policy.selection_tolerance_ns,
         )
-        selected_by_index: dict[int, IndexedSourceFrame] = {}
-        for selection in selections:
-            if selection.status is not SelectionStatus.SELECTED:
-                continue
-            assert selection.frame is not None
-            source_frame = frames_by_locator[selection.frame.source_locator_bytes]
-            packet_index = source_frame.source_locator["packet_index"]
-            if isinstance(packet_index, bool) or not isinstance(packet_index, int):
-                raise CanonicalMcapSourceError("canonical packet locator is not an integer")
-            selected_by_index[packet_index] = source_frame
-        selected_frames[camera_id] = selected_by_index
+        sentinel_indexes[camera_id] = frozenset(
+            _select_media_target_frames(
+                source_frames=source_frames,
+                requested_interval=requested_interval,
+                rate=SamplingRate(
+                    media_processing_policy.sentinel_rate_numerator,
+                    media_processing_policy.sentinel_rate_denominator,
+                ),
+                selection_tolerance_ns=media_processing_policy.selection_tolerance_ns,
+            )
+        )
     with ThreadPoolExecutor(
         max_workers=min(MCAP_FRAME_MATERIALIZATION_WORKERS, len(CAMERA_IDS)),
         thread_name_prefix="robata-frame-materializer",
@@ -1778,7 +2259,11 @@ def _materialize_selected_frames(
                 ledger=ledgers[camera_id],
                 quality_timings=quality_timings[camera_id],
                 selected_by_index=selected_frames[camera_id],
+                sentinel_indexes=sentinel_indexes[camera_id],
                 output_root=output_root,
+                quality_policy=quality_policy,
+                evidence_max_width=media_processing_policy.evidence_max_width,
+                evidence_extractor_version=media_processing_policy.evidence_extractor_version,
                 stop_after_selected=stop_after_selected,
             )
             for camera_id in CAMERA_IDS
@@ -1790,21 +2275,218 @@ def _materialize_selected_frames(
     return artifacts, quality_observations
 
 
+def _bind_export_time_visual_results(
+    *,
+    frame_index: CanonicalSixCameraFrameIndex,
+    ledgers: Mapping[CameraId, _CameraLedger],
+    quality_timings: Mapping[CameraId, tuple[FrameTimingEvidence, ...]],
+    requested_interval: NanosecondInterval,
+    output_root: Path,
+    media_processing_policy: McapMediaProcessingPolicy,
+    quality_policy: LocalMediaQualityPolicy,
+    visual_results: _ExportTimeVisualResults,
+) -> tuple[
+    dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
+    dict[CameraId, tuple[FrameQualityObservation, ...]],
+]:
+    """Bind bounded export-time facts to the final verified frame index."""
+
+    if not isinstance(media_processing_policy, McapMediaProcessingPolicy):
+        raise TypeError("media_processing_policy must be a McapMediaProcessingPolicy")
+    if not isinstance(quality_policy, LocalMediaQualityPolicy):
+        raise TypeError("quality_policy must be a LocalMediaQualityPolicy")
+    if quality_policy.analysis_width != media_processing_policy.sentinel_analysis_width:
+        raise ValueError("quality policy width must match the media sentinel analysis width")
+    artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
+    quality_observations: dict[CameraId, tuple[FrameQualityObservation, ...]] = {}
+    semantic_rate = SamplingRate(
+        media_processing_policy.semantic_rate_numerator,
+        media_processing_policy.semantic_rate_denominator,
+    )
+    sentinel_rate = SamplingRate(
+        media_processing_policy.sentinel_rate_numerator,
+        media_processing_policy.sentinel_rate_denominator,
+    )
+    for camera_id in CAMERA_IDS:
+        source_frames = frame_index.cameras[camera_id].frames
+        timings = quality_timings[camera_id]
+        if len(source_frames) != len(timings):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} quality timing differs from its canonical frame index"
+            )
+        selected_frames = _select_media_target_frames(
+            source_frames=source_frames,
+            requested_interval=requested_interval,
+            rate=semantic_rate,
+            selection_tolerance_ns=media_processing_policy.selection_tolerance_ns,
+        )
+        sentinel_indexes = frozenset(
+            _select_media_target_frames(
+                source_frames=source_frames,
+                requested_interval=requested_interval,
+                rate=sentinel_rate,
+                selection_tolerance_ns=media_processing_policy.selection_tolerance_ns,
+            )
+        )
+        result = visual_results.cameras.get(camera_id)
+        if result is None:
+            raise CanonicalMcapSourceError(f"{camera_id.value} has no export-time visual result")
+        if result.leading_access_unit_count != ledgers[camera_id].record.leading_drops.count:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export leading-drop count differs from its sidecar"
+            )
+        expected_semantic_orders = {
+            result.leading_access_unit_count + index for index in selected_frames
+        }
+        expected_sentinel_orders = {
+            result.leading_access_unit_count + index for index in sentinel_indexes
+        }
+        if result.semantic_source_orders != frozenset(expected_semantic_orders):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export semantic selection differs from its frame index"
+            )
+        if result.sentinel_source_orders != frozenset(expected_sentinel_orders):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export sentinel selection differs from its frame index"
+            )
+        frames_by_order = {frame.source_order: frame for frame in source_frames}
+        if set(result.rendered) != expected_semantic_orders:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export rendered keys differ from its semantic selection"
+            )
+        for raw_order, rendered in result.rendered.items():
+            exported_index = raw_order - result.leading_access_unit_count
+            source_frame = frames_by_order.get(exported_index)
+            if source_frame is None:
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} export rendered frame is absent from its frame index"
+                )
+            artifacts[(camera_id, source_frame.source_frame_id)] = (
+                _materialized_frame_artifact_from_rendered(
+                    source_frame=source_frame,
+                    rendered=rendered,
+                    evidence_extractor_version=media_processing_policy.evidence_extractor_version,
+                )
+            )
+        if set(result.observations) != expected_sentinel_orders:
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export observed keys differ from its sentinel selection"
+            )
+        observations_by_index: dict[int, FrameQualityObservation] = {}
+        for raw_order, evidence in result.observations.items():
+            exported_index = raw_order - result.leading_access_unit_count
+            if not 0 <= exported_index < len(timings):
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} export observation index is outside its sidecar"
+                )
+            if evidence.timing != timings[exported_index]:
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} export timing differs from its sidecar"
+                )
+            quality = evidence.quality
+            if (
+                quality.camera_id is not camera_id
+                or quality.packet_index != exported_index
+                or quality.aligned_timestamp_ns != evidence.timing.aligned_timestamp_ns
+                or quality.source_timestamp_ns != evidence.timing.source_timestamp_ns
+            ):
+                raise CanonicalMcapSourceError(
+                    f"{camera_id.value} export quality observation differs from its timing"
+                )
+            observations_by_index[exported_index] = quality
+        if set(observations_by_index) != set(sentinel_indexes):
+            raise CanonicalMcapSourceError(
+                f"{camera_id.value} export did not retain every selected quality observation"
+            )
+        quality_observations[camera_id] = tuple(
+            observations_by_index[index] for index in sorted(observations_by_index)
+        )
+    return artifacts, quality_observations
+
+
+def _select_media_target_frames(
+    *,
+    source_frames: tuple[IndexedSourceFrame, ...],
+    requested_interval: NanosecondInterval,
+    rate: SamplingRate,
+    selection_tolerance_ns: int,
+) -> dict[int, IndexedSourceFrame]:
+    """Select deterministic frame targets without decoding visual pixels."""
+
+    if not isinstance(rate, SamplingRate):
+        raise TypeError("rate must be a SamplingRate")
+    if (
+        isinstance(selection_tolerance_ns, bool)
+        or not isinstance(selection_tolerance_ns, int)
+        or selection_tolerance_ns <= 0
+    ):
+        raise ValueError("selection_tolerance_ns must be a positive integer")
+    frames_by_locator = {
+        canonical_json_bytes(frame.source_locator): frame for frame in source_frames
+    }
+    grid = SamplingGrid(grid_origin_ns=0, rate=rate)
+    selections = grid.select_frames(
+        (
+            FrameCandidate(
+                aligned_timestamp_ns=frame.alignment_projection.aligned_timestamp_ns,
+                source_timestamp_ns=frame.source_timestamp_ns,
+                source_locator_bytes=locator,
+                decodable=frame.decodable,
+            )
+            for locator, frame in frames_by_locator.items()
+        ),
+        requested_interval.start_ns,
+        requested_interval.end_ns,
+        selection_tolerance_ns,
+    )
+    selected_by_index: dict[int, IndexedSourceFrame] = {}
+    for selection in selections:
+        if selection.status is not SelectionStatus.SELECTED:
+            continue
+        assert selection.frame is not None
+        source_frame = frames_by_locator[selection.frame.source_locator_bytes]
+        packet_index = source_frame.source_locator.get("packet_index")
+        if isinstance(packet_index, bool) or not isinstance(packet_index, int):
+            raise CanonicalMcapSourceError("canonical packet locator is not an integer")
+        selected_by_index[packet_index] = source_frame
+    return selected_by_index
+
+
 def _decode_selected_camera_frames(
     *,
     camera_id: CameraId,
     ledger: _CameraLedger,
     quality_timings: tuple[FrameTimingEvidence, ...],
     selected_by_index: Mapping[int, IndexedSourceFrame],
+    sentinel_indexes: frozenset[int],
     output_root: Path,
+    quality_policy: LocalMediaQualityPolicy = DEFAULT_MEDIA_QUALITY_POLICY,
+    evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
+    evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
     stop_after_selected: bool = False,
 ) -> tuple[
     dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     tuple[FrameQualityObservation, ...],
 ]:
+    """Walk one verified MP4 sequentially and service both bounded target sets."""
+
     if not isinstance(stop_after_selected, bool):
         raise TypeError("stop_after_selected must be a boolean")
-    if stop_after_selected and not selected_by_index:
+    if not isinstance(sentinel_indexes, frozenset) or any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in sentinel_indexes
+    ):
+        raise TypeError("sentinel_indexes must be a frozen set of nonnegative integers")
+    if not isinstance(quality_policy, LocalMediaQualityPolicy):
+        raise TypeError("quality_policy must be a LocalMediaQualityPolicy")
+    if isinstance(evidence_max_width, bool) or not isinstance(evidence_max_width, int):
+        raise TypeError("evidence_max_width must be an integer")
+    if evidence_max_width <= 0:
+        raise ValueError("evidence_max_width must be positive")
+    if not isinstance(evidence_extractor_version, str) or not evidence_extractor_version:
+        raise ValueError("evidence_extractor_version must be a non-empty string")
+    required_indexes = frozenset(selected_by_index) | sentinel_indexes
+    if stop_after_selected and not required_indexes:
         return {}, ()
     if len(quality_timings) != len(ledger.rows):
         raise CanonicalMcapSourceError(
@@ -1813,10 +2495,11 @@ def _decode_selected_camera_frames(
 
     decoded_count = 0
     rendered_indexes: set[int] = set()
+    observed_indexes: set[int] = set()
     artifacts: dict[tuple[CameraId, str], MaterializedFrameArtifactFact] = {}
     observations: list[FrameQualityObservation] = []
-    analyzer = LocalFrameQualityAnalyzer(camera_id)
-    last_required_index = max(selected_by_index) if stop_after_selected else None
+    analyzer = LocalFrameQualityAnalyzer(camera_id, policy=quality_policy)
+    last_required_index = max(required_indexes) if stop_after_selected else None
     with av.open(str(ledger.video_path), mode="r") as container:
         streams = tuple(container.streams.video)
         if len(streams) != 1 or bool(streams[0].codec_context.has_b_frames):
@@ -1838,16 +2521,29 @@ def _decode_selected_camera_frames(
                     f"{camera_id.value} decoded frame differs from registered evidence"
                 )
             decoded_count += 1
-            observations.append(analyzer.observe(frame, quality_timings[decoded_index]))
+            if decoded_index in sentinel_indexes:
+                timing = quality_timings[decoded_index]
+                observations.append(
+                    analyzer.observe(
+                        pyav_decoded_frame_view(
+                            frame,
+                            timestamp_ns=timing.aligned_timestamp_ns,
+                            analysis_width=quality_policy.analysis_width,
+                        ),
+                        timing,
+                    )
+                )
+                observed_indexes.add(decoded_index)
             source_frame = selected_by_index.get(decoded_index)
-            if source_frame is None:
-                continue
-            artifacts[(camera_id, source_frame.source_frame_id)] = _materialized_frame_artifact(
-                source_frame=source_frame,
-                decoded_frame=frame,
-                output_root=output_root,
-            )
-            rendered_indexes.add(decoded_index)
+            if source_frame is not None:
+                artifacts[(camera_id, source_frame.source_frame_id)] = _materialized_frame_artifact(
+                    source_frame=source_frame,
+                    decoded_frame=frame,
+                    output_root=output_root,
+                    evidence_max_width=evidence_max_width,
+                    evidence_extractor_version=evidence_extractor_version,
+                )
+                rendered_indexes.add(decoded_index)
             if last_required_index is not None and decoded_index >= last_required_index:
                 break
     if last_required_index is None and decoded_count != len(ledger.rows):
@@ -1862,6 +2558,10 @@ def _decode_selected_camera_frames(
         raise CanonicalMcapSourceError(
             f"{camera_id.value} did not materialize every selected source frame"
         )
+    if observed_indexes != set(sentinel_indexes):
+        raise CanonicalMcapSourceError(
+            f"{camera_id.value} did not observe every selected sentinel frame"
+        )
     return artifacts, tuple(observations)
 
 
@@ -1871,6 +2571,8 @@ def _materialize_verified_source_frame(
     ledger: _CameraLedger,
     source_frame: IndexedSourceFrame,
     output_root: Path,
+    evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
+    evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
 ) -> MaterializedFrameArtifactFact:
     """Seek from verified keyframe evidence and materialize one exact source frame."""
 
@@ -1953,6 +2655,8 @@ def _materialize_verified_source_frame(
                         source_frame=source_frame,
                         decoded_frame=decoded_frame,
                         output_root=output_root,
+                        evidence_max_width=evidence_max_width,
+                        evidence_extractor_version=evidence_extractor_version,
                     )
                 if actual_pts_ns > row.relative_pts_ns:
                     break
@@ -1967,21 +2671,56 @@ def _materialize_verified_source_frame(
     )
 
 
+def _materialized_frame_artifact_from_rendered(
+    *,
+    source_frame: IndexedSourceFrame,
+    rendered: _RenderedPngFact,
+    evidence_extractor_version: str,
+) -> MaterializedFrameArtifactFact:
+    artifact_identity = semantic_sha256(
+        {
+            "extractor_version": evidence_extractor_version,
+            "source_frame_id": source_frame.source_frame_id,
+            "png_sha256": rendered.sha256,
+        }
+    )
+    return MaterializedFrameArtifactFact(
+        artifact=MaterializedArtifactManifest(
+            artifact_id=_stable_uuid(
+                "canonical-mcap-frame-artifact",
+                artifact_identity,
+            ),
+            uri=rendered.path.as_uri(),
+            sha256=rendered.sha256,
+            bytes=rendered.bytes,
+            media_type="image/png",
+        ),
+        width=rendered.width,
+        height=rendered.height,
+        quality_flags=(
+            "LOCAL_CONFORMANCE",
+            "REAL_MCAP_H264_DECODED",
+        ),
+    )
+
+
 def _materialized_frame_artifact(
     *,
     source_frame: IndexedSourceFrame,
     decoded_frame: Any,
     output_root: Path,
+    evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
+    evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
 ) -> MaterializedFrameArtifactFact:
     png_bytes, width, height = _encode_png(
         decoded_frame,
-        max_width=MCAP_PNG_MAX_WIDTH,
+        max_width=evidence_max_width,
     )
     digest = exact_bytes_sha256(png_bytes)
     path = _publish_png(output_root, digest, png_bytes)
     artifact_identity = semantic_sha256(
         {
-            "extractor_version": MCAP_PNG_EXTRACTOR_VERSION,
+            "extractor_version": evidence_extractor_version,
             "source_frame_id": source_frame.source_frame_id,
             "png_sha256": digest,
         }

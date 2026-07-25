@@ -263,9 +263,24 @@ def _validate_file(path: Path, artifact: _ViewArtifact) -> None:
         raise _FileValidationError(f"{path} does not contain the exact canonical manifest")
 
 
+def _validate_trusted_shape(path: Path, artifact: _ViewArtifact) -> None:
+    try:
+        file_stat = path.lstat()
+    except OSError:
+        raise
+    if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+        raise _FileValidationError(f"{path} is not a regular non-symlink file")
+    if file_stat.st_size != artifact.entry.bytes:
+        raise _FileValidationError(
+            f"{path} has {file_stat.st_size} bytes; expected {artifact.entry.bytes}"
+        )
+
+
 def _resolve_registry_sources(
     registry: ArtifactRegistry,
     artifacts: tuple[_ViewArtifact, ...],
+    *,
+    trusted_artifact_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Path]:
     sources: dict[str, Path] = {}
     unavailable_codes = {
@@ -273,9 +288,19 @@ def _resolve_registry_sources(
         ArtifactRegistryErrorCode.BLOB_SOURCE_MISSING,
         ArtifactRegistryErrorCode.DERIVATION_NOT_FOUND,
     }
+    trusted_resolver = getattr(registry, "resolve_blob_unverified", None)
     for artifact in artifacts:
+        trusted = (
+            artifact.exact_bytes is None
+            and artifact.entry.artifact_id in trusted_artifact_ids
+            and callable(trusted_resolver)
+        )
         try:
-            source = registry.resolve_blob(artifact.entry.artifact_id)
+            if trusted:
+                assert callable(trusted_resolver)
+                source = trusted_resolver(artifact.entry.artifact_id)
+            else:
+                source = registry.resolve_blob(artifact.entry.artifact_id)
         except ArtifactRegistryError as error:
             code = (
                 ArtifactViewErrorCode.REGISTRY_BLOB_UNAVAILABLE
@@ -294,7 +319,10 @@ def _resolve_registry_sources(
                 f"registry returned a non-Path source for {artifact.entry.artifact_id}",
             )
         try:
-            _validate_file(source, artifact)
+            if trusted:
+                _validate_trusted_shape(source, artifact)
+            else:
+                _validate_file(source, artifact)
         except FileNotFoundError as error:
             _raise(
                 ArtifactViewErrorCode.REGISTRY_BLOB_UNAVAILABLE,
@@ -309,7 +337,12 @@ def _resolve_registry_sources(
     return sources
 
 
-def _validate_view(directory: Path, artifacts: tuple[_ViewArtifact, ...]) -> None:
+def _validate_view(
+    directory: Path,
+    artifacts: tuple[_ViewArtifact, ...],
+    *,
+    trusted_artifact_ids: frozenset[str] = frozenset(),
+) -> None:
     if directory.is_symlink() or not directory.is_dir():
         raise _FileValidationError(f"{directory} is not a regular directory")
     expected_names = {artifact.filename for artifact in artifacts}
@@ -319,7 +352,11 @@ def _validate_view(directory: Path, artifacts: tuple[_ViewArtifact, ...]) -> Non
         extra = sorted(actual_names - expected_names)
         raise _FileValidationError(f"view layout mismatch; missing={missing}, extra={extra}")
     for artifact in artifacts:
-        _validate_file(directory / artifact.filename, artifact)
+        path = directory / artifact.filename
+        if artifact.exact_bytes is None and artifact.entry.artifact_id in trusted_artifact_ids:
+            _validate_trusted_shape(path, artifact)
+        else:
+            _validate_file(path, artifact)
 
 
 def _copy_registry_blob(source: Path, destination: Path, artifact: _ViewArtifact) -> None:
@@ -419,6 +456,7 @@ def materialize_camera_video_view(
     manifest_artifact_id: str,
     manifest: CameraVideoExportManifestV2,
     output_directory: Path,
+    trusted_artifact_ids: frozenset[str] = frozenset(),
 ) -> CameraVideoViewPublication:
     """Copy one complete V2 six-camera view from verified registry blobs."""
 
@@ -437,6 +475,13 @@ def materialize_camera_video_view(
             "output_directory must name a child directory",
         )
 
+    if not isinstance(trusted_artifact_ids, frozenset) or any(
+        not isinstance(artifact_id, str) for artifact_id in trusted_artifact_ids
+    ):
+        _raise(
+            ArtifactViewErrorCode.INVALID_REQUEST,
+            "trusted_artifact_ids must be a frozen set of artifact ID strings",
+        )
     validated_snapshot = _revalidate_snapshot(snapshot)
     validated_manifest = _revalidate_manifest(manifest)
     artifacts = _build_view_artifacts(
@@ -444,7 +489,13 @@ def materialize_camera_video_view(
         manifest_artifact_id=manifest_artifact_id,
         manifest=validated_manifest,
     )
-    sources = _resolve_registry_sources(registry, artifacts)
+    artifact_ids = {artifact.entry.artifact_id for artifact in artifacts}
+    trusted_view_artifact_ids = trusted_artifact_ids.intersection(artifact_ids)
+    sources = _resolve_registry_sources(
+        registry,
+        artifacts,
+        trusted_artifact_ids=trusted_view_artifact_ids,
+    )
     try:
         target = Path(os.path.abspath(output_directory))
     except (OSError, ValueError) as error:
@@ -484,7 +535,11 @@ def materialize_camera_video_view(
             for artifact in artifacts:
                 source = sources[artifact.entry.artifact_id]
                 _materialize_registry_blob(source, staging / artifact.filename, artifact)
-            _validate_view(staging, artifacts)
+            _validate_view(
+                staging,
+                artifacts,
+                trusted_artifact_ids=trusted_view_artifact_ids,
+            )
             _sync_directory(staging)
         except _FileValidationError as error:
             _raise(ArtifactViewErrorCode.REGISTRY_BLOB_INVALID, str(error))

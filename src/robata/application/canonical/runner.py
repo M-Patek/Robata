@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
 
@@ -56,6 +57,10 @@ from robata.application.canonical.output_admission import (
     FusionEventHypothesisProjector,
     validate_final_fusion_reduction,
 )
+from robata.application.canonical.product_qa import (
+    CanonicalProductQAContext,
+    CanonicalProductQAProjector,
+)
 from robata.application.canonical.projections import _stable_uuid
 from robata.application.canonical.reduction import (
     _build_canonical_fusion_reduction,
@@ -94,7 +99,7 @@ from robata.application.canonical_run_membership import (
     CanonicalRunMembershipJournal,
 )
 from robata.contracts.cameras import CAMERA_IDS, CameraId
-from robata.contracts.common import NanosecondInterval
+from robata.contracts.common import NanosecondInterval, Sha256Digest
 from robata.contracts.hashing import (
     canonical_json_bytes,
     exact_bytes_sha256,
@@ -116,6 +121,7 @@ from robata.event_pipeline.candidate import (
     CandidateReducer,
     CandidateReductionError,
     CandidateReductionPolicy,
+    CandidateReductionResult,
     CanonicalCandidateEvent,
 )
 from robata.event_pipeline.evidence import (
@@ -195,6 +201,7 @@ from robata.inference.orchestrator import (
     InferenceOrchestrator,
     InferencePolicy,
     InMemoryInferenceLedger,
+    OrchestratedAttemptResult,
 )
 from robata.inference.preparation import (
     InputPlanPreparer,
@@ -210,6 +217,7 @@ from robata.qa_pipeline.coarse import (
 )
 from robata.qa_pipeline.completion import (
     QACompletionProjector,
+    QACompletionResult,
     QACompletionStatus,
 )
 from robata.qa_pipeline.dense import (
@@ -290,6 +298,44 @@ class _ActionEvidenceExecutionError(RuntimeError):
         self.error = error
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CanonicalPreEosInferenceInvocation:
+    """One provider-neutral inference invocation admitted before recording EOS.
+
+    This is an execution hand-off, not a wire contract.  It deliberately carries
+    the same immutable inputs required by :class:`InferenceOrchestrator` so a
+    stream executor can reuse the canonical ledger, selection, and idempotency
+    behavior rather than create a second provider path.
+    """
+
+    task: VisionTask
+    mcap_id: str
+    camera_mapping_run_id: str
+    alignment_id: str
+    start_ns: int
+    end_ns: int
+    package_set_id: str | None = None
+    package_inputs: tuple[PackageInput, ...] = ()
+    rendered_input_digest: str | None = None
+    input_plan: InferenceInputPlan | None = None
+    input_plan_part_ordinal: int | None = None
+    input_config: Mapping[str, object] = field(default_factory=dict)
+    logical_dependency_sha256: Sha256Digest | None = None
+    sampling_config: Mapping[str, object] = field(default_factory=dict)
+    metadata: Mapping[str, str] = field(default_factory=dict)
+    attempt: int = 1
+    retry_count: int = 0
+
+
+_PRE_EOS_INFERENCE_TASKS = frozenset(
+    {
+        VisionTask.QA_COARSE,
+        VisionTask.QA_DENSE,
+        VisionTask.EVENT_PROPOSAL,
+    }
+)
+
+
 def _canonical_call_dependency_sha256(
     dependency_config: Mapping[str, object] | None,
 ) -> str | None:
@@ -302,6 +348,38 @@ def _canonical_call_dependency_sha256(
             "dependencies": dependencies,
         }
     )
+
+
+def _observe_known_output_tokens(
+    runtime_observer: RuntimeObserver | None,
+    *,
+    provider: str,
+    task: str,
+    outcome: VisionInferenceSuccess | VisionInferenceFailure,
+) -> None:
+    """Record provider-reported output tokens without affecting inference behavior."""
+
+    try:
+        output_tokens = outcome.usage.output_tokens
+    except (AttributeError, TypeError):
+        # Runtime observation is deliberately fail-open, including for an adapter that
+        # violates its result contract before the orchestrator rejects that result.
+        return
+    if isinstance(output_tokens, bool) or not isinstance(output_tokens, int) or output_tokens < 0:
+        return
+    attributes = {"provider": provider, "task": task}
+    runtime_increment(
+        runtime_observer,
+        "inference.output_token_responses",
+        attributes=attributes,
+    )
+    if output_tokens > 0:
+        runtime_increment(
+            runtime_observer,
+            "inference.output_tokens",
+            output_tokens,
+            attributes,
+        )
 
 
 class _CountingVisionModelAdapter:
@@ -337,7 +415,7 @@ class _CountingVisionModelAdapter:
         request: VisionInferenceRequest,
     ) -> VisionInferenceSuccess | VisionInferenceFailure:
         self._infer_calls += 1
-        attributes = {
+        attributes: dict[str, str | int | float | bool] = {
             "provider": self.provider,
             "task": request.task.value,
         }
@@ -345,6 +423,20 @@ class _CountingVisionModelAdapter:
             self._runtime_observer,
             "inference.provider_dispatches",
             attributes=attributes,
+        )
+        batch_attributes: dict[str, str | int | float | bool] = {
+            "provider": self.provider,
+            "batch_size": 1,
+        }
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_batches",
+            attributes=batch_attributes,
+        )
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_batch_requests",
+            attributes=batch_attributes,
         )
         with runtime_span(
             self._runtime_observer,
@@ -359,6 +451,12 @@ class _CountingVisionModelAdapter:
                 **attributes,
                 "outcome": type(outcome).__name__,
             },
+        )
+        _observe_known_output_tokens(
+            self._runtime_observer,
+            provider=self.provider,
+            task=request.task.value,
+            outcome=outcome,
         )
         return outcome
 
@@ -381,13 +479,24 @@ class _CountingBatchVisionModelAdapter(_CountingVisionModelAdapter):
             "inference.provider_batch_dispatches",
             attributes=attributes,
         )
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_batches",
+            attributes=attributes,
+        )
+        runtime_increment(
+            self._runtime_observer,
+            "inference.provider_batch_requests",
+            len(requests),
+            attributes,
+        )
         with runtime_span(
             self._runtime_observer,
             "inference.provider_batch_dispatch",
             attributes,
         ):
             outcomes = await batch_delegate.infer_batch(requests)
-        for outcome in outcomes:
+        for ordinal, outcome in enumerate(outcomes):
             runtime_increment(
                 self._runtime_observer,
                 "inference.provider_outcomes",
@@ -396,6 +505,13 @@ class _CountingBatchVisionModelAdapter(_CountingVisionModelAdapter):
                     "outcome": type(outcome).__name__,
                 },
             )
+            if ordinal < len(requests):
+                _observe_known_output_tokens(
+                    self._runtime_observer,
+                    provider=self.provider,
+                    task=requests[ordinal].task.value,
+                    outcome=outcome,
+                )
         return outcomes
 
 
@@ -531,6 +647,14 @@ class CanonicalOfflinePipeline:
         self._max_concurrent_call_parts = max_concurrent_call_parts
         self._clock = clock or _utc_now
         self._runtime_observer = runtime_observer
+        # This state is observation-only. It deduplicates selected source-frame
+        # identities across every stage handled by this pipeline instance.  Content
+        # hashes are not identities: identical black/frozen frames from different
+        # cameras or timestamps remain distinct selected images.
+        self._observed_unique_image_frame_ids: set[str] = set()
+        self._observed_coarse_image_frame_ids: set[str] = set()
+        self._observed_dense_image_frame_ids: set[str] = set()
+        self._observed_window_keys: set[tuple[str, str]] = set()
         self._validate_configuration()
 
         self._ledger = (
@@ -583,6 +707,7 @@ class CanonicalOfflinePipeline:
         self._enricher = ProviderClaimEnricher(schema_registry)
         self._coarse_qa_projector = CoarseQAProjector()
         self._qa_completion_projector = QACompletionProjector()
+        self._product_qa_projector = CanonicalProductQAProjector()
         self._dense_qa_projector = DenseQAProjector(self._qa_completion_projector.policy_version)
         self._event_proposal_projector = EventProposalProjector()
         self._action_evidence_projector = ActionEvidenceProjector()
@@ -624,6 +749,56 @@ class CanonicalOfflinePipeline:
     def adapter(self) -> VisionModelAdapter:
         return self._adapter
 
+    async def execute_pre_eos_inference(
+        self,
+        invocation: CanonicalPreEosInferenceInvocation,
+    ) -> OrchestratedAttemptResult:
+        """Execute one replay-safe provider-neutral pre-EOS invocation.
+
+        Stream scheduling remains outside this pipeline.  This narrow entry point
+        only admits the three window-local stages that can safely execute before
+        EOS, then delegates directly to the canonical orchestrator so its durable
+        selection and idempotency behavior also governs replay.
+        """
+
+        if not isinstance(invocation, CanonicalPreEosInferenceInvocation):
+            raise TypeError(
+                "invocation must be a CanonicalPreEosInferenceInvocation"
+            )
+        if invocation.task not in _PRE_EOS_INFERENCE_TASKS:
+            allowed = ", ".join(task.value for task in sorted(_PRE_EOS_INFERENCE_TASKS))
+            raise CanonicalOfflineConfigurationError(
+                "pre-EOS inference only supports " + allowed
+            )
+        if not isinstance(invocation.package_inputs, tuple):
+            raise TypeError("invocation.package_inputs must be a tuple")
+        if not isinstance(invocation.input_config, Mapping):
+            raise TypeError("invocation.input_config must be a mapping")
+        if not isinstance(invocation.sampling_config, Mapping):
+            raise TypeError("invocation.sampling_config must be a mapping")
+        if not isinstance(invocation.metadata, Mapping):
+            raise TypeError("invocation.metadata must be a mapping")
+
+        return await self._orchestrator.orchestrate_with_selection(
+            task=invocation.task,
+            package_set_id=invocation.package_set_id,
+            mcap_id=invocation.mcap_id,
+            camera_mapping_run_id=invocation.camera_mapping_run_id,
+            alignment_id=invocation.alignment_id,
+            start_ns=invocation.start_ns,
+            end_ns=invocation.end_ns,
+            package_inputs=invocation.package_inputs,
+            rendered_input_digest=invocation.rendered_input_digest,
+            input_plan=invocation.input_plan,
+            input_plan_part_ordinal=invocation.input_plan_part_ordinal,
+            input_config=invocation.input_config,
+            logical_dependency_sha256=invocation.logical_dependency_sha256,
+            sampling_config=invocation.sampling_config,
+            metadata=invocation.metadata,
+            attempt=invocation.attempt,
+            retry_count=invocation.retry_count,
+        )
+
     async def run(
         self,
         *,
@@ -634,6 +809,7 @@ class CanonicalOfflinePipeline:
         frame_index: CanonicalSixCameraFrameIndex,
         artifact_resolver: FrameArtifactResolver,
         rendered_item_factory: RenderedItemFactory | None = None,
+        product_qa_context: CanonicalProductQAContext | None = None,
     ) -> CanonicalOfflineRunResult:
         """Execute one exact local run, retaining every admitted intermediate."""
 
@@ -658,6 +834,15 @@ class CanonicalOfflinePipeline:
             raise TypeError("artifact_resolver must be callable")
         if rendered_item_factory is not None and not callable(rendered_item_factory):
             raise TypeError("rendered_item_factory must be callable")
+        if product_qa_context is None:
+            checked_product_qa_context = CanonicalProductQAContext()
+        elif not isinstance(product_qa_context, CanonicalProductQAContext):
+            raise TypeError("product_qa_context must be CanonicalProductQAContext or None")
+        else:
+            checked_product_qa_context = CanonicalProductQAContext.model_validate(
+                product_qa_context.model_dump(mode="python"),
+                strict=True,
+            )
 
         observed_at = _timestamp(self._clock)
         if _rfc3339_datetime(run_context.started_at) > _rfc3339_datetime(observed_at):
@@ -686,6 +871,8 @@ class CanonicalOfflinePipeline:
             "coarse_qa_result": None,
             "dense_qa_executions": (),
             "qa_completion_result": None,
+            "product_qa_context": checked_product_qa_context,
+            "product_qa_result": None,
             "event_proposal_result": None,
             "candidate_reduction_result": None,
             "action_evidence_executions": (),
@@ -738,6 +925,46 @@ class CanonicalOfflinePipeline:
                         "selected_output": None,
                         "enriched_output": None,
                     }
+                )
+            coarse_for_product = state["coarse_qa_result"]
+            completion_for_product = state["qa_completion_result"]
+            window_for_product = state["window"]
+            if (
+                isinstance(coarse_for_product, CoarseQAResult)
+                and isinstance(completion_for_product, QACompletionResult)
+                and isinstance(window_for_product, CanonicalRootWindow)
+            ):
+                candidate_for_product = state["candidate_reduction_result"]
+                candidate_reduction_for_product = (
+                    candidate_for_product
+                    if isinstance(candidate_for_product, CandidateReductionResult)
+                    else None
+                )
+                action_executions = cast(
+                    tuple[CanonicalActionEvidenceExecution, ...],
+                    state["action_evidence_executions"],
+                )
+                boundary_executions = cast(
+                    tuple[CanonicalBoundaryRefinementExecution, ...],
+                    state["boundary_refinement_executions"],
+                )
+                state["product_qa_result"] = self._product_qa_projector.project(
+                    recording_id=context.recording_identity,
+                    recording_duration_ns=window_for_product.recording_duration_ns,
+                    coarse_result=coarse_for_product,
+                    qa_completion_result=completion_for_product,
+                    candidate_reduction_result=candidate_reduction_for_product,
+                    action_evidence_results=tuple(
+                        item.evidence_result for item in action_executions
+                    ),
+                    boundary_results=tuple(item.result for item in boundary_executions),
+                    context=checked_product_qa_context,
+                    pipeline_incomplete=status not in {
+                        CanonicalOfflineRunStatus.SUCCEEDED,
+                        CanonicalOfflineRunStatus.NO_EVENTS,
+                        CanonicalOfflineRunStatus.ABSTAINED,
+                    },
+                    pipeline_abstained=status is CanonicalOfflineRunStatus.ABSTAINED,
                 )
             completed_run = journal.complete(
                 CanonicalProcessingRunPrimaryStatus(status.value),
@@ -1602,7 +1829,7 @@ class CanonicalOfflinePipeline:
             )
 
         for attempt in range(1, self._execution_policy.max_attempts + 1):
-            terminal = await self._orchestrator.orchestrate(
+            orchestrated = await self._orchestrator.orchestrate_with_selection(
                 task=task,
                 package_set_id=package_set.package_set_id,
                 mcap_id=context.ready_manifest.mcap_id,
@@ -1635,26 +1862,20 @@ class CanonicalOfflinePipeline:
                 attempt=attempt,
                 retry_count=attempt - 1,
             )
+            terminal = orchestrated.terminal
+            selection = orchestrated.selection
             if terminal.status is InferenceStatus.SUCCEEDED:
-                selection = self._ledger.get_selection(
-                    terminal.logical_invocation_id,
-                    inference_policy.selection_policy_version,
-                )
-                if selection is None:
-                    raise CanonicalOfflineConfigurationError(
-                        "successful invocation has no persisted selection"
-                    )
-                selected = self._ledger.get_terminal(selection.inference_id)
                 if (
-                    selected is None
-                    or selected.status is not InferenceStatus.SUCCEEDED
-                    or not selected.output_valid
-                    or selected.input_plan_part_ordinal != part.ordinal
+                    selection is None
+                    or selection.inference_id != terminal.inference_id
+                    or selection.logical_invocation_id != terminal.logical_invocation_id
+                    or not terminal.output_valid
+                    or terminal.input_plan_part_ordinal != part.ordinal
                 ):
                     raise CanonicalOfflineConfigurationError(
-                        "persisted selection does not reference the valid part success"
+                        "orchestrated selection does not reference the valid part success"
                     )
-                return selected, selection, attempt
+                return terminal, selection, attempt
 
             failure = terminal.failure
             retryable = failure is not None and failure.retryability in {
@@ -1911,6 +2132,132 @@ class CanonicalOfflinePipeline:
             None,
         )
 
+    def _observe_planned_call_part(
+        self,
+        *,
+        task: VisionTask,
+        window: CanonicalRootWindow
+        | CanonicalCandidateDenseWindow
+        | CanonicalBoundaryRefinementWindow,
+        input_plan: InferenceInputPlan,
+        part: InferenceCallPart,
+    ) -> None:
+        """Emit plan-derived workload counters without changing the immutable plan."""
+
+        attributes = {
+            "provider": input_plan.target.provider,
+            "purpose": window.purpose.value,
+            "task": task.value,
+        }
+        if part.ordinal == 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.logical_calls",
+                attributes=attributes,
+            )
+            window_id = getattr(window, "window_id", None)
+            if isinstance(window_id, str) and window_id:
+                window_key = (type(window).__name__, window_id)
+                if window_key not in self._observed_window_keys:
+                    self._observed_window_keys.add(window_key)
+                    runtime_increment(
+                        self._runtime_observer,
+                        "sampling.windows",
+                        attributes={"purpose": window.purpose.value},
+                    )
+        if part.ordinal > 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.call_splits",
+                attributes=attributes,
+            )
+        if part.measured_input_tokens > 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.input_tokens",
+                part.measured_input_tokens,
+                attributes,
+            )
+
+        part_items = input_plan.rendered_items[
+            part.start_item_ordinal : part.end_item_ordinal_exclusive
+        ]
+        image_sha256s = tuple(
+            str(item.artifact.sha256)
+            for item in part_items
+            if str(item.artifact.media_type).startswith("image/")
+        )
+        provider_image_count = len(image_sha256s)
+        if provider_image_count > 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.provider_images",
+                provider_image_count,
+                attributes,
+            )
+            if window.purpose is not SamplingPurpose.QA_COARSE:
+                runtime_increment(
+                    self._runtime_observer,
+                    "inference.dense_provider_images",
+                    provider_image_count,
+                    attributes,
+                )
+        if window.purpose is not SamplingPurpose.QA_COARSE and part.ordinal == 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.dense_logical_calls",
+                attributes=attributes,
+            )
+
+        selected_image_frame_ids = {
+            str(item.frame_id)
+            for item in part_items
+            if str(item.artifact.media_type).startswith("image/")
+        }
+        new_selected_image_frame_ids = selected_image_frame_ids.difference(
+            self._observed_unique_image_frame_ids
+        )
+        if new_selected_image_frame_ids:
+            self._observed_unique_image_frame_ids.update(new_selected_image_frame_ids)
+            runtime_increment(
+                self._runtime_observer,
+                "inference.unique_images",
+                len(new_selected_image_frame_ids),
+            )
+        selected_image_class = (
+            self._observed_coarse_image_frame_ids
+            if window.purpose is SamplingPurpose.QA_COARSE
+            else self._observed_dense_image_frame_ids
+        )
+        new_classified_image_frame_ids = selected_image_frame_ids.difference(selected_image_class)
+        if new_classified_image_frame_ids:
+            selected_image_class.update(new_classified_image_frame_ids)
+            runtime_increment(
+                self._runtime_observer,
+                (
+                    "inference.coarse_unique_images"
+                    if window.purpose is SamplingPurpose.QA_COARSE
+                    else "inference.dense_unique_images"
+                ),
+                len(new_classified_image_frame_ids),
+            )
+
+    def _observe_terminal_retry_count(
+        self,
+        *,
+        task: VisionTask,
+        terminal: ModelInference,
+    ) -> None:
+        """Record the final terminal's retry count once per logical call part."""
+
+        if terminal.retry_count > 0:
+            runtime_increment(
+                self._runtime_observer,
+                "inference.provider_retries",
+                terminal.retry_count,
+                {"provider": terminal.provider, "task": task.value},
+            )
+
     async def _execute_one_call_part(
         self,
         *,
@@ -1938,6 +2285,12 @@ class CanonicalOfflinePipeline:
             "inference.call_parts",
             attributes={"task": task.value},
         )
+        self._observe_planned_call_part(
+            task=task,
+            window=window,
+            input_plan=input_plan,
+            part=part,
+        )
         with runtime_span(
             self._runtime_observer,
             "inference.orchestration",
@@ -1961,6 +2314,7 @@ class CanonicalOfflinePipeline:
             attempts_used,
             {"task": task.value},
         )
+        self._observe_terminal_retry_count(task=task, terminal=terminal)
         if terminal.status is not InferenceStatus.SUCCEEDED:
             runtime_increment(
                 self._runtime_observer,
@@ -3441,4 +3795,4 @@ class CanonicalOfflinePipeline:
         return schema
 
 
-__all__ = ["CanonicalOfflinePipeline"]
+__all__ = ["CanonicalOfflinePipeline", "CanonicalPreEosInferenceInvocation"]
