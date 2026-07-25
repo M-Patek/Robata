@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from enum import StrEnum
-from itertools import pairwise
+from itertools import islice, pairwise
 from math import gcd
-from typing import TYPE_CHECKING, Annotated, Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
 from robata.contracts.artifacts import ArtifactId
-from robata.contracts.cameras import CameraId
+from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import (
     NanosecondInterval,
     Nanoseconds,
@@ -27,10 +27,8 @@ from robata.contracts.common import (
 )
 from robata.contracts.hashing import semantic_sha256 as compute_semantic_sha256
 from robata.contracts.schema_registry import SchemaRef
+from robata.ports.decoded_frame import DecodedFrameView
 from robata.sampling.grid import SamplingGrid, SamplingRate
-
-if TYPE_CHECKING:
-    from robata.frame_cache import FramePayload
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
@@ -87,6 +85,458 @@ class AdaptiveSamplingResult(StrictModel):
     actual_fps: NonNegativeFiniteFloat
     trigger_count: NonNegativeInt
     trigger_features: tuple[SignalTrigger, ...]
+
+
+class AdaptiveUpgradeReason(StrEnum):
+    """The runtime fact that requires additional evidence around a timestamp."""
+
+    SOURCE_QUALITY_SIGNAL = "SOURCE_QUALITY_SIGNAL"
+    COARSE_UNCERTAINTY = "COARSE_UNCERTAINTY"
+    CROSS_CAMERA_DISAGREEMENT = "CROSS_CAMERA_DISAGREEMENT"
+    EVENT_CANDIDATE = "EVENT_CANDIDATE"
+    BOUNDARY_REFINEMENT = "BOUNDARY_REFINEMENT"
+
+
+class AdaptiveUpgradeTargetRole(StrEnum):
+    """The relationship between an upgrade target and its original trigger."""
+
+    TRIGGER = "TRIGGER"
+    PRE_CONTEXT = "PRE_CONTEXT"
+    POST_CONTEXT = "POST_CONTEXT"
+
+
+class AdaptiveCoveragePolicy(StrictModel):
+    """Versioned bounded coverage and contextual-upgrade policy for one clip."""
+
+    version: SchemaVersion
+    base_rate_num: PositiveInt
+    base_rate_den: PositiveInt = 1
+    base_target_budget_per_camera: PositiveInt
+    grid_origin_ns: Nanoseconds = 0
+    max_context_offsets: PositiveInt = 16
+    context_offsets_ns: tuple[Nanoseconds, ...] = (-500_000_000, 500_000_000)
+    max_upgrade_requests: PositiveInt = 1_024
+    max_targets_per_camera: PositiveInt
+    max_targets_total: PositiveInt
+
+    @model_validator(mode="after")
+    def validate_coverage_budget(self) -> Self:
+        if gcd(self.base_rate_num, self.base_rate_den) != 1:
+            raise ValueError("base sampling rate must be a reduced rational")
+        if self.base_target_budget_per_camera > self.max_targets_per_camera:
+            raise ValueError("base_target_budget_per_camera must not exceed max_targets_per_camera")
+        if self.max_targets_total < len(CAMERA_IDS) * self.base_target_budget_per_camera:
+            raise ValueError("max_targets_total cannot reserve the base budget for every camera")
+        if not self.context_offsets_ns:
+            raise ValueError("context_offsets_ns must include pre and post context")
+        if len(self.context_offsets_ns) > self.max_context_offsets:
+            raise ValueError("context_offsets_ns exceeds max_context_offsets")
+        if tuple(sorted(self.context_offsets_ns)) != self.context_offsets_ns:
+            raise ValueError("context_offsets_ns must be strictly increasing")
+        if len(set(self.context_offsets_ns)) != len(self.context_offsets_ns):
+            raise ValueError("context_offsets_ns must be strictly increasing")
+        if 0 in self.context_offsets_ns:
+            raise ValueError("context_offsets_ns must not include the trigger offset")
+        if not any(offset < 0 for offset in self.context_offsets_ns):
+            raise ValueError("context_offsets_ns must include pre-trigger context")
+        if not any(offset > 0 for offset in self.context_offsets_ns):
+            raise ValueError("context_offsets_ns must include post-trigger context")
+        return self
+
+
+class AdaptiveUpgradeRequest(StrictModel):
+    """One exact source observation or semantic fact that merits an upgrade."""
+
+    camera_id: CameraId
+    trigger_timestamp_ns: Nanoseconds
+    reason: AdaptiveUpgradeReason
+
+
+class AdaptiveUpgradeProvenance(StrictModel):
+    """Auditable provenance retained for every trigger and neighbouring target."""
+
+    reason: AdaptiveUpgradeReason
+    trigger_timestamp_ns: Nanoseconds
+    role: AdaptiveUpgradeTargetRole
+    context_offset_ns: Nanoseconds = 0
+    context_clipped: bool = False
+
+    @model_validator(mode="after")
+    def validate_role(self) -> Self:
+        if self.role is AdaptiveUpgradeTargetRole.TRIGGER:
+            if self.context_offset_ns != 0 or self.context_clipped:
+                raise ValueError("trigger provenance cannot carry contextual clipping")
+        elif self.role is AdaptiveUpgradeTargetRole.PRE_CONTEXT:
+            if self.context_offset_ns >= 0:
+                raise ValueError("pre-context provenance requires a negative offset")
+        elif self.context_offset_ns <= 0:
+            raise ValueError("post-context provenance requires a positive offset")
+        return self
+
+
+def _upgrade_provenance_sort_key(
+    provenance: AdaptiveUpgradeProvenance,
+) -> tuple[str, int, int, str, bool]:
+    return (
+        provenance.reason.value,
+        provenance.trigger_timestamp_ns,
+        provenance.context_offset_ns,
+        provenance.role.value,
+        provenance.context_clipped,
+    )
+
+
+class AdaptiveCoverageTarget(StrictModel):
+    """One exact target retained for base coverage or an explicit upgrade."""
+
+    camera_id: CameraId
+    target_ns: Nanoseconds
+    base_coverage: bool
+    upgrade_provenance: tuple[AdaptiveUpgradeProvenance, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> Self:
+        canonical = tuple(sorted(self.upgrade_provenance, key=_upgrade_provenance_sort_key))
+        if self.upgrade_provenance != canonical:
+            raise ValueError("upgrade_provenance must be in canonical order")
+        if any(left == right for left, right in pairwise(self.upgrade_provenance)):
+            raise ValueError("upgrade_provenance must not contain duplicates")
+        if not self.base_coverage and not self.upgrade_provenance:
+            raise ValueError("non-base targets require upgrade provenance")
+        return self
+
+
+class AdaptiveCoveragePlan(StrictModel):
+    """Bounded, deterministic per-camera targets with retained upgrade provenance."""
+
+    policy_version: SchemaVersion
+    interval: NanosecondInterval
+    targets: tuple[AdaptiveCoverageTarget, ...]
+    base_target_count: NonNegativeInt
+    upgrade_coordinate_count: NonNegativeInt
+    upgrade_targets_added: NonNegativeInt
+    upgrade_coordinates_deduplicated_into_base: NonNegativeInt
+    dropped_by_per_camera_budget: NonNegativeInt
+    dropped_by_total_budget: NonNegativeInt
+
+    @model_validator(mode="after")
+    def validate_canonical_plan(self) -> Self:
+        canonical = tuple(
+            sorted(
+                self.targets,
+                key=lambda target: (target.camera_id.value, target.target_ns),
+            )
+        )
+        if self.targets != canonical:
+            raise ValueError("coverage targets must be ordered by camera and timestamp")
+        coordinates = tuple((target.camera_id, target.target_ns) for target in self.targets)
+        if len(set(coordinates)) != len(coordinates):
+            raise ValueError("coverage targets must have unique camera/timestamp coordinates")
+        if any(not self.interval.contains(target.target_ns) for target in self.targets):
+            raise ValueError("coverage targets must lie inside the interval")
+
+        base_targets = tuple(target for target in self.targets if target.base_coverage)
+        if self.base_target_count != len(base_targets):
+            raise ValueError("base_target_count does not match coverage targets")
+        base_cameras = {target.camera_id for target in base_targets}
+        if base_cameras != set(CAMERA_IDS):
+            raise ValueError("every canonical camera requires base coverage")
+
+        added = sum(
+            1 for target in self.targets if not target.base_coverage and target.upgrade_provenance
+        )
+        deduplicated = sum(
+            1 for target in self.targets if target.base_coverage and target.upgrade_provenance
+        )
+        if self.upgrade_targets_added != added:
+            raise ValueError("upgrade_targets_added does not match coverage targets")
+        if self.upgrade_coordinates_deduplicated_into_base != deduplicated:
+            raise ValueError(
+                "upgrade_coordinates_deduplicated_into_base does not match coverage targets"
+            )
+        expected_coordinates = (
+            added + deduplicated + self.dropped_by_per_camera_budget + self.dropped_by_total_budget
+        )
+        if self.upgrade_coordinate_count != expected_coordinates:
+            raise ValueError("upgrade counters do not account for every upgrade coordinate")
+        return self
+
+
+class AdaptiveCoveragePlanner:
+    """Produce deterministic base coverage plus bounded, contextual upgrades."""
+
+    def __init__(self, policy: AdaptiveCoveragePolicy) -> None:
+        if not isinstance(policy, AdaptiveCoveragePolicy):
+            raise TypeError("policy must be an AdaptiveCoveragePolicy")
+        self._policy = policy
+
+    @property
+    def policy(self) -> AdaptiveCoveragePolicy:
+        """The immutable policy used to build coverage plans."""
+
+        return self._policy
+
+    def plan(
+        self,
+        interval: NanosecondInterval,
+        upgrades: Iterable[AdaptiveUpgradeRequest] = (),
+    ) -> AdaptiveCoveragePlan:
+        """Return bounded targets without dropping base coverage or source observations."""
+
+        if not isinstance(interval, NanosecondInterval):
+            raise TypeError("interval must be a NanosecondInterval")
+
+        requests = tuple(islice(upgrades, self._policy.max_upgrade_requests + 1))
+        if len(requests) > self._policy.max_upgrade_requests:
+            raise ValueError("upgrade requests exceed max_upgrade_requests")
+        for request in requests:
+            if not isinstance(request, AdaptiveUpgradeRequest):
+                raise TypeError("upgrades must contain AdaptiveUpgradeRequest values")
+            if not interval.contains(request.trigger_timestamp_ns):
+                raise ValueError("upgrade trigger timestamps must lie inside the interval")
+
+        base_by_camera = self._base_targets(interval)
+        base_coordinates = {
+            (camera_id, target_ns)
+            for camera_id, targets in base_by_camera.items()
+            for target_ns in targets
+        }
+        base_target_count = len(base_coordinates)
+        if base_target_count > self._policy.max_targets_total:
+            raise ValueError("base coverage exceeds max_targets_total")
+
+        provenance_by_coordinate = self._expanded_upgrade_provenance(
+            interval=interval,
+            requests=requests,
+        )
+        base_upgrade_coordinates = {
+            coordinate for coordinate in provenance_by_coordinate if coordinate in base_coordinates
+        }
+
+        candidates_by_camera: dict[CameraId, list[tuple[CameraId, int]]] = {
+            camera_id: [] for camera_id in CAMERA_IDS
+        }
+        for coordinate in provenance_by_coordinate:
+            if coordinate not in base_coordinates:
+                candidates_by_camera[coordinate[0]].append(coordinate)
+
+        retained_after_camera_budget: list[tuple[CameraId, int]] = []
+        dropped_by_per_camera_budget = 0
+        for camera_id in CAMERA_IDS:
+            candidates = sorted(
+                candidates_by_camera[camera_id],
+                key=lambda coordinate: _upgrade_coordinate_sort_key(
+                    coordinate,
+                    provenance_by_coordinate[coordinate],
+                ),
+            )
+            capacity = self._policy.max_targets_per_camera - len(base_by_camera[camera_id])
+            trigger_count = sum(
+                _coordinate_has_trigger(provenance_by_coordinate[coordinate])
+                for coordinate in candidates
+            )
+            if trigger_count > capacity:
+                raise ValueError("per-camera budget cannot preserve every original upgrade trigger")
+            retained_after_camera_budget.extend(candidates[:capacity])
+            dropped_by_per_camera_budget += len(candidates[capacity:])
+
+        capacity_total = self._policy.max_targets_total - base_target_count
+        trigger_count = sum(
+            _coordinate_has_trigger(provenance_by_coordinate[coordinate])
+            for coordinate in retained_after_camera_budget
+        )
+        if trigger_count > capacity_total:
+            raise ValueError("total budget cannot preserve every original upgrade trigger")
+        retained_after_total_budget = tuple(
+            sorted(
+                retained_after_camera_budget,
+                key=lambda coordinate: _upgrade_coordinate_sort_key(
+                    coordinate,
+                    provenance_by_coordinate[coordinate],
+                ),
+            )[:capacity_total]
+        )
+        dropped_by_total_budget = len(retained_after_camera_budget) - len(
+            retained_after_total_budget
+        )
+        retained_coordinates = set(retained_after_total_budget)
+
+        targets: list[AdaptiveCoverageTarget] = []
+        for camera_id in CAMERA_IDS:
+            for target_ns in base_by_camera[camera_id]:
+                coordinate = (camera_id, target_ns)
+                targets.append(
+                    AdaptiveCoverageTarget(
+                        camera_id=camera_id,
+                        target_ns=target_ns,
+                        base_coverage=True,
+                        upgrade_provenance=provenance_by_coordinate.get(coordinate, ()),
+                    )
+                )
+            for coordinate in sorted(
+                (coordinate for coordinate in retained_coordinates if coordinate[0] is camera_id),
+                key=lambda item: item[1],
+            ):
+                targets.append(
+                    AdaptiveCoverageTarget(
+                        camera_id=camera_id,
+                        target_ns=coordinate[1],
+                        base_coverage=False,
+                        upgrade_provenance=provenance_by_coordinate[coordinate],
+                    )
+                )
+
+        return AdaptiveCoveragePlan(
+            policy_version=self._policy.version,
+            interval=interval,
+            targets=tuple(
+                sorted(targets, key=lambda target: (target.camera_id.value, target.target_ns))
+            ),
+            base_target_count=base_target_count,
+            upgrade_coordinate_count=len(provenance_by_coordinate),
+            upgrade_targets_added=len(retained_coordinates),
+            upgrade_coordinates_deduplicated_into_base=len(base_upgrade_coordinates),
+            dropped_by_per_camera_budget=dropped_by_per_camera_budget,
+            dropped_by_total_budget=dropped_by_total_budget,
+        )
+
+    def _base_targets(
+        self,
+        interval: NanosecondInterval,
+    ) -> dict[CameraId, tuple[int, ...]]:
+        grid = SamplingGrid(
+            grid_origin_ns=self._policy.grid_origin_ns,
+            rate=SamplingRate(self._policy.base_rate_num, self._policy.base_rate_den),
+        )
+        bounded = _bounded_grid_targets(
+            grid=grid,
+            interval=interval,
+            budget=self._policy.base_target_budget_per_camera,
+        )
+        return {camera_id: bounded for camera_id in CAMERA_IDS}
+
+    def _expanded_upgrade_provenance(
+        self,
+        *,
+        interval: NanosecondInterval,
+        requests: tuple[AdaptiveUpgradeRequest, ...],
+    ) -> dict[tuple[CameraId, int], tuple[AdaptiveUpgradeProvenance, ...]]:
+        provisional: dict[tuple[CameraId, int], list[AdaptiveUpgradeProvenance]] = {}
+        for request in requests:
+            trigger = AdaptiveUpgradeProvenance(
+                reason=request.reason,
+                trigger_timestamp_ns=request.trigger_timestamp_ns,
+                role=AdaptiveUpgradeTargetRole.TRIGGER,
+            )
+            provisional.setdefault(
+                (request.camera_id, request.trigger_timestamp_ns),
+                [],
+            ).append(trigger)
+            for offset_ns in self._policy.context_offsets_ns:
+                requested_target_ns = request.trigger_timestamp_ns + offset_ns
+                target_ns = min(
+                    max(requested_target_ns, interval.start_ns),
+                    interval.end_ns - 1,
+                )
+                role = (
+                    AdaptiveUpgradeTargetRole.PRE_CONTEXT
+                    if offset_ns < 0
+                    else AdaptiveUpgradeTargetRole.POST_CONTEXT
+                )
+                provisional.setdefault((request.camera_id, target_ns), []).append(
+                    AdaptiveUpgradeProvenance(
+                        reason=request.reason,
+                        trigger_timestamp_ns=request.trigger_timestamp_ns,
+                        role=role,
+                        context_offset_ns=offset_ns,
+                        context_clipped=target_ns != requested_target_ns,
+                    )
+                )
+        return {
+            coordinate: tuple(
+                sorted(
+                    set(provenance),
+                    key=_upgrade_provenance_sort_key,
+                )
+            )
+            for coordinate, provenance in provisional.items()
+        }
+
+
+def _bounded_grid_targets(
+    *,
+    grid: SamplingGrid,
+    interval: NanosecondInterval,
+    budget: int,
+) -> tuple[int, ...]:
+    """Select evenly spread grid coordinates without enumerating an unbounded clip.
+
+    SamplingGrid already owns the half-even inverse used to locate the first grid index
+    inside an interval. Choosing bounded positions in that index range preserves the
+    persisted grid phase while preventing an extreme rate or a long clip from expanding
+    the planner's memory footprint.
+    """
+
+    first_k = grid._first_k_at_or_after(interval.start_ns)
+    stop_k = grid._first_k_at_or_after(interval.end_ns)
+    if first_k >= stop_k:
+        return (interval.start_ns,)
+
+    last_k = stop_k - 1
+    if grid.period_num_ns < grid.period_den:
+        first_target_ns = grid.target_ns(first_k)
+        last_target_ns = grid.target_ns(last_k)
+        target_count = min(budget, last_target_ns - first_target_ns + 1)
+        if target_count <= 1:
+            return ((first_target_ns + last_target_ns) // 2,)
+        return tuple(
+            first_target_ns
+            + (ordinal * (last_target_ns - first_target_ns)) // (target_count - 1)
+            for ordinal in range(target_count)
+        )
+
+    target_count = min(budget, last_k - first_k + 1)
+    if target_count <= 1:
+        target_ns = grid.target_ns(first_k + (last_k - first_k) // 2)
+        return (target_ns,)
+    return tuple(
+        grid.target_ns(first_k + (ordinal * (last_k - first_k)) // (target_count - 1))
+        for ordinal in range(target_count)
+    )
+
+
+def _coordinate_has_trigger(
+    provenance: tuple[AdaptiveUpgradeProvenance, ...],
+) -> bool:
+    return any(item.role is AdaptiveUpgradeTargetRole.TRIGGER for item in provenance)
+
+
+def _upgrade_coordinate_sort_key(
+    coordinate: tuple[CameraId, int],
+    provenance: tuple[AdaptiveUpgradeProvenance, ...],
+) -> tuple[int, int, str, int, str]:
+    """Keep original observations before context without inventing severity ordering."""
+
+    role_rank = min(
+        0 if item.role is AdaptiveUpgradeTargetRole.TRIGGER else 1 for item in provenance
+    )
+    return (
+        role_rank,
+        min(item.trigger_timestamp_ns for item in provenance),
+        coordinate[0].value,
+        coordinate[1],
+        min(item.reason.value for item in provenance),
+    )
+
+
+def plan_adaptive_coverage(
+    policy: AdaptiveCoveragePolicy,
+    interval: NanosecondInterval,
+    upgrades: Iterable[AdaptiveUpgradeRequest] = (),
+) -> AdaptiveCoveragePlan:
+    """Convenience entry point for the pure bounded coverage planner."""
+
+    return AdaptiveCoveragePlanner(policy).plan(interval, upgrades)
 
 
 class AdaptiveResolutionMode(StrEnum):
@@ -406,14 +856,14 @@ class SignalDetector:
 
     def detect(
         self,
-        frames: Iterable[FramePayload],
+        frames: Iterable[DecodedFrameView],
         *,
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         """Detect signal triggers across the supplied frame sequence.
 
         Args:
-            frames: Ordered iterable of decoded frame payloads for one camera.
+            frames: Ordered iterable of compact decoded grayscale views for one camera.
             camera_id: Canonical camera identifier (e.g. ``cam_01``).
 
         Returns:
@@ -448,7 +898,7 @@ class AdaptiveSampler:
     def sample(
         self,
         window: object,
-        frames: dict[CameraId, Sequence[FramePayload]],
+        frames: dict[CameraId, Sequence[DecodedFrameView]],
     ) -> AdaptiveSamplingResult:
         """Return a deterministic window-average rate without materializing frames."""
 
@@ -465,6 +915,10 @@ class AdaptiveSampler:
         enabled = set(self._policy.triggers)
         for camera_id in CameraId:
             camera_frames = frames[camera_id]
+            if not isinstance(camera_frames, Sequence) or any(
+                not isinstance(frame, DecodedFrameView) for frame in camera_frames
+            ):
+                raise TypeError("adaptive frames must be DecodedFrameView values")
             for detector in self._detectors:
                 detected = detector.detect(camera_frames, camera_id=camera_id.value)
                 for trigger in detected:
@@ -537,11 +991,19 @@ def _window_average_fps(
 
 __all__ = [
     "ADAPTIVE_TARGET_PLAN_SEMANTIC_PROJECTION_VERSION",
+    "AdaptiveCoveragePlan",
+    "AdaptiveCoveragePlanner",
+    "AdaptiveCoveragePolicy",
+    "AdaptiveCoverageTarget",
     "AdaptiveResolutionMode",
     "AdaptiveSampler",
     "AdaptiveSamplingPolicy",
     "AdaptiveSamplingResult",
     "AdaptiveSignal",
+    "AdaptiveUpgradeProvenance",
+    "AdaptiveUpgradeReason",
+    "AdaptiveUpgradeRequest",
+    "AdaptiveUpgradeTargetRole",
     "CanonicalAdaptiveGridSegment",
     "FrozenAdaptiveResolutionRequest",
     "FrozenAdaptiveTriggerArtifactRef",
@@ -550,5 +1012,6 @@ __all__ = [
     "SignalDetector",
     "SignalTrigger",
     "adaptive_target_plan_semantic_projection",
+    "plan_adaptive_coverage",
     "resolve_frozen_adaptive_targets",
 ]

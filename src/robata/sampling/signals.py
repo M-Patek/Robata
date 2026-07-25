@@ -1,8 +1,8 @@
-"""Lightweight signal detector implementations for adaptive sampling.
+"""Lightweight signal detectors over compact decoded grayscale views.
 
-Each detector operates on raw frame payloads using only NumPy.  Where NumPy
-suffices the implementation is pure NumPy; OpenCV is avoided to keep the
-package dependency footprint minimal.
+Each detector consumes :class:`~robata.ports.decoded_frame.DecodedFrameView`,
+whose row-major luminance bytes and dimensions are explicit. NumPy is optional;
+OpenCV is intentionally avoided to keep the package dependency footprint minimal.
 """
 
 from __future__ import annotations
@@ -18,11 +18,8 @@ else:
     except ModuleNotFoundError:  # optional signal-detector dependency
         np = None
 
-from robata.contracts.common import INT64_MAX, INT64_MIN
+from robata.ports.decoded_frame import DecodedFrameView
 from robata.sampling.adaptive import AdaptiveSignal, SignalDetector, SignalTrigger
-
-if TYPE_CHECKING:
-    from robata.frame_cache import FramePayload
 
 
 def _require_numpy() -> object:
@@ -33,24 +30,24 @@ def _require_numpy() -> object:
     return np
 
 
-def _to_gray_ndarray(data: bytes) -> np.ndarray[Any, np.dtype[np.uint8]]:
-    """Best-effort decode of raw frame bytes into a grayscale NumPy array.
+def _to_gray_ndarray(frame: DecodedFrameView) -> np.ndarray[Any, np.dtype[np.uint8]]:
+    """Return the explicit 2-D luminance raster from one normalized frame view."""
 
-    The implementation assumes the payload is a raw 8-bit grayscale image
-    whose width and height can be inferred from the payload length.  If
-    the payload cannot be decoded, an empty array is returned so the
-    detector degrades gracefully.
-    """
+    if not isinstance(frame, DecodedFrameView):
+        raise TypeError("adaptive signal frames must be DecodedFrameView values")
     _require_numpy()
-    arr = np.frombuffer(data, dtype=np.uint8)
-    # Try common square-ish sizes first, then fall back to a linear array.
-    for size in (1920, 1280, 1080, 640, 480, 256):
-        if len(arr) == size * size:
-            return arr.reshape((size, size))
-        if len(arr) == size * (size // 2):
-            return arr.reshape((size, size // 2))
-    # Fallback: treat as 1-D signal; downstream detectors will handle it.
-    return arr
+    return np.frombuffer(frame.gray_pixels, dtype=np.uint8).reshape((frame.height, frame.width))
+
+
+def _overlapping_rasters(
+    previous: np.ndarray[Any, np.dtype[np.uint8]],
+    current: np.ndarray[Any, np.dtype[np.uint8]],
+) -> tuple[np.ndarray[Any, np.dtype[np.uint8]], np.ndarray[Any, np.dtype[np.uint8]]]:
+    """Align two explicitly shaped rasters to their common top-left region."""
+
+    height = min(previous.shape[0], current.shape[0])
+    width = min(previous.shape[1], current.shape[1])
+    return previous[:height, :width], current[:height, :width]
 
 
 class MotionEnergyDetector(SignalDetector):
@@ -66,36 +63,26 @@ class MotionEnergyDetector(SignalDetector):
 
     def detect(
         self,
-        frames: Iterable[FramePayload],
+        frames: Iterable[DecodedFrameView],
         *,
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         triggers: list[SignalTrigger] = []
         prev_gray: np.ndarray[Any, np.dtype[np.uint8]] | None = None
-        for payload in frames:
-            gray = _to_gray_ndarray(payload.data)
-            if gray.size == 0:
-                continue
+        for frame in frames:
+            gray = _to_gray_ndarray(frame)
             if prev_gray is not None:
-                # Resize to the smaller common shape if dimensions differ.
-                if prev_gray.shape != gray.shape:
-                    min_shape = tuple(
-                        min(a, b) for a, b in zip(prev_gray.shape, gray.shape, strict=True)
-                    )
-                    prev_gray = prev_gray[: min_shape[0], : min_shape[1]]
-                    gray = gray[: min_shape[0], : min_shape[1]]
-                diff = np.mean(np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32)))
+                previous, current = _overlapping_rasters(prev_gray, gray)
+                diff = np.mean(np.abs(previous.astype(np.float32) - current.astype(np.float32)))
                 if diff > self._threshold:
-                    ts_ns = int(payload.timestamp_sec * 1_000_000_000)
-                    if INT64_MIN <= ts_ns <= INT64_MAX:
-                        triggers.append(
-                            SignalTrigger(
-                                signal_type=AdaptiveSignal.MOTION_ENERGY,
-                                timestamp_ns=ts_ns,
-                                strength=float(diff),
-                                confidence=min(diff / (self._threshold * 2), 1.0),
-                            )
+                    triggers.append(
+                        SignalTrigger(
+                            signal_type=AdaptiveSignal.MOTION_ENERGY,
+                            timestamp_ns=frame.timestamp_ns,
+                            strength=float(diff),
+                            confidence=min(diff / (self._threshold * 2), 1.0),
                         )
+                    )
             prev_gray = gray
         return triggers
 
@@ -113,16 +100,14 @@ class SceneChangeDetector(SignalDetector):
 
     def detect(
         self,
-        frames: Iterable[FramePayload],
+        frames: Iterable[DecodedFrameView],
         *,
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         triggers: list[SignalTrigger] = []
         prev_hist: np.ndarray[Any, np.dtype[np.float32]] | None = None
-        for payload in frames:
-            gray = _to_gray_ndarray(payload.data)
-            if gray.size == 0:
-                continue
+        for frame in frames:
+            gray = _to_gray_ndarray(frame)
             hist, _ = np.histogram(gray, bins=self._bins, range=(0, 256))
             hist = hist.astype(np.float32)
             total = hist.sum()
@@ -132,16 +117,14 @@ class SceneChangeDetector(SignalDetector):
                 # Chi-square-like distance
                 distance = np.sum((hist - prev_hist) ** 2)
                 if distance > self._threshold:
-                    ts_ns = int(payload.timestamp_sec * 1_000_000_000)
-                    if INT64_MIN <= ts_ns <= INT64_MAX:
-                        triggers.append(
-                            SignalTrigger(
-                                signal_type=AdaptiveSignal.SCENE_CHANGE,
-                                timestamp_ns=ts_ns,
-                                strength=float(distance),
-                                confidence=min(distance / (self._threshold * 2), 1.0),
-                            )
+                    triggers.append(
+                        SignalTrigger(
+                            signal_type=AdaptiveSignal.SCENE_CHANGE,
+                            timestamp_ns=frame.timestamp_ns,
+                            strength=float(distance),
+                            confidence=min(distance / (self._threshold * 2), 1.0),
                         )
+                    )
             prev_hist = hist
         return triggers
 
@@ -159,16 +142,14 @@ class BlurDetector(SignalDetector):
 
     def detect(
         self,
-        frames: Iterable[FramePayload],
+        frames: Iterable[DecodedFrameView],
         *,
         camera_id: str,
     ) -> Sequence[SignalTrigger]:
         triggers: list[SignalTrigger] = []
         prev_variance: float | None = None
-        for payload in frames:
-            gray = _to_gray_ndarray(payload.data)
-            if gray.size == 0:
-                continue
+        for frame in frames:
+            gray = _to_gray_ndarray(frame)
             # Approximate 2-D Laplacian via finite differences.
             laplacian = (
                 -4 * gray.astype(np.float32)
@@ -181,16 +162,14 @@ class BlurDetector(SignalDetector):
             if prev_variance is not None:
                 drop = max(0.0, prev_variance - variance)
                 if drop > self._threshold:
-                    ts_ns = int(payload.timestamp_sec * 1_000_000_000)
-                    if INT64_MIN <= ts_ns <= INT64_MAX:
-                        triggers.append(
-                            SignalTrigger(
-                                signal_type=AdaptiveSignal.BLUR_CHANGE,
-                                timestamp_ns=ts_ns,
-                                strength=drop,
-                                confidence=min(drop / (self._threshold * 2), 1.0),
-                            )
+                    triggers.append(
+                        SignalTrigger(
+                            signal_type=AdaptiveSignal.BLUR_CHANGE,
+                            timestamp_ns=frame.timestamp_ns,
+                            strength=drop,
+                            confidence=min(drop / (self._threshold * 2), 1.0),
                         )
+                    )
             prev_variance = variance
         return triggers
 
