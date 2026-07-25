@@ -1,7 +1,6 @@
 {
   "suite_id": "robata-rational-grid-canonicalization",
   "suite_version": "1.0.0",
-  "authority": "ARCHITECTURE_DESIGN_V1.md#253-exact-rational-sampling-grid",
   "canonicalization": "RFC8785",
   "integer_encoding": "canonical-base10-string",
   "vectors": [

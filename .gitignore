@@ -1,10 +1,5 @@
-# Documentation and specs (local only, not in remote)
-docs/
+# Local historical material (not repository contracts)
 archive/
-ARCHITECTURE_DESIGN_V1.md
-IMPLEMENTATION_PLAN.md
-large_scale_6camera_video_agent_execution_spec.md
-REQUIREMENTS.md
 
 # Python
 __pycache__/
@@ -14,6 +9,7 @@ __pycache__/
 /pytest-temp-*/
 /pytest-cache-files-*/
 /GithubRobatatmppytest-audit/
+/.test-tmp-*/
 .mypy_cache/
 .ruff_cache/
 **/.schema-registration.lock
@@ -38,6 +34,13 @@ dist/
 # Worker-local data and artifacts
 tmp/
 *.log
+*.aux
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+/REPORT.out
 /file.zip
 /data/source/
+/.playwright-mcp/
 .claude/

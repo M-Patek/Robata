@@ -3,20 +3,21 @@
 A contract-first streaming pipeline for six-camera video QA and physical-action event extraction.
 
 > **Environment Notice**
-> - **Production**: The `src/` directory contains all executable code. No dependency on `docs/`, `archive/`, or external documentation.
-> - **Development**: Comprehensive design documents, ADRs, and WP progress are available in `docs/`.
+> - **Executable contracts**: `schemas/schema-catalog.json` and `schemas/v*/` govern published wire contracts; `src/`, `tests/`, and `conformance/` govern executable behavior.
+> - **Agent navigation**: Start at `AGENTS.md`, then use the blueprint template and module guides in `governance/`.
+> - **Local archive**: `archive/` is non-authoritative historical context. It cannot define or override a contract.
 
 ---
 
 ## Overview
 
-Robata implements a deterministic, replayable streaming architecture for processing egocentric six-camera video streams. The current implementation completes WP6 local conformance validation with the following characteristics:
+Robata implements a deterministic, replayable streaming architecture for processing egocentric six-camera video streams. The checked-in local-conformance slice has the following characteristics:
 
 | Attribute | Value |
 |-----------|-------|
 | Processing Model | Window-based streaming (2s windows, 1s hop) |
-| Throughput | 2.162 rec-sec/wall-sec (WP6 smoke, fixture-backed) |
-| Latency | p95 3.908s end-to-end |
+| Throughput | 2.162 rec-sec/wall-sec (dated fixture-backed smoke snapshot; not capacity evidence) |
+| Latency | p95 3.908s (dated fixture-backed smoke snapshot) |
 | State Management | Durable Window DAG + SQLite work scheduler |
 | Evidence Chain | 74 registered schemas, content-addressed |
 | Replay | Exact replay verified (deterministic) |
@@ -158,21 +159,18 @@ robata/
 │   ├── queue/                  # Work scheduler, backpressure
 │   └── runtime/                # Observability, profiling
 ├── schemas/                    # JSON Schema catalog (74 entries)
-├── tests/                      # Test suite (1,137 tests)
+├── tests/                      # Test suite (run `pytest --collect-only` for the current count)
 ├── scripts/                    # CLI entry points
-├── docs/                       # Development documentation
-│   ├── architecture/           # WP progress, design records
-│   ├── adr/                    # Architecture Decision Records
-│   └── README.md               # Documentation index
-├── archive/old_mvp/            # Historical (non-normative)
+├── governance/                 # Agent-friendly blueprint template and module guides
 ├── README.md                   # This file
-├── REQUIREMENTS.md             # Product requirements (Chinese)
 └── uv.lock                     # Locked dependencies
 ```
 
 ---
 
-## Current Status
+## Local Conformance Snapshot
+
+This is dated local evidence, not a release or production-capacity claim. Re-run the documented checks to establish the current working-tree result.
 
 ### Completed (WP0-WP6)
 
@@ -240,7 +238,7 @@ python scripts/run_canonical_fixture.py \
 Raw MCAP (authorized source required):
 ```bash
 python scripts/run_canonical_mcap.py \
-    data/source/sample.mcap \
+    /absolute/path/to/authorized-recording.mcap \
     --mapping-config config/genrobot-observed-v0.json \
     --state-dir tmp/mcap-state \
     --run-key primary \
@@ -334,16 +332,16 @@ Recovery is idempotent: re-running on already-completed graph produces no change
 
 ---
 
-## Development Documentation
+## Agent Development Guide
 
-| Document | Path | Audience |
-|----------|------|----------|
-| WP Progress & Metrics | `docs/architecture/streaming-throughput-next-iteration-v1.md` | Developers |
-| Implementation Status | `docs/current-implementation-status.md` | Developers |
-| Architecture Decisions | `docs/adr/` | Developers |
-| Requirements (Chinese) | `REQUIREMENTS.md` | Product |
+| Entry point | Path | Audience |
+|---|---|---|
+| Start guide | `AGENTS.md` | Any development agent |
+| Architecture blueprint template | `governance/BLUEPRINT_TEMPLATE.md` | Architecture agents |
+| Actual blueprint (created on demand) | `governance/BLUEPRINT.md` | Architecture and phase agents |
+| Module guides | `governance/modules/` | Phase implementation agents |
 
-**Note**: Production deployments do not require these documents.
+Local architecture, requirement, and historical materials remain optional context. They cannot be required to navigate or validate a clean checkout.
 
 ---
 

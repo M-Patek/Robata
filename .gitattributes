@@ -1,6 +1,7 @@
 *.json text eol=lf
 *.py text eol=lf
 *.md text eol=lf
+*.toml text eol=lf
 
 # These published v1 artifacts predate the LF-only release rule. Their exact
 # checkout bytes are pinned by schema-catalog.json and must not be normalized.
