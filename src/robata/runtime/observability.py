@@ -96,7 +96,13 @@ class RuntimeResourceSnapshot(StrictModel):
 
 
 class RuntimeSpanSnapshot(StrictModel):
-    """Immutable terminal observation for one span."""
+    """Immutable terminal observation for one span.
+
+    ``process_cpu_ns`` is process-wide CPU time observed between this span's start and
+    end. Concurrent spans can therefore overlap, just as their wall-clock intervals
+    can. ``None`` preserves compatibility with snapshots created before span-level CPU
+    timing was recorded.
+    """
 
     sequence: _PositiveInt
     parent_sequence: _PositiveInt | None = None
@@ -107,6 +113,7 @@ class RuntimeSpanSnapshot(StrictModel):
     started_offset_ns: _NonNegativeInt
     ended_offset_ns: _NonNegativeInt
     elapsed_ns: _NonNegativeInt
+    process_cpu_ns: _NonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_span_shape(self) -> RuntimeSpanSnapshot:
@@ -205,6 +212,7 @@ class _ActiveSpan:
         "parent_sequence",
         "recorder_identity",
         "sequence",
+        "started_cpu_ns",
         "started_ns",
     )
 
@@ -216,6 +224,7 @@ class _ActiveSpan:
         parent_sequence: int | None,
         name: str,
         attributes: tuple[RuntimeAttribute, ...],
+        started_cpu_ns: int,
         started_ns: int,
         context_token: Token[tuple[int, ...]],
     ) -> None:
@@ -224,6 +233,7 @@ class _ActiveSpan:
         self.parent_sequence = parent_sequence
         self.name = name
         self.attributes = attributes
+        self.started_cpu_ns = started_cpu_ns
         self.started_ns = started_ns
         self.context_token = context_token
 
@@ -289,6 +299,7 @@ class RuntimeProfileRecorder:
                 parent_sequence=stack[-1] if stack else None,
                 name=normalized_name,
                 attributes=normalized_attributes,
+                started_cpu_ns=_safe_clock_value(self._process_cpu_clock_ns),
                 started_ns=_safe_clock_value(self._clock_ns),
                 context_token=context_token,
             )
@@ -311,6 +322,7 @@ class RuntimeProfileRecorder:
         ):
             raise ValueError("span token does not belong to this recorder")
 
+        ended_cpu_ns = _safe_clock_value(self._process_cpu_clock_ns)
         ended_ns = _safe_clock_value(self._clock_ns)
         with suppress(LookupError, RuntimeError, ValueError):
             self._span_stack.reset(token.context_token)
@@ -334,6 +346,7 @@ class RuntimeProfileRecorder:
                     started_offset_ns=started_offset_ns,
                     ended_offset_ns=ended_offset_ns,
                     elapsed_ns=ended_offset_ns - started_offset_ns,
+                    process_cpu_ns=max(0, ended_cpu_ns - active.started_cpu_ns),
                 )
             )
 
@@ -389,6 +402,7 @@ class RuntimeProfileRecorder:
                         started_offset_ns=started_offset_ns,
                         ended_offset_ns=span_end_offset_ns,
                         elapsed_ns=span_end_offset_ns - started_offset_ns,
+                        process_cpu_ns=max(0, ended_cpu_ns - active.started_cpu_ns),
                     )
                 )
             self._active_spans.clear()

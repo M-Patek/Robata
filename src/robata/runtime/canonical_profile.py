@@ -26,10 +26,23 @@ from robata.application.canonical.local_composition import CanonicalLocalRunRece
 from robata.contracts.common import Nanoseconds, Sha256Digest, StrictModel
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
 from robata.queue.models import TERMINAL_WORK_STATES, WorkItemState
-from robata.runtime.observability import RuntimeProfileSnapshot, RuntimeSpanSnapshot
+from robata.runtime.capacity import (
+    CapacityEvidenceClass,
+    MeasuredCapacityComparison,
+    MeasuredCapacityInput,
+    MeasuredCapacityReport,
+    ProviderMode,
+    build_measured_capacity_report,
+    compare_measured_capacity_reports,
+)
+from robata.runtime.observability import (
+    RuntimeProfileSnapshot,
+    RuntimeResourceMeasurement,
+    RuntimeSpanSnapshot,
+)
 
 CANONICAL_PROFILE_MANIFEST_VERSION: Final = "canonical-profile-manifest-v1"
-CANONICAL_PROFILE_REPORT_VERSION: Final = "canonical-profile-report-v2"
+CANONICAL_PROFILE_REPORT_VERSION: Final = "canonical-profile-report-v3"
 CANONICAL_PROFILE_DURATION_DENOMINATOR_POLICY: Final = "canonical-requested-camera-interval-v1"
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
@@ -455,11 +468,205 @@ class CanonicalProfileRunError(StrictModel):
     detail: NonEmptyString
 
 
+class ProfileMetricAvailability(StrEnum):
+    """Whether a metric is complete, instrumented-partial, or deliberately absent."""
+
+    AVAILABLE = "AVAILABLE"
+    PARTIAL = "PARTIAL"
+    NOT_AVAILABLE = "NOT_AVAILABLE"
+
+
+class SQLiteProfileMeasurements(StrictModel):
+    """SQLite work and byte-accounting facts with explicit scope boundaries.
+
+    The runtime observer currently exposes process I/O, not SQLite-device I/O.  The
+    SQLite-specific read/write byte fields therefore remain unavailable instead of
+    relabeling whole-process bytes as database bytes.  Connection and transaction
+    counters are instrumented-subset observations until every profile-path adapter
+    emits the corresponding counters, and are marked ``PARTIAL`` accordingly.
+    """
+
+    state_bytes_before: NonNegativeInt
+    state_bytes_after: NonNegativeInt
+    state_byte_delta: SignedInt
+    connection_count_status: ProfileMetricAvailability
+    connection_count: NonNegativeInt | None
+    transaction_count_status: ProfileMetricAvailability
+    transaction_count: NonNegativeInt | None
+    read_transaction_count_status: ProfileMetricAvailability
+    read_transaction_count: NonNegativeInt | None
+    write_transaction_count_status: ProfileMetricAvailability
+    write_transaction_count: NonNegativeInt | None
+    sqlite_read_bytes_status: ProfileMetricAvailability
+    sqlite_read_bytes: NonNegativeInt | None = None
+    sqlite_write_bytes_status: ProfileMetricAvailability
+    sqlite_write_bytes: NonNegativeInt | None = None
+    process_read_bytes: RuntimeResourceMeasurement
+    process_write_bytes: RuntimeResourceMeasurement
+
+    @model_validator(mode="after")
+    def validate_sqlite_measurements(self) -> Self:
+        if self.state_byte_delta != self.state_bytes_after - self.state_bytes_before:
+            raise ValueError("SQLite state byte delta does not reconcile")
+        for status, value, name in (
+            (self.connection_count_status, self.connection_count, "connection_count"),
+            (self.transaction_count_status, self.transaction_count, "transaction_count"),
+            (
+                self.read_transaction_count_status,
+                self.read_transaction_count,
+                "read_transaction_count",
+            ),
+            (
+                self.write_transaction_count_status,
+                self.write_transaction_count,
+                "write_transaction_count",
+            ),
+            (self.sqlite_read_bytes_status, self.sqlite_read_bytes, "sqlite_read_bytes"),
+            (self.sqlite_write_bytes_status, self.sqlite_write_bytes, "sqlite_write_bytes"),
+        ):
+            if (
+                status
+                in {
+                    ProfileMetricAvailability.AVAILABLE,
+                    ProfileMetricAvailability.PARTIAL,
+                }
+                and value is None
+            ):
+                raise ValueError(f"{status.value.lower()} {name} requires a value")
+            if status is ProfileMetricAvailability.NOT_AVAILABLE and value is not None:
+                raise ValueError(f"unavailable {name} must be null")
+        if (
+            self.transaction_count is not None
+            and self.read_transaction_count is not None
+            and self.write_transaction_count is not None
+            and self.transaction_count != self.read_transaction_count + self.write_transaction_count
+        ):
+            raise ValueError("SQLite transaction counts do not reconcile")
+        return self
+
+
+class ProfileStageResource(StrictModel):
+    """Inclusive wall and process CPU aggregation for one instrumented stage name."""
+
+    stage: NonEmptyString
+    span_count: NonNegativeInt
+    inclusive_wall_time_ns: NonNegativeInt
+    process_cpu_status: ProfileMetricAvailability
+    inclusive_process_cpu_ns: NonNegativeInt | None = None
+
+    @model_validator(mode="after")
+    def validate_stage_resource(self) -> Self:
+        if self.span_count <= 0:
+            raise ValueError("stage span_count must be positive")
+        if self.process_cpu_status is ProfileMetricAvailability.AVAILABLE:
+            if self.inclusive_process_cpu_ns is None:
+                raise ValueError("available stage process CPU requires a value")
+        elif self.inclusive_process_cpu_ns is not None:
+            raise ValueError("unavailable stage process CPU must be null")
+        return self
+
+
+class CanonicalProfileMeasurements(StrictModel):
+    """Profile-only resource projection independent of capacity-rate eligibility."""
+
+    workload_fingerprint: Sha256Digest
+    source_bytes: NonNegativeInt
+    recording_count: PositiveInt
+    recording_worker_count: PositiveInt
+    camera_count: Literal[6]
+    provider_mode: ProviderMode
+    sqlite: SQLiteProfileMeasurements
+    stages: tuple[ProfileStageResource, ...]
+
+    @model_validator(mode="after")
+    def validate_measurements(self) -> Self:
+        stage_names = tuple(item.stage for item in self.stages)
+        if stage_names != tuple(sorted(stage_names)) or len(set(stage_names)) != len(stage_names):
+            raise ValueError("profile stages must be unique and ordered")
+        return self
+
+
+class ProfileStageComparison(StrictModel):
+    """One stage-level row; ratios remain null for incompatible workload lineage."""
+
+    stage: NonEmptyString
+    baseline_inclusive_wall_time_ns: NonNegativeInt | None
+    candidate_inclusive_wall_time_ns: NonNegativeInt | None
+    inclusive_wall_time_ratio: float | None
+    baseline_inclusive_process_cpu_ns: NonNegativeInt | None
+    candidate_inclusive_process_cpu_ns: NonNegativeInt | None
+    inclusive_process_cpu_ratio: float | None
+
+
+class ProfileResourceComparison(StrictModel):
+    """One source, SQLite, or process-resource value from a profile comparison."""
+
+    metric: NonEmptyString
+    baseline_availability: ProfileMetricAvailability
+    candidate_availability: ProfileMetricAvailability
+    baseline_value: SignedInt | None
+    candidate_value: SignedInt | None
+    candidate_to_baseline_ratio: float | None
+
+    @model_validator(mode="after")
+    def validate_resource_comparison(self) -> Self:
+        for availability, value, side in (
+            (self.baseline_availability, self.baseline_value, "baseline"),
+            (self.candidate_availability, self.candidate_value, "candidate"),
+        ):
+            if availability is ProfileMetricAvailability.NOT_AVAILABLE and value is not None:
+                raise ValueError(f"unavailable {side} resource must be null")
+            if availability is not ProfileMetricAvailability.NOT_AVAILABLE and value is None:
+                raise ValueError(f"available {side} resource requires a value")
+        return self
+
+
+class CanonicalProfileComparison(StrictModel):
+    """Machine-readable profile comparison with capacity and stage attribution."""
+
+    schema_version: Literal["1.0"]
+    model_version: Literal["canonical-profile-comparison-v1"]
+    baseline_manifest_sha256: Sha256Digest
+    candidate_manifest_sha256: Sha256Digest
+    capacity: MeasuredCapacityComparison
+    resources: tuple[ProfileResourceComparison, ...]
+    stages: tuple[ProfileStageComparison, ...]
+    evidence_class: Literal["LOCAL_CONFORMANCE"] = "LOCAL_CONFORMANCE"
+    production_eligible: Literal[False] = False
+    measurement_status: Literal["NOT_MEASURED"] = "NOT_MEASURED"
+    qualification_status: Literal["NOT_PRODUCTION_QUALIFIED"] = "NOT_PRODUCTION_QUALIFIED"
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> Self:
+        names = tuple(item.stage for item in self.stages)
+        if names != tuple(sorted(names)) or len(set(names)) != len(names):
+            raise ValueError("comparison stages must be unique and ordered")
+        resource_names = tuple(item.metric for item in self.resources)
+        if resource_names != tuple(sorted(resource_names)) or len(set(resource_names)) != len(
+            resource_names
+        ):
+            raise ValueError("comparison resources must be unique and ordered")
+        if not self.capacity.comparable:
+            for stage in self.stages:
+                if (
+                    stage.inclusive_wall_time_ratio is not None
+                    or stage.inclusive_process_cpu_ratio is not None
+                ):
+                    raise ValueError("non-comparable profile stages must not report ratios")
+            if any(item.candidate_to_baseline_ratio is not None for item in self.resources):
+                raise ValueError("non-comparable profile resources must not report ratios")
+        return self
+
+
 class CanonicalProfileReport(StrictModel):
     """One local observation bound to an immutable pre-execution manifest."""
 
     schema_version: Literal["1.0"]
-    model_version: Literal["canonical-profile-report-v1", "canonical-profile-report-v2"]
+    model_version: Literal[
+        "canonical-profile-report-v1",
+        "canonical-profile-report-v2",
+        "canonical-profile-report-v3",
+    ]
     manifest: CanonicalProfileManifest
     manifest_sha256: Sha256Digest
     observer: RuntimeProfileSnapshot
@@ -475,6 +682,8 @@ class CanonicalProfileReport(StrictModel):
     recording_duration_ns: Nanoseconds | None
     requested_duration_ns: Nanoseconds | None
     reconciliation: CanonicalProfileReconciliation | None = None
+    measurements: CanonicalProfileMeasurements | None = None
+    capacity: MeasuredCapacityReport | None = None
     evidence_class: Literal["LOCAL_CONFORMANCE"] = "LOCAL_CONFORMANCE"
     production_eligible: Literal[False] = False
     measurement_status: Literal["NOT_MEASURED"] = "NOT_MEASURED"
@@ -511,11 +720,30 @@ class CanonicalProfileReport(StrictModel):
         ):
             raise ValueError("requested_duration_ns cannot exceed recording_duration_ns")
         if (
-            self.model_version == "canonical-profile-report-v2"
+            self.model_version in {"canonical-profile-report-v2", "canonical-profile-report-v3"}
             and self.receipt is not None
             and self.reconciliation is None
         ):
             raise ValueError("successful profile reports require reconciliation facts")
+        if self.model_version == "canonical-profile-report-v3":
+            if self.measurements is None or self.capacity is None:
+                raise ValueError("v3 profile reports require measurements and capacity facts")
+            if self.measurements.workload_fingerprint != self.capacity.workload_fingerprint:
+                raise ValueError("measurement and capacity workload fingerprints must match")
+            if self.measurements.provider_mode is not self.capacity.provider_mode:
+                raise ValueError("measurement and capacity provider modes must match")
+            if self.capacity.evidence_class is not CapacityEvidenceClass.LOCAL_CONFORMANCE:
+                raise ValueError("local profile capacity evidence must remain LOCAL_CONFORMANCE")
+            if self.measurements.recording_count != self.capacity.recording_count:
+                raise ValueError("measurement and capacity recording counts must match")
+            if self.measurements.recording_worker_count != self.capacity.recording_worker_count:
+                raise ValueError("measurement and capacity worker counts must match")
+            if self.measurements.source_bytes != self.manifest.source.byte_count:
+                raise ValueError("measurement source bytes must match the manifest")
+            if self.measurements.camera_count != self.manifest.camera_count:
+                raise ValueError("measurement camera count must match the manifest")
+        elif self.measurements is not None or self.capacity is not None:
+            raise ValueError("only v3 profile reports may carry measurement capacity facts")
         return self
 
 
@@ -778,6 +1006,597 @@ def build_profile_reconciliation(
         ledger=ledger,
         artifact_bytes=artifact_bytes,
     )
+
+
+def canonical_profile_workload_fingerprint(manifest: CanonicalProfileManifest) -> str:
+    """Return the stable workload/configuration fingerprint used for local comparisons.
+
+    The fingerprint deliberately excludes run key, host facts, and git dirty state, so a
+    fresh/replay pair can compare the same workload.  It is profiling metadata only and
+    never contributes to canonical run identity.
+    """
+
+    if not isinstance(manifest, CanonicalProfileManifest):
+        raise TypeError("manifest must be a CanonicalProfileManifest")
+    return exact_bytes_sha256(
+        canonical_json_bytes(
+            {
+                "source": manifest.source.model_dump(mode="json"),
+                "mapping_config": manifest.mapping_config.model_dump(mode="json"),
+                "uv_lock": manifest.uv_lock.model_dump(mode="json"),
+                "schema_catalog": manifest.schema_catalog.model_dump(mode="json"),
+                "policies": manifest.policies.model_dump(mode="json"),
+                "camera_count": manifest.camera_count,
+                "max_duration_ns": (
+                    None if manifest.max_duration_ns is None else str(manifest.max_duration_ns)
+                ),
+                "duration_denominator_policy": manifest.duration_denominator_policy,
+            }
+        )
+    )
+
+
+def build_canonical_profile_measurements(
+    *,
+    observer: RuntimeProfileSnapshot,
+    state_before: StateTreeSnapshot,
+    state_after: StateTreeSnapshot,
+    manifest: CanonicalProfileManifest,
+    receipt: CanonicalLocalRunReceipt | None,
+    recording_count: int = 1,
+    recording_worker_count: int = 1,
+) -> CanonicalProfileMeasurements:
+    """Project raw observer/state facts into explicit source, SQLite, and CPU units."""
+
+    if not isinstance(observer, RuntimeProfileSnapshot):
+        raise TypeError("observer must be a RuntimeProfileSnapshot")
+    if not isinstance(state_before, StateTreeSnapshot):
+        raise TypeError("state_before must be a StateTreeSnapshot")
+    if not isinstance(state_after, StateTreeSnapshot):
+        raise TypeError("state_after must be a StateTreeSnapshot")
+    if not isinstance(manifest, CanonicalProfileManifest):
+        raise TypeError("manifest must be a CanonicalProfileManifest")
+    if receipt is not None and not isinstance(receipt, CanonicalLocalRunReceipt):
+        raise TypeError("receipt must be a CanonicalLocalRunReceipt or None")
+    if (
+        isinstance(recording_count, bool)
+        or not isinstance(recording_count, int)
+        or recording_count <= 0
+    ):
+        raise ValueError("recording_count must be a positive integer")
+    if (
+        isinstance(recording_worker_count, bool)
+        or not isinstance(recording_worker_count, int)
+        or recording_worker_count <= 0
+    ):
+        raise ValueError("recording_worker_count must be a positive integer")
+    sqlite_before = _state_class_bytes(state_before, StateFileClass.SQLITE)
+    sqlite_after = _state_class_bytes(state_after, StateFileClass.SQLITE)
+    connection_count, transaction_count, read_transactions, write_transactions = (
+        _sqlite_observer_counts(observer)
+    )
+    return CanonicalProfileMeasurements(
+        workload_fingerprint=canonical_profile_workload_fingerprint(manifest),
+        source_bytes=manifest.source.byte_count,
+        recording_count=recording_count,
+        recording_worker_count=recording_worker_count,
+        camera_count=manifest.camera_count,
+        provider_mode=profile_provider_mode(receipt),
+        sqlite=SQLiteProfileMeasurements(
+            state_bytes_before=sqlite_before,
+            state_bytes_after=sqlite_after,
+            state_byte_delta=sqlite_after - sqlite_before,
+            connection_count_status=(
+                ProfileMetricAvailability.PARTIAL
+                if connection_count is not None
+                else ProfileMetricAvailability.NOT_AVAILABLE
+            ),
+            connection_count=connection_count,
+            transaction_count_status=(
+                ProfileMetricAvailability.PARTIAL
+                if transaction_count is not None
+                else ProfileMetricAvailability.NOT_AVAILABLE
+            ),
+            transaction_count=transaction_count,
+            read_transaction_count_status=(
+                ProfileMetricAvailability.PARTIAL
+                if read_transactions is not None
+                else ProfileMetricAvailability.NOT_AVAILABLE
+            ),
+            read_transaction_count=read_transactions,
+            write_transaction_count_status=(
+                ProfileMetricAvailability.PARTIAL
+                if write_transactions is not None
+                else ProfileMetricAvailability.NOT_AVAILABLE
+            ),
+            write_transaction_count=write_transactions,
+            sqlite_read_bytes_status=ProfileMetricAvailability.NOT_AVAILABLE,
+            sqlite_read_bytes=None,
+            sqlite_write_bytes_status=ProfileMetricAvailability.NOT_AVAILABLE,
+            sqlite_write_bytes=None,
+            process_read_bytes=observer.resources.read_bytes_delta,
+            process_write_bytes=observer.resources.write_bytes_delta,
+        ),
+        stages=_profile_stage_resources(observer),
+    )
+
+
+def build_profile_capacity(
+    *,
+    observer: RuntimeProfileSnapshot,
+    manifest: CanonicalProfileManifest,
+    receipt: CanonicalLocalRunReceipt | None,
+    execution_mode: Literal["FRESH", "REPLAY", "UNKNOWN"],
+    recording_duration_ns: int | None,
+    requested_duration_ns: int | None,
+    measurements: CanonicalProfileMeasurements,
+) -> MeasuredCapacityReport:
+    """Build a rate projection only from direct counters and known workload duration."""
+
+    if not isinstance(observer, RuntimeProfileSnapshot):
+        raise TypeError("observer must be a RuntimeProfileSnapshot")
+    if not isinstance(manifest, CanonicalProfileManifest):
+        raise TypeError("manifest must be a CanonicalProfileManifest")
+    if receipt is not None and not isinstance(receipt, CanonicalLocalRunReceipt):
+        raise TypeError("receipt must be a CanonicalLocalRunReceipt or None")
+    if execution_mode not in {"FRESH", "REPLAY", "UNKNOWN"}:
+        raise ValueError("execution_mode must be FRESH, REPLAY, or UNKNOWN")
+    if not isinstance(measurements, CanonicalProfileMeasurements):
+        raise TypeError("measurements must be a CanonicalProfileMeasurements")
+    expected_fingerprint = canonical_profile_workload_fingerprint(manifest)
+    if measurements.workload_fingerprint != expected_fingerprint:
+        raise ValueError("measurements do not match the profile manifest")
+    if measurements.provider_mode is not profile_provider_mode(receipt):
+        raise ValueError("measurements do not match the profile provider mode")
+    for field_name, value in (
+        ("recording_duration_ns", recording_duration_ns),
+        ("requested_duration_ns", requested_duration_ns),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError(f"{field_name} must be a nonnegative integer or None")
+    # The duration policy is the requested six-camera interval.  An unbounded/full
+    # recording may use recording_duration_ns only when no requested interval was found.
+    workload_duration_ns = requested_duration_ns if requested_duration_ns else recording_duration_ns
+    if workload_duration_ns is not None and workload_duration_ns <= 0:
+        workload_duration_ns = None
+    no_provider_calls = measurements.provider_mode is ProviderMode.NO_PROVIDER_CALLS
+    # The P0 plan counter marks the new counter family.  Its presence lets us turn
+    # counters whose producer intentionally skips zero increments into known zeros;
+    # older artifacts stay nullable instead of being retroactively guessed.
+    direct_logical_calls = _counter_total(observer, "inference.logical_calls")
+    plan_counter_family_observed = direct_logical_calls is not None
+    logical_calls = (
+        direct_logical_calls
+        if direct_logical_calls is not None
+        else _counter_total_with_fallback(
+            observer,
+            primary="inference.logical_calls",
+            fallback=("inference.call_parts",),
+            zero_when_no_provider_calls=no_provider_calls,
+        )
+    )
+    windows = _counter_total_with_fallback(
+        observer,
+        primary="sampling.windows",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    call_parts = _counter_total_with_fallback(
+        observer,
+        primary="inference.call_parts",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    call_splits = _counter_total_with_fallback(
+        observer,
+        primary="inference.call_splits",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    provider_images = _counter_total_with_fallback(
+        observer,
+        primary="inference.provider_images",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    unique_images = _counter_total_with_fallback(
+        observer,
+        primary="inference.unique_images",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    coarse_unique_images = _counter_total_with_fallback(
+        observer,
+        primary="inference.coarse_unique_images",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    dense_unique_images = _counter_total_with_fallback(
+        observer,
+        primary="inference.dense_unique_images",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    input_tokens = _counter_total_with_fallback(
+        observer,
+        primary="inference.input_tokens",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    output_tokens = _counter_total_with_fallback(
+        observer,
+        primary="inference.output_tokens",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    output_token_responses = _counter_total_with_fallback(
+        observer,
+        primary="inference.output_token_responses",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    if output_tokens is None and output_token_responses is not None:
+        # Output-token counters deliberately skip zero values while their paired
+        # response counter records each response with a known output-token value.
+        output_tokens = 0
+    retries = _counter_total_with_fallback(
+        observer,
+        primary="inference.provider_retries",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    batches = _counter_total_with_fallback(
+        observer,
+        primary="inference.provider_batches",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    if batches is None:
+        # Old recorder output distinguished scalar and batch dispatches.  They are
+        # disjoint provider batches, so adding them is safe only as a compatibility path.
+        scalar = _counter_total(observer, "inference.provider_dispatches")
+        grouped = _counter_total(observer, "inference.provider_batch_dispatches")
+        if scalar is not None or grouped is not None:
+            batches = (scalar or 0) + (grouped or 0)
+        elif no_provider_calls:
+            batches = 0
+    batch_requests = _counter_total_with_fallback(
+        observer,
+        primary="inference.provider_batch_requests",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    dense_logical_calls = _counter_total_with_fallback(
+        observer,
+        primary="inference.dense_logical_calls",
+        zero_when_no_provider_calls=(no_provider_calls or plan_counter_family_observed),
+    )
+    dense_provider_images = _counter_total(observer, "inference.dense_provider_images")
+    if dense_provider_images is None and (no_provider_calls or plan_counter_family_observed):
+        dense_provider_images = 0
+    http_requests = None if receipt is None else receipt.network_call_count
+    return build_measured_capacity_report(
+        MeasuredCapacityInput(
+            workload_fingerprint=measurements.workload_fingerprint,
+            evidence_class=CapacityEvidenceClass.LOCAL_CONFORMANCE,
+            provider_mode=measurements.provider_mode,
+            execution_mode=execution_mode,
+            recording_count=measurements.recording_count,
+            recording_worker_count=measurements.recording_worker_count,
+            camera_count=measurements.camera_count,
+            recording_duration_ns=workload_duration_ns,
+            wall_time_ns=observer.elapsed_ns,
+            windows=windows,
+            unique_images=unique_images,
+            coarse_unique_images=coarse_unique_images,
+            dense_unique_images=dense_unique_images,
+            provider_images=provider_images,
+            logical_calls=logical_calls,
+            call_parts=call_parts,
+            call_splits=call_splits,
+            http_requests=http_requests,
+            retries=retries,
+            batches=batches,
+            batch_requests=batch_requests,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_token_responses=output_token_responses,
+            dense_logical_calls=dense_logical_calls,
+            dense_provider_images=dense_provider_images,
+        )
+    )
+
+
+def profile_provider_mode(receipt: CanonicalLocalRunReceipt | None) -> ProviderMode:
+    """Classify provider behavior from the authoritative local receipt, if any."""
+
+    if receipt is None:
+        return ProviderMode.UNKNOWN
+    if receipt.network_call_count > 0:
+        return ProviderMode.NETWORK_PROVIDER
+    if receipt.fixture_inference_calls > 0:
+        return ProviderMode.LOCAL_OFFLINE_FIXTURE
+    return ProviderMode.NO_PROVIDER_CALLS
+
+
+def compare_canonical_profile_reports(
+    baseline: CanonicalProfileReport,
+    candidate: CanonicalProfileReport,
+) -> CanonicalProfileComparison:
+    """Compare two v3 profile reports by unit-safe capacity and instrumented stage."""
+
+    if not isinstance(baseline, CanonicalProfileReport):
+        raise TypeError("baseline must be a CanonicalProfileReport")
+    if not isinstance(candidate, CanonicalProfileReport):
+        raise TypeError("candidate must be a CanonicalProfileReport")
+    if (
+        baseline.capacity is None
+        or candidate.capacity is None
+        or baseline.measurements is None
+        or candidate.measurements is None
+    ):
+        raise ValueError("profile comparison requires v3 reports with capacity facts")
+    additional_reasons: tuple[str, ...] = ()
+    if {baseline.execution_mode, candidate.execution_mode} == {
+        "FRESH",
+        "REPLAY",
+    } and baseline.manifest.run_key != candidate.manifest.run_key:
+        # Workload fingerprints intentionally omit run_key so independent runs can
+        # share a capacity workload identity.  A replay comparison additionally
+        # requires the same run lineage rather than merely matching source bytes.
+        additional_reasons = ("RUN_KEY_CHANGED",)
+    capacity = compare_measured_capacity_reports(
+        baseline.capacity,
+        candidate.capacity,
+        additional_non_comparable_reasons=additional_reasons,
+    )
+    resources = _profile_resource_comparisons(
+        baseline.measurements,
+        candidate.measurements,
+        comparable=capacity.comparable,
+    )
+    baseline_stages = _stages_by_name(baseline.measurements)
+    candidate_stages = _stages_by_name(candidate.measurements)
+    stages: list[ProfileStageComparison] = []
+    for name in sorted(set(baseline_stages) | set(candidate_stages)):
+        before = baseline_stages.get(name)
+        after = candidate_stages.get(name)
+        before_wall = None if before is None else before.inclusive_wall_time_ns
+        after_wall = None if after is None else after.inclusive_wall_time_ns
+        before_cpu = None if before is None else before.inclusive_process_cpu_ns
+        after_cpu = None if after is None else after.inclusive_process_cpu_ns
+        stages.append(
+            ProfileStageComparison(
+                stage=name,
+                baseline_inclusive_wall_time_ns=before_wall,
+                candidate_inclusive_wall_time_ns=after_wall,
+                inclusive_wall_time_ratio=(
+                    _profile_ratio(after_wall, before_wall) if capacity.comparable else None
+                ),
+                baseline_inclusive_process_cpu_ns=before_cpu,
+                candidate_inclusive_process_cpu_ns=after_cpu,
+                inclusive_process_cpu_ratio=(
+                    _profile_ratio(after_cpu, before_cpu) if capacity.comparable else None
+                ),
+            )
+        )
+    return CanonicalProfileComparison(
+        schema_version="1.0",
+        model_version="canonical-profile-comparison-v1",
+        baseline_manifest_sha256=baseline.manifest_sha256,
+        candidate_manifest_sha256=candidate.manifest_sha256,
+        capacity=capacity,
+        resources=resources,
+        stages=tuple(stages),
+    )
+
+
+def _profile_resource_comparisons(
+    baseline: CanonicalProfileMeasurements,
+    candidate: CanonicalProfileMeasurements,
+    *,
+    comparable: bool,
+) -> tuple[ProfileResourceComparison, ...]:
+    """Compare source, SQLite, and process-resource values with availability intact."""
+
+    baseline_sqlite = baseline.sqlite
+    candidate_sqlite = candidate.sqlite
+    values: dict[
+        str,
+        tuple[
+            ProfileMetricAvailability,
+            int | None,
+            ProfileMetricAvailability,
+            int | None,
+        ],
+    ] = {
+        "process.read_bytes": _resource_comparison_values(
+            baseline_sqlite.process_read_bytes,
+            candidate_sqlite.process_read_bytes,
+        ),
+        "process.write_bytes": _resource_comparison_values(
+            baseline_sqlite.process_write_bytes,
+            candidate_sqlite.process_write_bytes,
+        ),
+        "source.bytes": (
+            ProfileMetricAvailability.AVAILABLE,
+            baseline.source_bytes,
+            ProfileMetricAvailability.AVAILABLE,
+            candidate.source_bytes,
+        ),
+        "sqlite.connection_count": (
+            baseline_sqlite.connection_count_status,
+            baseline_sqlite.connection_count,
+            candidate_sqlite.connection_count_status,
+            candidate_sqlite.connection_count,
+        ),
+        "sqlite.read_bytes": (
+            baseline_sqlite.sqlite_read_bytes_status,
+            baseline_sqlite.sqlite_read_bytes,
+            candidate_sqlite.sqlite_read_bytes_status,
+            candidate_sqlite.sqlite_read_bytes,
+        ),
+        "sqlite.read_transaction_count": (
+            baseline_sqlite.read_transaction_count_status,
+            baseline_sqlite.read_transaction_count,
+            candidate_sqlite.read_transaction_count_status,
+            candidate_sqlite.read_transaction_count,
+        ),
+        "sqlite.state_bytes_after": (
+            ProfileMetricAvailability.AVAILABLE,
+            baseline_sqlite.state_bytes_after,
+            ProfileMetricAvailability.AVAILABLE,
+            candidate_sqlite.state_bytes_after,
+        ),
+        "sqlite.state_bytes_before": (
+            ProfileMetricAvailability.AVAILABLE,
+            baseline_sqlite.state_bytes_before,
+            ProfileMetricAvailability.AVAILABLE,
+            candidate_sqlite.state_bytes_before,
+        ),
+        "sqlite.state_byte_delta": (
+            ProfileMetricAvailability.AVAILABLE,
+            baseline_sqlite.state_byte_delta,
+            ProfileMetricAvailability.AVAILABLE,
+            candidate_sqlite.state_byte_delta,
+        ),
+        "sqlite.transaction_count": (
+            baseline_sqlite.transaction_count_status,
+            baseline_sqlite.transaction_count,
+            candidate_sqlite.transaction_count_status,
+            candidate_sqlite.transaction_count,
+        ),
+        "sqlite.write_bytes": (
+            baseline_sqlite.sqlite_write_bytes_status,
+            baseline_sqlite.sqlite_write_bytes,
+            candidate_sqlite.sqlite_write_bytes_status,
+            candidate_sqlite.sqlite_write_bytes,
+        ),
+        "sqlite.write_transaction_count": (
+            baseline_sqlite.write_transaction_count_status,
+            baseline_sqlite.write_transaction_count,
+            candidate_sqlite.write_transaction_count_status,
+            candidate_sqlite.write_transaction_count,
+        ),
+    }
+    return tuple(
+        ProfileResourceComparison(
+            metric=name,
+            baseline_availability=baseline_availability,
+            baseline_value=baseline_value,
+            candidate_availability=candidate_availability,
+            candidate_value=candidate_value,
+            candidate_to_baseline_ratio=(
+                _profile_ratio(candidate_value, baseline_value) if comparable else None
+            ),
+        )
+        for name, (
+            baseline_availability,
+            baseline_value,
+            candidate_availability,
+            candidate_value,
+        ) in sorted(values.items())
+    )
+
+
+def _resource_comparison_values(
+    baseline: RuntimeResourceMeasurement,
+    candidate: RuntimeResourceMeasurement,
+) -> tuple[ProfileMetricAvailability, int | None, ProfileMetricAvailability, int | None]:
+    return (
+        _resource_metric_availability(baseline),
+        baseline.value,
+        _resource_metric_availability(candidate),
+        candidate.value,
+    )
+
+
+def _resource_metric_availability(
+    measurement: RuntimeResourceMeasurement,
+) -> ProfileMetricAvailability:
+    return (
+        ProfileMetricAvailability.AVAILABLE
+        if measurement.value is not None
+        else ProfileMetricAvailability.NOT_AVAILABLE
+    )
+
+
+def _state_class_bytes(snapshot: StateTreeSnapshot, file_class: StateFileClass) -> int:
+    for entry in snapshot.classes:
+        if entry.file_class is file_class:
+            return entry.byte_count
+    raise AssertionError("state snapshot omitted a required file class")
+
+
+def _sqlite_observer_counts(
+    observer: RuntimeProfileSnapshot,
+) -> tuple[int | None, int | None, int | None, int | None]:
+    connections = [
+        counter.value
+        for counter in observer.counters
+        if counter.name.startswith("sqlite.") and counter.name.endswith(".connections")
+    ]
+    transactions = [
+        counter
+        for counter in observer.counters
+        if counter.name.startswith("sqlite.") and counter.name.endswith(".transactions")
+    ]
+    if not transactions:
+        return (sum(connections) if connections else None, None, None, None)
+    total = sum(counter.value for counter in transactions)
+    write_count = 0
+    for counter in transactions:
+        attributes = {attribute.name: attribute.value for attribute in counter.attributes}
+        write = attributes.get("write")
+        if not isinstance(write, bool):
+            return (sum(connections) if connections else None, total, None, None)
+        if write:
+            write_count += counter.value
+    return (sum(connections) if connections else None, total, total - write_count, write_count)
+
+
+def _profile_stage_resources(observer: RuntimeProfileSnapshot) -> tuple[ProfileStageResource, ...]:
+    grouped: dict[str, list[RuntimeSpanSnapshot]] = {}
+    for span in observer.spans:
+        grouped.setdefault(span.name, []).append(span)
+    rows: list[ProfileStageResource] = []
+    for name, spans in sorted(grouped.items()):
+        cpu_values = tuple(span.process_cpu_ns for span in spans)
+        cpu_available = all(value is not None for value in cpu_values)
+        rows.append(
+            ProfileStageResource(
+                stage=name,
+                span_count=len(spans),
+                inclusive_wall_time_ns=sum(span.elapsed_ns for span in spans),
+                process_cpu_status=(
+                    ProfileMetricAvailability.AVAILABLE
+                    if cpu_available
+                    else ProfileMetricAvailability.NOT_AVAILABLE
+                ),
+                inclusive_process_cpu_ns=(
+                    sum(cast(int, value) for value in cpu_values) if cpu_available else None
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _counter_total_with_fallback(
+    observer: RuntimeProfileSnapshot,
+    *,
+    primary: str,
+    fallback: tuple[str, ...] = (),
+    zero_when_no_provider_calls: bool,
+) -> int | None:
+    value = _counter_total(observer, primary)
+    if value is not None:
+        return value
+    for name in fallback:
+        value = _counter_total(observer, name)
+        if value is not None:
+            return value
+    return 0 if zero_when_no_provider_calls else None
+
+
+def _stages_by_name(
+    measurements: CanonicalProfileMeasurements | None,
+) -> dict[str, ProfileStageResource]:
+    return {} if measurements is None else {item.stage: item for item in measurements.stages}
+
+
+def _profile_ratio(candidate: int | None, baseline: int | None) -> float | None:
+    if candidate is None or baseline is None or baseline == 0:
+        return None
+    return candidate / baseline
 
 
 def reconcile_runtime_spans(snapshot: RuntimeProfileSnapshot) -> SpanReconciliation:
@@ -1223,8 +2042,10 @@ __all__ = [
     "CANONICAL_PROFILE_MANIFEST_VERSION",
     "CANONICAL_PROFILE_REPORT_VERSION",
     "ArtifactByteReconciliation",
+    "CanonicalProfileComparison",
     "CanonicalProfileError",
     "CanonicalProfileManifest",
+    "CanonicalProfileMeasurements",
     "CanonicalProfilePolicyFacts",
     "CanonicalProfileReconciliation",
     "CanonicalProfileReport",
@@ -1233,9 +2054,14 @@ __all__ = [
     "LedgerReconciliationFact",
     "ProfileFileFact",
     "ProfileGitFacts",
+    "ProfileMetricAvailability",
+    "ProfileResourceComparison",
     "ProfileRuntimeFacts",
+    "ProfileStageComparison",
+    "ProfileStageResource",
     "ReconciliationStatus",
     "SQLiteDatabaseSnapshot",
+    "SQLiteProfileMeasurements",
     "SQLiteReadError",
     "SQLiteTableRowCount",
     "SpanReconciliation",
@@ -1246,9 +2072,14 @@ __all__ = [
     "WorkQueueObservationStatus",
     "WorkQueueStateCount",
     "build_canonical_profile_manifest",
+    "build_canonical_profile_measurements",
+    "build_profile_capacity",
     "build_profile_reconciliation",
+    "canonical_profile_workload_fingerprint",
+    "compare_canonical_profile_reports",
     "discover_canonical_profile_durations",
     "exact_file_fact",
+    "profile_provider_mode",
     "reconcile_runtime_spans",
     "snapshot_state_tree",
     "snapshot_work_queue",
