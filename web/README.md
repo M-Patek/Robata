@@ -92,11 +92,11 @@ RecordingFinalizationMap
 
 ## Evidence Class
 
-All displayed runs are marked `LOCAL_CONFORMANCE` and `production_eligible: false` per Architecture V1.1 Section 25.11.
+All displayed runs are mock/local views and must not be interpreted as production evidence.
 
 ## Next Steps
 
-1. **Backend integration** — Connect to FastAPI WebSocket endpoint when WP3–WP6 complete
+1. **Backend API integration** - Connect the UI only after a supported API contract is available.
 2. **Real-time updates** — Replace mock simulation with live stream events
 3. **Video player** — Embed six-video player in segment detail
 4. **Metrics dashboard** — Real-time capacity and SLO charts

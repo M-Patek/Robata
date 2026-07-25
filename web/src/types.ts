@@ -1,14 +1,7 @@
-// ── Core domain types mirroring the Python streaming contracts ───────────────
+// Core domain types mirroring the Python streaming contracts.
 //
-// These types reflect the two-plane streaming architecture defined in:
-//   - ADR 0015 (pre-EOS stream identity)
-//   - docs/architecture/streaming-throughput-next-iteration-v1.md
-//   - src/robata/contracts/stream_*.py
-//
-// The frontend remains mock-driven until WP3–WP6 backend work completes.
-
-// ── Identity primitives ────────────────────────────────────────────────────
-
+// Contract sources are the registered schemas and `src/robata/contracts/stream_*.py`.
+// This UI remains mock-driven until a supported backend API is connected.
 export type OpaqueUuid = string
 export type Sha256Digest = string
 
