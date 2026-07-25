@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -23,6 +24,12 @@ from robata.application.canonical.local_composition import (
     run_local_canonical_fixture,
 )
 from robata.application.canonical.local_outbox_delivery import LocalOutboxDeliveryOutcome
+from robata.application.canonical.parallel_service import (
+    CanonicalLocalFixtureJob,
+    CanonicalLocalRecordingService,
+)
+from robata.application.canonical.primary_completion import PreparedPrimaryCompletionCommand
+from robata.contracts.hashing import canonical_json_bytes
 from robata.queue.models import WorkAttemptOutcome, WorkItemState
 from robata.review.routing import ReviewRoutingDisposition
 from robata.runtime.observability import RuntimeProfileRecorder
@@ -158,7 +165,16 @@ def test_runtime_observation_preserves_canonical_identity_and_replay(
         "sqlite.outbox_delivery.transaction",
         "sqlite.outbox_sink.transaction",
         "sqlite.review_queue.transaction",
+        "completion.evidence.audit",
+        "completion.command.serialize_validate",
         "completion.commit",
+        "completion.commit.validate",
+        "completion.commit.identity",
+        "completion.commit.detail",
+        "completion.commit.serialize",
+        "completion.commit.outbox",
+        "completion.commit.run_close",
+        "completion.commit.authoritative",
         "delivery.outbox.reconcile",
         "review.route",
     } <= span_names
@@ -493,59 +509,224 @@ def test_local_command_maps_invalid_state_schema_to_structured_error(
     assert "unsupported inference evidence schema version" in str(caught.value)
 
 
-def test_local_command_audits_inference_evidence_before_primary_completion(
+def test_local_command_seals_inference_evidence_before_primary_completion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_dir = tmp_path / "canonical-state"
-    audited_paths: list[Path] = []
+    sealed_paths: list[Path] = []
+    full_audit_paths: list[Path] = []
     boundary_events: list[str] = []
-    original_verify = SQLiteInferenceEvidenceLedger.verify_integrity
-    original_commit = SQLitePrimaryCompletionRepository.commit
+    original_seal = SQLiteInferenceEvidenceLedger.verify_completion_seal
+    original_commit = SQLitePrimaryCompletionRepository.commit_prepared
+    captured_prepared: list[PreparedPrimaryCompletionCommand] = []
 
-    def recording_verify(ledger: SQLiteInferenceEvidenceLedger) -> None:
-        audited_paths.append(ledger.database_path)
-        boundary_events.append("audit")
-        original_verify(ledger)
+    def recording_seal(ledger: SQLiteInferenceEvidenceLedger) -> None:
+        sealed_paths.append(ledger.database_path)
+        boundary_events.append("seal")
+        original_seal(ledger)
 
-    def recording_commit(repository, command):  # type: ignore[no-untyped-def]
+    def unexpected_full_audit(ledger: SQLiteInferenceEvidenceLedger) -> None:
+        full_audit_paths.append(ledger.database_path)
+        raise AssertionError("normal precommit completion must not rescan the evidence ledger")
+
+    def recording_commit(repository, prepared):  # type: ignore[no-untyped-def]
         boundary_events.append("commit")
-        return original_commit(repository, command)
+        captured_prepared.append(prepared)
+        return original_commit(repository, prepared)
 
-    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_integrity", recording_verify)
-    monkeypatch.setattr(SQLitePrimaryCompletionRepository, "commit", recording_commit)
+    def unexpected_strict_validation(
+        _repository: SQLitePrimaryCompletionRepository,
+        _command: object,
+    ) -> None:
+        raise AssertionError("prepared completion must not revalidate the full command")
+
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_completion_seal", recording_seal)
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_integrity", unexpected_full_audit)
+    monkeypatch.setattr(SQLitePrimaryCompletionRepository, "commit_prepared", recording_commit)
+    monkeypatch.setattr(
+        SQLitePrimaryCompletionRepository,
+        "_validate_command",
+        unexpected_strict_validation,
+    )
 
     receipt = run_local_canonical_fixture(
         source_path=SOURCE_FIXTURE,
         state_dir=state_dir,
-        run_key="pre-completion-evidence-audit",
+        run_key="pre-completion-evidence-seal",
     )
 
     _assert_local_conformance(receipt)
     assert receipt.replayed is False
-    assert audited_paths == [(state_dir / "inference-evidence.sqlite3").resolve()]
-    assert boundary_events == ["audit", "commit"]
+    assert sealed_paths == [(state_dir / "inference-evidence.sqlite3").resolve()]
+    assert full_audit_paths == []
+    assert boundary_events == ["seal", "commit"]
+    assert len(captured_prepared) == 1
+    prepared = captured_prepared[0]
+    assert prepared.is_canonical_preparation is True
+    command = prepared.command
+    assert prepared.detail_bytes == canonical_json_bytes(command.detail)
+    assert prepared.command_bytes == canonical_json_bytes(command)
+    assert prepared.processing_run_bytes == canonical_json_bytes(
+        command.detail.processing_run
+    )
+    with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
+        detail_row = connection.execute(
+            "SELECT payload_json, exact_bytes_sha256 FROM detailed_results"
+        ).fetchone()
+        completion_row = connection.execute(
+            "SELECT command_json, command_json_sha256 FROM primary_completions"
+        ).fetchone()
+        run_row = connection.execute(
+            "SELECT run_json, run_json_sha256 FROM primary_runs WHERE run_id = ?",
+            (command.detail.run_id,),
+        ).fetchone()
+    assert detail_row == (
+        prepared.detail_bytes,
+        prepared.detail_exact_bytes_sha256,
+    )
+    assert completion_row == (
+        prepared.command_bytes,
+        prepared.command_exact_bytes_sha256,
+    )
+    assert run_row == (
+        prepared.processing_run_bytes,
+        prepared.processing_run_exact_bytes_sha256,
+    )
 
 
-def test_failed_precommit_evidence_audit_publishes_no_primary_fact(
+def test_failed_precommit_evidence_seal_publishes_no_primary_fact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_dir = tmp_path / "canonical-state"
 
-    def fail_audit(_ledger: SQLiteInferenceEvidenceLedger) -> None:
-        raise SQLiteInferenceEvidenceLedgerError("injected integrity failure")
+    def fail_seal(_ledger: SQLiteInferenceEvidenceLedger) -> None:
+        raise SQLiteInferenceEvidenceLedgerError("injected completion seal failure")
 
-    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_integrity", fail_audit)
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_completion_seal", fail_seal)
 
     with pytest.raises(CanonicalLocalCompositionError) as caught:
         run_local_canonical_fixture(
             source_path=SOURCE_FIXTURE,
             state_dir=state_dir,
-            run_key="failed-precommit-evidence-audit",
+            run_key="failed-precommit-evidence-seal",
         )
 
     assert caught.value.code is CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
     with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM primary_completions").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM primary_outbox").fetchone()[0] == 0
+
+
+def test_external_inference_evidence_data_version_change_fails_seal_before_primary_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    sealed_paths: list[Path] = []
+    original_seal = SQLiteInferenceEvidenceLedger.verify_completion_seal
+    original_prepare = local_composition_module.prepare_initial_action_event_publications
+
+    def externally_advance_data_version(*args, **kwargs):  # type: ignore[no-untyped-def]
+        publications = original_prepare(*args, **kwargs)
+        evidence_database = state_dir / "inference-evidence.sqlite3"
+        with sqlite3.connect(evidence_database) as connection:
+            # Write the same valid schema version through a second connection. SQLite
+            # still advances the first connection's data_version without changing the
+            # ledger's contract, so the completion seal must reject its stale cache.
+            schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            connection.execute(f"PRAGMA user_version = {int(schema_version)}")
+            connection.commit()
+        return publications
+
+    def recording_seal(ledger: SQLiteInferenceEvidenceLedger) -> None:
+        sealed_paths.append(ledger.database_path)
+        original_seal(ledger)
+
+    monkeypatch.setattr(
+        local_composition_module,
+        "prepare_initial_action_event_publications",
+        externally_advance_data_version,
+    )
+    monkeypatch.setattr(SQLiteInferenceEvidenceLedger, "verify_completion_seal", recording_seal)
+
+    with pytest.raises(CanonicalLocalCompositionError) as caught:
+        run_local_canonical_fixture(
+            source_path=SOURCE_FIXTURE,
+            state_dir=state_dir,
+            run_key="stale-inference-evidence-seal",
+        )
+
+    assert caught.value.code is CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
+    assert sealed_paths == [(state_dir / "inference-evidence.sqlite3").resolve()]
+    with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM primary_completions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM primary_outbox").fetchone()[0] == 0
+
+
+
+def test_parallel_local_commands_share_bounded_provider_and_replay_independently(
+    tmp_path: Path,
+) -> None:
+    """Four state-affine recordings can share one bounded provider dispatcher."""
+
+    jobs: list[CanonicalLocalFixtureJob] = []
+    source_document = json.loads(SOURCE_FIXTURE.read_text(encoding="utf-8"))
+    for ordinal in range(4):
+        # The fixture's source hash defines recording identity.  Give each
+        # concurrent job distinct immutable source bytes, rather than treating
+        # four copies of one recording as independent production identities.
+        document = dict(source_document)
+        document["source_clock_id"] = f"parallel-fixture-clock-{ordinal}"
+        source = tmp_path / f"source-{ordinal}.json"
+        source.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+        jobs.append(
+            CanonicalLocalFixtureJob(
+                source_path=source,
+                state_dir=tmp_path / f"state-{ordinal}",
+                run_key="parallel-local-command",
+            )
+        )
+
+    with CanonicalLocalRecordingService(
+        recording_worker_count=4,
+        ingress_queue_capacity=4,
+        provider_concurrency=1,
+        provider_queue_capacity=1,
+    ) as service:
+        fresh = service.run_fixtures(jobs)
+        snapshot_after_fresh = service.snapshot
+        replay = service.run_fixtures(jobs)
+        snapshot_after_replay = service.snapshot
+
+    assert len(fresh) == len(replay) == 4
+    assert all(receipt.ok and not receipt.replayed for receipt in fresh)
+    assert all(receipt.ok and receipt.replayed for receipt in replay)
+    assert len({receipt.recording_identity for receipt in fresh}) == 4
+    assert len({receipt.run_id for receipt in fresh}) == 4
+    assert tuple(receipt.run_id for receipt in replay) == tuple(
+        receipt.run_id for receipt in fresh
+    )
+    assert tuple(receipt.recording_identity for receipt in replay) == tuple(
+        receipt.recording_identity for receipt in fresh
+    )
+    assert all(receipt.fixture_inference_calls > 0 for receipt in fresh)
+    assert all(receipt.fixture_inference_calls == 0 for receipt in replay)
+
+    assert snapshot_after_fresh.completed == 4
+    assert snapshot_after_fresh.fresh_receipts == 4
+    assert snapshot_after_fresh.replayed_receipts == 0
+    assert snapshot_after_fresh.max_active == 4
+    assert snapshot_after_fresh.claimed_state_dir_count == 0
+    assert snapshot_after_fresh.unique_state_dir_count == 4
+    assert snapshot_after_fresh.state_dir_claim_conflicts == 0
+    assert snapshot_after_fresh.provider_queue.completed > 0
+    assert snapshot_after_fresh.provider_queue.max_queue_depth <= 1
+
+    assert snapshot_after_replay.completed == 8
+    assert snapshot_after_replay.fresh_receipts == 4
+    assert snapshot_after_replay.replayed_receipts == 4
+    assert snapshot_after_replay.provider_queue.completed == (
+        snapshot_after_fresh.provider_queue.completed
+    )

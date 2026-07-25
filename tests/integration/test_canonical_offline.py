@@ -41,6 +41,7 @@ from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 from robata.contracts.logical_nodes import RunNodeDisposition
 from robata.contracts.pipeline import SamplingPurpose
+from robata.contracts.qa import ProductQAIssue
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.temporal import PackageLineage
 from robata.event_pipeline.candidate import (
@@ -117,6 +118,7 @@ from robata.ports.logical_node_registry import (
 )
 from robata.qa_pipeline.completion import DenseQAOutcome, QACompletionStatus
 from robata.qa_pipeline.dense import DenseQAStatus
+from robata.qa_pipeline.product import ProductQACascadeStatus, ProductQAClassState
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     FrameArtifactResolver,
@@ -996,6 +998,15 @@ def test_success_connects_raw_claim_enrichment_and_local_hypothesis(
         == CAMERA_IDS
     )
     assert result.qa_completion_result.production_eligible is False
+    assert result.product_qa_context is not None
+    assert result.product_qa_result is not None
+    assert result.product_qa_result.status is ProductQACascadeStatus.COMPLETE
+    assert tuple(item.issue for item in result.product_qa_result.class_coverage) == tuple(
+        ProductQAIssue
+    )
+    assert {item.state for item in result.product_qa_result.class_coverage} == {
+        ProductQAClassState.NO_ISSUE
+    }
     assert len(result.action_evidence_executions) == 1
     action_execution = result.action_evidence_executions[0]
     assert action_execution.window.purpose is SamplingPurpose.ACTION_DENSE
@@ -1871,6 +1882,11 @@ def test_unknown_coarse_qa_persists_incomplete_gate_without_dense_or_fusion(
     )
     assert result.qa_completion_result.dense_work_manifest.items == ()
     assert result.qa_completion_result.final_aggregate is None
+    assert result.product_qa_result is not None
+    assert result.product_qa_result.status is ProductQACascadeStatus.INCOMPLETE_INPUT
+    assert {item.state for item in result.product_qa_result.class_coverage} == {
+        ProductQAClassState.INCOMPLETE_INPUT
+    }
     assert result.input_plan is None
     assert fusion_calls == 0
     assert result.coarse_qa_result is not None
