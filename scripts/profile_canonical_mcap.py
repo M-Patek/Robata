@@ -25,7 +25,10 @@ from robata.runtime.canonical_profile import (  # noqa: E402
     CanonicalProfileReport,
     CanonicalProfileRunError,
     build_canonical_profile_manifest,
+    build_canonical_profile_measurements,
+    build_profile_capacity,
     build_profile_reconciliation,
+    compare_canonical_profile_reports,
     discover_canonical_profile_durations,
     snapshot_state_tree,
     snapshot_work_queue,
@@ -101,6 +104,16 @@ def _parser() -> argparse.ArgumentParser:
         help="atomically written machine-readable profile report",
     )
     parser.add_argument(
+        "--compare-with",
+        type=Path,
+        help="existing v3 profile report used as the comparison baseline",
+    )
+    parser.add_argument(
+        "--comparison-output",
+        type=Path,
+        help="atomically written fresh/replay or worker-scaling comparison report",
+    )
+    parser.add_argument(
         "--require-clean",
         action="store_true",
         help="reject a profile candidate when the repository worktree is dirty",
@@ -142,10 +155,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     max_duration_ns = args.max_duration_seconds * 1_000_000_000
     output = args.output.resolve()
+    comparison_output = None if args.comparison_output is None else args.comparison_output.resolve()
+    compare_with = None if args.compare_with is None else args.compare_with.resolve()
     try:
+        if (compare_with is None) != (comparison_output is None):
+            raise CanonicalProfileError(
+                "--compare-with and --comparison-output must be supplied together"
+            )
+        if comparison_output is not None and comparison_output == output:
+            raise CanonicalProfileError("comparison output must differ from profile output")
         if output.exists() and output.is_dir():
             raise CanonicalProfileError("profile output must not be a directory")
+        if (
+            comparison_output is not None
+            and comparison_output.exists()
+            and comparison_output.is_dir()
+        ):
+            raise CanonicalProfileError("comparison output must not be a directory")
         output.parent.mkdir(parents=True, exist_ok=True)
+        if comparison_output is not None:
+            comparison_output.parent.mkdir(parents=True, exist_ok=True)
         manifest = build_canonical_profile_manifest(
             repository_root=REPOSITORY_ROOT,
             source_path=args.source,
@@ -160,7 +189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         state_before = snapshot_state_tree(
             args.state_dir,
-            excluded_paths=(output,),
+            excluded_paths=tuple(path for path in (output, comparison_output) if path is not None),
             externally_owned_paths=(args.source,),
         )
     except CanonicalProfileError as error:
@@ -200,7 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         state_after = snapshot_state_tree(
             args.state_dir,
-            excluded_paths=(output,),
+            excluded_paths=tuple(path for path in (output, comparison_output) if path is not None),
             externally_owned_paths=(args.source,),
         )
         work_queue_after = snapshot_work_queue(args.state_dir)
@@ -231,9 +260,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest=manifest,
             execution_mode=execution_mode,
         )
+        measurements = build_canonical_profile_measurements(
+            observer=observer,
+            state_before=state_before,
+            state_after=state_after,
+            manifest=manifest,
+            receipt=receipt,
+        )
+        capacity = build_profile_capacity(
+            observer=observer,
+            manifest=manifest,
+            receipt=receipt,
+            execution_mode=execution_mode,
+            recording_duration_ns=recording_duration_ns,
+            requested_duration_ns=requested_duration_ns,
+            measurements=measurements,
+        )
         report = CanonicalProfileReport(
             schema_version="1.0",
-            model_version="canonical-profile-report-v2",
+            model_version="canonical-profile-report-v3",
             manifest=manifest,
             manifest_sha256=manifest.manifest_sha256,
             observer=observer,
@@ -249,9 +294,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             recording_duration_ns=recording_duration_ns,
             requested_duration_ns=requested_duration_ns,
             reconciliation=reconciliation,
+            measurements=measurements,
+            capacity=capacity,
         )
+        comparison_payload = None
+        if compare_with is not None and comparison_output is not None:
+            try:
+                baseline = CanonicalProfileReport.model_validate_json(compare_with.read_bytes())
+            except OSError as error:
+                raise CanonicalProfileError(f"cannot read comparison baseline: {error}") from error
+            comparison = compare_canonical_profile_reports(baseline, report)
+            comparison_payload = canonical_json_bytes(comparison.model_dump(mode="json"))
         payload = canonical_json_bytes(report.model_dump(mode="json"))
         _atomic_write(output, payload)
+        if comparison_output is not None and comparison_payload is not None:
+            _atomic_write(comparison_output, comparison_payload)
     except (CanonicalProfileError, OSError, TypeError, ValueError) as error:
         _write_json(
             {

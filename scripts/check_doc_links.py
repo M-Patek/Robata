@@ -1,4 +1,4 @@
-"""Check local Markdown links in current authoritative documentation."""
+"""Check links in the Markdown files delivered with the repository."""
 
 from __future__ import annotations
 
@@ -21,10 +21,13 @@ class DocumentLinkIssue:
 
 
 def _markdown_files(root: Path) -> tuple[Path, ...]:
-    files = list(root.glob("*.md"))
-    docs = root / "docs"
-    if docs.is_dir():
-        files.extend(docs.rglob("*.md"))
+    """Return the tracked control-plane Markdown files only."""
+    files = [
+        root / name for name in ("README.md", "AGENTS.md", "CLAUDE.md") if (root / name).is_file()
+    ]
+    governance = root / "governance"
+    if governance.is_dir():
+        files.extend(governance.rglob("*.md"))
     return tuple(sorted({path.resolve() for path in files}))
 
 
@@ -42,7 +45,7 @@ def _link_destination(raw_target: str) -> str | None:
 
 
 def check_document_links(root: Path) -> tuple[DocumentLinkIssue, ...]:
-    """Return broken or escaping local links outside the historical archive scan."""
+    """Return broken or escaping links in the tracked documentation control plane."""
 
     resolved_root = root.resolve()
     issues: list[DocumentLinkIssue] = []
