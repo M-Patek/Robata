@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 
+from robata.adapters.local_artifact_registry import LocalArtifactRegistry
 from robata.alignment.rational_time import round_half_even
 from robata.application.artifact_view import (
     ArtifactViewError,
@@ -165,19 +166,30 @@ class RegisteredSixCameraVideoExportService:
         self,
         request: LocalVideoExportRequest,
         staged_producer: StagedSixCameraVideoProducer,
+        *,
+        verify_file_digests: bool | None = None,
     ) -> PublishedRegisteredVideoExport:
         """Publish six artifacts produced by one source traversal in private staging."""
 
-        return self._run_export_local(request, staged_producer=staged_producer)
+        return self._run_export_local(
+            request,
+            staged_producer=staged_producer,
+            verify_file_digests=verify_file_digests,
+        )
 
     def _run_export_local(
         self,
         request: LocalVideoExportRequest,
         *,
         staged_producer: StagedSixCameraVideoProducer | None,
+        verify_file_digests: bool | None = None,
     ) -> PublishedRegisteredVideoExport:
         try:
-            return self._export_local(request, staged_producer=staged_producer)
+            return self._export_local(
+                request,
+                staged_producer=staged_producer,
+                verify_file_digests=verify_file_digests,
+            )
         except VideoExportRunError:
             raise
         except ArtifactViewError as error:
@@ -206,7 +218,18 @@ class RegisteredSixCameraVideoExportService:
         request: LocalVideoExportRequest,
         *,
         staged_producer: StagedSixCameraVideoProducer | None,
+        verify_file_digests: bool | None = None,
     ) -> PublishedRegisteredVideoExport:
+        if verify_file_digests is None:
+            if not isinstance(request.verify_staged_file_digests, bool):
+                raise TypeError("request.verify_staged_file_digests must be a boolean")
+            effective_verify_file_digests = (
+                request.verify_staged_file_digests if staged_producer is not None else True
+            )
+        elif not isinstance(verify_file_digests, bool):
+            raise TypeError("verify_file_digests must be a boolean or None")
+        else:
+            effective_verify_file_digests = verify_file_digests
         SixCameraVideoExportService._validate_request(request)
         output_directory = self._resolve_output_directory(request.output_directory)
         created_at = self._created_at()
@@ -264,6 +287,7 @@ class RegisteredSixCameraVideoExportService:
                     request,
                     staging_directory,
                     staged,
+                    verify_file_digests=effective_verify_file_digests,
                 )
             built = self._build_derivation(
                 request,
@@ -279,13 +303,35 @@ class RegisteredSixCameraVideoExportService:
             _sync_directory(staging_directory)
             publication_manifest = built.manifest
             publication_manifest_bytes = built.manifest_bytes
-            try:
-                published = self._artifact_registry.publish_derivation(
-                    snapshot=built.snapshot,
-                    logical_key=logical_key,
-                    manifest_artifact_id=built.manifest_entry.artifact_id,
-                    blob_sources=built.blob_sources,
+            trusted_artifact_ids = frozenset(
+                (
+                    *(
+                        artifact_id
+                        for record in built.manifest.cameras
+                        for artifact_id in (
+                            record.video_artifact.artifact_id,
+                            record.timestamp_sidecar_artifact.artifact.artifact_id,
+                        )
+                    ),
                 )
+            )
+            try:
+                if isinstance(self._artifact_registry, LocalArtifactRegistry):
+                    published = self._artifact_registry.publish_derivation(
+                        snapshot=built.snapshot,
+                        logical_key=logical_key,
+                        manifest_artifact_id=built.manifest_entry.artifact_id,
+                        blob_sources=built.blob_sources,
+                        trusted_artifact_ids=trusted_artifact_ids,
+                        verify_blobs=False,
+                    )
+                else:
+                    published = self._artifact_registry.publish_derivation(
+                        snapshot=built.snapshot,
+                        logical_key=logical_key,
+                        manifest_artifact_id=built.manifest_entry.artifact_id,
+                        blob_sources=built.blob_sources,
+                    )
             except ArtifactRegistryError:
                 recovered = self._artifact_registry.lookup_derivation(logical_key)
                 if recovered is None:
@@ -308,6 +354,12 @@ class RegisteredSixCameraVideoExportService:
             manifest_artifact_id=published.manifest_artifact_id,
             manifest=publication_manifest,
             output_directory=output_directory,
+            trusted_artifact_ids=(
+                trusted_artifact_ids
+                if isinstance(self._artifact_registry, LocalArtifactRegistry)
+                and not published.reused
+                else frozenset()
+            ),
         )
         return PublishedRegisteredVideoExport(
             output_directory=view.output_directory,

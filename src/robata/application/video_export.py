@@ -114,6 +114,7 @@ class LocalVideoExportRequest:
     mapping_profile: TopicMappingProfile
     mapping_profile_digest: Sha256Digest
     exporter: VideoExporterDescriptor
+    verify_staged_file_digests: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,8 +276,13 @@ class SixCameraVideoExportService:
         request: LocalVideoExportRequest,
         staging_directory: Path,
         staged: StagedSixCameraVideoExport,
+        *,
+        verify_file_digests: bool = True,
     ) -> tuple[ExportedCameraVideoFacts, ...]:
         """Verify one traversal result without re-reading or re-hashing the source."""
+
+        if not isinstance(verify_file_digests, bool):
+            raise TypeError("verify_file_digests must be a boolean")
 
         if (
             staged.source_size_bytes != request.inspection.source_size_bytes
@@ -292,7 +298,13 @@ class SixCameraVideoExportService:
                 "single-traversal export must return exactly six camera facts",
             )
         return tuple(
-            self._verify_camera_facts(request, camera_id, staging_directory, facts)
+            self._verify_camera_facts(
+                request,
+                camera_id,
+                staging_directory,
+                facts,
+                verify_file_digests=verify_file_digests,
+            )
             for camera_id, facts in zip(CAMERA_IDS, staged.camera_facts, strict=True)
         )
 
@@ -302,7 +314,11 @@ class SixCameraVideoExportService:
         camera_id: CameraId,
         staging_directory: Path,
         facts: ExportedCameraVideoFacts,
+        *,
+        verify_file_digests: bool = True,
     ) -> ExportedCameraVideoFacts:
+        if not isinstance(verify_file_digests, bool):
+            raise TypeError("verify_file_digests must be a boolean")
         channel = request.channels[camera_id]
         video_path = staging_directory / f"{camera_id.value}.mp4"
         sidecar_path = staging_directory / f"{camera_id.value}.timestamps.jsonl"
@@ -325,8 +341,9 @@ class SixCameraVideoExportService:
                 or facts.duration_ns != facts.last_pts_ns + facts.tail_duration_ns
             ):
                 raise ValueError("exporter facts do not match the selected source channel")
-            _verify_file_facts(video_path, facts.video_size_bytes, facts.video_sha256)
-            _verify_file_facts(sidecar_path, facts.sidecar_size_bytes, facts.sidecar_sha256)
+            if verify_file_digests:
+                _verify_file_facts(video_path, facts.video_size_bytes, facts.video_sha256)
+                _verify_file_facts(sidecar_path, facts.sidecar_size_bytes, facts.sidecar_sha256)
             _verify_sidecar_rows(
                 sidecar_path,
                 camera_id=camera_id,

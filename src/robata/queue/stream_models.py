@@ -267,8 +267,8 @@ class StreamWorkLeaseClaim(StrictModel):
     def validate_binding(self) -> Self:
         item = self.work_item
         lease = self.lease
-        if item.state is not StreamWorkItemState.LEASED:
-            raise ValueError("a stream claim must contain a leased work item")
+        if item.state not in {StreamWorkItemState.LEASED, StreamWorkItemState.RUNNING}:
+            raise ValueError("a stream claim must contain a leased or running work item")
         if (
             item.work_item_id != lease.work_item_id
             or item.leased_by != lease.worker_id
