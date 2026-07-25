@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Protocol, cast
@@ -81,6 +82,42 @@ class InferenceBatchDispatchError(InferenceOrchestrationError):
     """One adapter batch violated its all-or-nothing dispatch contract."""
 
 
+class _BatchMemberCancellationAfterDispatch(InferenceOrchestrationError):
+    """A cancelled caller's shared adapter dispatch completed before cancellation.
+
+    A microbatch cannot withdraw one member once the adapter has received the
+    shared request. The owning orchestration records the settled outcome, then
+    re-raises cancellation to the member that requested it.
+    """
+
+    def __init__(
+        self,
+        *,
+        outcome: VisionInferenceOutcome | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if (outcome is None) == (error is None):
+            raise ValueError("a settled batch cancellation requires one outcome or error")
+        super().__init__("cancelled microbatch member completed after adapter dispatch")
+        self.outcome = outcome
+        self.error = error
+
+
+@dataclass(frozen=True, slots=True)
+class OrchestratedAttemptResult:
+    """A terminal attempt together with its accepted selection, when one exists.
+
+    This is an execution convenience rather than a persisted contract. It lets
+    callers advance from a completed attempt to its already-persisted selection
+    without rereading the evidence ledger. A concurrent duplicate delivery can
+    select an earlier attempt; in that case ``terminal`` is that selected
+    terminal, rather than merely the locally dispatched attempt.
+    """
+
+    terminal: ModelInference
+    selection: InferenceAttemptSelection | None
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchCompatibilityKey:
     provider: str
@@ -98,6 +135,8 @@ class _QueuedBatchRequest:
     request: VisionInferenceRequest
     future: asyncio.Future[VisionInferenceOutcome]
     enqueued_at: float
+    cancelled: bool = False
+    provider_dispatch_started: bool = False
 
 
 def _batch_compatibility_key(request: VisionInferenceRequest) -> _BatchCompatibilityKey:
@@ -131,7 +170,12 @@ def _batch_compatibility_key(request: VisionInferenceRequest) -> _BatchCompatibi
 
 
 class _BoundedMicrobatchDispatcher:
-    """Coalesce only compatible concurrent requests into bounded adapter calls."""
+    """Coalesce only compatible concurrent requests into bounded adapter calls.
+
+    A member can leave while it is still queued. Once a shared provider call
+    starts, cancellation is deferred until that call settles so a cancellation
+    terminal cannot contradict raw output produced by the provider.
+    """
 
     def __init__(self, *, max_batch_size: int, max_queue_delay_ms: int) -> None:
         self._max_batch_size = max_batch_size
@@ -159,7 +203,52 @@ class _BoundedMicrobatchDispatcher:
             self._start_flush(key, adapter)
         elif len(bucket) == 1:
             self._timers[key] = asyncio.create_task(self._flush_after_delay(key, adapter))
-        return await future
+        try:
+            # Shield the shared result from a single waiting caller. A direct
+            # await would cancel this future and make its in-flight provider
+            # work unobservable to the remaining batch members.
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if not queued.provider_dispatch_started:
+                queued.cancelled = True
+                future.cancel()
+                self._remove_queued_member(key, queued)
+                raise
+            try:
+                outcome = await self._await_settled_outcome(future)
+            except BaseException as exc:
+                raise _BatchMemberCancellationAfterDispatch(error=exc) from exc
+            raise _BatchMemberCancellationAfterDispatch(outcome=outcome) from None
+
+    def _remove_queued_member(
+        self,
+        key: tuple[int, _BatchCompatibilityKey],
+        queued: _QueuedBatchRequest,
+    ) -> None:
+        bucket = self._queues.get(key)
+        if bucket is None:
+            return
+        try:
+            bucket.remove(queued)
+        except ValueError:
+            return
+        if bucket:
+            return
+        self._queues.pop(key, None)
+        timer = self._timers.pop(key, None)
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+
+    async def _await_settled_outcome(
+        self,
+        future: asyncio.Future[VisionInferenceOutcome],
+    ) -> VisionInferenceOutcome:
+        while True:
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                if future.done():
+                    return future.result()
 
     async def _flush_after_delay(
         self,
@@ -189,7 +278,9 @@ class _BoundedMicrobatchDispatcher:
         adapter: VisionModelAdapter,
         bucket: tuple[_QueuedBatchRequest, ...],
     ) -> None:
-        active = tuple(item for item in bucket if not item.future.cancelled())
+        active = tuple(
+            item for item in bucket if not item.cancelled and not item.future.cancelled()
+        )
         if not active:
             return
         loop = asyncio.get_running_loop()
@@ -199,6 +290,8 @@ class _BoundedMicrobatchDispatcher:
             if remaining <= 0:
                 raise TimeoutError("adapter batch expired while awaiting dispatch")
             batch_adapter = cast(BatchVisionModelAdapter, adapter)
+            for item in active:
+                item.provider_dispatch_started = True
             async with asyncio.timeout(remaining):
                 returned = await batch_adapter.infer_batch(tuple(item.request for item in active))
             outcomes = tuple(returned)
@@ -358,6 +451,48 @@ class InMemoryInferenceLedger:
     def get_terminal(self, inference_id: str) -> ModelInference | None:
         return self._terminals.get(inference_id)
 
+    @staticmethod
+    def _validate_selection_target(
+        selection: InferenceAttemptSelection,
+        terminal: ModelInference | None,
+    ) -> None:
+        if terminal is None or terminal.status is not InferenceStatus.SUCCEEDED:
+            raise InferenceLedgerError("selection requires a successful terminal attempt")
+        expected_selection_id = _stable_uuid(
+            "inference-selection",
+            inference_attempt_selection_digest(
+                logical_invocation_id=selection.logical_invocation_id,
+                policy_version=selection.policy_version,
+            ),
+        )
+        try:
+            selected_at = datetime.fromisoformat(
+                f"{selection.selected_at[:-1]}+00:00"
+                if selection.selected_at.endswith("Z")
+                else selection.selected_at
+            )
+            completed_at = datetime.fromisoformat(
+                f"{terminal.completed_at[:-1]}+00:00"
+                if terminal.completed_at.endswith("Z")
+                else terminal.completed_at
+            )
+        except ValueError as exc:
+            raise InferenceLedgerError("selection timestamp is not RFC3339") from exc
+        if (
+            selected_at.tzinfo is None
+            or selected_at.utcoffset() is None
+            or completed_at.tzinfo is None
+            or completed_at.utcoffset() is None
+            or selection.inference_id != terminal.inference_id
+            or terminal.shadow
+            or not terminal.output_valid
+            or terminal.failure is not None
+            or terminal.logical_invocation_id != selection.logical_invocation_id
+            or selection.selection_id != expected_selection_id
+            or selected_at < completed_at
+        ):
+            raise InferenceLedgerError("selected terminal attempt is semantically inconsistent")
+
     def append_selection(self, selection: InferenceAttemptSelection) -> InferenceAttemptSelection:
         key = (selection.logical_invocation_id, selection.policy_version)
         existing = self._selections.get(key)
@@ -366,10 +501,7 @@ class InMemoryInferenceLedger:
                 "logical invocation already has a different selected attempt"
             )
         terminal = self.get_terminal(selection.inference_id)
-        if terminal is None or terminal.status is not InferenceStatus.SUCCEEDED:
-            raise InferenceLedgerError("selection requires a successful terminal attempt")
-        if terminal.shadow or not terminal.output_valid:
-            raise InferenceLedgerError("shadow or invalid output cannot be selected")
+        self._validate_selection_target(selection, terminal)
         self._selections[key] = selection
         return selection
 
@@ -388,20 +520,9 @@ class InMemoryInferenceLedger:
             raise InferenceLedgerError(f"conflicting terminal attempt: {terminal.inference_id}")
         if self.get_intent(terminal.inference_id) is None:
             raise InferenceLedgerError("terminal attempt requires a persisted intent")
-        if (
-            selection.inference_id != terminal.inference_id
-            or selection.logical_invocation_id != terminal.logical_invocation_id
-            or terminal.status is not InferenceStatus.SUCCEEDED
-            or terminal.shadow
-            or not terminal.output_valid
-        ):
-            raise InferenceLedgerError("atomic selection requires its successful primary terminal")
+        self._validate_selection_target(selection, terminal)
         key = (selection.logical_invocation_id, selection.policy_version)
         existing_selection = self._selections.get(key)
-        if existing_selection is not None and existing_selection != selection:
-            raise InferenceLedgerError(
-                "logical invocation already has a different selected attempt"
-            )
         self._terminals[terminal.inference_id] = existing_terminal or terminal
         self._selections[key] = existing_selection or selection
         return (
@@ -698,6 +819,13 @@ class InferenceOrchestrator:
         )
         self._clock = clock or _utc_now
         self._compiled_schemas: dict[str, _CompiledSchema] = {}
+        # Selection is produced synchronously with the durable terminal append.
+        # Keep it task-local so concurrent call parts can reuse their own result
+        # without a second ledger read.
+        self._orchestrated_selection: ContextVar[InferenceAttemptSelection | None] = ContextVar(
+            f"robata_orchestrated_selection_{id(self)}",
+            default=None,
+        )
 
     async def _dispatch_adapter(
         self,
@@ -1088,6 +1216,7 @@ class InferenceOrchestrator:
             raise InferenceLedgerError(
                 "selected terminal normalized output is schema-invalid"
             ) from exc
+        self._orchestrated_selection.set(selection)
         return terminal
 
     @staticmethod
@@ -1390,6 +1519,40 @@ class InferenceOrchestrator:
             return "normalized output input-plan part digest does not match request"
         return None
 
+    @staticmethod
+    def _selection_winner(
+        selection: object,
+        *,
+        logical_invocation_id: str,
+        policy_version: str,
+    ) -> InferenceAttemptSelection:
+        """Validate the immutable winner returned by a ledger append race."""
+
+        try:
+            checked = InferenceAttemptSelection.model_validate(selection.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InferenceLedgerError("persisted attempt selection is invalid") from exc
+        if (
+            checked.logical_invocation_id != logical_invocation_id
+            or checked.policy_version != policy_version
+            or checked.selection_reason != _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON
+            or checked.selection_id
+            != _stable_uuid(
+                "inference-selection",
+                inference_attempt_selection_digest(
+                    logical_invocation_id=logical_invocation_id,
+                    policy_version=policy_version,
+                ),
+            )
+            or checked.selection_decision_logical_key
+            != inference_attempt_selection_logical_key(
+                logical_invocation_id=logical_invocation_id,
+                policy_version=policy_version,
+            )
+        ):
+            raise InferenceLedgerError("persisted attempt selection winner is inconsistent")
+        return checked
+
     def _select_success(
         self, inference: ModelInference, *, policy_version: str
     ) -> InferenceAttemptSelection | None:
@@ -1401,9 +1564,13 @@ class InferenceOrchestrator:
             return None
         existing = self._ledger.get_selection(inference.logical_invocation_id, policy_version)
         if existing is not None:
-            if existing.selection_reason != _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON:
-                raise InferenceLedgerError("persisted attempt selection reason is inconsistent")
-            return existing
+            winner = self._selection_winner(
+                existing,
+                logical_invocation_id=inference.logical_invocation_id,
+                policy_version=policy_version,
+            )
+            self._orchestrated_selection.set(winner)
+            return winner
         selected_at = _timestamp(self._clock)
         selection_digest = inference_attempt_selection_digest(
             logical_invocation_id=inference.logical_invocation_id,
@@ -1422,7 +1589,9 @@ class InferenceOrchestrator:
             ),
             selected_at=selected_at,
         )
-        return self._ledger.append_selection(selection)
+        persisted = self._ledger.append_selection(selection)
+        self._orchestrated_selection.set(persisted)
+        return persisted
 
     def _persist_terminal(
         self, inference: ModelInference, *, selection_policy_version: str
@@ -1432,6 +1601,7 @@ class InferenceOrchestrator:
             or inference.status is not InferenceStatus.SUCCEEDED
             or not inference.output_valid
         ):
+            self._orchestrated_selection.set(None)
             return self._ledger.append_terminal(inference)
         existing = self._ledger.get_selection(
             inference.logical_invocation_id,
@@ -1439,7 +1609,9 @@ class InferenceOrchestrator:
         )
         if existing is not None:
             stored = self._ledger.append_terminal(inference)
-            self._select_success(stored, policy_version=selection_policy_version)
+            selected = self._select_success(stored, policy_version=selection_policy_version)
+            if selected is None:
+                raise InferenceLedgerError("successful attempt did not retain its selection")
             return stored
         selected_at = _timestamp(self._clock)
         selection_digest = inference_attempt_selection_digest(
@@ -1466,13 +1638,29 @@ class InferenceOrchestrator:
                 inference,
                 selection,
             )
-            if stored_selection != selection:
-                raise InferenceLedgerError("atomic terminal selection replay changed the selection")
+            winner = self._selection_winner(
+                stored_selection,
+                logical_invocation_id=inference.logical_invocation_id,
+                policy_version=selection_policy_version,
+            )
+            self._orchestrated_selection.set(winner)
             return stored
         stored = self._ledger.append_terminal(inference)
-        persisted_selection = self._ledger.append_selection(selection)
-        if persisted_selection != selection:
-            raise InferenceLedgerError("persisted attempt selection changed content")
+        try:
+            persisted_selection = self._ledger.append_selection(selection)
+        except InferenceLedgerError:
+            persisted_selection = self._ledger.get_selection(
+                inference.logical_invocation_id,
+                selection_policy_version,
+            )
+            if persisted_selection is None:
+                raise
+        winner = self._selection_winner(
+            persisted_selection,
+            logical_invocation_id=inference.logical_invocation_id,
+            policy_version=selection_policy_version,
+        )
+        self._orchestrated_selection.set(winner)
         return stored
 
     def _local_failure_terminal(
@@ -1509,6 +1697,158 @@ class InferenceOrchestrator:
                 retryability=retryability,
             ),
         )
+
+    def _validate_orchestrated_selection(
+        self,
+        *,
+        task: VisionTask,
+        terminal: object,
+        selection: object,
+    ) -> tuple[ModelInference, InferenceAttemptSelection]:
+        """Validate the in-memory selection handoff before a stage receives it."""
+
+        policy = self._policy(task)
+        try:
+            checked_selection = InferenceAttemptSelection.model_validate(
+                selection.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InferenceLedgerError("persisted attempt selection is invalid") from exc
+        try:
+            checked_terminal = ModelInference.model_validate(terminal.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InferenceLedgerError("selected terminal attempt is invalid") from exc
+        if (
+            checked_selection.policy_version != policy.selection_policy_version
+            or checked_selection.selection_reason != _FIRST_SCHEMA_VALID_SUCCESS_SELECTION_REASON
+            or checked_selection.selection_decision_logical_key
+            != inference_attempt_selection_logical_key(
+                logical_invocation_id=checked_selection.logical_invocation_id,
+                policy_version=checked_selection.policy_version,
+            )
+            or checked_selection.logical_invocation_id != checked_terminal.logical_invocation_id
+            or checked_selection.inference_id != checked_terminal.inference_id
+            or checked_terminal.stage is not task
+            or checked_terminal.provider != policy.provider
+            or checked_terminal.model_name != policy.model_name
+            or checked_terminal.model_version != policy.model_version
+            or checked_terminal.adapter_version != policy.adapter_version
+            or checked_terminal.prompt_version != policy.prompt_version
+            or checked_terminal.prompt_sha256 != policy.prompt_sha256
+            or checked_terminal.output_schema_id != policy.output_schema.schema_id
+            or checked_terminal.output_schema_version != policy.output_schema.version
+            or checked_terminal.output_schema_sha256 != policy.output_schema.sha256
+            or checked_terminal.generation_config != dict(policy.generation_config)
+            or checked_terminal.status is not InferenceStatus.SUCCEEDED
+            or not checked_terminal.output_valid
+            or checked_terminal.normalized_output is None
+            or checked_terminal.failure is not None
+            or checked_terminal.shadow
+        ):
+            raise InferenceLedgerError("persisted selection does not target a valid terminal")
+        try:
+            self._schema(policy.output_schema).validate(checked_terminal.normalized_output)
+        except JsonSchemaValidationError as exc:
+            raise InferenceLedgerError(
+                "selected terminal normalized output is schema-invalid"
+            ) from exc
+        return checked_terminal, checked_selection
+
+    async def orchestrate_with_selection(
+        self,
+        *,
+        task: VisionTask,
+        package_set_id: str | None,
+        mcap_id: str,
+        camera_mapping_run_id: str,
+        alignment_id: str,
+        start_ns: int,
+        end_ns: int,
+        package_inputs: Sequence[PackageInput] = (),
+        rendered_input_digest: str | None = None,
+        input_plan: InferenceInputPlan | None = None,
+        input_plan_part_ordinal: int | None = None,
+        input_config: Mapping[str, object] | None = None,
+        logical_dependency_sha256: Sha256Digest | None = None,
+        sampling_config: Mapping[str, object] | None = None,
+        metadata: Mapping[str, str] | None = None,
+        attempt: int = 1,
+        retry_count: int = 0,
+        shadow: bool = False,
+        experiment_id: str | None = None,
+        shadow_route_id: str | None = None,
+        primary_inference_id: str | None = None,
+    ) -> OrchestratedAttemptResult:
+        """Execute an attempt and return its already-persisted selection.
+
+        The public ``orchestrate`` method remains the compatibility entry point
+        for callers interested only in the terminal.  Canonical stage code uses
+        this form so a just-completed successful call does not immediately query
+        the ledger for its selection and terminal again.
+        """
+
+        token = self._orchestrated_selection.set(None)
+        try:
+            terminal = await self.orchestrate(
+                task=task,
+                package_set_id=package_set_id,
+                mcap_id=mcap_id,
+                camera_mapping_run_id=camera_mapping_run_id,
+                alignment_id=alignment_id,
+                start_ns=start_ns,
+                end_ns=end_ns,
+                package_inputs=package_inputs,
+                rendered_input_digest=rendered_input_digest,
+                input_plan=input_plan,
+                input_plan_part_ordinal=input_plan_part_ordinal,
+                input_config=input_config,
+                logical_dependency_sha256=logical_dependency_sha256,
+                sampling_config=sampling_config,
+                metadata=metadata,
+                attempt=attempt,
+                retry_count=retry_count,
+                shadow=shadow,
+                experiment_id=experiment_id,
+                shadow_route_id=shadow_route_id,
+                primary_inference_id=primary_inference_id,
+            )
+            selection = self._orchestrated_selection.get()
+            if (
+                terminal.shadow
+                or terminal.status is not InferenceStatus.SUCCEEDED
+                or not terminal.output_valid
+            ):
+                if selection is not None:
+                    raise InferenceLedgerError(
+                        "non-selected attempt retained an accepted selection"
+                    )
+                return OrchestratedAttemptResult(terminal=terminal, selection=None)
+            if selection is None:
+                # A third-party ledger can implement the public protocol without
+                # participating in the task-local write hand-off. Preserve that
+                # compatibility with one guarded lookup.
+                selection = self._ledger.get_selection(
+                    terminal.logical_invocation_id,
+                    self._policy(task).selection_policy_version,
+                )
+            if selection is None:
+                raise InferenceLedgerError("successful invocation has no persisted selection")
+            selected_terminal = terminal
+            if selection.inference_id != terminal.inference_id:
+                selected_terminal = self._ledger.get_terminal(selection.inference_id)
+                if selected_terminal is None:
+                    raise InferenceLedgerError("persisted selection has no terminal attempt")
+            selected_terminal, checked_selection = self._validate_orchestrated_selection(
+                task=task,
+                terminal=selected_terminal,
+                selection=selection,
+            )
+            return OrchestratedAttemptResult(
+                terminal=selected_terminal,
+                selection=checked_selection,
+            )
+        finally:
+            self._orchestrated_selection.reset(token)
 
     async def orchestrate(
         self,
@@ -1855,8 +2195,55 @@ class InferenceOrchestrator:
                 selection_policy_version=policy.selection_policy_version,
             )
 
+        cancellation_after_shared_dispatch = False
+
+        def _persist_dispatched_terminal(terminal: ModelInference) -> ModelInference:
+            stored = self._persist_terminal(
+                terminal,
+                selection_policy_version=policy.selection_policy_version,
+            )
+            if cancellation_after_shared_dispatch:
+                raise asyncio.CancelledError
+            return stored
+
         try:
             outcome = await self._dispatch_adapter(adapter, request)
+        except _BatchMemberCancellationAfterDispatch as exc:
+            cancellation_after_shared_dispatch = True
+            if exc.outcome is not None:
+                outcome = exc.outcome
+            else:
+                error = exc.error
+                assert error is not None
+                if isinstance(error, TimeoutError):
+                    timeout = self._local_failure_terminal(
+                        intent=persisted_intent,
+                        started_at=started_at,
+                        status=InferenceStatus.TIMEOUT,
+                        code="ADAPTER_TIMEOUT",
+                        detail=_exception_detail(error),
+                        retryability=Retryability.RETRYABLE,
+                    )
+                    return _persist_dispatched_terminal(timeout)
+                if isinstance(error, asyncio.CancelledError):
+                    cancelled = self._local_failure_terminal(
+                        intent=persisted_intent,
+                        started_at=started_at,
+                        status=InferenceStatus.CANCELLED,
+                        code="ADAPTER_CANCELLED",
+                        detail="shared adapter batch cancelled before completion",
+                        retryability=Retryability.RETRYABLE,
+                    )
+                    return _persist_dispatched_terminal(cancelled)
+                failed = self._local_failure_terminal(
+                    intent=persisted_intent,
+                    started_at=started_at,
+                    status=InferenceStatus.FAILED,
+                    code="ADAPTER_EXCEPTION",
+                    detail=_exception_detail(error),
+                    retryability=Retryability.RETRYABLE,
+                )
+                return _persist_dispatched_terminal(failed)
         except asyncio.CancelledError:
             cancelled = self._local_failure_terminal(
                 intent=persisted_intent,
@@ -1880,10 +2267,7 @@ class InferenceOrchestrator:
                 detail=_exception_detail(exc),
                 retryability=Retryability.RETRYABLE,
             )
-            return self._persist_terminal(
-                timeout,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(timeout)
         except Exception as exc:
             failed = self._local_failure_terminal(
                 intent=persisted_intent,
@@ -1893,10 +2277,7 @@ class InferenceOrchestrator:
                 detail=_exception_detail(exc),
                 retryability=Retryability.RETRYABLE,
             )
-            return self._persist_terminal(
-                failed,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(failed)
 
         if not isinstance(outcome, (VisionInferenceSuccess, VisionInferenceFailure)):
             invalid_contract = self._local_failure_terminal(
@@ -1907,10 +2288,7 @@ class InferenceOrchestrator:
                 detail="adapter returned an unsupported outcome type",
                 retryability=Retryability.PERMANENT,
             )
-            return self._persist_terminal(
-                invalid_contract,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(invalid_contract)
 
         identity_error = self._outcome_identity_error(outcome, request)
         if identity_error is not None:
@@ -1935,10 +2313,7 @@ class InferenceOrchestrator:
                     retryability=Retryability.PERMANENT,
                 ),
             )
-            return self._persist_terminal(
-                identity_failure,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(identity_failure)
 
         if isinstance(outcome, VisionInferenceFailure):
             provider_failure = self._terminal(
@@ -1958,10 +2333,7 @@ class InferenceOrchestrator:
                 reported_confidence=None,
                 failure=outcome.failure,
             )
-            return self._persist_terminal(
-                provider_failure,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(provider_failure)
 
         payload = dict(outcome.normalized_output.payload)
         raw_output: dict[str, object] = {"artifact_id": outcome.raw_output_artifact_id}
@@ -1984,10 +2356,7 @@ class InferenceOrchestrator:
                     retryability=Retryability.PERMANENT,
                 ),
             )
-            return self._persist_terminal(
-                invalid_envelope,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(invalid_envelope)
 
         compiled_schema = self._schema(request.output_schema)
         try:
@@ -2010,10 +2379,7 @@ class InferenceOrchestrator:
                     retryability=Retryability.PERMANENT,
                 ),
             )
-            return self._persist_terminal(
-                invalid_output,
-                selection_policy_version=policy.selection_policy_version,
-            )
+            return _persist_dispatched_terminal(invalid_output)
 
         success = self._terminal(
             intent=persisted_intent,
@@ -2028,10 +2394,7 @@ class InferenceOrchestrator:
             reported_confidence=outcome.reported_confidence,
             failure=None,
         )
-        return self._persist_terminal(
-            success,
-            selection_policy_version=policy.selection_policy_version,
-        )
+        return _persist_dispatched_terminal(success)
 
     async def apply_rate_limits(
         self,
@@ -2140,5 +2503,6 @@ __all__ = [
     "InferenceOrchestrationError",
     "InferenceOrchestrator",
     "InferencePolicy",
+    "OrchestratedAttemptResult",
     "OrchestrationConfigurationError",
 ]

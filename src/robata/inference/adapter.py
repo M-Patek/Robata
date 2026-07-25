@@ -257,6 +257,91 @@ class VisionInferenceFailure(StrictModel):
 # ---------------------------------------------------------------------------
 
 
+class ProviderQualificationRequestContract(StrictModel):
+    """One exact P6 prompt and context contract permitted in a qualification run."""
+
+    task: VisionTask
+    prompt_artifact_id: NonEmptyString
+    prompt_version: SchemaVersion
+    prompt_sha256: Sha256Digest
+    output_schema_sha256: Sha256Digest
+    max_input_tokens: PositiveInt
+    timeout_ms: PositiveInt
+    generation_config_sha256: Sha256Digest
+
+
+class ProviderQualificationSession(StrictModel):
+    """Immutable scope for one real-provider qualification measurement."""
+
+    session_id: OpaqueUuid
+    run_namespace: NonEmptyString
+    configuration_digest: Sha256Digest
+    workload_manifest_digest: Sha256Digest
+    request_contracts: tuple[ProviderQualificationRequestContract, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_request_contracts(self) -> Self:
+        identities = tuple(
+            (
+                contract.task,
+                contract.prompt_artifact_id,
+                contract.prompt_version,
+                contract.prompt_sha256,
+                contract.output_schema_sha256,
+                contract.max_input_tokens,
+                contract.timeout_ms,
+                contract.generation_config_sha256,
+            )
+            for contract in self.request_contracts
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("qualification request contracts must be unique")
+        return self
+
+
+class ProviderQualificationObserver(Protocol):
+    """Optional fail-open sink for one scoped real-provider qualification run."""
+
+    def record_provider_timing(
+        self,
+        *,
+        qualification_session: ProviderQualificationSession,
+        request_id: str,
+        logical_invocation_id: str,
+        input_plan_part_ordinal: int,
+        provider_image_count: int,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        provider_queue_ms: int | None,
+        provider_execution_ms: int | None,
+        time_to_first_token_ms: int | None,
+        end_to_end_ms: int,
+        input_tokens_known: bool,
+        output_tokens_known: bool,
+        accepted: bool,
+    ) -> None:
+        """Observe one terminal provider response without changing inference semantics."""
+        ...
+
+    def record_provider_http_requests(
+        self,
+        *,
+        qualification_session: ProviderQualificationSession,
+        count: int,
+    ) -> None:
+        """Observe actual HTTP posts made after the adapter obtains endpoint capacity."""
+        ...
+
+    def record_provider_retries(
+        self,
+        *,
+        qualification_session: ProviderQualificationSession,
+        count: int,
+    ) -> None:
+        """Observe adapter transport retry attempts represented by one retry delay."""
+        ...
+
+
 class VisionModelAdapter(Protocol):
     """Protocol for provider-neutral vision model adapters.
 
@@ -323,6 +408,9 @@ __all__ = [
     "JsonSchemaRef",
     "NormalizedOutputEnvelope",
     "PackageInput",
+    "ProviderQualificationObserver",
+    "ProviderQualificationRequestContract",
+    "ProviderQualificationSession",
     "VisionInferenceFailure",
     "VisionInferenceRequest",
     "VisionInferenceSuccess",
