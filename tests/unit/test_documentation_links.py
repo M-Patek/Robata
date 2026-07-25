@@ -22,6 +22,15 @@ def test_document_link_checker_reports_only_invalid_local_targets(tmp_path: Path
     assert issues[0].reason == "TARGET_NOT_FOUND"
 
 
+def test_document_link_checker_ignores_local_only_docs(tmp_path: Path) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "private-notes.md").write_text("[broken](missing.md)\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Tracked entry point\n", encoding="utf-8")
+
+    assert check_document_links(tmp_path) == ()
+
+
 def test_current_authoritative_document_links_resolve() -> None:
     repository_root = Path(__file__).resolve().parents[2]
 

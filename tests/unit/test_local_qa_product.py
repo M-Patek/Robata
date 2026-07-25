@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from robata.contracts.cameras import CameraId
+from robata.application.canonical.media_quality import (
+    FrameQualityObservation,
+    FrameTimingEvidence,
+    LocalQualityFlag,
+    build_local_media_quality_report,
+)
+from robata.application.canonical.product_qa import (
+    product_qa_context_from_media_quality_report,
+)
+from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.qa import (
     ClipMark,
@@ -16,6 +25,11 @@ from robata.contracts.qa import (
     QAClassifier,
     QAIssue,
     QAStatus,
+)
+from robata.qa_pipeline.product import (
+    ProductQACascadeProjector,
+    ProductQACascadeStatus,
+    ProductQAClassState,
 )
 
 
@@ -254,3 +268,131 @@ def test_assessment_flags_cannot_be_promoted_or_changed_to_deletion() -> None:
         QAAssessment(**fields, production_eligible=True)
     with pytest.raises(ValidationError, match="delete_source"):
         QAAssessment(**fields, delete_source=True)
+
+
+
+def test_complete_product_cascade_has_one_deterministic_state_for_every_class() -> None:
+    result = ProductQACascadeProjector().project(
+        recording_id="recording-1",
+        recording_duration_ns=10_000_000_000,
+    )
+
+    assert result.status is ProductQACascadeStatus.COMPLETE
+    assert tuple(item.issue for item in result.class_coverage) == tuple(ProductQAIssue)
+    assert {item.state for item in result.class_coverage} == {ProductQAClassState.NO_ISSUE}
+    assert result.product_result.assessment.status is QAStatus.PASS
+
+
+def test_product_cascade_preserves_observed_issue_while_source_gap_marks_rest_incomplete() -> None:
+    black = _evidence(issue=ProductQAIssue.BLACK_SCREEN)
+
+    result = ProductQACascadeProjector().project(
+        recording_id="recording-1",
+        recording_duration_ns=10_000_000_000,
+        observed_evidence=(black,),
+        incomplete_reason_codes=("SOURCE_CADENCE_GAP:cam_01:1000000000",),
+    )
+    coverage = {item.issue: item for item in result.class_coverage}
+
+    assert result.status is ProductQACascadeStatus.INCOMPLETE_INPUT
+    assert coverage[ProductQAIssue.BLACK_SCREEN].state is ProductQAClassState.OBSERVED
+    assert coverage[ProductQAIssue.BLACK_SCREEN].evidence == (black,)
+    assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].state is (
+        ProductQAClassState.INCOMPLETE_INPUT
+    )
+    assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].reason_codes == (
+        "SOURCE_CADENCE_GAP:cam_01:1000000000",
+    )
+    assert result.product_result.issue_evidence == (black,)
+
+
+def test_product_cascade_supports_a_selected_abstained_class_without_erasing_no_issue() -> None:
+    result = ProductQACascadeProjector().project(
+        recording_id="recording-1",
+        recording_duration_ns=10_000_000_000,
+        abstained_issues=(ProductQAIssue.ARM_HAND_OBSTRUCTED,),
+    )
+    coverage = {item.issue: item for item in result.class_coverage}
+
+    assert result.status is ProductQACascadeStatus.ABSTAINED
+    assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].state is ProductQAClassState.ABSTAINED
+    assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].reason_codes == ("SEMANTIC_ABSTAINED",)
+    assert coverage[ProductQAIssue.BLACK_SCREEN].state is ProductQAClassState.NO_ISSUE
+
+
+def test_media_quality_context_maps_direct_and_proxy_evidence_at_original_timestamp() -> None:
+    duration_ns = 10_000_000_000
+    timestamp_ns = 2_000_000_000
+    interval = NanosecondInterval(start_ns=0, end_ns=duration_ns)
+    timings = {
+        camera_id: (
+            FrameTimingEvidence(
+                camera_id=camera_id,
+                packet_index=0,
+                aligned_timestamp_ns=0,
+                source_timestamp_ns=1_000_000_000,
+                source_sequence=0,
+            ),
+        )
+        for camera_id in CAMERA_IDS
+    }
+    flags = tuple(
+        sorted(
+            (
+                LocalQualityFlag.OBSERVED_BLACK_LUMA,
+                LocalQualityFlag.OBSERVED_OVEREXPOSED_LUMA,
+                LocalQualityFlag.PROXY_LOW_EDGE_ENERGY,
+                LocalQualityFlag.PROXY_FROZEN_CONTENT,
+            ),
+            key=lambda value: value.value,
+        )
+    )
+    observations = {camera_id: () for camera_id in CAMERA_IDS}
+    observations[CameraId.CAM_01] = (
+        FrameQualityObservation(
+            camera_id=CameraId.CAM_01,
+            packet_index=2,
+            aligned_timestamp_ns=timestamp_ns,
+            source_timestamp_ns=3_000_000_000,
+            grayscale_sha256="0" * 64,
+            mean_luma_milli=127_000,
+            black_fraction_ppm=1_000_000,
+            overexposed_fraction_ppm=1_000_000,
+            edge_energy_milli=0,
+            frame_delta_milli=0,
+            flags=flags,
+        ),
+    )
+    report = build_local_media_quality_report(
+        requested_max_duration_ns=duration_ns,
+        recording_duration_ns=duration_ns,
+        requested_interval=interval,
+        timings=timings,
+        frame_observations=observations,
+    )
+
+    context = product_qa_context_from_media_quality_report(report)
+    by_issue = {item.issue: item for item in context.observed_evidence}
+
+    assert context.media_quality_report_semantic_sha256 == report.semantic_sha256
+    assert set(by_issue) == {
+        ProductQAIssue.BLACK_SCREEN,
+        ProductQAIssue.TOO_DARK_OR_OVEREXPOSED,
+        ProductQAIssue.BLURRY_LENS,
+        ProductQAIssue.CAMERA_STATIONARY_OVER_5S,
+    }
+    assert all(
+        item.interval == NanosecondInterval(start_ns=timestamp_ns, end_ns=timestamp_ns + 1)
+        for item in by_issue.values()
+    )
+    assert (
+        by_issue[ProductQAIssue.BLACK_SCREEN].confidence_kind
+        is ProductQAConfidenceKind.DETECTOR_REPORTED
+    )
+    assert (
+        by_issue[ProductQAIssue.BLURRY_LENS].confidence_kind
+        is ProductQAConfidenceKind.POLICY_DERIVED
+    )
+    assert "media-quality:" + report.semantic_sha256 in by_issue[
+        ProductQAIssue.BLACK_SCREEN
+    ].evidence_refs[0]

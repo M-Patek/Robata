@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import av
+import pytest
 
 from robata.application.canonical.media_quality import (
     FrameTimingEvidence,
@@ -12,9 +13,11 @@ from robata.application.canonical.media_quality import (
     QualityTriggerSource,
     build_local_media_quality_report,
     plan_neighbor_targets,
+    pyav_decoded_frame_view,
 )
 from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
+from robata.ports.decoded_frame import DecodedFrameView
 
 
 def _gray_frame(rows: tuple[tuple[int, ...], ...]) -> av.VideoFrame:
@@ -29,6 +32,19 @@ def _gray_frame(rows: tuple[tuple[int, ...], ...]) -> av.VideoFrame:
         contents[start : start + width] = bytes(row)
     plane.update(contents)
     return frame
+
+
+def _decoded_view(
+    rows: tuple[tuple[int, ...], ...],
+    *,
+    timestamp_ns: int,
+    analysis_width: int = 64,
+) -> DecodedFrameView:
+    return pyav_decoded_frame_view(
+        _gray_frame(rows),
+        timestamp_ns=timestamp_ns,
+        analysis_width=analysis_width,
+    )
 
 
 def _timing(
@@ -49,21 +65,22 @@ def _timing(
 def test_frame_analyzer_observes_luma_and_keeps_blur_as_a_proxy() -> None:
     analyzer = LocalFrameQualityAnalyzer(CameraId.CAM_01)
     black = analyzer.observe(
-        _gray_frame(((0, 0, 0, 0),) * 4),
+        _decoded_view(((0, 0, 0, 0),) * 4, timestamp_ns=0),
         _timing(CameraId.CAM_01, 0, 0),
     )
     overexposed = analyzer.observe(
-        _gray_frame(((255, 255, 255, 255),) * 4),
+        _decoded_view(((255, 255, 255, 255),) * 4, timestamp_ns=1_000_000_000),
         _timing(CameraId.CAM_01, 1, 1_000_000_000),
     )
     checkerboard = analyzer.observe(
-        _gray_frame(
+        _decoded_view(
             (
                 (0, 255, 0, 255),
                 (255, 0, 255, 0),
                 (0, 255, 0, 255),
                 (255, 0, 255, 0),
-            )
+            ),
+            timestamp_ns=2_000_000_000,
         ),
         _timing(CameraId.CAM_01, 2, 2_000_000_000),
     )
@@ -82,11 +99,17 @@ def test_frame_analyzer_marks_only_sustained_stable_content_as_freeze_proxy() ->
         freeze_min_duration_ns=2_000_000_000,
     )
     analyzer = LocalFrameQualityAnalyzer(CameraId.CAM_01, policy)
-    frame = _gray_frame(((80, 80, 80, 80),) * 4)
+    rows = ((80, 80, 80, 80),) * 4
 
-    first = analyzer.observe(frame, _timing(CameraId.CAM_01, 0, 0))
-    second = analyzer.observe(frame, _timing(CameraId.CAM_01, 1, 1_000_000_000))
-    third = analyzer.observe(frame, _timing(CameraId.CAM_01, 2, 2_000_000_000))
+    first = analyzer.observe(_decoded_view(rows, timestamp_ns=0), _timing(CameraId.CAM_01, 0, 0))
+    second = analyzer.observe(
+        _decoded_view(rows, timestamp_ns=1_000_000_000),
+        _timing(CameraId.CAM_01, 1, 1_000_000_000),
+    )
+    third = analyzer.observe(
+        _decoded_view(rows, timestamp_ns=2_000_000_000),
+        _timing(CameraId.CAM_01, 2, 2_000_000_000),
+    )
 
     assert LocalQualityFlag.PROXY_FROZEN_CONTENT not in first.flags
     assert LocalQualityFlag.PROXY_FROZEN_CONTENT not in second.flags
@@ -100,21 +123,27 @@ def test_frame_analyzer_resets_freeze_proxy_after_content_changes() -> None:
         freeze_min_duration_ns=2_000_000_000,
     )
     analyzer = LocalFrameQualityAnalyzer(CameraId.CAM_01, policy)
-    first_frame = _gray_frame(((80, 80, 80, 80),) * 4)
-    changed_frame = _gray_frame(((160, 160, 160, 160),) * 4)
+    first_rows = ((80, 80, 80, 80),) * 4
+    changed_rows = ((160, 160, 160, 160),) * 4
 
-    analyzer.observe(first_frame, _timing(CameraId.CAM_01, 0, 0))
-    analyzer.observe(first_frame, _timing(CameraId.CAM_01, 1, 1_000_000_000))
+    analyzer.observe(
+        _decoded_view(first_rows, timestamp_ns=0),
+        _timing(CameraId.CAM_01, 0, 0),
+    )
+    analyzer.observe(
+        _decoded_view(first_rows, timestamp_ns=1_000_000_000),
+        _timing(CameraId.CAM_01, 1, 1_000_000_000),
+    )
     changed = analyzer.observe(
-        changed_frame,
+        _decoded_view(changed_rows, timestamp_ns=2_000_000_000),
         _timing(CameraId.CAM_01, 2, 2_000_000_000),
     )
     stable_once = analyzer.observe(
-        changed_frame,
+        _decoded_view(changed_rows, timestamp_ns=3_000_000_000),
         _timing(CameraId.CAM_01, 3, 3_000_000_000),
     )
     stable_long_enough = analyzer.observe(
-        changed_frame,
+        _decoded_view(changed_rows, timestamp_ns=4_000_000_000),
         _timing(CameraId.CAM_01, 4, 4_000_000_000),
     )
 
@@ -234,3 +263,53 @@ def test_neighbor_targets_clip_dedupe_budget_and_preserve_provenance() -> None:
     assert len(plan.targets[0].provenance) == 2
     assert all(item.clipped for item in plan.targets[0].provenance)
     assert plan.semantic_sha256 == replay.semantic_sha256
+
+
+def test_pyav_decoded_frame_view_is_row_major_and_strips_plane_padding() -> None:
+    rows = (
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+    )
+
+    view = _decoded_view(rows, timestamp_ns=123)
+    downscaled = _decoded_view(rows, timestamp_ns=124, analysis_width=2)
+
+    assert (view.timestamp_ns, view.width, view.height) == (123, 4, 2)
+    assert view.gray_pixels == bytes(range(8))
+    assert (downscaled.width, downscaled.height, downscaled.pixel_count) == (2, 1, 2)
+
+
+def test_frame_analyzer_requires_a_view_with_matching_exact_timestamp() -> None:
+    analyzer = LocalFrameQualityAnalyzer(CameraId.CAM_01)
+    timing = _timing(CameraId.CAM_01, 0, 0)
+
+    with pytest.raises(TypeError, match="DecodedFrameView"):
+        analyzer.observe(_gray_frame(((0,),)), timing)
+    with pytest.raises(ValueError, match="timestamp differs"):
+        analyzer.observe(_decoded_view(((0,),), timestamp_ns=1), timing)
+
+
+def test_decoded_frame_view_requires_exact_row_major_dimensions() -> None:
+    with pytest.raises(ValueError, match=r"width \* height"):
+        DecodedFrameView(timestamp_ns=0, width=2, height=2, gray_pixels=b"\x00")
+    with pytest.raises(TypeError, match="immutable bytes"):
+        DecodedFrameView(
+            timestamp_ns=0,
+            width=1,
+            height=1,
+            gray_pixels=bytearray(b"\x00"),  # type: ignore[arg-type]
+        )
+
+
+def test_frame_analyzer_rejects_changed_dimensions_even_when_pixel_count_matches() -> None:
+    analyzer = LocalFrameQualityAnalyzer(CameraId.CAM_01)
+    analyzer.observe(
+        DecodedFrameView(timestamp_ns=0, width=2, height=2, gray_pixels=bytes(4)),
+        _timing(CameraId.CAM_01, 0, 0),
+    )
+
+    with pytest.raises(ValueError, match="dimensions must remain stable"):
+        analyzer.observe(
+            DecodedFrameView(timestamp_ns=1, width=1, height=4, gray_pixels=bytes(4)),
+            _timing(CameraId.CAM_01, 1, 1),
+        )

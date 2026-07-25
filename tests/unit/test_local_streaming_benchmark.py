@@ -5,6 +5,12 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from robata.runtime.benchmark import (
+    RecordingWorkerBatchFacts,
+    RecordingWorkerQueueObservation,
+    build_measured_recording_worker_scaling_report,
+    run_measured_recording_worker_matrix,
+)
 from robata.runtime.local_streaming_benchmark import (
     WP6_MINIMUM_SMOKE_DURATION_MS,
     BenchmarkCacheState,
@@ -330,3 +336,201 @@ def test_mock_latency_distribution_requires_canonical_order() -> None:
                 MockLatencyPoint(latency_ms=100, weight=2),
             )
         )
+
+
+
+def _worker_facts(
+    *,
+    recording_count: int = 4,
+    named_shared_resource_limit: str | None = None,
+    cancelled_recording_count: int = 0,
+) -> RecordingWorkerBatchFacts:
+    return RecordingWorkerBatchFacts(
+        successful_recording_count=recording_count - cancelled_recording_count,
+        failed_recording_count=0,
+        cancelled_recording_count=cancelled_recording_count,
+        replay_verified_recording_count=cancelled_recording_count,
+        distinct_state_root_count=recording_count,
+        state_affinity_violation_count=0,
+        queues=(
+            RecordingWorkerQueueObservation(
+                name="ingress",
+                capacity=4,
+                high_watermark=4,
+                end_depth=0,
+                backpressure_event_count=1,
+            ),
+            RecordingWorkerQueueObservation(
+                name="provider",
+                capacity=8,
+                high_watermark=6,
+                end_depth=0,
+            ),
+            RecordingWorkerQueueObservation(
+                name="publish",
+                capacity=4,
+                high_watermark=3,
+                end_depth=0,
+            ),
+        ),
+        named_shared_resource_limit=named_shared_resource_limit,
+    )
+
+
+def test_measured_recording_worker_matrix_reports_queue_drain_and_local_sizing() -> None:
+    hour_ns = 3_600_000_000_000
+    ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 9 * hour_ns))
+
+    report = run_measured_recording_worker_matrix(
+        lambda _worker_count: lambda: _worker_facts(),
+        workload_id="f" * 64,
+        recording_count=4,
+        recording_duration_ns=hour_ns,
+        worker_counts=(1, 2, 4),
+        target_recording_rtf=25.0,
+        clock_ns=lambda: next(ticks),
+    )
+
+    assert report.worker_counts == (1, 2, 4)
+    assert report.four_worker_speedup == pytest.approx(4.0)
+    assert report.four_worker_meets_2_5x is True
+    assert report.four_worker_outcome_explained is True
+    assert report.queues_bounded is True
+    assert report.backlog_drains_after_burst is True
+    assert report.cancellation_restart_replayable is True
+    assert report.capacity_projection is not None
+    assert report.capacity_projection.per_worker_recording_rtf == pytest.approx(1.0)
+    assert report.capacity_projection.required_cpu_worker_count == 25
+    assert report.capacity_projection.required_nvme_worker_count == 25
+    assert report.evidence_class == "LOCAL_CONFORMANCE"
+    assert report.measurement_status == "MEASURED"
+    assert report.production_eligible is False
+    assert report.as_dict()["runs"][2]["recording_rtf"] == pytest.approx(4.0)
+
+
+def test_measured_worker_report_requires_named_limit_when_four_workers_do_not_scale() -> None:
+    hour_ns = 3_600_000_000_000
+    ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 10 * hour_ns))
+
+    measured = run_measured_recording_worker_matrix(
+        lambda worker_count: lambda: _worker_facts(
+            named_shared_resource_limit=(
+                None if worker_count < 4 else "offline fixture provider concurrency=2"
+            ),
+        ),
+        workload_id="e" * 64,
+        recording_count=4,
+        recording_duration_ns=hour_ns,
+        worker_counts=(1, 2, 4),
+        clock_ns=lambda: next(ticks),
+    )
+    report = build_measured_recording_worker_scaling_report(measured.runs)
+
+    assert report.four_worker_speedup == pytest.approx(2.0)
+    assert report.four_worker_meets_2_5x is False
+    assert (
+        report.four_worker_named_shared_resource_limit
+        == "offline fixture provider concurrency=2"
+    )
+    assert report.four_worker_outcome_explained is True
+
+
+
+def test_verified_cancellation_replay_remains_state_affine_and_sustainable() -> None:
+    hour_ns = 3_600_000_000_000
+    ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 9 * hour_ns))
+
+    report = run_measured_recording_worker_matrix(
+        lambda _worker_count: lambda: _worker_facts(cancelled_recording_count=1),
+        workload_id="c" * 64,
+        recording_count=4,
+        recording_duration_ns=hour_ns,
+        worker_counts=(1, 2, 4),
+        clock_ns=lambda: next(ticks),
+    )
+
+    first_run = report.runs[0]
+    assert first_run.terminal_or_replay_completed_recording_count == 4
+    assert first_run.complete_without_state_leakage is True
+    assert first_run.sustainable is True
+    assert report.cancellation_restart_replayable is True
+    assert report.capacity_projection is not None
+    assert report.as_dict()["runs"][0]["replay_verified_cancelled_recording_count"] == 1
+
+
+def test_queue_burst_observation_reports_overflow_and_missing_drain() -> None:
+    facts = RecordingWorkerBatchFacts(
+        successful_recording_count=4,
+        failed_recording_count=0,
+        cancelled_recording_count=0,
+        replay_verified_recording_count=0,
+        distinct_state_root_count=4,
+        state_affinity_violation_count=0,
+        queues=(
+            RecordingWorkerQueueObservation(
+                name="ingress",
+                capacity=2,
+                high_watermark=3,
+                end_depth=1,
+                backpressure_event_count=1,
+            ),
+            RecordingWorkerQueueObservation(
+                name="provider",
+                capacity=2,
+                high_watermark=1,
+                end_depth=0,
+            ),
+            RecordingWorkerQueueObservation(
+                name="publish",
+                capacity=2,
+                high_watermark=1,
+                end_depth=0,
+            ),
+        ),
+    )
+
+    assert facts.queues_bounded is False
+    assert facts.queue_burst_observed is True
+    assert facts.ingress_backpressure_observed is True
+    assert facts.burst_backpressure_drained is False
+    assert facts.queues[0].as_dict()["bounded"] is False
+
+
+def test_n_worker_saturation_reports_named_resource_limit() -> None:
+    hour_ns = 3_600_000_000_000
+    ticks = iter(
+        (
+            0,
+            4 * hour_ns,
+            5 * hour_ns,
+            7 * hour_ns,
+            8 * hour_ns,
+            9 * hour_ns,
+            10 * hour_ns,
+            11 * hour_ns,
+        )
+    )
+    resource_limit = "offline fixture provider concurrency=4"
+
+    report = run_measured_recording_worker_matrix(
+        lambda worker_count: lambda: _worker_facts(
+            named_shared_resource_limit=(
+                resource_limit if worker_count == 8 else None
+            ),
+        ),
+        workload_id="d" * 64,
+        recording_count=4,
+        recording_duration_ns=hour_ns,
+        worker_counts=(1, 2, 4, 8),
+        clock_ns=lambda: next(ticks),
+    )
+
+    assert report.scale_out_worker_counts == (8,)
+    assert report.saturation_worker_count == 8
+    assert report.saturation_named_shared_resource_limit == resource_limit
+    assert report.named_shared_resource_limits == ((8, resource_limit),)
+    assert report.saturation_outcome_explained is True
+    assert report.unexplained_non_scaling_worker_counts == ()
+    assert report.scale_out_outcome_explained is True
+    assert report.n_worker_outcome_explained is True
+    assert report.as_dict()["saturation_worker_count"] == 8

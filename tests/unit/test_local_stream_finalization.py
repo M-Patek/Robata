@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -49,7 +50,10 @@ from robata.contracts.stream_common import (
     TerminalOutcome,
 )
 from robata.contracts.stream_inference import create_stream_window_result
-from robata.contracts.stream_planning import create_expected_window_plan
+from robata.contracts.stream_planning import (
+    StreamWorkItemPlan,
+    create_expected_window_plan,
+)
 from robata.contracts.stream_source import create_pre_eos_capture_subject
 from robata.queue.outbox import (
     OutboxDeliveryStatus,
@@ -238,6 +242,11 @@ def _finalizer(
     *,
     policy: str = "local-test-mock-v1",
     now: datetime = _NOW + timedelta(hours=1),
+    stage_terminal_executor: (
+        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
+    ) = None,
+    model_inference_schema_ref: SchemaRef | None = None,
+    recover_graph_before_execute: bool = True,
 ) -> LocalConformanceStreamFinalizer:
     return LocalConformanceStreamFinalizer(
         scheduler=composition,
@@ -264,6 +273,7 @@ def _finalizer(
             stream_inference_intent=_schema(27),
             stream_accepted_call=_schema(28),
             stream_inference_terminal=_schema(29),
+            model_inference=model_inference_schema_ref,
         ),
         final_recording=FinalRecordingFacts(
             final_source_subject_type="MCAP_RECORDING",
@@ -274,6 +284,8 @@ def _finalizer(
         ),
         window_purpose=StreamPurpose.QA_COARSE,
         mock_executor_policy_version=policy,
+        recover_graph_before_execute=recover_graph_before_execute,
+        stage_terminal_executor=stage_terminal_executor,
         clock=lambda: now,
     )
 
@@ -490,6 +502,93 @@ def test_drain_ready_is_bounded_replay_safe_and_execute_finishes_eos(
     assert outcome.terminal_closure.complete
     assert len(outcome.window_results) == 1
 
+
+def test_pre_eos_restart_resumes_owned_active_lease_without_second_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    composition = _composition(tmp_path, close_eos=False)
+    qa_plan = next(
+        plan for plan in composition.work_plans() if plan.stage is StreamStage.QA_COARSE
+    )
+    assert _finalizer(composition, tmp_path).drain_ready(max_items=1) == 1
+    assert composition.get(qa_plan.work_item_id).state is StreamWorkItemState.READY
+    model_inference_schema = SchemaRef(
+        schema_id="https://schemas.robata.dev/model-inference",
+        version="1.0.0",
+        artifact_id=_uuid(301),
+        sha256=_digest(302),
+    )
+    provider_payload = b"persisted-provider-terminal"
+    provider_ref = ArtifactEvidenceRef(
+        artifact_id=_uuid(303),
+        exact_sha256=exact_bytes_sha256(provider_payload),
+        byte_count=len(provider_payload),
+        media_type="application/json",
+        schema_ref=model_inference_schema,
+    )
+    provider_path = (
+        tmp_path
+        / "artifacts"
+        / provider_ref.exact_sha256[:2]
+        / f"{provider_ref.exact_sha256}.json"
+    )
+    provider_path.parent.mkdir(parents=True)
+    provider_path.write_bytes(provider_payload)
+    provider_terminal = StreamTerminalEvidence(
+        outcome=TerminalOutcome.SUCCEEDED,
+        evidence_ref=provider_ref,
+        terminal_policy_version="stream-terminal-policy-v1",
+        completed_at=_NOW.isoformat(),
+    )
+    hook_calls = 0
+    provider_dispatches = 0
+
+    def provider_terminal_executor(plan: StreamWorkItemPlan) -> StreamTerminalEvidence:
+        nonlocal hook_calls, provider_dispatches
+        assert plan.work_item_id == qa_plan.work_item_id
+        hook_calls += 1
+        if hook_calls == 1:
+            provider_dispatches += 1
+        return provider_terminal
+
+    # The first call represents provider evidence persisted immediately before
+    # a crash prevents scheduler.complete() from accepting the stream terminal.
+    claim = composition.claim_and_start(
+        "local-conformance-stream-worker",
+        300,
+        work_item_id=qa_plan.work_item_id,
+        now=_NOW + timedelta(hours=1),
+    )
+    assert claim is not None
+    assert provider_terminal_executor(qa_plan) == provider_terminal
+    assert composition.get(qa_plan.work_item_id).state is StreamWorkItemState.RUNNING
+
+    # A local restart retains the original fence and attempt. The finalizer
+    # re-enters the idempotent provider hook, whose durable ledger would reuse
+    # the persisted terminal rather than send another provider request.
+    (recovered,) = DurableStreamWindowScheduler.recover_registered(
+        execution_scheduler=SQLiteWorkScheduler(composition.database_path),
+        stream_run_id=_uuid(50),
+        clock=lambda: _NOW,
+    )
+    finalizer = _finalizer(
+        recovered,
+        tmp_path,
+        stage_terminal_executor=provider_terminal_executor,
+        model_inference_schema_ref=model_inference_schema,
+        recover_graph_before_execute=False,
+    )
+
+    assert finalizer.drain_ready(max_items=1) == 1
+    accepted = recovered.get(qa_plan.work_item_id)
+    assert accepted.state is StreamWorkItemState.SUCCEEDED
+    assert accepted.terminal_evidence_ref == provider_ref
+    attempts = SQLiteWorkScheduler(recovered.database_path).list_attempts(
+        qa_plan.work_item_id
+    )
+    assert len(attempts) == 1
+    assert hook_calls == 2
+    assert provider_dispatches == 1
 
 def test_exact_replay_executes_no_work_and_policy_change_fails_closed(
     tmp_path: Path,

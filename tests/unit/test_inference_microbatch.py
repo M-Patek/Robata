@@ -74,11 +74,15 @@ class BatchFakeAdapter:
         outcome_factory: Callable[[VisionInferenceRequest], Outcome] = _outcome,
         batch_error: BaseException | None = None,
         batch_delay_seconds: float = 0,
+        batch_started: asyncio.Event | None = None,
+        batch_release: asyncio.Event | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._outcome_factory = outcome_factory
         self._batch_error = batch_error
         self._batch_delay_seconds = batch_delay_seconds
+        self._batch_started = batch_started
+        self._batch_release = batch_release
         self.infer_calls: list[VisionInferenceRequest] = []
         self.batch_calls: list[tuple[VisionInferenceRequest, ...]] = []
 
@@ -95,6 +99,10 @@ class BatchFakeAdapter:
         requests: tuple[VisionInferenceRequest, ...],
     ) -> tuple[Outcome, ...]:
         self.batch_calls.append(requests)
+        if self._batch_started is not None:
+            self._batch_started.set()
+        if self._batch_release is not None:
+            await self._batch_release.wait()
         if self._batch_delay_seconds:
             await asyncio.sleep(self._batch_delay_seconds)
         if self._batch_error is not None:
@@ -141,6 +149,20 @@ def _orchestrator(
         ),
         ledger,
     )
+
+
+async def _wait_for_queued_members(
+    orchestrator: InferenceOrchestrator,
+    expected_count: int,
+) -> None:
+    dispatcher = orchestrator._batch_dispatcher
+    assert dispatcher is not None
+    for _ in range(100):
+        queued_count = sum(len(bucket) for bucket in dispatcher._queues.values())
+        if queued_count == expected_count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"expected {expected_count} queued microbatch members")
 
 
 def test_compatible_requests_use_one_real_batch_dispatch_in_input_order() -> None:
@@ -273,5 +295,140 @@ def test_queue_delay_flushes_a_partial_batch_within_the_bound() -> None:
         assert result.status is InferenceStatus.SUCCEEDED
         assert len(adapter.batch_calls) == 1
         assert elapsed < 0.2
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_queued_member_removes_only_that_member() -> None:
+    async def scenario() -> None:
+        policies = _policies(VisionTask.ACTION_EVIDENCE)
+        adapter = BatchFakeAdapter(capabilities=_capabilities())
+        orchestrator, ledger = _orchestrator(
+            adapter,
+            policies,
+            max_batch_size=3,
+            max_queue_delay_ms=20,
+        )
+
+        cancelled_task = asyncio.create_task(orchestrator.orchestrate(**_request(1)))
+        active_task = asyncio.create_task(orchestrator.orchestrate(**_request(2)))
+        await _wait_for_queued_members(orchestrator, 2)
+
+        cancelled_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        active = await active_task
+
+        assert active.status is InferenceStatus.SUCCEEDED
+        assert len(adapter.batch_calls) == 1
+        assert tuple(request.request_id for request in adapter.batch_calls[0]) == (
+            active.request_id,
+        )
+        terminals = ledger.list_terminals()
+        assert {terminal.status for terminal in terminals} == {
+            InferenceStatus.CANCELLED,
+            InferenceStatus.SUCCEEDED,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_all_queued_members_prevents_provider_dispatch() -> None:
+    async def scenario() -> None:
+        policies = _policies(VisionTask.ACTION_EVIDENCE)
+        adapter = BatchFakeAdapter(capabilities=_capabilities())
+        orchestrator, ledger = _orchestrator(
+            adapter,
+            policies,
+            max_batch_size=3,
+            max_queue_delay_ms=20,
+        )
+
+        first = asyncio.create_task(orchestrator.orchestrate(**_request(1)))
+        second = asyncio.create_task(orchestrator.orchestrate(**_request(2)))
+        await _wait_for_queued_members(orchestrator, 2)
+
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        await asyncio.sleep(0.03)
+
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert adapter.batch_calls == []
+        assert all(
+            terminal.status is InferenceStatus.CANCELLED for terminal in ledger.list_terminals()
+        )
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_inflight_member_records_settled_batch_outcome_then_reraises() -> None:
+    async def scenario() -> None:
+        policies = _policies(VisionTask.ACTION_EVIDENCE)
+        batch_started = asyncio.Event()
+        batch_release = asyncio.Event()
+        adapter = BatchFakeAdapter(
+            capabilities=_capabilities(),
+            batch_started=batch_started,
+            batch_release=batch_release,
+        )
+        orchestrator, ledger = _orchestrator(adapter, policies, max_batch_size=2)
+
+        cancelled_task = asyncio.create_task(orchestrator.orchestrate(**_request(1)))
+        active_task = asyncio.create_task(orchestrator.orchestrate(**_request(2)))
+        await asyncio.wait_for(batch_started.wait(), timeout=0.5)
+
+        cancelled_task.cancel()
+        await asyncio.sleep(0)
+        assert not cancelled_task.done()
+        assert ledger.list_terminals() == ()
+
+        batch_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        active = await active_task
+
+        assert active.status is InferenceStatus.SUCCEEDED
+        assert len(adapter.batch_calls) == 1
+        assert len(adapter.batch_calls[0]) == 2
+        terminals = ledger.list_terminals()
+        assert len(terminals) == 2
+        assert all(terminal.status is InferenceStatus.SUCCEEDED for terminal in terminals)
+        assert all(terminal.failure is None for terminal in terminals)
+
+    asyncio.run(scenario())
+
+def test_cancelling_inflight_member_records_settled_batch_failure_then_reraises() -> None:
+    async def scenario() -> None:
+        policies = _policies(VisionTask.ACTION_EVIDENCE)
+        batch_started = asyncio.Event()
+        batch_release = asyncio.Event()
+        adapter = BatchFakeAdapter(
+            capabilities=_capabilities(),
+            batch_error=RuntimeError("batch transport failed"),
+            batch_started=batch_started,
+            batch_release=batch_release,
+        )
+        orchestrator, ledger = _orchestrator(adapter, policies, max_batch_size=2)
+
+        cancelled_task = asyncio.create_task(orchestrator.orchestrate(**_request(1)))
+        active_task = asyncio.create_task(orchestrator.orchestrate(**_request(2)))
+        await asyncio.wait_for(batch_started.wait(), timeout=0.5)
+
+        cancelled_task.cancel()
+        batch_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        active = await active_task
+
+        assert active.status is InferenceStatus.FAILED
+        assert active.failure is not None
+        assert active.failure.code == "ADAPTER_EXCEPTION"
+        terminals = ledger.list_terminals()
+        assert len(terminals) == 2
+        assert all(terminal.status is InferenceStatus.FAILED for terminal in terminals)
+        assert {terminal.failure.code for terminal in terminals if terminal.failure} == {
+            "ADAPTER_EXCEPTION"
+        }
 
     asyncio.run(scenario())

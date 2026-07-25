@@ -333,6 +333,68 @@ def test_declaration_is_durable_before_child_projection_and_restart_recovers(
     assert reopened.append_window(_window(capture, 0)) == reopened.declarations()[0]
 
 
+def test_projection_crash_before_batch_publish_replays_once_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+
+    def crash_before_publish(_work_item_ids: object) -> int:
+        raise RuntimeError("injected after execution batch projection")
+
+    monkeypatch.setattr(composition._ledger, "mark_published_many", crash_before_publish)
+    with pytest.raises(RuntimeError, match="after execution batch projection"):
+        composition.append_window(_window(capture, 0))
+
+    with sqlite3.connect(execution.database_path) as connection:
+        publication_states = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT publication_state FROM stream_work_plans ORDER BY role_order"
+            )
+        )
+        projected_count = connection.execute("SELECT COUNT(*) FROM work_items").fetchone()[0]
+    assert publication_states == ("PENDING",) * 5
+    assert projected_count == 5
+
+    reopened = _composition(tmp_path, capture=capture, scheduler=execution)
+    root = _plan_for(reopened, StreamStage.WINDOW)
+    assert execution.get(root.work_item_id).state is WorkItemState.READY
+    assert reopened.recover() == 0
+    with sqlite3.connect(execution.database_path) as connection:
+        publication_states = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT publication_state FROM stream_work_plans ORDER BY role_order"
+            )
+        )
+        projected_count = connection.execute("SELECT COUNT(*) FROM work_items").fetchone()[0]
+    assert publication_states == ("PUBLISHED",) * 5
+    assert projected_count == 5
+
+
+def test_hot_stream_reads_do_not_scan_pending_terminal_intents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+    composition.append_window(_window(capture, 0))
+    root = _plan_for(composition, StreamStage.WINDOW)
+
+    def reject_pending_terminal_scan(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("normal hot reads must not scan all pending terminal intents")
+
+    monkeypatch.setattr(composition._ledger, "pending_work_rows", reject_pending_terminal_scan)
+    assert composition.get(root.work_item_id).state is StreamWorkItemState.READY
+    assert composition.backlog(now=_NOW).active_backlog == 5
+    assert len(composition.bounded_drain_scope(1)) == 1
+    assert len(composition.work_items(recover_graph=False)) == 5
+
+
 def test_backpressure_throttles_only_new_windows_and_recovers_same_policy(
     tmp_path: Path,
 ) -> None:
@@ -576,6 +638,38 @@ def test_forged_future_fence_does_not_poison_pending_terminal(tmp_path: Path) ->
     assert completed.state is StreamWorkItemState.SUCCEEDED
     assert completed.terminal_evidence == evidence
 
+
+def test_forged_capability_expiry_cannot_create_pending_terminal(
+    tmp_path: Path,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+    composition.append_window(_window(capture, 0))
+    root = _plan_for(composition, StreamStage.WINDOW)
+    claim = composition.claim("worker", 20, work_item_id=root.work_item_id, now=_NOW)
+    assert claim is not None
+    composition.start(claim.lease, now=_NOW + timedelta(seconds=1))
+    forged = claim.lease.model_copy(
+        update={"lease_expires_at": (_NOW + timedelta(days=1)).isoformat()}
+    )
+
+    with pytest.raises(WorkFenceError, match="stale, expired, or inactive"):
+        composition.complete(
+            forged,
+            _terminal_evidence(8, _NOW + timedelta(seconds=2)),
+            now=_NOW + timedelta(seconds=2),
+        )
+
+    with sqlite3.connect(execution.database_path) as connection:
+        pending = connection.execute(
+            """
+            SELECT pending_terminal_json, pending_lease_epoch, pending_fencing_token
+            FROM stream_work_plans WHERE work_item_id = ?
+            """,
+            (root.work_item_id,),
+        ).fetchone()
+    assert pending == (None, None, None)
 
 def test_backdated_evidence_cannot_revive_expired_authority_lease(
     tmp_path: Path,

@@ -278,3 +278,63 @@ def test_canonical_error_still_publishes_structured_report(
     }
     assert report["observer"]["spans"][0]["status"] == "ERROR"
     assert report["qualification_status"] == "NOT_PRODUCTION_QUALIFIED"
+
+
+def test_comparison_output_compares_a_prior_v3_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = _manifest()
+    (tmp_path / "source.mcap").write_bytes(b"fixture source")
+
+    def run_fake(**kwargs: object) -> CanonicalLocalRunReceipt:
+        observer = kwargs["runtime_observer"]
+        assert isinstance(observer, RuntimeProfileRecorder)
+        observer.increment_counter("source.recording_duration_ns", 100)
+        observer.increment_counter("source.requested_duration_ns", 90)
+        return _receipt(replayed=False)
+
+    monkeypatch.setattr(cli, "build_canonical_profile_manifest", lambda **_kwargs: manifest)
+    monkeypatch.setattr(cli, "run_local_canonical_mcap", run_fake)
+    monkeypatch.setattr(cli, "discover_canonical_profile_durations", lambda *_a, **_k: (100, 90))
+    baseline = tmp_path / "baseline.json"
+    candidate = tmp_path / "candidate.json"
+    comparison = tmp_path / "comparison.json"
+
+    assert cli.main(_arguments(tmp_path, baseline)) == 0
+    capsys.readouterr()
+    exit_code = cli.main(
+        [
+            *_arguments(tmp_path, candidate),
+            "--compare-with",
+            str(baseline),
+            "--comparison-output",
+            str(comparison),
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == json.loads(candidate.read_bytes())
+    comparison_document = json.loads(comparison.read_bytes())
+    assert comparison_document["model_version"] == "canonical-profile-comparison-v1"
+    assert comparison_document["capacity"]["comparable"] is True
+    assert comparison_document["capacity"]["comparison_kind"] == "LIKE_FOR_LIKE"
+
+
+def test_comparison_arguments_must_be_supplied_as_a_pair(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = cli.main(
+        [
+            *_arguments(tmp_path, tmp_path / "profile.json"),
+            "--compare-with",
+            str(tmp_path / "baseline.json"),
+        ]
+    )
+
+    assert exit_code == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["code"] == "PROFILE_PRECONDITION_FAILED"
+    assert "must be supplied together" in error["detail"]

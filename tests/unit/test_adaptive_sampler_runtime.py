@@ -7,6 +7,7 @@ import pytest
 from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
 from robata.frame_cache import FramePayload
+from robata.ports.decoded_frame import DecodedFrameView
 from robata.sampling.adaptive import (
     AdaptiveSampler,
     AdaptiveSamplingPolicy,
@@ -42,9 +43,9 @@ class _Detector:
         )
 
 
-def _frames() -> dict[CameraId, tuple[FramePayload, ...]]:
-    payload = (FramePayload(timestamp_sec=0.0, data=b"frame"),)
-    return {camera_id: payload for camera_id in CAMERA_IDS}
+def _frames() -> dict[CameraId, tuple[DecodedFrameView, ...]]:
+    view = (DecodedFrameView(timestamp_ns=0, width=1, height=1, gray_pixels=b"\x00"),)
+    return {camera_id: view for camera_id in CAMERA_IDS}
 
 
 def test_sampler_filters_signals_binds_camera_and_applies_hysteresis() -> None:
@@ -93,4 +94,28 @@ def test_sampler_requires_complete_six_camera_input() -> None:
                 interval=NanosecondInterval(start_ns=0, end_ns=10_000_000_000),
             ),
             frames,
+        )
+
+
+def test_sampler_rejects_opaque_frame_payloads() -> None:
+    sampler = AdaptiveSampler(
+        AdaptiveSamplingPolicy(
+            version="local-adaptive-runtime-v1",
+            min_fps=2.0,
+            max_fps=10.0,
+            triggers=(AdaptiveSignal.MOTION_ENERGY,),
+            hysteresis_sec=0.0,
+        ),
+        (_Detector(),),
+    )
+    payload = (FramePayload(timestamp_sec=0.0, data=b"\x89PNG-not-a-view"),)
+    frames = {camera_id: payload for camera_id in CAMERA_IDS}
+
+    with pytest.raises(TypeError, match="DecodedFrameView"):
+        sampler.sample(
+            _Window(
+                window_id="window-1",
+                interval=NanosecondInterval(start_ns=0, end_ns=10_000_000_000),
+            ),
+            frames,  # type: ignore[arg-type]
         )

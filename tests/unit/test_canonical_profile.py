@@ -28,7 +28,11 @@ from robata.runtime.canonical_profile import (
     ProfileRuntimeFacts,
     StateFileClass,
     build_canonical_profile_manifest,
+    build_canonical_profile_measurements,
+    build_profile_capacity,
     build_profile_reconciliation,
+    canonical_profile_workload_fingerprint,
+    compare_canonical_profile_reports,
     discover_canonical_profile_durations,
     snapshot_state_tree,
     snapshot_work_queue,
@@ -563,3 +567,279 @@ def test_report_requires_exactly_one_result_and_matches_replay_mode() -> None:
         }
     )
     assert failed.error is not None
+
+
+def _available_resource(value: int) -> RuntimeResourceMeasurement:
+    return RuntimeResourceMeasurement(status=RuntimeResourceStatus.AVAILABLE, value=value)
+
+
+def _measured_observer() -> RuntimeProfileSnapshot:
+    counters = (
+        RuntimeCounterSnapshot(name="inference.call_parts", value=8),
+        RuntimeCounterSnapshot(name="inference.call_splits", value=3),
+        RuntimeCounterSnapshot(name="inference.coarse_unique_images", value=8),
+        RuntimeCounterSnapshot(name="inference.dense_logical_calls", value=2),
+        RuntimeCounterSnapshot(name="inference.dense_provider_images", value=4),
+        RuntimeCounterSnapshot(name="inference.dense_unique_images", value=4),
+        RuntimeCounterSnapshot(name="inference.input_tokens", value=1_200),
+        RuntimeCounterSnapshot(name="inference.logical_calls", value=5),
+        RuntimeCounterSnapshot(name="inference.output_token_responses", value=5),
+        RuntimeCounterSnapshot(name="inference.output_tokens", value=150),
+        RuntimeCounterSnapshot(name="inference.provider_batch_requests", value=5),
+        RuntimeCounterSnapshot(name="inference.provider_batches", value=2),
+        RuntimeCounterSnapshot(name="inference.provider_images", value=20),
+        RuntimeCounterSnapshot(name="inference.provider_retries", value=1),
+        RuntimeCounterSnapshot(name="inference.unique_images", value=12),
+        RuntimeCounterSnapshot(name="sampling.windows", value=4),
+        RuntimeCounterSnapshot(name="sqlite.inference_evidence.connections", value=3),
+        RuntimeCounterSnapshot(
+            name="sqlite.inference_evidence.transactions",
+            attributes=(
+                RuntimeAttribute(name="operation", value="read"),
+                RuntimeAttribute(name="write", value=False),
+            ),
+            value=2,
+        ),
+        RuntimeCounterSnapshot(
+            name="sqlite.inference_evidence.transactions",
+            attributes=(
+                RuntimeAttribute(name="operation", value="write"),
+                RuntimeAttribute(name="write", value=True),
+            ),
+            value=4,
+        ),
+    )
+    return RuntimeProfileSnapshot(
+        elapsed_ns=1_000,
+        process_cpu_ns=500,
+        resources=RuntimeResourceSnapshot(
+            rss_bytes=_available_resource(99),
+            read_bytes_delta=_available_resource(123),
+            write_bytes_delta=_available_resource(456),
+        ),
+        spans=(
+            RuntimeSpanSnapshot(
+                sequence=1,
+                name="source.decode",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=0,
+                ended_offset_ns=100,
+                elapsed_ns=100,
+                process_cpu_ns=40,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=2,
+                name="source.decode",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=100,
+                ended_offset_ns=200,
+                elapsed_ns=100,
+                process_cpu_ns=30,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=3,
+                name="sqlite.inference_evidence.transaction",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=200,
+                ended_offset_ns=400,
+                elapsed_ns=200,
+                process_cpu_ns=50,
+            ),
+        ),
+        counters=counters,
+    )
+
+
+def _v3_report(
+    *,
+    replayed: bool,
+    worker_count: int = 1,
+    wall_time_ns: int = 1_000,
+    run_key: str = "profile-run",
+) -> CanonicalProfileReport:
+    manifest = _manifest(run_key=run_key)
+    state = _empty_state()
+    receipt = _receipt(replayed=replayed).model_copy(update={"fixture_inference_calls": 5})
+    observer = _measured_observer().model_copy(update={"elapsed_ns": wall_time_ns})
+    measurements = build_canonical_profile_measurements(
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        manifest=manifest,
+        receipt=receipt,
+        recording_worker_count=worker_count,
+    )
+    capacity = build_profile_capacity(
+        observer=observer,
+        manifest=manifest,
+        receipt=receipt,
+        execution_mode="REPLAY" if replayed else "FRESH",
+        recording_duration_ns=500,
+        requested_duration_ns=400,
+        measurements=measurements,
+    )
+    return CanonicalProfileReport(
+        schema_version="1.0",
+        model_version="canonical-profile-report-v3",
+        manifest=manifest,
+        manifest_sha256=manifest.manifest_sha256,
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        state_file_count_delta=0,
+        state_byte_count_delta=0,
+        work_queue_after=snapshot_work_queue(Path("this-profile-state-does-not-exist")),
+        receipt=receipt,
+        error=None,
+        execution_mode="REPLAY" if replayed else "FRESH",
+        source_span_duration_ns=None,
+        recording_duration_ns=500,
+        requested_duration_ns=400,
+        reconciliation=build_profile_reconciliation(
+            observer=observer,
+            state_after=state,
+            manifest=manifest,
+            execution_mode="REPLAY" if replayed else "FRESH",
+        ),
+        measurements=measurements,
+        capacity=capacity,
+    )
+
+
+def test_profile_measurements_expose_provider_multipliers_sqlite_scope_and_stage_cpu() -> None:
+    report = _v3_report(replayed=False)
+
+    assert report.measurements is not None
+    assert report.capacity is not None
+    assert report.measurements.workload_fingerprint == canonical_profile_workload_fingerprint(
+        report.manifest
+    )
+    assert report.measurements.source_bytes == 10
+    assert report.measurements.provider_mode.value == "LOCAL_OFFLINE_FIXTURE"
+    assert report.measurements.sqlite.connection_count_status.value == "PARTIAL"
+    assert report.measurements.sqlite.connection_count == 3
+    assert report.measurements.sqlite.transaction_count_status.value == "PARTIAL"
+    assert report.measurements.sqlite.transaction_count == 6
+    assert report.measurements.sqlite.read_transaction_count == 2
+    assert report.measurements.sqlite.write_transaction_count == 4
+    assert report.measurements.sqlite.sqlite_read_bytes_status.value == "NOT_AVAILABLE"
+    assert report.measurements.sqlite.sqlite_read_bytes is None
+    assert report.measurements.sqlite.process_read_bytes.value == 123
+    stages = {stage.stage: stage for stage in report.measurements.stages}
+    assert stages["source.decode"].span_count == 2
+    assert stages["source.decode"].inclusive_wall_time_ns == 200
+    assert stages["source.decode"].inclusive_process_cpu_ns == 70
+    assert report.capacity.provider_images == 20
+    assert report.capacity.unique_images == 12
+    assert report.capacity.windows == 4
+    assert report.capacity.logical_calls == 5
+    assert report.capacity.call_parts == 8
+    assert report.capacity.call_splits == 3
+    assert report.capacity.call_parts_per_logical_call == pytest.approx(1.6)
+    assert report.capacity.logical_calls_per_window == pytest.approx(1.25)
+    assert report.capacity.input_tokens == 1_200
+    assert report.capacity.output_tokens == 150
+    assert report.capacity.dense_logical_calls == 2
+    assert report.capacity.dense_logical_call_fraction == pytest.approx(0.4)
+    assert report.capacity.dense_unique_images == 4
+    assert report.capacity.dense_upgrade_fraction == pytest.approx(4 / 12)
+    assert report.capacity.dense_provider_image_fraction == pytest.approx(0.2)
+    assert report.capacity.provider_images_per_unique_image == pytest.approx(20 / 12)
+    assert report.capacity.production_eligible is False
+
+
+def test_profile_capacity_preserves_known_zero_output_tokens() -> None:
+    manifest = _manifest()
+    state = _empty_state()
+    receipt = _receipt().model_copy(update={"fixture_inference_calls": 5})
+    observer = _measured_observer().model_copy(
+        update={
+            "counters": tuple(
+                counter
+                for counter in _measured_observer().counters
+                if counter.name != "inference.output_tokens"
+            )
+        }
+    )
+    measurements = build_canonical_profile_measurements(
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        manifest=manifest,
+        receipt=receipt,
+    )
+
+    capacity = build_profile_capacity(
+        observer=observer,
+        manifest=manifest,
+        receipt=receipt,
+        execution_mode="FRESH",
+        recording_duration_ns=500,
+        requested_duration_ns=400,
+        measurements=measurements,
+    )
+
+    assert capacity.output_token_responses == 5
+    assert capacity.output_tokens == 0
+
+
+def test_profile_capacity_stays_unavailable_when_a_failed_run_has_no_provider_mode() -> None:
+    manifest = _manifest()
+    state = _empty_state()
+    observer = _measured_observer()
+    measurements = build_canonical_profile_measurements(
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        manifest=manifest,
+        receipt=None,
+    )
+
+    capacity = build_profile_capacity(
+        observer=observer,
+        manifest=manifest,
+        receipt=None,
+        execution_mode="UNKNOWN",
+        recording_duration_ns=500,
+        requested_duration_ns=400,
+        measurements=measurements,
+    )
+
+    assert capacity.measurement_status.value == "NOT_AVAILABLE"
+    assert capacity.unavailable_reasons == ("MISSING_PROVIDER_MODE",)
+    assert capacity.recording_hours_per_wall_hour is None
+
+
+def test_profile_comparison_exposes_fresh_replay_and_recording_worker_stage_ratios() -> None:
+    fresh = _v3_report(replayed=False, worker_count=1, wall_time_ns=1_000)
+    replay = _v3_report(replayed=True, worker_count=1, wall_time_ns=500)
+    scaled = _v3_report(replayed=False, worker_count=2, wall_time_ns=500)
+
+    fresh_replay = compare_canonical_profile_reports(fresh, replay)
+    worker_scaling = compare_canonical_profile_reports(fresh, scaled)
+
+    assert fresh_replay.capacity.comparable is True
+    assert fresh_replay.capacity.comparison_kind.value == "FRESH_VS_REPLAY"
+    assert fresh_replay.capacity.recording_hours_per_wall_hour_ratio == pytest.approx(2.0)
+    assert fresh_replay.capacity.rate_ratios[-1].name == "windows_per_wall_hour"
+    sqlite_transactions = next(
+        item for item in fresh_replay.resources if item.metric == "sqlite.transaction_count"
+    )
+    assert sqlite_transactions.baseline_availability.value == "PARTIAL"
+    assert sqlite_transactions.candidate_to_baseline_ratio == pytest.approx(1.0)
+    source_stage = next(stage for stage in fresh_replay.stages if stage.stage == "source.decode")
+    assert source_stage.inclusive_wall_time_ratio == pytest.approx(1.0)
+    assert worker_scaling.capacity.comparison_kind.value == "RECORDING_WORKER_SCALING"
+    assert worker_scaling.capacity.camera_hours_per_wall_hour_ratio == pytest.approx(2.0)
+
+
+def test_fresh_replay_comparison_requires_a_shared_run_key() -> None:
+    fresh = _v3_report(replayed=False, run_key="fresh-run")
+    replay = _v3_report(replayed=True, run_key="unrelated-run")
+
+    comparison = compare_canonical_profile_reports(fresh, replay)
+
+    assert comparison.capacity.comparable is False
+    assert comparison.capacity.comparison_kind.value == "FRESH_VS_REPLAY"
+    assert comparison.capacity.non_comparable_reasons == ("RUN_KEY_CHANGED",)
+    assert all(item.candidate_to_baseline_ratio is None for item in comparison.resources)

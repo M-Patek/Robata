@@ -35,6 +35,7 @@ from robata.inference.orchestrator import (
     InferenceOrchestrator,
     InferencePolicy,
     InMemoryInferenceLedger,
+    OrchestratedAttemptResult,
     OrchestrationConfigurationError,
 )
 
@@ -410,6 +411,196 @@ def test_intent_is_persisted_before_dispatch_and_success_is_idempotent() -> None
     assert adapter.infer_calls == 1
     assert len(store.list_terminals()) == 1
     assert len(store.list_selections()) == 1
+
+
+def test_orchestrate_with_selection_returns_fresh_selection_replays_and_keeps_wrapper_compatibility(
+) -> None:
+    """The runner can reuse the selection returned by the same orchestration call."""
+
+    orchestrator, adapter, store = _orchestrator(_success)
+    kwargs = _request_kwargs()
+
+    fresh = _run(orchestrator.orchestrate_with_selection(**kwargs))
+
+    assert isinstance(fresh, OrchestratedAttemptResult)
+    assert fresh.terminal.status is InferenceStatus.SUCCEEDED
+    assert fresh.selection is not None
+    assert fresh.selection.inference_id == fresh.terminal.inference_id
+    assert fresh.selection.logical_invocation_id == fresh.terminal.logical_invocation_id
+    assert fresh.selection == store.list_selections()[0]
+    assert adapter.infer_calls == 1
+
+    replay = _run(orchestrator.orchestrate_with_selection(**kwargs))
+
+    assert replay.terminal == fresh.terminal
+    assert replay.selection == fresh.selection
+    assert adapter.infer_calls == 1
+
+    compatibility_terminal = _run(orchestrator.orchestrate(**kwargs))
+
+    assert compatibility_terminal == fresh.terminal
+    assert adapter.infer_calls == 1
+
+
+def test_orchestrate_with_selection_returns_no_selection_for_terminal_failure() -> None:
+    orchestrator, adapter, store = _orchestrator(_failure)
+
+    result = _run(orchestrator.orchestrate_with_selection(**_request_kwargs()))
+
+    assert isinstance(result, OrchestratedAttemptResult)
+    assert result.terminal.status is InferenceStatus.TIMEOUT
+    assert result.selection is None
+    assert store.list_selections() == ()
+    assert adapter.infer_calls == 1
+
+def test_orchestrated_selection_handoff_is_task_local_and_matches_concurrent_results() -> None:
+    """A direct prior call and sibling deliveries cannot leak a stale selection."""
+
+    orchestrator, adapter, _store = _orchestrator(_success)
+    direct_kwargs = _request_kwargs()
+    direct_kwargs["rendered_input_digest"] = _digest(90)
+
+    async def delayed_infer(
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        await asyncio.sleep(0)
+        return _success(request)
+
+    adapter.infer = delayed_infer  # type: ignore[method-assign]
+
+    first_kwargs = _request_kwargs()
+    first_kwargs["rendered_input_digest"] = _digest(91)
+    second_kwargs = _request_kwargs()
+    second_kwargs["rendered_input_digest"] = _digest(92)
+
+    async def scenario() -> tuple[
+        OrchestratedAttemptResult,
+        OrchestratedAttemptResult,
+        OrchestratedAttemptResult,
+        OrchestratedAttemptResult,
+    ]:
+        # A legacy call leaves its own handoff in this task context. Child tasks
+        # inherit context, so the typed API must reset it before each delivery.
+        await orchestrator.orchestrate(**direct_kwargs)
+        first, second = await asyncio.gather(
+            orchestrator.orchestrate_with_selection(**first_kwargs),
+            orchestrator.orchestrate_with_selection(**second_kwargs),
+        )
+        replay_first, replay_duplicate = await asyncio.gather(
+            orchestrator.orchestrate_with_selection(**first_kwargs),
+            orchestrator.orchestrate_with_selection(**first_kwargs),
+        )
+        return first, second, replay_first, replay_duplicate
+
+    first, second, replay_first, replay_duplicate = _run(scenario())
+
+    assert first.selection is not None
+    assert second.selection is not None
+    assert first.selection.inference_id == first.terminal.inference_id
+    assert second.selection.inference_id == second.terminal.inference_id
+    assert first.terminal.logical_invocation_id != second.terminal.logical_invocation_id
+    assert replay_first == first
+    assert replay_duplicate == first
+
+
+def test_concurrent_successful_attempts_keep_first_selection_and_return_its_terminal() -> None:
+    """A later successful attempt is durable, while both deliveries receive the winner."""
+
+    orchestrator, adapter, store = _orchestrator(_success)
+    first_dispatched = asyncio.Event()
+    release_first = asyncio.Event()
+    original_infer = adapter.infer
+    dispatch_count = 0
+
+    async def ordered_infer(
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        nonlocal dispatch_count
+        dispatch_count += 1
+        if dispatch_count == 1:
+            first_dispatched.set()
+            await release_first.wait()
+        return await original_infer(request)
+
+    adapter.infer = ordered_infer  # type: ignore[method-assign]
+    first_kwargs = _request_kwargs()
+    second_kwargs = {
+        **_request_kwargs(),
+        "attempt": 2,
+        "retry_count": 1,
+    }
+
+    async def scenario() -> tuple[OrchestratedAttemptResult, OrchestratedAttemptResult]:
+        first_task = asyncio.create_task(orchestrator.orchestrate_with_selection(**first_kwargs))
+        await first_dispatched.wait()
+        second = await orchestrator.orchestrate_with_selection(**second_kwargs)
+        release_first.set()
+        first = await first_task
+        return first, second
+
+    first, second = _run(scenario())
+
+    assert first.selection is not None
+    assert first == second
+    assert first.selection.inference_id == second.terminal.inference_id
+    assert len(store.list_terminals()) == 2
+    assert {terminal.status for terminal in store.list_terminals()} == {InferenceStatus.SUCCEEDED}
+    assert store.list_selections() == (first.selection,)
+
+
+def test_in_memory_atomic_ledger_rejects_invalid_selection_semantics() -> None:
+    orchestrator, _adapter, store = _orchestrator(_success)
+    accepted = _run(orchestrator.orchestrate_with_selection(**_request_kwargs()))
+    assert accepted.selection is not None
+
+    invalid_candidates = (
+        accepted.selection.model_copy(update={"selection_id": _uuid(999)}),
+        accepted.selection.model_copy(update={"selected_at": "2026-07-18T12:00:00Z"}),
+    )
+    for invalid in invalid_candidates:
+        with pytest.raises(InferenceLedgerError, match="semantically inconsistent"):
+            store.append_terminal_and_selection(accepted.terminal, invalid)
+
+    assert store.list_terminals() == (accepted.terminal,)
+    assert store.list_selections() == (accepted.selection,)
+
+
+def test_typed_handoff_reads_winner_returned_by_atomic_append() -> None:
+    """The typed API reads the selected terminal returned by an atomic race."""
+
+    class _SelectionRaceLedger(InMemoryInferenceLedger):
+        hidden_selection_reads = 0
+
+        def get_selection(self, logical_invocation_id: str, policy_version: str):
+            if self.hidden_selection_reads:
+                self.hidden_selection_reads -= 1
+                return None
+            return super().get_selection(logical_invocation_id, policy_version)
+
+    ledger = _SelectionRaceLedger()
+    orchestrator, adapter, store = _orchestrator(_success, ledger=ledger)
+    winner = _run(orchestrator.orchestrate_with_selection(**_request_kwargs()))
+    assert winner.selection is not None
+
+    # Retry attempts bypass the initial-delivery replay check. Hide the one
+    # pre-append selection lookup so the atomic append returns the existing winner.
+    ledger.hidden_selection_reads = 1
+    loser = _run(
+        orchestrator.orchestrate_with_selection(
+            **{
+                **_request_kwargs(),
+                "attempt": 2,
+                "retry_count": 1,
+            }
+        )
+    )
+
+    assert ledger.hidden_selection_reads == 0
+    assert loser == winner
+    assert loser.selection == winner.selection
+    assert loser.terminal == winner.terminal
+    assert len(store.list_terminals()) == 2
+    assert adapter.infer_calls == 2
 
 
 def test_logical_identity_uses_capability_digest_not_snapshot_row_id() -> None:

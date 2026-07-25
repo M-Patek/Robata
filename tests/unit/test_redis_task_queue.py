@@ -44,4 +44,60 @@ def test_redis_task_queue_operations_fail_closed(
         operation(queue)
 
     assert captured.value.code is TaskQueueErrorCode.ADAPTER_UNAVAILABLE
-    assert str(captured.value) == "RedisTaskQueue is a non-runnable architecture skeleton"
+    assert str(captured.value).startswith("Redis task queue adapter is unavailable:")
+
+
+class _ScriptedRedis:
+    def __init__(self, *responses: list[bytes]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, int, tuple[object, ...]]] = []
+
+    def eval(self, script: str, numkeys: int, *keys_and_args: object) -> list[bytes]:
+        self.calls.append((script, numkeys, keys_and_args))
+        return self._responses.pop(0)
+
+
+def test_redis_task_queue_uses_injected_atomic_client_for_claim_and_completion() -> None:
+    client = _ScriptedRedis(
+        [b"ok", b"task-1"],
+        [
+            b"ok",
+            b"task-1",
+            b"recording-1",
+            b"QA_COARSE",
+            b"cGF5bG9hZA==",
+            b"0",
+            b"2026-07-25T00:00:00.000000Z",
+            b"0",
+            b"3",
+            b"lease-00000000000000000001",
+            b"worker-1",
+            b"1784937630000000",
+        ],
+        [b"ok"],
+    )
+    queue = RedisTaskQueue(client=client, key_prefix="test:queue")
+
+    assert queue.enqueue(_task()) == TaskId("task-1")
+    claimed = queue.claim("worker-1", 30)
+    assert claimed is not None
+    assert claimed.lease_id == LeaseId("lease-00000000000000000001")
+    assert claimed.payload == b"payload"
+    queue.complete(claimed.lease_id, b"result")
+
+    assert len(client.calls) == 3
+    script, numkeys, arguments = client.calls[0]
+    assert "redis.call('TIME')" in script
+    assert numkeys == 1
+    assert arguments[0:4] == ("test:queue", "enqueue", "1000000", "86400")
+    assert client.calls[1][2][1] == "claim"
+    assert client.calls[2][2][1] == "complete"
+
+
+def test_redis_task_queue_maps_atomic_script_errors_to_port_errors() -> None:
+    queue = RedisTaskQueue(client=_ScriptedRedis([b"error", b"DUPLICATE_TASK"]))
+
+    with pytest.raises(TaskQueueError) as captured:
+        queue.enqueue(_task())
+
+    assert captured.value.code is TaskQueueErrorCode.DUPLICATE_TASK

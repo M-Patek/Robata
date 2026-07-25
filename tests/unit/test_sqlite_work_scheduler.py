@@ -10,6 +10,7 @@ import pytest
 
 from robata.adapters.sqlite_work_scheduler import (
     SQLiteWorkScheduler,
+    WorkConflictError,
     WorkFenceError,
     WorkNotFoundError,
 )
@@ -139,6 +140,88 @@ def test_dependency_stays_planned_until_required_upstream_succeeds(
     )
 
     assert scheduler.get(downstream.work_item_id).state is WorkItemState.READY
+
+
+def test_plan_many_is_exact_replay_safe_and_uses_targeted_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3", runtime_observer=recorder)
+    upstream = _plan(70)
+    downstream = _plan(71)
+    dependency = WorkDependency(
+        dependency_id=_uuid(370),
+        downstream_work_item_id=downstream.work_item_id,
+        upstream_work_item_id=upstream.work_item_id,
+        criticality=DependencyCriticality.REQUIRED,
+    )
+
+    def reject_global_planned_scan(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("normal batch planning must not scan every planned work row")
+
+    monkeypatch.setattr(scheduler, "_refresh_planned", reject_global_planned_scan)
+    batch = ((upstream, ()), (downstream, (dependency,)))
+    planned = scheduler.plan_many(batch)
+    replayed = scheduler.plan_many(batch)
+
+    assert tuple(item.state for item in planned) == (
+        WorkItemState.READY,
+        WorkItemState.PLANNED,
+    )
+    assert tuple(item.work_item_id for item in replayed) == (
+        upstream.work_item_id,
+        downstream.work_item_id,
+    )
+
+    claim = scheduler.claim_and_start(
+        "same-process-worker",
+        30,
+        work_item_id=upstream.work_item_id,
+        now=_BASE,
+    )
+    assert claim is not None
+    assert claim.work_item.state is WorkItemState.RUNNING
+    assert scheduler.list_attempts(upstream.work_item_id)[0].started_at == _timestamp(_BASE)
+    scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=1))
+    assert scheduler.get(downstream.work_item_id).state is WorkItemState.READY
+
+    snapshot = recorder.snapshot()
+
+    def transactions_for(operation: str) -> int:
+        return sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.transactions"
+            and any(
+                attribute.name == "operation" and attribute.value == operation
+                for attribute in counter.attributes
+            )
+        )
+
+    assert transactions_for("plan_many") == 2
+    assert transactions_for("claim_and_start") == 1
+    assert transactions_for("start") == 0
+
+
+def test_plan_many_rolls_back_all_members_after_late_dependency_conflict(
+    tmp_path: Path,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    first = _plan(72)
+    invalid = _plan(73)
+    missing_upstream = _uuid(9_999)
+    dependency = WorkDependency(
+        dependency_id=_uuid(371),
+        downstream_work_item_id=invalid.work_item_id,
+        upstream_work_item_id=missing_upstream,
+        criticality=DependencyCriticality.REQUIRED,
+    )
+
+    with pytest.raises(WorkConflictError, match="upstream dependency"):
+        scheduler.plan_many(((first, ()), (invalid, (dependency,))))
+
+    assert scheduler.items_for_run(_RUN_ID) == ()
 
 
 def test_start_and_succeed_avoid_pretransition_reconcile_and_progress_downstream(
@@ -457,6 +540,33 @@ def test_due_maintenance_queries_use_range_indexes(tmp_path: Path) -> None:
     assert any("work_items_due_lease" in detail for detail in lease_plan)
     assert all("SCAN work_items" not in detail for detail in (*expiry_plan, *lease_plan))
     assert all("USE TEMP B-TREE" not in detail for detail in (*expiry_plan, *lease_plan))
+
+
+def test_ready_dispatch_uses_ordered_index_without_a_queue_scan(tmp_path: Path) -> None:
+    scheduler = _scheduler(tmp_path)
+    with connect(scheduler.database_path) as connection:
+        query_plan = tuple(
+            row[3]
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM work_items
+                WHERE state = ?
+                ORDER BY
+                    priority DESC,
+                    CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END,
+                    sla_deadline_at,
+                    created_at,
+                    work_item_id
+                LIMIT 1
+                """,
+                (WorkItemState.READY.value,),
+            )
+        )
+
+    assert any("work_items_dispatch_order" in detail for detail in query_plan)
+    assert all("SCAN work_items" not in detail for detail in query_plan)
+    assert all("USE TEMP B-TREE" not in detail for detail in query_plan)
 
 
 def test_cancel_skip_and_invalidate_are_explicit_terminal_states(

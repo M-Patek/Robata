@@ -19,6 +19,13 @@ from robata.sampling import (
     adaptive_target_plan_semantic_projection,
     resolve_frozen_adaptive_targets,
 )
+from robata.sampling.adaptive import (
+    AdaptiveCoveragePlanner,
+    AdaptiveCoveragePolicy,
+    AdaptiveUpgradeReason,
+    AdaptiveUpgradeRequest,
+    AdaptiveUpgradeTargetRole,
+)
 
 
 def _artifact(
@@ -349,3 +356,340 @@ def test_strict_plan_validation_recomputes_complete_targets_after_rehash() -> No
     for forged_targets in (missing, extra, wrong_lowest_k):
         with pytest.raises(ValidationError, match="complete canonical target set"):
             ResolvedAdaptivePlan.model_validate(_forged_plan_values(plan, forged_targets))
+
+
+def _coverage_policy(
+    *,
+    base_target_budget_per_camera: int = 2,
+    context_offsets_ns: tuple[int, ...] = (-500_000_000, 500_000_000),
+    max_targets_per_camera: int = 5,
+    max_targets_total: int = 30,
+    max_upgrade_requests: int = 1_024,
+) -> AdaptiveCoveragePolicy:
+    return AdaptiveCoveragePolicy(
+        version="adaptive-coverage-v1",
+        base_rate_num=1,
+        base_target_budget_per_camera=base_target_budget_per_camera,
+        context_offsets_ns=context_offsets_ns,
+        max_upgrade_requests=max_upgrade_requests,
+        max_targets_per_camera=max_targets_per_camera,
+        max_targets_total=max_targets_total,
+    )
+
+
+def _coverage_target(
+    plan: object,
+    camera_id: CameraId,
+    target_ns: int,
+) -> object:
+    targets = plan.targets
+    return next(
+        target
+        for target in targets
+        if target.camera_id is camera_id and target.target_ns == target_ns
+    )
+
+
+def test_coverage_planner_reserves_phase_stable_base_budget_for_every_camera() -> None:
+    plan = AdaptiveCoveragePlanner(_coverage_policy(base_target_budget_per_camera=3)).plan(
+        NanosecondInterval(start_ns=0, end_ns=10_000_000_000)
+    )
+
+    assert plan.base_target_count == 18
+    for camera_id in CameraId:
+        assert [
+            target.target_ns
+            for target in plan.targets
+            if target.camera_id is camera_id and target.base_coverage
+        ] == [0, 4_000_000_000, 9_000_000_000]
+    assert len(plan.targets) == 18
+
+
+def test_coverage_planner_bounded_base_selection_skips_extreme_grid_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_enumerated(
+        _grid: SamplingGrid,
+        _start_ns: int,
+        _end_ns: int,
+    ) -> object:
+        raise AssertionError("coverage planner must not enumerate every extreme-rate target")
+
+    monkeypatch.setattr(SamplingGrid, "iter_unique_targets", fail_if_enumerated)
+
+    plan = AdaptiveCoveragePlanner(
+        AdaptiveCoveragePolicy(
+            version="adaptive-coverage-v1",
+            base_rate_num=10**18,
+            base_target_budget_per_camera=2,
+            max_targets_per_camera=2,
+            max_targets_total=12,
+        )
+    ).plan(NanosecondInterval(start_ns=0, end_ns=1_000_000_000))
+
+    assert plan.base_target_count == 12
+    assert len(plan.targets) == 12
+
+
+def test_coverage_planner_preserves_available_unique_targets_on_rounded_high_rate_grid() -> None:
+    plan = AdaptiveCoveragePlanner(
+        AdaptiveCoveragePolicy(
+            version="adaptive-coverage-v1",
+            base_rate_num=2_000_000_000,
+            base_target_budget_per_camera=4,
+            max_targets_per_camera=4,
+            max_targets_total=24,
+        )
+    ).plan(NanosecondInterval(start_ns=0, end_ns=4))
+
+    for camera_id in CameraId:
+        assert [
+            target.target_ns
+            for target in plan.targets
+            if target.camera_id is camera_id and target.base_coverage
+        ] == [0, 1, 2, 3]
+
+
+def test_coverage_planner_caps_base_budget_at_available_unique_targets() -> None:
+    plan = AdaptiveCoveragePlanner(
+        AdaptiveCoveragePolicy(
+            version="adaptive-coverage-v1",
+            base_rate_num=1,
+            base_target_budget_per_camera=3,
+            max_targets_per_camera=3,
+            max_targets_total=18,
+        )
+    ).plan(NanosecondInterval(start_ns=0, end_ns=1))
+
+    assert plan.base_target_count == 6
+    for camera_id in CameraId:
+        assert [
+            target.target_ns
+            for target in plan.targets
+            if target.camera_id is camera_id and target.base_coverage
+        ] == [0]
+
+    high_rate_plan = AdaptiveCoveragePlanner(
+        AdaptiveCoveragePolicy(
+            version="adaptive-coverage-v1",
+            base_rate_num=2_000_000_000,
+            base_target_budget_per_camera=4,
+            max_targets_per_camera=4,
+            max_targets_total=24,
+        )
+    ).plan(NanosecondInterval(start_ns=0, end_ns=2))
+    assert high_rate_plan.base_target_count == 12
+    for camera_id in CameraId:
+        assert [
+            target.target_ns
+            for target in high_rate_plan.targets
+            if target.camera_id is camera_id and target.base_coverage
+        ] == [0, 1]
+
+
+def test_coverage_planner_keeps_trigger_and_pre_post_context_for_all_upgrade_reasons() -> None:
+    interval = NanosecondInterval(start_ns=0, end_ns=2_000_000_000)
+    requests = (
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_01,
+            trigger_timestamp_ns=1_000_000_000,
+            reason=AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL,
+        ),
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_02,
+            trigger_timestamp_ns=1_000_000_000,
+            reason=AdaptiveUpgradeReason.COARSE_UNCERTAINTY,
+        ),
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_03,
+            trigger_timestamp_ns=1_000_000_000,
+            reason=AdaptiveUpgradeReason.CROSS_CAMERA_DISAGREEMENT,
+        ),
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_04,
+            trigger_timestamp_ns=1_000_000_000,
+            reason=AdaptiveUpgradeReason.EVENT_CANDIDATE,
+        ),
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_05,
+            trigger_timestamp_ns=1_000_000_000,
+            reason=AdaptiveUpgradeReason.BOUNDARY_REFINEMENT,
+        ),
+    )
+    planner = AdaptiveCoveragePlanner(_coverage_policy())
+
+    plan = planner.plan(interval, requests)
+    replay = planner.plan(interval, tuple(reversed(requests)))
+
+    assert plan == replay
+    assert plan.base_target_count == 12
+    assert plan.upgrade_coordinate_count == 15
+    assert plan.upgrade_targets_added == 10
+    assert plan.upgrade_coordinates_deduplicated_into_base == 5
+    assert {
+        provenance.reason for target in plan.targets for provenance in target.upgrade_provenance
+    } == set(AdaptiveUpgradeReason)
+
+    original_observation = _coverage_target(plan, CameraId.CAM_01, 1_000_000_000)
+    assert original_observation.base_coverage is True
+    assert original_observation.upgrade_provenance == (original_observation.upgrade_provenance[0],)
+    assert original_observation.upgrade_provenance[0].role is AdaptiveUpgradeTargetRole.TRIGGER
+
+    assert (
+        _coverage_target(
+            plan,
+            CameraId.CAM_01,
+            500_000_000,
+        )
+        .upgrade_provenance[0]
+        .role
+        is AdaptiveUpgradeTargetRole.PRE_CONTEXT
+    )
+    assert (
+        _coverage_target(
+            plan,
+            CameraId.CAM_01,
+            1_500_000_000,
+        )
+        .upgrade_provenance[0]
+        .role
+        is AdaptiveUpgradeTargetRole.POST_CONTEXT
+    )
+
+
+def test_coverage_planner_retains_clipped_edge_context_with_its_original_trigger() -> None:
+    plan = AdaptiveCoveragePlanner(_coverage_policy()).plan(
+        NanosecondInterval(start_ns=0, end_ns=2_000_000_000),
+        (
+            AdaptiveUpgradeRequest(
+                camera_id=CameraId.CAM_01,
+                trigger_timestamp_ns=100_000_000,
+                reason=AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL,
+            ),
+        ),
+    )
+
+    clipped_pre_context = _coverage_target(plan, CameraId.CAM_01, 0).upgrade_provenance[0]
+    assert clipped_pre_context.role is AdaptiveUpgradeTargetRole.PRE_CONTEXT
+    assert clipped_pre_context.trigger_timestamp_ns == 100_000_000
+    assert clipped_pre_context.context_offset_ns == -500_000_000
+    assert clipped_pre_context.context_clipped is True
+
+    trigger = _coverage_target(plan, CameraId.CAM_01, 100_000_000).upgrade_provenance[0]
+    assert trigger.role is AdaptiveUpgradeTargetRole.TRIGGER
+    assert trigger.trigger_timestamp_ns == 100_000_000
+
+
+def test_coverage_planner_prioritizes_triggers_and_reports_per_camera_budget_drops() -> None:
+    plan = AdaptiveCoveragePlanner(
+        _coverage_policy(
+            context_offsets_ns=(-200_000_000, 200_000_000),
+            max_targets_per_camera=3,
+            max_targets_total=18,
+        )
+    ).plan(
+        NanosecondInterval(start_ns=0, end_ns=2_000_000_000),
+        (
+            AdaptiveUpgradeRequest(
+                camera_id=CameraId.CAM_01,
+                trigger_timestamp_ns=500_000_000,
+                reason=AdaptiveUpgradeReason.EVENT_CANDIDATE,
+            ),
+        ),
+    )
+
+    assert plan.upgrade_coordinate_count == 3
+    assert plan.upgrade_targets_added == 1
+    assert plan.dropped_by_per_camera_budget == 2
+    assert plan.dropped_by_total_budget == 0
+    assert (
+        _coverage_target(
+            plan,
+            CameraId.CAM_01,
+            500_000_000,
+        )
+        .upgrade_provenance[0]
+        .role
+        is AdaptiveUpgradeTargetRole.TRIGGER
+    )
+
+
+def test_coverage_planner_applies_total_budget_after_base_and_per_camera_reservations() -> None:
+    plan = AdaptiveCoveragePlanner(
+        _coverage_policy(
+            context_offsets_ns=(-200_000_000, -100_000_000, 100_000_000, 200_000_000),
+            max_targets_per_camera=7,
+            max_targets_total=13,
+        )
+    ).plan(
+        NanosecondInterval(start_ns=0, end_ns=2_000_000_000),
+        (
+            AdaptiveUpgradeRequest(
+                camera_id=CameraId.CAM_01,
+                trigger_timestamp_ns=500_000_000,
+                reason=AdaptiveUpgradeReason.EVENT_CANDIDATE,
+            ),
+        ),
+    )
+
+    assert plan.base_target_count == 12
+    assert plan.upgrade_coordinate_count == 5
+    assert plan.upgrade_targets_added == 1
+    assert plan.dropped_by_per_camera_budget == 0
+    assert plan.dropped_by_total_budget == 4
+    assert (
+        _coverage_target(
+            plan,
+            CameraId.CAM_01,
+            500_000_000,
+        )
+        .upgrade_provenance[0]
+        .role
+        is AdaptiveUpgradeTargetRole.TRIGGER
+    )
+
+
+def test_coverage_planner_rejects_upgrade_input_beyond_its_declared_bound() -> None:
+    planner = AdaptiveCoveragePlanner(_coverage_policy(max_upgrade_requests=1))
+    interval = NanosecondInterval(start_ns=0, end_ns=2_000_000_000)
+    requests = (
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_01,
+            trigger_timestamp_ns=100_000_000,
+            reason=AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL,
+        ),
+        AdaptiveUpgradeRequest(
+            camera_id=CameraId.CAM_02,
+            trigger_timestamp_ns=200_000_000,
+            reason=AdaptiveUpgradeReason.EVENT_CANDIDATE,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="max_upgrade_requests"):
+        planner.plan(interval, requests)
+
+
+def test_coverage_planner_fails_closed_when_budget_would_erase_an_original_trigger() -> None:
+    planner = AdaptiveCoveragePlanner(
+        _coverage_policy(
+            context_offsets_ns=(-100_000_000, 100_000_000),
+            max_targets_total=13,
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot preserve every original upgrade trigger"):
+        planner.plan(
+            NanosecondInterval(start_ns=0, end_ns=2_000_000_000),
+            (
+                AdaptiveUpgradeRequest(
+                    camera_id=CameraId.CAM_01,
+                    trigger_timestamp_ns=500_000_000,
+                    reason=AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL,
+                ),
+                AdaptiveUpgradeRequest(
+                    camera_id=CameraId.CAM_02,
+                    trigger_timestamp_ns=250_000_000,
+                    reason=AdaptiveUpgradeReason.BOUNDARY_REFINEMENT,
+                ),
+            ),
+        )

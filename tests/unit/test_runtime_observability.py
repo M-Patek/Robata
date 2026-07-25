@@ -14,6 +14,7 @@ from robata.runtime.observability import (
     RuntimeProfileSnapshot,
     RuntimeResourceMeasurement,
     RuntimeResourceStatus,
+    RuntimeSpanSnapshot,
     RuntimeSpanStatus,
     runtime_increment,
     runtime_span,
@@ -42,7 +43,7 @@ def _iterator_clock(values: tuple[int, ...]) -> Callable[[], int]:
 
 def test_snapshot_has_deterministic_serialization_shape_and_nesting() -> None:
     wall_clock = _iterator_clock((100, 110, 120, 130, 140, 150))
-    cpu_clock = _iterator_clock((1_000, 1_040))
+    cpu_clock = _iterator_clock((1_000, 1_010, 1_015, 1_020, 1_030, 1_040))
     resource_samples = iter(
         (
             _resources(rss=1_000, read=10, write=20),
@@ -85,6 +86,7 @@ def test_snapshot_has_deterministic_serialization_shape_and_nesting() -> None:
                 "started_offset_ns": 10,
                 "ended_offset_ns": 40,
                 "elapsed_ns": 30,
+                "process_cpu_ns": 20,
             },
             {
                 "sequence": 2,
@@ -96,6 +98,7 @@ def test_snapshot_has_deterministic_serialization_shape_and_nesting() -> None:
                 "started_offset_ns": 20,
                 "ended_offset_ns": 30,
                 "elapsed_ns": 10,
+                "process_cpu_ns": 5,
             },
         ],
         "counters": [
@@ -106,6 +109,43 @@ def test_snapshot_has_deterministic_serialization_shape_and_nesting() -> None:
             }
         ],
     }
+
+
+def test_span_process_cpu_defaults_for_legacy_construction() -> None:
+    span = RuntimeSpanSnapshot(
+        sequence=1,
+        name="legacy",
+        status=RuntimeSpanStatus.OK,
+        started_offset_ns=10,
+        ended_offset_ns=20,
+        elapsed_ns=10,
+    )
+
+    assert span.process_cpu_ns is None
+
+
+def test_snapshot_synthesizes_active_span_process_cpu_duration() -> None:
+    wall_clock = _iterator_clock((100, 110, 120))
+    cpu_clock = _iterator_clock((1_000, 1_010, 1_025))
+    unsupported = RuntimeResourceMeasurement(status=RuntimeResourceStatus.UNSUPPORTED)
+    sample = ProcessResourceSample(
+        rss_bytes=unsupported,
+        read_bytes=unsupported,
+        write_bytes=unsupported,
+    )
+    recorder = RuntimeProfileRecorder(
+        clock_ns=wall_clock,
+        process_cpu_clock_ns=cpu_clock,
+        resource_sampler=lambda: sample,
+    )
+
+    recorder.begin_span("active")
+    snapshot = recorder.snapshot()
+
+    assert snapshot.process_cpu_ns == 25
+    assert snapshot.spans[0].status is RuntimeSpanStatus.ERROR
+    assert snapshot.spans[0].error_type == "RuntimeProfileSnapshotWhileSpanActive"
+    assert snapshot.spans[0].process_cpu_ns == 15
 
 
 def test_runtime_span_records_error_type_only_and_rethrows() -> None:

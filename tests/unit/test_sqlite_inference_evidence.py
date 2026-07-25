@@ -101,6 +101,124 @@ def test_initialization_observes_exact_transaction_boundaries(tmp_path: Path) ->
     assert sum(span.name == "sqlite.inference_evidence.transaction" for span in snapshot.spans) == 2
 
 
+def test_ledger_reuses_one_owned_connection_until_closed(tmp_path: Path) -> None:
+    recorder = RuntimeProfileRecorder()
+    ledger = SQLiteInferenceEvidenceLedger(
+        _database(tmp_path),
+        SchemaRegistry(),
+        runtime_observer=recorder,
+    )
+    connection = ledger._connection
+    assert connection is not None
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    _fixture, intent, _raw_data = _intent()
+
+    assert ledger.append_intent(intent) == intent
+    assert ledger.get_intent(intent.inference_id) == intent
+    assert ledger._connection is connection
+    snapshot = recorder.snapshot()
+    assert sum(
+        counter.value
+        for counter in snapshot.counters
+        if counter.name == "sqlite.inference_evidence.connections"
+    ) == 1
+
+    ledger.close()
+    ledger.close()
+    with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="ledger is closed"):
+        ledger.get_intent(intent.inference_id)
+
+
+def test_owned_connection_serializes_cross_thread_calls(tmp_path: Path) -> None:
+    ledger = SQLiteInferenceEvidenceLedger(_database(tmp_path), SchemaRegistry())
+    _first_fixture, first, _first_raw_data = _intent(identity_offset=1)
+    _second_fixture, second, _second_raw_data = _intent(identity_offset=2)
+    barrier = Barrier(2)
+
+    def append(intent: InferenceIntent) -> InferenceIntent:
+        barrier.wait(timeout=5)
+        return ledger.append_intent(intent)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert tuple(pool.map(append, (first, second))) == (first, second)
+        assert ledger.get_intent(first.inference_id) == first
+        assert ledger.get_intent(second.inference_id) == second
+    finally:
+        ledger.close()
+
+
+def test_write_cache_avoids_dependency_readback_and_hot_getters_invalidate(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    _fixture, intent, raw_data = _intent()
+    ledger.append_intent(intent)
+    connection = ledger._connection
+    assert connection is not None
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    external: SQLiteInferenceEvidenceLedger | None = None
+    try:
+        ledger.append(
+            request_id=intent.request_id,
+            provider_request_id="cache-readback-provider",
+            data=raw_data,
+        )
+        assert not any(
+            "SELECT * FROM INFERENCE_INTENTS WHERE INFERENCE_ID =" in statement.upper()
+            for statement in statements
+        )
+
+        statements.clear()
+        assert ledger.get_intent(intent.inference_id) == intent
+        assert not any(
+            "SELECT * FROM INFERENCE_INTENTS WHERE INFERENCE_ID =" in statement.upper()
+            for statement in statements
+        )
+
+        _other_fixture, other, _other_raw_data = _intent(identity_offset=1)
+        external = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+        assert external.append_intent(other) == other
+        statements.clear()
+        assert ledger.get_intent(intent.inference_id) == intent
+        assert any(
+            "SELECT * FROM INFERENCE_INTENTS WHERE INFERENCE_ID =" in statement.upper()
+            for statement in statements
+        )
+    finally:
+        connection.set_trace_callback(None)
+        if external is not None:
+            external.close()
+        ledger.close()
+
+
+def test_cached_getters_return_defensive_copies(tmp_path: Path) -> None:
+    ledger = SQLiteInferenceEvidenceLedger(_database(tmp_path), SchemaRegistry())
+    _fixture, intent, raw_data = _intent()
+    try:
+        assert ledger.append_intent(intent) == intent
+        returned_intent = ledger.get_intent(intent.inference_id)
+        assert returned_intent is not None
+        assert returned_intent is not ledger.get_intent(intent.inference_id)
+        # Strict Pydantic models are frozen at the top level, but their nested
+        # JSON-shaped mapping remains mutable. Mutating a caller-owned result
+        # must not alter the cache used by future reads or idempotent appends.
+        returned_intent.input_config["input_images"] = 999
+        assert ledger.get_intent(intent.inference_id) == intent
+        assert ledger.append_intent(intent) == intent
+
+        stored = ledger.append(
+            request_id=intent.request_id,
+            provider_request_id="defensive-copy-provider",
+            data=raw_data,
+        )
+        assert ledger.get(stored.artifact_id) is not ledger.get(stored.artifact_id)
+    finally:
+        ledger.close()
+
+
 @dataclass(frozen=True)
 class _Evidence:
     intent: InferenceIntent
@@ -380,6 +498,61 @@ def _persist_chain(ledger: SQLiteInferenceEvidenceLedger) -> _Evidence:
     ledger.append_selected_output(evidence.selected)
     ledger.append_enriched_output(evidence.enriched)
     return evidence
+
+
+def test_sixteen_batched_calls_stay_within_p3_ledger_budget(tmp_path: Path) -> None:
+    """P3 keeps 16 complete evidence calls within the ledger I/O envelope."""
+
+    recorder = RuntimeProfileRecorder()
+    ledger = SQLiteInferenceEvidenceLedger(
+        _database(tmp_path),
+        SchemaRegistry(),
+        runtime_observer=recorder,
+    )
+    try:
+        for identity_offset in range(16):
+            fixture, intent, raw_data = _intent(identity_offset=identity_offset)
+            assert ledger.append_intent(intent) == intent
+            stored = ledger.append(
+                request_id=intent.request_id,
+                provider_request_id=f"offline:{intent.request_id}",
+                data=raw_data,
+            )
+            evidence = _build_after_raw(
+                fixture,
+                intent,
+                raw_data,
+                stored.artifact_id,
+                stored.provider_request_id,
+                identity_offset=identity_offset,
+            )
+            assert ledger.append_terminal_and_selection(
+                evidence.terminal,
+                evidence.selection,
+            ) == (evidence.terminal, evidence.selection)
+            assert ledger.append_accepted_lineage(
+                evidence.parsed,
+                evidence.selected,
+                evidence.enriched,
+            ) == (evidence.parsed, evidence.selected, evidence.enriched)
+
+        snapshot = recorder.snapshot()
+        connection_count = sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.inference_evidence.connections"
+        )
+        transaction_count = sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.inference_evidence.transactions"
+        )
+        # Two initialization scopes plus one durable checkpoint for each phase:
+        # intent, raw bytes, terminal/selection, and accepted lineage.
+        assert connection_count <= 12
+        assert transaction_count <= 80
+    finally:
+        ledger.close()
 
 
 def test_restart_preserves_complete_selected_evidence_chain(tmp_path: Path) -> None:
@@ -713,6 +886,106 @@ def test_conflicting_intent_is_rejected_without_mutation(tmp_path: Path) -> None
     with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="conflicting intent"):
         ledger.append_intent(conflicting)
     assert ledger.get_intent(intent.inference_id) == intent
+
+
+def test_combined_terminal_selection_keeps_first_winner_and_later_terminal(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    winner_ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    loser_ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    first_fixture, first_intent, first_raw_data = _intent()
+    second_fixture, second_intent, second_raw_data = _intent(
+        identity_offset=1_000,
+        logical_invocation_id=first_intent.logical_invocation_id,
+        attempt=2,
+    )
+    third_fixture, third_intent, third_raw_data = _intent(
+        identity_offset=2_000,
+        logical_invocation_id=first_intent.logical_invocation_id,
+        attempt=3,
+    )
+
+    def prepare_attempt(
+        ledger: SQLiteInferenceEvidenceLedger,
+        fixture: _EnrichmentFixture,
+        intent: InferenceIntent,
+        raw_data: bytes,
+        *,
+        identity_offset: int,
+    ) -> _Evidence:
+        ledger.append_intent(intent)
+        stored = ledger.append(
+            request_id=intent.request_id,
+            provider_request_id=f"winner-race:{intent.request_id}",
+            data=raw_data,
+        )
+        return _build_after_raw(
+            fixture,
+            intent,
+            raw_data,
+            stored.artifact_id,
+            stored.provider_request_id,
+            identity_offset=identity_offset,
+        )
+
+    try:
+        first = prepare_attempt(
+            winner_ledger,
+            first_fixture,
+            first_intent,
+            first_raw_data,
+            identity_offset=0,
+        )
+        second = prepare_attempt(
+            loser_ledger,
+            second_fixture,
+            second_intent,
+            second_raw_data,
+            identity_offset=1_000,
+        )
+        assert first.selection != second.selection
+
+        assert winner_ledger.append_terminal_and_selection(
+            first.terminal,
+            first.selection,
+        ) == (first.terminal, first.selection)
+        # The loser ledger starts this operation with a stale cache. Its retry must
+        # preserve the already-durable winner while committing the other terminal.
+        assert loser_ledger.append_terminal_and_selection(
+            second.terminal,
+            second.selection,
+        ) == (second.terminal, first.selection)
+
+        assert winner_ledger.get_terminal(second.terminal.inference_id) == second.terminal
+        assert (
+            loser_ledger.get_selection(
+                first.selection.logical_invocation_id,
+                first.selection.policy_version,
+            )
+            == first.selection
+        )
+        with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="different selected attempt"):
+            loser_ledger.append_selection(second.selection)
+
+        third = prepare_attempt(
+            loser_ledger,
+            third_fixture,
+            third_intent,
+            third_raw_data,
+            identity_offset=2_000,
+        )
+        # The candidate selection is valid for the second terminal but not the
+        # third. The combined operation must roll back that mismatched terminal.
+        with pytest.raises(
+            SQLiteInferenceEvidenceLedgerError,
+            match="candidate terminal attempt",
+        ):
+            loser_ledger.append_terminal_and_selection(third.terminal, second.selection)
+        assert loser_ledger.get_terminal(third.terminal.inference_id) is None
+    finally:
+        loser_ledger.close()
+        winner_ledger.close()
 
 
 def test_concurrent_conflicting_raw_appends_have_one_durable_winner(tmp_path: Path) -> None:
@@ -1115,6 +1388,78 @@ def test_crud_uses_targeted_validation_until_explicit_full_audit(
 
     monkeypatch.setattr(ledger, "_load_state", original_load_state)
     ledger.verify_integrity()
+
+
+def test_completion_seal_uses_current_incremental_cache_without_full_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = SQLiteInferenceEvidenceLedger(_database(tmp_path), SchemaRegistry())
+    try:
+        _persist_chain(ledger)
+
+        def unexpected_full_load(_connection: sqlite3.Connection) -> None:
+            raise AssertionError("completion seal must not scan the full evidence graph")
+
+        monkeypatch.setattr(ledger, "_load_state", unexpected_full_load)
+
+        ledger.verify_completion_seal()
+    finally:
+        ledger.close()
+
+
+def test_completion_seal_fails_closed_after_external_database_change(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    try:
+        connection = sqlite3.connect(database)
+        try:
+            # This is an external committed database change. The owned ledger
+            # connection must observe it through PRAGMA data_version rather than
+            # silently refreshing its incrementally validated cache.
+            connection.execute("PRAGMA user_version = 999")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with pytest.raises(SQLiteInferenceEvidenceLedgerError, match="seal is stale"):
+            ledger.verify_completion_seal()
+    finally:
+        ledger.close()
+
+
+def test_full_integrity_audit_remains_available_after_completion_seal(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    ledger = SQLiteInferenceEvidenceLedger(database, SchemaRegistry())
+    evidence = _persist_chain(ledger)
+    try:
+        ledger.verify_completion_seal()
+        connection = sqlite3.connect(database)
+        try:
+            trigger_sql = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name = 'enriched_provider_outputs_no_update'"
+            ).fetchone()[0]
+            connection.execute("DROP TRIGGER enriched_provider_outputs_no_update")
+            connection.execute(
+                "UPDATE enriched_provider_outputs SET semantic_sha256 = ? WHERE artifact_id = ?",
+                (_digest(99_998), evidence.enriched.artifact_id),
+            )
+            connection.execute(trigger_sql)
+            connection.commit()
+        finally:
+            connection.close()
+
+        with pytest.raises(
+            SQLiteInferenceEvidenceLedgerError,
+            match="indexed column semantic_sha256",
+        ):
+            ledger.verify_integrity()
+    finally:
+        ledger.close()
 
 
 def test_hot_reads_defer_registered_schema_validation_to_full_audit(
