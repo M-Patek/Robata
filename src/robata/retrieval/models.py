@@ -1,6 +1,5 @@
 """Retrieval models for structured event and clip queries.
 
-Implements the retrieval contract from ARCHITECTURE_DESIGN_V1.md Section 16.5.
 All models inherit StrictModel (frozen=True, extra="forbid", strict=True).
 """
 

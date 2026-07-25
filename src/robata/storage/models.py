@@ -1,7 +1,4 @@
-"""Database storage models using SQLAlchemy 2.0 declarative syntax.
-
-Implements the core tables from ARCHITECTURE_DESIGN_V1.md Section 16.
-"""
+"""Database storage models using SQLAlchemy 2.0 declarative syntax."""
 
 from __future__ import annotations
 
