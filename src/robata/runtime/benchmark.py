@@ -387,6 +387,42 @@ class RecordingWorkerQueueObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordingWorkerConcurrency:
+    """Explicit stage concurrency used by one recording-worker observation.
+
+    A worker matrix is useful only when the shared limits are visible. Keeping
+    media, provider, completion, and outbox pools separate prevents a report
+    from attributing a provider bottleneck to recording workers. ``None`` on
+    :class:`MeasuredRecordingWorkerRun` means the caller did not instrument
+    this boundary; it is never represented as zero.
+    """
+
+    media_worker_count: int
+    provider_worker_count: int
+    completion_worker_count: int
+    outbox_worker_count: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "media_worker_count",
+            "provider_worker_count",
+            "completion_worker_count",
+            "outbox_worker_count",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer")
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "media_worker_count": self.media_worker_count,
+            "provider_worker_count": self.provider_worker_count,
+            "completion_worker_count": self.completion_worker_count,
+            "outbox_worker_count": self.outbox_worker_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RecordingWorkerBatchFacts:
     """Queue, completion, cancellation, and state-affinity facts from a real batch."""
 
@@ -398,6 +434,12 @@ class RecordingWorkerBatchFacts:
     state_affinity_violation_count: int
     queues: tuple[RecordingWorkerQueueObservation, ...]
     named_shared_resource_limit: str | None = None
+    admission_rejection_count: int = 0
+    lease_recovery_count: int = 0
+    lease_recovery_succeeded_count: int = 0
+    optional_work_offered_count: int = 0
+    optional_work_shed_count: int = 0
+    optional_work_shedding_actions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -407,6 +449,11 @@ class RecordingWorkerBatchFacts:
             "replay_verified_recording_count",
             "distinct_state_root_count",
             "state_affinity_violation_count",
+            "admission_rejection_count",
+            "lease_recovery_count",
+            "lease_recovery_succeeded_count",
+            "optional_work_offered_count",
+            "optional_work_shed_count",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -423,6 +470,25 @@ class RecordingWorkerBatchFacts:
             or not self.named_shared_resource_limit.strip()
         ):
             raise ValueError("named_shared_resource_limit must be nonempty or None")
+        if not isinstance(self.optional_work_shedding_actions, tuple):
+            raise TypeError("optional_work_shedding_actions must be a tuple")
+        if any(
+            not isinstance(action, str) or not action.strip()
+            for action in self.optional_work_shedding_actions
+        ):
+            raise ValueError("optional_work_shedding_actions must contain nonempty strings")
+        if len(set(self.optional_work_shedding_actions)) != len(
+            self.optional_work_shedding_actions
+        ):
+            raise ValueError("optional_work_shedding_actions must be unique")
+        if self.lease_recovery_succeeded_count > self.lease_recovery_count:
+            raise ValueError("lease recovery successes cannot exceed recovery attempts")
+        if self.optional_work_shed_count > self.optional_work_offered_count:
+            raise ValueError("optional work shed cannot exceed optional work offered")
+        if self.optional_work_shed_count and not self.optional_work_shedding_actions:
+            raise ValueError("optional work shedding requires at least one named action")
+        if not self.optional_work_shed_count and self.optional_work_shedding_actions:
+            raise ValueError("optional shedding actions require shed work")
 
     @property
     def queues_bounded(self) -> bool:
@@ -472,6 +538,64 @@ class RecordingWorkerBatchFacts:
             == self.cancelled_recording_count
         )
 
+    @property
+    def lease_recovery_reconciled(self) -> bool:
+        """Whether every observed lease recovery attempt reached a terminal proof."""
+
+        return self.lease_recovery_succeeded_count == self.lease_recovery_count
+
+    @property
+    def optional_work_admitted_count(self) -> int:
+        return self.optional_work_offered_count - self.optional_work_shed_count
+
+    @property
+    def optional_work_shed_fraction(self) -> float | None:
+        if self.optional_work_offered_count == 0:
+            return None
+        return self.optional_work_shed_count / self.optional_work_offered_count
+
+    @property
+    def backlog_peak(self) -> int:
+        """Aggregate queue high-water mark for this finite batch."""
+
+        return sum(queue.high_watermark for queue in self.queues)
+
+    @property
+    def backlog_end(self) -> int:
+        """Aggregate residual queue depth at the observation cutoff."""
+
+        return sum(queue.end_depth for queue in self.queues)
+
+    @property
+    def backpressure_event_count(self) -> int:
+        return sum(queue.backpressure_event_count for queue in self.queues)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "successful_recording_count": self.successful_recording_count,
+            "failed_recording_count": self.failed_recording_count,
+            "cancelled_recording_count": self.cancelled_recording_count,
+            "replay_verified_recording_count": self.replay_verified_recording_count,
+            "distinct_state_root_count": self.distinct_state_root_count,
+            "state_affinity_violation_count": self.state_affinity_violation_count,
+            "admission_rejection_count": self.admission_rejection_count,
+            "lease_recovery_count": self.lease_recovery_count,
+            "lease_recovery_succeeded_count": self.lease_recovery_succeeded_count,
+            "lease_recovery_reconciled": self.lease_recovery_reconciled,
+            "optional_work_offered_count": self.optional_work_offered_count,
+            "optional_work_admitted_count": self.optional_work_admitted_count,
+            "optional_work_shed_count": self.optional_work_shed_count,
+            "optional_work_shed_fraction": self.optional_work_shed_fraction,
+            "optional_work_shedding_actions": list(self.optional_work_shedding_actions),
+            "backlog_peak": self.backlog_peak,
+            "backlog_end": self.backlog_end,
+            "backpressure_event_count": self.backpressure_event_count,
+            "named_shared_resource_limit": self.named_shared_resource_limit,
+            "queues_bounded": self.queues_bounded,
+            "backlog_drained": self.backlog_drained,
+            "queues": [queue.as_dict() for queue in self.queues],
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class MeasuredRecordingWorkerRun:
@@ -491,6 +615,7 @@ class MeasuredRecordingWorkerRun:
     camera_count: int = 6
     provider_mode: ProviderMode = ProviderMode.LOCAL_OFFLINE_FIXTURE
     execution_mode: str = "FRESH"
+    concurrency: RecordingWorkerConcurrency | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workload_id, str) or not self.workload_id:
@@ -511,6 +636,11 @@ class MeasuredRecordingWorkerRun:
             raise TypeError("provider_mode must be ProviderMode")
         if self.execution_mode not in {"FRESH", "REPLAY", "UNKNOWN"}:
             raise ValueError("execution_mode must be FRESH, REPLAY, or UNKNOWN")
+        if self.concurrency is not None and not isinstance(
+            self.concurrency,
+            RecordingWorkerConcurrency,
+        ):
+            raise TypeError("concurrency must be RecordingWorkerConcurrency or None")
         if (
             self.facts.successful_recording_count
             + self.facts.failed_recording_count
@@ -572,7 +702,20 @@ class MeasuredRecordingWorkerRun:
             and self.facts.queues_bounded
             and self.facts.burst_backpressure_drained
             and self.facts.cancellation_restart_replayable
+            and self.facts.lease_recovery_reconciled
         )
+
+    @property
+    def backlog_peak(self) -> int:
+        return self.facts.backlog_peak
+
+    @property
+    def backlog_end(self) -> int:
+        return self.facts.backlog_end
+
+    @property
+    def optional_work_shed_fraction(self) -> float | None:
+        return self.facts.optional_work_shed_fraction
 
     def as_dict(self, *, throughput_ratio: float) -> dict[str, object]:
         return {
@@ -602,7 +745,24 @@ class MeasuredRecordingWorkerRun:
             "backlog_drained": self.facts.backlog_drained,
             "burst_backpressure_drained": self.facts.burst_backpressure_drained,
             "cancellation_restart_replayable": self.facts.cancellation_restart_replayable,
+            "backlog_peak": self.backlog_peak,
+            "backlog_end": self.backlog_end,
+            "backpressure_event_count": self.facts.backpressure_event_count,
+            "admission_rejection_count": self.facts.admission_rejection_count,
+            "lease_recovery_count": self.facts.lease_recovery_count,
+            "lease_recovery_succeeded_count": self.facts.lease_recovery_succeeded_count,
+            "lease_recovery_reconciled": self.facts.lease_recovery_reconciled,
+            "optional_work_offered_count": self.facts.optional_work_offered_count,
+            "optional_work_admitted_count": self.facts.optional_work_admitted_count,
+            "optional_work_shed_count": self.facts.optional_work_shed_count,
+            "optional_work_shed_fraction": self.optional_work_shed_fraction,
+            "optional_work_shedding_actions": list(
+                self.facts.optional_work_shedding_actions
+            ),
             "named_shared_resource_limit": self.facts.named_shared_resource_limit,
+            "concurrency": (
+                None if self.concurrency is None else self.concurrency.as_dict()
+            ),
             "queues": [queue.as_dict() for queue in self.facts.queues],
         }
 
@@ -865,6 +1025,69 @@ class MeasuredRecordingWorkerScalingReport:
         return all(run.facts.cancellation_restart_replayable for run in self.runs)
 
     @property
+    def lease_recovery_reconciled(self) -> bool:
+        return all(run.facts.lease_recovery_reconciled for run in self.runs)
+
+    @property
+    def backlog_peak(self) -> int:
+        """Largest aggregate queue backlog observed at any worker point."""
+
+        return max(run.backlog_peak for run in self.runs)
+
+    @property
+    def backlog_end(self) -> int:
+        """Largest residual aggregate queue depth across worker points."""
+
+        return max(run.backlog_end for run in self.runs)
+
+    @property
+    def backpressure_event_count(self) -> int:
+        return sum(run.facts.backpressure_event_count for run in self.runs)
+
+    @property
+    def admission_rejection_count(self) -> int:
+        return sum(run.facts.admission_rejection_count for run in self.runs)
+
+    @property
+    def lease_recovery_count(self) -> int:
+        return sum(run.facts.lease_recovery_count for run in self.runs)
+
+    @property
+    def lease_recovery_succeeded_count(self) -> int:
+        return sum(run.facts.lease_recovery_succeeded_count for run in self.runs)
+
+    @property
+    def optional_work_offered_count(self) -> int:
+        return sum(run.facts.optional_work_offered_count for run in self.runs)
+
+    @property
+    def optional_work_shed_count(self) -> int:
+        return sum(run.facts.optional_work_shed_count for run in self.runs)
+
+    @property
+    def optional_work_shed_fraction(self) -> float | None:
+        offered = self.optional_work_offered_count
+        if offered == 0:
+            return None
+        return self.optional_work_shed_count / offered
+
+    @property
+    def optional_work_shedding_actions(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    action
+                    for run in self.runs
+                    for action in run.facts.optional_work_shedding_actions
+                }
+            )
+        )
+
+    @property
+    def stage_concurrency_observed(self) -> bool:
+        return all(run.concurrency is not None for run in self.runs)
+
+    @property
     def evidence_class(self) -> str:
         return "LOCAL_CONFORMANCE"
 
@@ -904,6 +1127,18 @@ class MeasuredRecordingWorkerScalingReport:
             "ingress_backpressure_observed": self.ingress_backpressure_observed,
             "backlog_drains_after_burst": self.backlog_drains_after_burst,
             "cancellation_restart_replayable": self.cancellation_restart_replayable,
+            "lease_recovery_reconciled": self.lease_recovery_reconciled,
+            "backlog_peak": self.backlog_peak,
+            "backlog_end": self.backlog_end,
+            "backpressure_event_count": self.backpressure_event_count,
+            "admission_rejection_count": self.admission_rejection_count,
+            "lease_recovery_count": self.lease_recovery_count,
+            "lease_recovery_succeeded_count": self.lease_recovery_succeeded_count,
+            "optional_work_offered_count": self.optional_work_offered_count,
+            "optional_work_shed_count": self.optional_work_shed_count,
+            "optional_work_shed_fraction": self.optional_work_shed_fraction,
+            "optional_work_shedding_actions": list(self.optional_work_shedding_actions),
+            "stage_concurrency_observed": self.stage_concurrency_observed,
             "capacity_projection": (
                 None if self.capacity_projection is None else self.capacity_projection.as_dict()
             ),
@@ -927,6 +1162,7 @@ def measure_recording_worker_batch(
     camera_count: int = 6,
     provider_mode: ProviderMode = ProviderMode.LOCAL_OFFLINE_FIXTURE,
     execution_mode: str = "FRESH",
+    concurrency: RecordingWorkerConcurrency | None = None,
     clock_ns: Callable[[], int] = time.perf_counter_ns,
 ) -> MeasuredRecordingWorkerRun:
     """Time one real finite worker batch and preserve its topology/recovery facts."""
@@ -948,6 +1184,7 @@ def measure_recording_worker_batch(
         camera_count=camera_count,
         provider_mode=provider_mode,
         execution_mode=execution_mode,
+        concurrency=concurrency,
     )
 
 
@@ -999,6 +1236,7 @@ def run_measured_recording_worker_matrix(
     camera_count: int = 6,
     provider_mode: ProviderMode = ProviderMode.LOCAL_OFFLINE_FIXTURE,
     execution_mode: str = "FRESH",
+    concurrency_factory: Callable[[int], RecordingWorkerConcurrency] | None = None,
     target_recording_rtf: float = 25.0,
     clock_ns: Callable[[], int] = time.perf_counter_ns,
 ) -> MeasuredRecordingWorkerScalingReport:
@@ -1010,6 +1248,8 @@ def run_measured_recording_worker_matrix(
 
     if not callable(workload_factory):
         raise TypeError("workload_factory must be callable")
+    if concurrency_factory is not None and not callable(concurrency_factory):
+        raise TypeError("concurrency_factory must be callable or None")
     if not isinstance(worker_counts, tuple) or not worker_counts:
         raise ValueError("worker_counts must be a nonempty tuple")
     if worker_counts != tuple(sorted(set(worker_counts))):
@@ -1030,6 +1270,11 @@ def run_measured_recording_worker_matrix(
                 camera_count=camera_count,
                 provider_mode=provider_mode,
                 execution_mode=execution_mode,
+                concurrency=(
+                    None
+                    if concurrency_factory is None
+                    else concurrency_factory(worker_count)
+                ),
                 clock_ns=clock_ns,
             )
             for worker_count in worker_counts
@@ -1044,6 +1289,7 @@ __all__ = [
     "MeasuredRecordingWorkerRun",
     "MeasuredRecordingWorkerScalingReport",
     "RecordingWorkerBatchFacts",
+    "RecordingWorkerConcurrency",
     "RecordingWorkerQueueObservation",
     "ResourceSample",
     "ThroughputSample",

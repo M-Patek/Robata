@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from enum import StrEnum
 from threading import RLock
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -23,6 +23,7 @@ from robata.inference.adapter import (
     ProviderQualificationRequestContract,
     ProviderQualificationSession,
 )
+from robata.inference.models import ModelCapabilities
 from robata.inference.runpod import (
     RunPodDeploymentConfiguration,
     RunPodEndpointConfig,
@@ -112,6 +113,7 @@ class TwoH100ProviderConfiguration(StrictModel):
     max_images_per_request: PositiveInt
     max_input_tokens: PositiveInt
     max_output_tokens: PositiveInt
+    native_batch_enabled: bool = False
     native_batch_max_size: PositiveInt
     max_concurrent_requests: PositiveInt
     endpoint_configuration: RunPodEndpointConfig
@@ -121,9 +123,10 @@ class TwoH100ProviderConfiguration(StrictModel):
 
     @classmethod
     def create(cls, **values: object) -> Self:
+        # The configuration digest is derived from the canonical projection.
         if "configuration_digest" in values:
             raise ValueError("configuration_digest is derived")
-        draft = cls.model_construct(**{**values, "configuration_digest": "0" * 64})
+        draft = cls.model_construct(**cast(Any, {**values, "configuration_digest": "0" * 64}))
         digest = exact_bytes_sha256(
             canonical_json_bytes(draft.model_dump(mode="json", exclude={"configuration_digest"}))
         )
@@ -140,7 +143,6 @@ class TwoH100ProviderConfiguration(StrictModel):
     ) -> None:
         """Reject a report configuration that does not match the active adapter."""
 
-        from robata.inference.models import ModelCapabilities
 
         if not isinstance(endpoint_config, RunPodEndpointConfig):
             raise TypeError("endpoint_config must be a RunPodEndpointConfig")
@@ -148,6 +150,10 @@ class TwoH100ProviderConfiguration(StrictModel):
             raise TypeError("capabilities must be a ModelCapabilities")
         if not isinstance(retry_policy, RunPodRetryPolicy):
             raise TypeError("retry_policy must be a RunPodRetryPolicy")
+        if endpoint_config.native_batch_enabled != self.native_batch_enabled:
+            raise ValueError(
+                "RunPod native batch enablement does not match qualification configuration"
+            )
         if endpoint_config != self.endpoint_configuration:
             raise ValueError(
                 "RunPod endpoint configuration does not match qualification configuration"
@@ -209,8 +215,7 @@ class TwoH100ProviderConfiguration(StrictModel):
         if len(set(request_contract_identities)) != len(request_contract_identities):
             raise ValueError("qualification request contracts must be unique")
         if any(
-            contract.max_input_tokens > self.max_input_tokens
-            for contract in self.request_contracts
+            contract.max_input_tokens > self.max_input_tokens for contract in self.request_contracts
         ):
             raise ValueError("qualification prompt context exceeds the configured input limit")
         if any(
@@ -222,6 +227,7 @@ class TwoH100ProviderConfiguration(StrictModel):
         deployment = endpoint.deployment_configuration
         if (
             endpoint.provider != self.provider
+            or endpoint.native_batch_enabled != self.native_batch_enabled
             or endpoint.native_batch_max_size != self.native_batch_max_size
             or endpoint.max_concurrent_requests != self.max_concurrent_requests
             or deployment is None
@@ -241,6 +247,7 @@ class TwoH100ProviderConfiguration(StrictModel):
         if self.configuration_digest != expected:
             raise ValueError("configuration_digest does not match configuration")
         return self
+
 
 class ProviderGpuMeasurement(StrictModel):
     """Externally exported H100 telemetry tied to one qualification session."""
@@ -411,12 +418,8 @@ class ProviderRuntimeTelemetry(StrictModel):
             for sample in accepted_samples
             if sample.time_to_first_token_ms is not None
         )
-        input_known_response_count = sum(
-            sample.input_tokens_known for sample in final_samples
-        )
-        usage_known_response_count = sum(
-            sample.output_tokens_known for sample in final_samples
-        )
+        input_known_response_count = sum(sample.input_tokens_known for sample in final_samples)
+        usage_known_response_count = sum(sample.output_tokens_known for sample in final_samples)
         input_known_attempt_count = sum(sample.input_tokens_known for sample in samples)
         usage_known_attempt_count = sum(sample.output_tokens_known for sample in samples)
         return cls(
@@ -481,15 +484,9 @@ class ProviderRuntimeTelemetry(StrictModel):
             raise ValueError("known input-token attempts exceed provider attempts")
         if self.usage_known_attempt_count > attempts:
             raise ValueError("known output-token attempts exceed provider attempts")
-        if (
-            self.adapter_terminal_workload.input_token_responses
-            != self.input_known_attempt_count
-        ):
+        if self.adapter_terminal_workload.input_token_responses != self.input_known_attempt_count:
             raise ValueError("workload input-token attempts must match provider observations")
-        if (
-            self.adapter_terminal_workload.output_token_responses
-            != self.usage_known_attempt_count
-        ):
+        if self.adapter_terminal_workload.output_token_responses != self.usage_known_attempt_count:
             raise ValueError("workload output-token attempts must match provider observations")
         if self.adapter_terminal_workload.call_parts != self.terminal_response_count:
             raise ValueError("workload call parts must match terminal provider responses")
@@ -506,6 +503,7 @@ class ProviderRuntimeTelemetry(StrictModel):
         if self.end_to_end.count != self.terminal_response_count:
             raise ValueError("end-to-end samples must match terminal provider responses")
         return self
+
 
 class ProviderSaturationPoint(StrictModel):
     """One sealed session at one offered-concurrency point of the adaptive workload."""
@@ -538,36 +536,47 @@ class ProviderSaturationPoint(StrictModel):
             )
         if self.capacity.recording_hours is None or self.capacity.recording_hours <= 0:
             raise ValueError("saturation points require recording-hour denominators")
+        provider_images = self.capacity.provider_images
+        logical_calls = self.capacity.logical_calls
+        http_requests = self.capacity.http_requests
+        input_tokens = self.capacity.input_tokens
+        output_tokens = self.capacity.output_tokens
+        output_token_responses = self.capacity.output_token_responses
         required_counts = (
-            self.capacity.provider_images,
-            self.capacity.logical_calls,
-            self.capacity.http_requests,
-            self.capacity.input_tokens,
-            self.capacity.output_tokens,
-            self.capacity.output_token_responses,
+            provider_images,
+            logical_calls,
+            http_requests,
+            input_tokens,
+            output_tokens,
+            output_token_responses,
         )
         if any(value is None for value in required_counts):
             raise ValueError("saturation points require image, call, request, and token counts")
-        if (
-            self.capacity.provider_images <= 0
-            or self.capacity.logical_calls <= 0
-            or self.capacity.http_requests <= 0
-            or self.capacity.input_tokens <= 0
-        ):
+        assert (
+            provider_images is not None
+            and logical_calls is not None
+            and http_requests is not None
+            and input_tokens is not None
+            and output_tokens is not None
+            and output_token_responses is not None
+        )
+        if provider_images <= 0 or logical_calls <= 0 or http_requests <= 0 or input_tokens <= 0:
             raise ValueError("saturation points require observed provider work")
         observed = self.telemetry.adapter_terminal_workload
-        if (
-            self.capacity.output_tokens != observed.output_tokens
-            or self.capacity.output_token_responses != observed.output_token_responses
+        for name in (
+            "provider_images",
+            "logical_calls",
+            "call_parts",
+            "http_requests",
+            "input_tokens",
+            "output_tokens",
+            "output_token_responses",
         ):
-            raise ValueError("capacity output-token totals do not match adapter observations")
-        if (
-            self.telemetry.usage_known_attempt_count
-            != self.capacity.output_token_responses
-        ):
-            raise ValueError(
-                "known output-token attempts must match the capacity observation"
-            )
+            capacity_value = getattr(self.capacity, name)
+            if capacity_value is not None and capacity_value != getattr(observed, name):
+                raise ValueError(f"capacity {name} total does not match adapter observations")
+        if self.telemetry.usage_known_attempt_count != output_token_responses:
+            raise ValueError("known output-token attempts must match the capacity observation")
         if self.telemetry.gpu.qualification_session_id != self.qualification_session.session_id:
             raise ValueError("GPU telemetry does not match the qualification session")
         if self.telemetry.gpu.aggregate_gpu_seconds <= 0:
@@ -621,12 +630,11 @@ class ProviderSaturationPoint(StrictModel):
         return (
             self.telemetry.terminal_response_count > 0
             and self.telemetry.rejected_response_count == 0
-            and self.telemetry.input_known_response_count
-            == self.telemetry.terminal_response_count
-            and self.telemetry.usage_known_response_count
-            == self.telemetry.terminal_response_count
+            and self.telemetry.input_known_response_count == self.telemetry.terminal_response_count
+            and self.telemetry.usage_known_response_count == self.telemetry.terminal_response_count
             and self.telemetry.gpu.oom_count == 0
         )
+
 
 class ProviderQualificationCollector:
     """One-shot collector for one scoped provider saturation-point execution."""
@@ -803,9 +811,7 @@ class ProviderQualificationCollector:
                     sample.time_to_first_token_ms,
                 )
             ):
-                raise ValueError(
-                    "accepted timing observations require queue, execution, and TTFT"
-                )
+                raise ValueError("accepted timing observations require queue, execution, and TTFT")
             if telemetry.usage_known_attempt_count != expected_known_responses:
                 raise ValueError(
                     "known output-token attempts must match capacity output-token responses"
@@ -829,6 +835,7 @@ class ProviderQualificationCollector:
             raise TypeError("qualification_session must be a ProviderQualificationSession")
         if qualification_session != self._qualification_session:
             raise ValueError("qualification observation belongs to a different session")
+
 
 class ProviderQualificationRunContext(StrictModel):
     """Explicit session and fresh namespace handed to one P6 workload callback."""
@@ -895,6 +902,8 @@ async def run_provider_saturation_point(
         raise TypeError("context must be a ProviderQualificationRunContext")
     if type(offered_concurrency) is not int or offered_concurrency <= 0:
         raise ValueError("offered_concurrency must be a positive integer")
+    if offered_concurrency > configuration.max_concurrent_requests:
+        raise ValueError("offered_concurrency exceeds configured provider concurrency")
     if not isinstance(workload_manifest_bytes, bytes) or not workload_manifest_bytes:
         raise ValueError("workload_manifest_bytes must be nonempty bytes")
     if not callable(adapter_factory) or not callable(workload):
@@ -926,8 +935,7 @@ async def run_provider_saturation_point(
         raise TypeError("workload must return a MeasuredCapacityInput")
     if adapter.qualification_observation_error is not None:
         raise ValueError(
-            "RunPod qualification observation failed: "
-            f"{adapter.qualification_observation_error}"
+            f"RunPod qualification observation failed: {adapter.qualification_observation_error}"
         )
     observed_request_ids = set(adapter.qualification_observed_request_ids)
     collector_request_ids = {sample.request_id for sample in collector.timing_samples}
@@ -949,6 +957,7 @@ async def run_provider_saturation_point(
     capacity = build_measured_capacity_report(capacity_input)
     return collector.build_point(capacity=capacity, gpu=gpu)
 
+
 class TwoH100ProviderQualificationReport(StrictModel):
     """Measured saturation curve for one pinned model/topology configuration."""
 
@@ -956,9 +965,9 @@ class TwoH100ProviderQualificationReport(StrictModel):
         "two-h100-provider-qualification-v1"
     )
     configuration: TwoH100ProviderConfiguration
-    endpoint_config: object
-    capabilities: object
-    retry_policy: object
+    endpoint_config: RunPodEndpointConfig
+    capabilities: ModelCapabilities
+    retry_policy: RunPodRetryPolicy
     points: tuple[ProviderSaturationPoint, ...] = Field(min_length=2)
     evidence_class: CapacityEvidenceClass
     production_eligible: Literal[False] = False
@@ -970,6 +979,12 @@ class TwoH100ProviderQualificationReport(StrictModel):
             capabilities=self.capabilities,
             retry_policy=self.retry_policy,
         )
+        # ``model_copy(update=...)`` can bypass nested model validators; re-run
+        # each point validator before consuming its derived safety state.
+        for point in self.points:
+            # Pydantic's descriptor is callable at runtime; use the existing
+            # validator directly so the dataclass capacity remains intact.
+            cast(Any, point).validate_point()
         offered = tuple(point.offered_concurrency for point in self.points)
         if offered != tuple(sorted(offered)) or len(set(offered)) != len(offered):
             raise ValueError("saturation points must have unique increasing concurrency")
@@ -984,8 +999,7 @@ class TwoH100ProviderQualificationReport(StrictModel):
         ):
             raise ValueError("saturation point workload does not match configuration")
         if any(
-            point.qualification_session.request_contracts
-            != self.configuration.request_contracts
+            point.qualification_session.request_contracts != self.configuration.request_contracts
             for point in self.points
         ):
             raise ValueError("saturation point prompt contracts do not match configuration")
@@ -1003,8 +1017,7 @@ class TwoH100ProviderQualificationReport(StrictModel):
         ):
             raise ValueError("saturation point exceeds configured provider concurrency")
         if any(
-            point.telemetry.gpu.gpu_count != self.configuration.gpu_count
-            for point in self.points
+            point.telemetry.gpu.gpu_count != self.configuration.gpu_count for point in self.points
         ):
             raise ValueError("GPU measurement count does not match qualification configuration")
         hardware_identity = (
@@ -1081,6 +1094,7 @@ class TwoH100ProviderQualificationReport(StrictModel):
             "# Two-H100 Provider Saturation Report",
             "",
             f"- Evidence class: {self.evidence_class.value}",
+            "- Production eligible: NO",
             "- Provider/model: "
             f"{self.configuration.provider} / {self.configuration.model_identifier}",
             f"- Topology: {self.configuration.topology.value}",
@@ -1107,8 +1121,7 @@ class TwoH100ProviderQualificationReport(StrictModel):
             f"(sha256:{gpu.telemetry_artifact_sha256})",
             "- Qualification sessions: "
             + ", ".join(point.qualification_session.session_id for point in self.points),
-            "- Fresh P6 namespaces: "
-            + ", ".join(point.run_namespace for point in self.points),
+            "- Fresh P6 namespaces: " + ", ".join(point.run_namespace for point in self.points),
             "- Work-count reconciliation: adapter-observed provider output tokens and "
             "known attempt counts match the P6 capacity observation; input/output token "
             "rates are shown only when every provider attempt reported that usage.",
@@ -1162,6 +1175,7 @@ class TwoH100ProviderQualificationReport(StrictModel):
             )
         return "\n".join(lines)
 
+
 class TwoH100TopologyComparison(StrictModel):
     """Like-for-like comparison of two explicitly supported two-H100 topologies."""
 
@@ -1202,6 +1216,7 @@ class TwoH100TopologyComparison(StrictModel):
             "max_images_per_request",
             "max_input_tokens",
             "max_output_tokens",
+            "native_batch_enabled",
             "native_batch_max_size",
             "max_concurrent_requests",
             "retry_policy",
@@ -1212,11 +1227,10 @@ class TwoH100TopologyComparison(StrictModel):
             for field in comparable_fields
         ):
             raise ValueError("topology reports must use the same workload and model configuration")
-        if (
-            _qualification_transport_projection(replicas.configuration.endpoint_configuration)
-            != _qualification_transport_projection(
-                tensor_parallel.configuration.endpoint_configuration
-            )
+        if _qualification_transport_projection(
+            replicas.configuration.endpoint_configuration
+        ) != _qualification_transport_projection(
+            tensor_parallel.configuration.endpoint_configuration
         ):
             raise ValueError("topology reports must use the same transport configuration")
         replica_gpu = replicas.safe_point.telemetry.gpu
@@ -1284,6 +1298,7 @@ def _qualification_transport_projection(
 
 def _format_rate(rate: float | None) -> str:
     return "n/a" if rate is None else f"{rate:.2f}"
+
 
 def _format_latency(latency: ProviderLatencyPercentiles | None) -> str:
     if latency is None:

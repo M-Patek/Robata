@@ -16,7 +16,7 @@ import math
 import time
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self, cast
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -80,10 +80,8 @@ class MediaSourceProfile(StrictModel):
 
         if "profile_digest" in values:
             raise ValueError("profile_digest is derived")
-        draft = cls.model_construct(**{**values, "profile_digest": "0" * 64})
-        digest = semantic_sha256(
-            media_source_profile_projection(draft, include_digest=False)
-        )
+        draft = cls.model_construct(**cast(Any, {**values, "profile_digest": "0" * 64}))
+        digest = semantic_sha256(media_source_profile_projection(draft, include_digest=False))
         return cls.model_validate(
             {**draft.model_dump(mode="python"), "profile_digest": digest},
             strict=True,
@@ -194,15 +192,27 @@ class MediaQualificationMeasurement(StrictModel):
             raise ValueError("resized_frames cannot exceed decoded_frames")
         if self.materialized_frames > self.resized_frames:
             raise ValueError("materialized_frames cannot exceed resized_frames")
+        if (
+            self.timestamp_parity is MediaParityStatus.MATCH
+            and self.timestamp_contract_digest is None
+        ):
+            raise ValueError("timestamp parity MATCH requires a contract digest")
+        if (
+            self.artifact_parity is MediaParityStatus.MATCH
+            and self.artifact_contract_digest is None
+        ):
+            raise ValueError("artifact parity MATCH requires a contract digest")
         if self.backend is MediaBackend.CPU and self.nvdec_fallback_count:
             raise ValueError("CPU measurements cannot report NVDEC fallbacks")
-        if self.nvdec_fallback_count and self.backend is MediaBackend.NVDEC:
+        if (
+            self.nvdec_fallback_count
+            and self.backend is MediaBackend.NVDEC
+            and self.timestamp_parity is MediaParityStatus.MATCH
+            and self.artifact_parity is MediaParityStatus.MATCH
+        ):
             # A fallback means the target path did not process every frame.  Keep the
             # row usable for diagnosis but make it ineligible for the safe envelope.
-            if self.timestamp_parity is MediaParityStatus.MATCH and self.artifact_parity is MediaParityStatus.MATCH:
-                raise ValueError(
-                    "NVDEC fallback observations cannot claim complete media parity"
-                )
+            raise ValueError("NVDEC fallback observations cannot claim complete media parity")
         return self
 
     @property
@@ -226,8 +236,64 @@ class MediaQualificationMeasurement(StrictModel):
         return (
             self.timestamp_parity is MediaParityStatus.MATCH
             and self.artifact_parity is MediaParityStatus.MATCH
+            and self.timestamp_contract_digest is not None
+            and self.artifact_contract_digest is not None
             and self.nvdec_fallback_count == 0
         )
+
+
+def _media_matrix_facts(
+    measurements: tuple[MediaQualificationMeasurement, ...],
+    required_backends: tuple[MediaBackend, ...],
+) -> tuple[bool, bool, bool]:
+    """Derive complete-matrix, parity, and fresh-run facts from media rows.
+
+    A parity flag is only meaningful when CPU and NVDEC observed the same frozen
+    source profile and emitted the same timestamp/artifact contract identities. The
+    helper deliberately reports a failed fact instead of silently accepting a
+    backend/profile mismatch; the enclosing report then records the blocker in its
+    safe-envelope reasons.
+    """
+
+    by_profile: dict[str, dict[MediaBackend, list[MediaQualificationMeasurement]]] = {}
+    for item in measurements:
+        by_profile.setdefault(item.source_profile.profile_digest, {}).setdefault(
+            item.backend, []
+        ).append(item)
+
+    required = set(required_backends)
+    matrix_complete = bool(by_profile)
+    parity_complete = True
+    for rows_by_backend in by_profile.values():
+        if set(rows_by_backend) != required:
+            matrix_complete = False
+        if any(len(rows_by_backend.get(backend, ())) != 1 for backend in required):
+            matrix_complete = False
+        if MediaBackend.CPU in required and MediaBackend.NVDEC in required:
+            cpu_rows = rows_by_backend.get(MediaBackend.CPU, ())
+            nvdec_rows = rows_by_backend.get(MediaBackend.NVDEC, ())
+            if len(cpu_rows) != 1 or len(nvdec_rows) != 1:
+                parity_complete = False
+            else:
+                cpu = cpu_rows[0]
+                nvdec = nvdec_rows[0]
+                parity_complete = parity_complete and (
+                    cpu.parity_matches
+                    and nvdec.parity_matches
+                    and cpu.timestamp_contract_digest is not None
+                    and cpu.timestamp_contract_digest == nvdec.timestamp_contract_digest
+                    and cpu.artifact_contract_digest is not None
+                    and cpu.artifact_contract_digest == nvdec.artifact_contract_digest
+                )
+        else:
+            parity_complete = parity_complete and all(
+                item.parity_matches for rows in rows_by_backend.values() for item in rows
+            )
+
+    fresh_complete = bool(measurements) and all(
+        item.execution_mode is MediaExecutionMode.FRESH for item in measurements
+    )
+    return matrix_complete, parity_complete, fresh_complete
 
 
 class MediaQualificationEnvelope(StrictModel):
@@ -243,6 +309,9 @@ class MediaQualificationEnvelope(StrictModel):
     )
     parity_complete: bool
     required_backends_present: bool
+    matrix_complete: bool = False
+    fresh_measurements_complete: bool = False
+    target_hardware_measured: bool = False
     safe_envelope: bool
     unmet_requirements: tuple[NonEmptyString, ...] = ()
 
@@ -260,6 +329,9 @@ class MediaQualificationEnvelope(StrictModel):
             >= self.required_margin_camera_seconds_per_second
             and self.parity_complete
             and self.required_backends_present
+            and self.matrix_complete
+            and self.fresh_measurements_complete
+            and self.target_hardware_measured
         )
         if self.safe_envelope != expected_safe:
             raise ValueError("safe_envelope does not match measured rates and parity")
@@ -294,18 +366,45 @@ class MediaQualificationReport(StrictModel):
             sorted(self.required_backends, key=lambda value: value.value)
         ):
             raise ValueError("required_backends must be unique and ordered")
-        if any(item.workload_manifest_digest != self.workload_manifest_digest for item in self.measurements):
+        if any(
+            item.workload_manifest_digest != self.workload_manifest_digest
+            for item in self.measurements
+        ):
             raise ValueError("all media measurements must use the report workload manifest")
-        keys = tuple((item.backend, item.source_profile.profile_digest, item.execution_mode) for item in self.measurements)
+        keys = tuple(
+            (item.backend, item.source_profile.profile_digest, item.execution_mode)
+            for item in self.measurements
+        )
         if len(keys) != len(set(keys)):
             raise ValueError("media measurements must not duplicate backend/profile/execution")
+        fresh_namespaces = tuple(
+            item.run_namespace
+            for item in self.measurements
+            if item.execution_mode is MediaExecutionMode.FRESH
+        )
+        if len(fresh_namespaces) != len(set(fresh_namespaces)):
+            raise ValueError("fresh media measurements must use unique run namespaces")
         observed_backends = {item.backend for item in self.measurements}
-        if self.envelope.required_backends_present != set(self.required_backends).issubset(observed_backends):
+        if self.envelope.required_backends_present != set(self.required_backends).issubset(
+            observed_backends
+        ):
             raise ValueError("required_backends_present does not match media observations")
-        expected_parity = all(item.parity_matches for item in self.measurements)
+        expected_matrix, expected_parity, expected_fresh = _media_matrix_facts(
+            self.measurements,
+            self.required_backends,
+        )
+        if self.envelope.matrix_complete != expected_matrix:
+            raise ValueError("matrix_complete does not match media observations")
         if self.envelope.parity_complete != expected_parity:
-            raise ValueError("parity_complete does not match media observations")
-        expected_digest = semantic_sha256(media_qualification_projection(self, include_digest=False))
+            raise ValueError("parity_complete does not match paired media observations")
+        if self.envelope.fresh_measurements_complete != expected_fresh:
+            raise ValueError("fresh_measurements_complete does not match media observations")
+        expected_target_hardware = self.target_hardware_status == "MEASURED"
+        if self.envelope.target_hardware_measured != expected_target_hardware:
+            raise ValueError("target_hardware_measured does not match report status")
+        expected_digest = semantic_sha256(
+            media_qualification_projection(self, include_digest=False)
+        )
         if self.report_sha256 != expected_digest:
             raise ValueError("report_sha256 does not match media qualification projection")
         return self
@@ -339,11 +438,14 @@ class MediaQualificationReport(StrictModel):
             f"- Target hardware: {self.target_hardware_status}",
             f"- Average camera-sec/s: {self.average_camera_seconds_per_second:.3f}",
             f"- Minimum camera-sec/s: {self.minimum_camera_seconds_per_second:.3f}",
-            f"- Required average/margin: {self.envelope.required_average_camera_seconds_per_second:.3f} / {self.envelope.required_margin_camera_seconds_per_second:.3f}",
+            "- Required average/margin: "
+            f"{self.envelope.required_average_camera_seconds_per_second:.3f} / "
+            f"{self.envelope.required_margin_camera_seconds_per_second:.3f}",
             f"- Safe envelope: {'YES' if self.safe_envelope else 'NO'}",
             "- Production eligible: NO",
             "",
-            "| Backend | Codec | Resolution | FPS | GOP | Transfer | Camera-sec/s | Timestamp parity | Artifact parity |",
+            "| Backend | Codec | Resolution | FPS | GOP | Transfer | Camera-sec/s | "
+            "Timestamp parity | Artifact parity |",
             "| --- | --- | --- | ---: | ---: | --- | ---: | --- | --- |",
         ]
         for item in self.measurements:
@@ -355,7 +457,9 @@ class MediaQualificationReport(StrictModel):
                 f"{item.artifact_parity.value} |"
             )
         if self.envelope.unmet_requirements:
-            lines.extend(("", "- Unmet requirements: " + ", ".join(self.envelope.unmet_requirements)))
+            lines.extend(
+                ("", "- Unmet requirements: " + ", ".join(self.envelope.unmet_requirements))
+            )
         return "\n".join(lines) + "\n"
 
 
@@ -428,7 +532,11 @@ def build_media_qualification_report(
     minimum_rate = min(item.camera_seconds_per_second for item in checked)
     observed_backends = {item.backend for item in checked}
     required_present = set(required).issubset(observed_backends)
-    parity_complete = all(item.parity_matches for item in checked)
+    matrix_complete, parity_complete, fresh_complete = _media_matrix_facts(
+        checked,
+        required,
+    )
+    target_measured = target_hardware_status == "MEASURED"
     unmet: list[str] = []
     if average_rate < required_average_camera_seconds_per_second:
         unmet.append("AVERAGE_THROUGHPUT_BELOW_TARGET")
@@ -436,8 +544,16 @@ def build_media_qualification_report(
         unmet.append("MARGIN_THROUGHPUT_BELOW_TARGET")
     if not required_present:
         unmet.append("REQUIRED_BACKEND_NOT_MEASURED")
+    if not matrix_complete:
+        unmet.append("MEDIA_MATRIX_INCOMPLETE")
     if not parity_complete:
         unmet.append("MEDIA_CONTRACT_PARITY_NOT_PROVEN")
+    if not fresh_complete:
+        unmet.append("FRESH_MEDIA_RUN_NOT_MEASURED")
+    if not target_measured:
+        unmet.append("TARGET_HARDWARE_NOT_MEASURED")
+    if measurement_status != "MEASURED":
+        unmet.append("MEDIA_MEASUREMENT_STATUS_NOT_MEASURED")
     unmet_tuple = tuple(sorted(set(unmet)))
     envelope = MediaQualificationEnvelope(
         average_camera_seconds_per_second=average_rate,
@@ -446,6 +562,9 @@ def build_media_qualification_report(
         required_margin_camera_seconds_per_second=required_margin_camera_seconds_per_second,
         parity_complete=parity_complete,
         required_backends_present=required_present,
+        matrix_complete=matrix_complete,
+        fresh_measurements_complete=fresh_complete,
+        target_hardware_measured=target_measured,
         safe_envelope=not unmet_tuple,
         unmet_requirements=unmet_tuple,
     )
@@ -494,7 +613,12 @@ def measure_media_callable(
     started = clock()
     result = workload()
     elapsed = clock() - started
-    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed <= 0:
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(elapsed)
+        or elapsed <= 0
+    ):
         raise ValueError("media qualification clock must advance by a positive finite duration")
     observed = dict(stats or {})
     if isinstance(result, Mapping):
@@ -515,6 +639,11 @@ def measure_media_callable(
             raise ValueError(f"{name} must be a nonnegative integer or None")
         return value
 
+    timestamp_parity = observed.get("timestamp_parity", MediaParityStatus.NOT_MEASURED)
+    artifact_parity = observed.get("artifact_parity", MediaParityStatus.NOT_MEASURED)
+    timestamp_contract_digest = observed.get("timestamp_contract_digest")
+    artifact_contract_digest = observed.get("artifact_contract_digest")
+
     return MediaQualificationMeasurement(
         workload_manifest_digest=workload_manifest_digest,
         run_namespace=run_namespace,
@@ -530,10 +659,10 @@ def measure_media_callable(
         write_bytes=optional_counter("write_bytes", "process_write_bytes"),
         peak_rss_bytes=optional_counter("peak_rss_bytes", "peak_rss"),
         process_cpu_ns=optional_counter("process_cpu_ns"),
-        timestamp_parity=MediaParityStatus(observed.get("timestamp_parity", MediaParityStatus.NOT_MEASURED)),
-        artifact_parity=MediaParityStatus(observed.get("artifact_parity", MediaParityStatus.NOT_MEASURED)),
-        timestamp_contract_digest=observed.get("timestamp_contract_digest"),
-        artifact_contract_digest=observed.get("artifact_contract_digest"),
+        timestamp_parity=MediaParityStatus(cast(str, timestamp_parity)),
+        artifact_parity=MediaParityStatus(cast(str, artifact_parity)),
+        timestamp_contract_digest=cast(str | None, timestamp_contract_digest),
+        artifact_contract_digest=cast(str | None, artifact_contract_digest),
         nvdec_fallback_count=counter("nvdec_fallback_count", "fallback_count"),
     )
 

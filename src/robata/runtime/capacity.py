@@ -430,6 +430,10 @@ def build_measured_capacity_report(measurement: MeasuredCapacityInput) -> Measur
     if reasons:
         return _unavailable_measured_capacity(measurement, tuple(sorted(reasons)))
 
+    # The early return above establishes the denominator required by the rate
+    # calculations, but mypy cannot infer that from a dynamically built list.
+    assert measurement.recording_duration_ns is not None
+
     recording_hours = (
         measurement.recording_count * measurement.recording_duration_ns / _NANOSECONDS_PER_HOUR
     )
@@ -2017,12 +2021,6 @@ def _validate_ordinals(
 
 
 __all__ = [
-    'WorkerCapacityProjection',
-    'WorkerScalingPoint',
-    'WorkerScalingReport',
-    'build_worker_scaling_report',
-    'required_worker_count_for_rtf',
-    'run_worker_scaling',
     "BottleneckKind",
     "CapacityEvidenceClass",
     "CapacityRegressionPolicy",
@@ -2042,10 +2040,16 @@ __all__ = [
     "SyntheticObservation",
     "SyntheticOutcome",
     "SyntheticWorkUnit",
+    'WorkerCapacityProjection',
+    'WorkerScalingPoint',
+    'WorkerScalingReport',
     "build_measured_capacity_report",
+    'build_worker_scaling_report',
     "compare_capacity_reports",
     "compare_measured_capacity_reports",
     "evaluate_local_slo",
     "generate_synthetic_load",
+    'required_worker_count_for_rtf',
+    'run_worker_scaling',
     "simulate_capacity",
 ]
