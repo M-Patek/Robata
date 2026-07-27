@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-from robata.adapters import OfficialMcapInspector, PyAvH264DecoderProbe
-from robata.contracts import CAMERA_IDS, recording_identity
-from robata.ingestion import ExactTopicMappingPolicy, TopicMappingProfile
-from robata.ports import (
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
+from robata.adapters import OfficialMcapInspector, PyAvH264DecoderProbe  # noqa: E402
+from robata.contracts import CAMERA_IDS, recording_identity  # noqa: E402
+from robata.ingestion import ExactTopicMappingPolicy, TopicMappingProfile  # noqa: E402
+from robata.ports import (  # noqa: E402
     ChannelInspection,
     DecodeFailure,
     DecoderProbeResult,
@@ -19,7 +23,6 @@ from robata.ports import (
     McapInspection,
 )
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MAPPING_CONFIG = REPOSITORY_ROOT / "config" / "genrobot-observed-v0.json"
 
 
