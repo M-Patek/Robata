@@ -628,3 +628,22 @@ def test_coarse_projector_rejects_missing_camera_and_out_of_package_interval() -
             input_plan=plan,
             enriched_outputs=(outside_package,),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "delta"),
+    (("aligned_timestamp_ns", 1), ("source_timestamp_ns", 1)),
+)
+def test_coarse_projector_rejects_forged_evidence_timestamps(field: str, delta: int) -> None:
+    package_set, plan, output = _coarse_fixture()
+    original = output.claims[0].evidence[0]
+    forged_evidence = original.model_copy(update={field: getattr(original, field) + delta})
+    forged_claim = output.claims[0].model_copy(update={"evidence": (forged_evidence,)})
+    forged = _replace_enriched_claims(output, (forged_claim, *output.claims[1:]))
+
+    with pytest.raises(CoarseQAProjectionError, match="does not resolve"):
+        CoarseQAProjector().project(
+            package_set=package_set,
+            input_plan=plan,
+            enriched_outputs=(forged,),
+        )

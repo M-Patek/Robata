@@ -453,6 +453,59 @@ def test_hard_expiry_fences_running_attempt(tmp_path: Path) -> None:
         scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=3))
 
 
+def test_heartbeat_returns_replacement_capability_and_fences_previous_lease(
+    tmp_path: Path,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    plan = _plan(24)
+    scheduler.plan(plan)
+    claim = scheduler.claim("worker", 10, now=_BASE)
+    assert claim is not None
+    scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+
+    renewed = scheduler.heartbeat(
+        claim.lease,
+        60,
+        now=_BASE + timedelta(seconds=5),
+    )
+
+    assert renewed.work_item_id == claim.lease.work_item_id
+    assert renewed.worker_id == claim.lease.worker_id
+    assert renewed.lease_epoch == claim.lease.lease_epoch
+    assert renewed.fencing_token == claim.lease.fencing_token
+    assert renewed.lease_expires_at == _timestamp(_BASE + timedelta(seconds=65))
+    assert scheduler.get(plan.work_item_id).lease_expires_at == renewed.lease_expires_at
+
+    # The expiry is part of the capability. A caller must use the returned
+    # lease after renewal, even though the epoch and fencing token are stable.
+    with pytest.raises(WorkFenceError, match="stale, expired, or inactive"):
+        scheduler.succeed(claim.lease, now=_BASE + timedelta(seconds=6))
+
+    assert (
+        scheduler.succeed(renewed, now=_BASE + timedelta(seconds=6)).state
+        is WorkItemState.SUCCEEDED
+    )
+
+
+def test_heartbeat_cannot_extend_past_execution_hard_expiry(tmp_path: Path) -> None:
+    scheduler = _scheduler(tmp_path)
+    plan = _plan(25, execution_expiry_at=_BASE + timedelta(seconds=5))
+    scheduler.plan(plan)
+    claim = scheduler.claim("worker", 60, now=_BASE)
+    assert claim is not None
+    scheduler.start(claim.lease, now=_BASE + timedelta(seconds=1))
+
+    with pytest.raises(WorkFenceError, match="stale, expired, or inactive"):
+        scheduler.heartbeat(
+            claim.lease,
+            60,
+            now=_BASE + timedelta(seconds=5),
+        )
+
+    assert scheduler.get(plan.work_item_id).state is WorkItemState.EXPIRED
+    assert scheduler.list_attempts(plan.work_item_id)[0].outcome is WorkAttemptOutcome.EXPIRED
+
+
 def test_reconcile_materializes_only_due_deadlines_and_leases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

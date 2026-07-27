@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -55,6 +55,7 @@ from robata.contracts.stream_planning import (
     create_expected_window_plan,
 )
 from robata.contracts.stream_source import create_pre_eos_capture_subject
+from robata.inference.models import InferenceStatus, ModelInference, ModelInferenceUsage, VisionTask
 from robata.queue.outbox import (
     OutboxDeliveryStatus,
     OutboxFenceError,
@@ -76,6 +77,76 @@ def _uuid(value: int) -> str:
 
 def _digest(value: int) -> str:
     return f"{value:064x}"
+
+
+def _provider_fixture_model(task: VisionTask = VisionTask.QA_COARSE) -> ModelInference:
+    ordinal = {
+        VisionTask.QA_COARSE: 1,
+        VisionTask.QA_DENSE: 2,
+        VisionTask.EVENT_PROPOSAL: 3,
+    }[task]
+    return ModelInference(
+        schema_version='1.0',
+        inference_id=str(uuid5(NAMESPACE_URL, f'p5-test-inference:{task.value}')),
+        logical_invocation_id=str(
+            uuid5(NAMESPACE_URL, f'p5-test-logical-invocation:{task.value}')
+        ),
+        request_id=str(uuid5(NAMESPACE_URL, f'p5-test-request:{task.value}')),
+        idempotency_key=f'p5-test-idempotency-{task.value}',
+        mcap_id='00000000-0000-0000-0000-000000000401',
+        package_set_id='00000000-0000-0000-0000-000000000402',
+        package_id=None,
+        package_ids=(f'p5-test-package-{ordinal}',),
+        camera_mapping_run_id='00000000-0000-0000-0000-000000000403',
+        alignment_id='00000000-0000-0000-0000-000000000404',
+        start_ns=0,
+        end_ns=1_000_000_000,
+        stage=task,
+        provider='local-test-provider',
+        model_name='local-test-model',
+        model_version='1.0',
+        adapter_version='local-test-adapter-v1',
+        prompt_version='local-test-prompt-v1',
+        prompt_artifact_id='local-test-prompt',
+        prompt_sha256=f'{500 + ordinal:064x}',
+        rendered_input_digest=f'{510 + ordinal:064x}',
+        input_plan_id=None,
+        input_plan_semantic_sha256=None,
+        input_plan_part_ordinal=None,
+        input_plan_part_count=None,
+        input_plan_part_semantic_sha256=None,
+        output_schema_id='local-test-output',
+        output_schema_version='1.0',
+        output_schema_artifact_id='local-test-output-schema',
+        output_schema_sha256=f'{520 + ordinal:064x}',
+        capability_snapshot_id='00000000-0000-0000-0000-000000000405',
+        capability_snapshot_digest=f'{530 + ordinal:064x}',
+        input_manifest_set_sha256=f'{540 + ordinal:064x}',
+        input_config={'input_images': 1},
+        sampling_config={'policy': 'p5-test-v1'},
+        generation_config={'temperature': 0},
+        provider_idempotency_key=f'p5-test-provider-idempotency-{task.value}',
+        provider_request_id=f'p5-test-provider-request-{task.value}',
+        experiment_id=None,
+        shadow_route_id=None,
+        primary_inference_id=None,
+        shadow=False,
+        attempt=1,
+        retry_count=0,
+        status=InferenceStatus.SUCCEEDED,
+        queued_at='2026-07-20T00:00:00Z',
+        started_at='2026-07-20T00:00:00Z',
+        completed_at='2026-07-20T00:00:00Z',
+        latency_ms=1,
+        raw_output={'fixture': task.value},
+        normalized_output={'label': task.value},
+        output_valid=True,
+        reported_confidence=None,
+        calibrated_confidence=None,
+        usage=ModelInferenceUsage(input_frames=1, input_images=1),
+        failure=None,
+        created_at='2026-07-20T00:00:00Z',
+    )
 
 
 def _schema(value: int) -> SchemaRef:
@@ -519,6 +590,7 @@ def test_pre_eos_restart_resumes_owned_active_lease_without_second_provider_disp
         sha256=_digest(302),
     )
     provider_payload = b"persisted-provider-terminal"
+    provider_payload = canonical_json_bytes(_provider_fixture_model())
     provider_ref = ArtifactEvidenceRef(
         artifact_id=_uuid(303),
         exact_sha256=exact_bytes_sha256(provider_payload),
@@ -589,6 +661,201 @@ def test_pre_eos_restart_resumes_owned_active_lease_without_second_provider_disp
     assert len(attempts) == 1
     assert hook_calls == 2
     assert provider_dispatches == 1
+
+
+def test_finalization_restart_resumes_owned_active_lease_without_second_attempt(
+    tmp_path: Path,
+) -> None:
+    composition = _composition(tmp_path)
+    finalizer = _finalizer(composition, tmp_path)
+    nonfinal_count = sum(
+        plan.stage is not StreamStage.FINALIZATION for plan in composition.work_plans()
+    )
+    assert finalizer.drain_ready(max_items=nonfinal_count) == nonfinal_count
+    composition.close_finalization_gate()
+
+    final_plan = next(
+        plan for plan in composition.work_plans() if plan.stage is StreamStage.FINALIZATION
+    )
+    claim = composition.claim_and_start(
+        "local-conformance-stream-worker",
+        300,
+        work_item_id=final_plan.work_item_id,
+        now=_NOW + timedelta(hours=1),
+        recover_graph=False,
+    )
+    assert claim is not None
+    assert composition.get(final_plan.work_item_id).state is StreamWorkItemState.RUNNING
+
+    recovered = _finalizer(
+        composition,
+        tmp_path,
+        now=_NOW + timedelta(hours=1, minutes=1),
+        recover_graph_before_execute=False,
+    ).execute()
+
+    assert recovered.finalization_work.state is StreamWorkItemState.SUCCEEDED
+    assert recovered.newly_executed_work_count == 1
+    attempts = SQLiteWorkScheduler(composition.database_path).list_attempts(
+        final_plan.work_item_id
+    )
+    assert len(attempts) == 1
+
+
+def test_provider_terminal_outcome_mismatch_fails_closed_before_window_reduction(
+    tmp_path: Path,
+) -> None:
+    composition = _composition(tmp_path, close_eos=False)
+    model_schema = SchemaRef(
+        schema_id='https://schemas.robata.dev/model-inference',
+        version='1.0.0',
+        artifact_id=_uuid(401),
+        sha256=_digest(402),
+    )
+    model = _provider_fixture_model()
+    payload = canonical_json_bytes(model)
+    reference = ArtifactEvidenceRef(
+        artifact_id=_uuid(403),
+        exact_sha256=exact_bytes_sha256(payload),
+        byte_count=len(payload),
+        media_type='application/json',
+        schema_ref=model_schema,
+    )
+    artifact_path = (
+        tmp_path
+        / 'artifacts'
+        / reference.exact_sha256[:2]
+        / f'{reference.exact_sha256}.json'
+    )
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(payload)
+
+    def provider_terminal_executor(plan: StreamWorkItemPlan) -> StreamTerminalEvidence | None:
+        if plan.stage is not StreamStage.QA_COARSE:
+            return None
+        return StreamTerminalEvidence(
+            outcome=TerminalOutcome.FAILED,
+            evidence_ref=reference,
+            terminal_policy_version='stream-terminal-policy-v1',
+            completed_at=_NOW.isoformat(),
+            reason_code='TEST_CONTRADICTORY_TERMINAL',
+        )
+
+    with pytest.raises(
+        LocalStreamFinalizationError,
+        match='provider terminal outcome conflicts',
+    ):
+        _finalizer(
+            composition,
+            tmp_path,
+            stage_terminal_executor=provider_terminal_executor,
+            model_inference_schema_ref=model_schema,
+        ).drain_ready(max_items=2)
+
+
+def test_provider_stage_cannot_fall_back_to_local_receipt_when_model_schema_is_pinned(
+    tmp_path: Path,
+) -> None:
+    composition = _composition(tmp_path, close_eos=False)
+    model_schema = SchemaRef(
+        schema_id='https://schemas.robata.dev/model-inference',
+        version='1.0.0',
+        artifact_id=_uuid(451),
+        sha256=_digest(452),
+    )
+
+    with pytest.raises(LocalStreamFinalizationError, match='must provide a model inference'):
+        _finalizer(
+            composition,
+            tmp_path,
+            stage_terminal_executor=lambda _plan: None,
+            model_inference_schema_ref=model_schema,
+        ).drain_ready(max_items=2)
+
+
+def test_provider_stage_schema_pin_requires_a_provider_executor(tmp_path: Path) -> None:
+    composition = _composition(tmp_path, close_eos=False)
+    model_schema = SchemaRef(
+        schema_id='https://schemas.robata.dev/model-inference',
+        version='1.0.0',
+        artifact_id=_uuid(461),
+        sha256=_digest(462),
+    )
+
+    with pytest.raises(LocalStreamFinalizationError, match='must provide a model inference'):
+        _finalizer(
+            composition,
+            tmp_path,
+            model_inference_schema_ref=model_schema,
+        ).drain_ready(max_items=2)
+
+
+def test_valid_failed_provider_terminal_degrades_window_and_closes_eos(tmp_path: Path) -> None:
+    composition = _composition(tmp_path)
+    model_schema = SchemaRef(
+        schema_id='https://schemas.robata.dev/model-inference',
+        version='1.0.0',
+        artifact_id=_uuid(411),
+        sha256=_digest(412),
+    )
+    task_by_stage = {
+        StreamStage.QA_COARSE: VisionTask.QA_COARSE,
+        StreamStage.QA_DENSE: VisionTask.QA_DENSE,
+        StreamStage.EVENT_PROPOSAL: VisionTask.EVENT_PROPOSAL,
+    }
+
+    def provider_terminal_executor(plan: StreamWorkItemPlan) -> StreamTerminalEvidence | None:
+        task = task_by_stage.get(plan.stage)
+        if task is None:
+            return None
+        model = _provider_fixture_model(task)
+        outcome = TerminalOutcome.SUCCEEDED
+        reason_code = None
+        if plan.stage is StreamStage.QA_COARSE:
+            model = model.model_copy(
+                update={
+                    'status': InferenceStatus.FAILED,
+                    'raw_output': None,
+                    'normalized_output': None,
+                    'output_valid': False,
+                }
+            )
+            outcome = TerminalOutcome.FAILED
+            reason_code = 'TEST_PROVIDER_FAILURE'
+        payload = canonical_json_bytes(model)
+        reference = ArtifactEvidenceRef(
+            artifact_id=_uuid(420 + len(payload)),
+            exact_sha256=exact_bytes_sha256(payload),
+            byte_count=len(payload),
+            media_type='application/json',
+            schema_ref=model_schema,
+        )
+        artifact_path = (
+            tmp_path
+            / 'artifacts'
+            / reference.exact_sha256[:2]
+            / f'{reference.exact_sha256}.json'
+        )
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(payload)
+        return StreamTerminalEvidence(
+            outcome=outcome,
+            evidence_ref=reference,
+            terminal_policy_version='stream-terminal-policy-v1',
+            completed_at=_NOW.isoformat(),
+            reason_code=reason_code,
+        )
+
+    outcome = _finalizer(
+        composition,
+        tmp_path,
+        stage_terminal_executor=provider_terminal_executor,
+        model_inference_schema_ref=model_schema,
+    ).execute()
+
+    assert outcome.window_results[0].terminal_outcome is TerminalOutcome.ABSTAINED
+    assert outcome.terminal_closure.complete
+    assert outcome.recording_result.output_decision == 'ABSTAINED'
 
 def test_exact_replay_executes_no_work_and_policy_change_fails_closed(
     tmp_path: Path,

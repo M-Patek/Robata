@@ -171,6 +171,7 @@ def _configuration(
     *,
     supported_topologies: tuple[TwoH100Topology, ...] = _SUPPORTED_TOPOLOGIES,
     request_contracts: tuple[ProviderQualificationRequestContract, ...] | None = None,
+    native_batch_enabled: bool = True,
 ) -> TwoH100ProviderConfiguration:
     return TwoH100ProviderConfiguration.create(
         workload_manifest_digest=_DIGEST,
@@ -184,6 +185,7 @@ def _configuration(
         max_images_per_request=12,
         max_input_tokens=8_192,
         max_output_tokens=512,
+        native_batch_enabled=native_batch_enabled,
         native_batch_max_size=8,
         max_concurrent_requests=16,
         endpoint_configuration=_make_endpoint_configuration(
@@ -248,14 +250,13 @@ def _endpoint_config(
 ) -> RunPodEndpointConfig:
     return configuration.endpoint_configuration
 
+
 def _gpu(session: ProviderQualificationSession) -> ProviderGpuMeasurement:
     return ProviderGpuMeasurement(
         qualification_session_id=session.session_id,
         hardware_inventory_artifact_uri="object://qualification/h100-inventory.json",
         hardware_inventory_sha256="d" * 64,
-        telemetry_artifact_uri=(
-            f"object://qualification/{session.session_id}/gpu-metrics.json"
-        ),
+        telemetry_artifact_uri=(f"object://qualification/{session.session_id}/gpu-metrics.json"),
         telemetry_artifact_sha256="e" * 64,
         gpu_sku="NVIDIA H100 SXM5 80GB",
         driver_version="555.42.06",
@@ -301,9 +302,7 @@ def _sample(
     return ProviderTimingSample(
         request_id=_uuid(1_000 + value),
         logical_invocation_id=_uuid(
-            logical_invocation_value
-            if logical_invocation_value is not None
-            else 10_000 + value
+            logical_invocation_value if logical_invocation_value is not None else 10_000 + value
         ),
         input_plan_part_ordinal=input_plan_part_ordinal,
         provider_image_count=10,
@@ -354,7 +353,16 @@ def _point(
         qualification_session=session,
         run_namespace=session.run_namespace,
         offered_concurrency=offered_concurrency,
-        capacity=_capacity() if capacity is None else capacity,
+        capacity=(
+            _capacity(
+                provider_images=120 + 10 * rejected_response_count,
+                logical_calls=12 + rejected_response_count,
+                http_requests=12 + rejected_response_count,
+                input_tokens=1_200 + 100 * rejected_response_count,
+            )
+            if capacity is None
+            else capacity
+        ),
         telemetry=_telemetry(session, rejected_response_count=rejected_response_count),
     )
 
@@ -670,6 +678,7 @@ def _completed_qualification_response(request: VisionInferenceRequest) -> RunPod
         ),
     )
 
+
 def test_recorded_runpod_transport_binds_response_to_exact_request_bytes() -> None:
     request = RunPodHttpRequest(
         url="https://api.runpod.test/runsync",
@@ -707,6 +716,7 @@ def test_two_h100_report_binds_sessions_and_renders_measured_facts() -> None:
     assert report.safe_point.offered_concurrency == 4
     assert report.safe_point.aggregate_gpu_minutes_per_recording_hour == pytest.approx(2.0)
     assert "Pinned prompt/context contracts" in rendered
+    assert "Production eligible: NO" in rendered
     assert "Fresh P6 namespaces" in rendered
     assert "Accepted queue P50/P95/P99 ms" in rendered
     assert "object://qualification/h100-inventory.json" in rendered
@@ -763,6 +773,12 @@ def test_two_h100_configuration_binds_to_active_runpod_limits_and_model() -> Non
             capabilities=capabilities,
             retry_policy=configuration.retry_policy,
         )
+    with pytest.raises(ValueError, match="native batch"):
+        configuration.validate_runpod_configuration(
+            endpoint_config=endpoint.model_copy(update={"native_batch_enabled": False}),
+            capabilities=capabilities,
+            retry_policy=configuration.retry_policy,
+        )
     with pytest.raises(ValueError, match="retry policy"):
         configuration.validate_runpod_configuration(
             endpoint_config=endpoint,
@@ -774,6 +790,11 @@ def test_two_h100_configuration_binds_to_active_runpod_limits_and_model() -> Non
                 max_delay_ms=0,
             ),
         )
+
+
+def test_two_h100_configuration_rejects_native_batch_enablement_mismatch() -> None:
+    with pytest.raises(ValueError, match="embedded RunPod endpoint"):
+        _configuration(native_batch_enabled=False)
 
 
 def test_two_h100_report_rejects_replay_or_unmeasured_provider_work() -> None:
@@ -813,6 +834,32 @@ def test_two_h100_report_rejects_replay_or_unmeasured_provider_work() -> None:
         )
 
 
+def test_saturation_point_rejects_capacity_workload_count_mismatch() -> None:
+    configuration = _configuration()
+    session = _session(configuration, 31)
+    with pytest.raises(ValueError, match="provider_images"):
+        ProviderSaturationPoint(
+            configuration_digest=configuration.configuration_digest,
+            qualification_session=session,
+            run_namespace=session.run_namespace,
+            offered_concurrency=1,
+            capacity=_capacity(provider_images=1),
+            telemetry=_telemetry(session),
+        )
+
+
+def test_report_revalidates_nested_saturation_point_after_model_copy() -> None:
+    configuration = _configuration()
+    report = _report(configuration)
+    mutated_point = report.points[0].model_copy(
+        update={"capacity": replace(report.points[0].capacity, provider_images=1)}
+    )
+    mutated_report = report.model_copy(update={"points": (mutated_point, report.points[1])})
+
+    with pytest.raises(ValueError, match="provider_images"):
+        mutated_report.validate_report()
+
+
 def test_two_h100_topology_comparison_requires_declared_support() -> None:
     replicas = _report(_configuration(), session_offset=40)
     tensor = _report(
@@ -825,9 +872,7 @@ def test_two_h100_topology_comparison_requires_declared_support() -> None:
     )
     assert "Two-card tensor parallel" in comparison.render_markdown()
 
-    one_mode = _configuration(
-        supported_topologies=(TwoH100Topology.TWO_SINGLE_CARD_REPLICAS,)
-    )
+    one_mode = _configuration(supported_topologies=(TwoH100Topology.TWO_SINGLE_CARD_REPLICAS,))
     with pytest.raises(ValueError, match="support for both modes"):
         compare_two_h100_topologies(
             single_card_replicas=_report(one_mode, session_offset=60),
@@ -939,6 +984,7 @@ def test_provider_telemetry_collapses_canonical_retry_to_one_final_success() -> 
             adapter_transport_retry_count=0,
         )
 
+
 def test_gpu_measurement_requires_h100_and_feasible_two_gpu_window() -> None:
     session = _session(_configuration(), 80)
     values = _gpu(session).model_dump(mode="python")
@@ -1028,7 +1074,15 @@ def test_collector_marks_rejected_terminal_outcome_unsafe() -> None:
     )
     collector.record_provider_http_requests(qualification_session=session, count=13)
 
-    point = collector.build_point(capacity=_capacity(), gpu=_gpu(session))
+    point = collector.build_point(
+        capacity=_capacity(
+            provider_images=130,
+            logical_calls=13,
+            http_requests=13,
+            input_tokens=1_300,
+        ),
+        gpu=_gpu(session),
+    )
 
     assert point.safe_envelope is False
     assert point.telemetry.terminal_response_count == 13
@@ -1095,9 +1149,7 @@ def test_run_provider_saturation_point_binds_actual_runpod_adapter() -> None:
     qualified_request = request.model_copy(
         update={"metadata": context.bind_request_metadata(request.metadata)}
     )
-    transport = _RetryThenSuccessTransport(
-        _completed_qualification_response(qualified_request)
-    )
+    transport = _RetryThenSuccessTransport(_completed_qualification_response(qualified_request))
     captured: dict[str, ProviderQualificationCollector] = {}
 
     def adapter_factory(
@@ -1130,10 +1182,7 @@ def test_run_provider_saturation_point_binds_actual_runpod_adapter() -> None:
         assert adapter.qualification_observer is captured["collector"]
         metadata = received_context.bind_request_metadata({"source": "p6"})
         assert metadata[RUNPOD_QUALIFICATION_SESSION_METADATA_KEY] == session.session_id
-        assert (
-            metadata[RUNPOD_QUALIFICATION_RUN_NAMESPACE_METADATA_KEY]
-            == session.run_namespace
-        )
+        assert metadata[RUNPOD_QUALIFICATION_RUN_NAMESPACE_METADATA_KEY] == session.run_namespace
         with pytest.raises(ValueError, match="conflicting scope"):
             received_context.bind_request_metadata(
                 {RUNPOD_QUALIFICATION_SESSION_METADATA_KEY: _uuid(999)}
@@ -1150,7 +1199,7 @@ def test_run_provider_saturation_point_binds_actual_runpod_adapter() -> None:
             retries=7,
             provider_images=6,
             logical_calls=1,
-            http_requests=1,
+            http_requests=2,
             input_tokens=123,
             output_tokens=7,
             output_token_responses=1,
@@ -1177,6 +1226,36 @@ def test_run_provider_saturation_point_binds_actual_runpod_adapter() -> None:
     assert point.telemetry.canonical_retry_attempt_count == 0
     assert point.telemetry.adapter_terminal_workload.http_requests == 2
     assert point.telemetry.adapter_terminal_workload.output_tokens == 7
+
+
+def test_run_provider_saturation_point_rejects_excess_concurrency_before_dispatch() -> None:
+    configuration = _configuration()
+    session = _session(configuration, 135)
+    context = ProviderQualificationRunContext(
+        qualification_session=session,
+        run_namespace=session.run_namespace,
+    )
+
+    async def workload(
+        _adapter: object,
+        _context: ProviderQualificationRunContext,
+    ) -> MeasuredCapacityInput:
+        pytest.fail("an over-limit saturation point must be rejected before dispatch")
+
+    with pytest.raises(ValueError, match="configured provider concurrency"):
+        asyncio.run(
+            run_provider_saturation_point(
+                configuration=configuration,
+                context=context,
+                offered_concurrency=configuration.max_concurrent_requests + 1,
+                workload_manifest_bytes=_WORKLOAD_MANIFEST_BYTES,
+                adapter_factory=lambda _collector, _context: pytest.fail(
+                    "an over-limit saturation point must not construct an adapter"
+                ),
+                workload=workload,
+                gpu=_gpu(session),
+            )
+        )
 
 
 def test_run_provider_saturation_point_rejects_manual_collector_injection() -> None:

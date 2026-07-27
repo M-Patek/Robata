@@ -13,9 +13,12 @@ from robata.application.canonical.local_composition import (
     run_local_canonical_mcap,
 )
 from robata.contracts.cameras import CAMERA_IDS
-from robata.contracts.hashing import canonical_json_bytes
-from robata.contracts.stream_common import StreamStage
+from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
+from robata.contracts.stream_common import ArtifactEvidenceRef, StreamStage, TerminalOutcome
 from robata.contracts.stream_planning import StreamWorkItemPlan
+from robata.inference.models import VisionTask
+from robata.queue.stream_models import StreamTerminalEvidence
+from tests.integration.test_canonical_mcap_source import _pre_eos_fixture_model
 from tests.support.six_camera_mcap import SIX_CAMERA_TOPICS, write_six_camera_mcap
 
 
@@ -55,20 +58,49 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
     state_dir = tmp_path / "canonical-state"
     sequence: list[str] = []
     contexts: list[LocalPreEosExecutorContext] = []
+    hooks: list[object] = []
     pre_eos_stages: list[StreamStage] = []
     eos_hooks: list[object] = []
 
-    def hook(plan: StreamWorkItemPlan) -> None:
-        sequence.append("pre-eos")
-        pre_eos_stages.append(plan.stage)
-        # The explicit hook may decline a work item; the local mock then owns
-        # only that item. A real ProviderNeutralStreamStageExecutor returns its
-        # typed terminal instead.
-        return None
+    task_by_stage = {
+        StreamStage.QA_COARSE: VisionTask.QA_COARSE,
+        StreamStage.QA_DENSE: VisionTask.QA_DENSE,
+        StreamStage.EVENT_PROPOSAL: VisionTask.EVENT_PROPOSAL,
+    }
 
     def factory(context: LocalPreEosExecutorContext):
         sequence.append("factory")
         contexts.append(context)
+
+        def hook(plan: StreamWorkItemPlan) -> StreamTerminalEvidence | None:
+            sequence.append("pre-eos")
+            pre_eos_stages.append(plan.stage)
+            task = task_by_stage.get(plan.stage)
+            if task is None:
+                return None
+            model = _pre_eos_fixture_model(task)
+            payload = canonical_json_bytes(model)
+            digest = exact_bytes_sha256(payload)
+            artifact_path = context.artifact_root / digest[:2] / f"{digest}.json"
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            if artifact_path.exists():
+                assert artifact_path.read_bytes() == payload
+            else:
+                artifact_path.write_bytes(payload)
+            return StreamTerminalEvidence(
+                outcome=TerminalOutcome.SUCCEEDED,
+                evidence_ref=ArtifactEvidenceRef(
+                    artifact_id=model.inference_id,
+                    exact_sha256=digest,
+                    byte_count=len(payload),
+                    media_type="application/json",
+                    schema_ref=context.model_inference_schema_ref,
+                ),
+                terminal_policy_version=context.terminal_policy_version,
+                completed_at=model.completed_at,
+            )
+
+        hooks.append(hook)
         return hook
 
     original_source_loader = mcap_source_module.load_canonical_mcap_source
@@ -76,7 +108,8 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
     def observed_source_loader(*args: object, **kwargs: object):
         sequence.append("source")
         assert contexts
-        assert kwargs["stage_terminal_executor"] is hook
+        assert kwargs["stage_terminal_executor"] is hooks[-1]
+        assert kwargs["provider_terminal_required"] is True
         return original_source_loader(*args, **kwargs)
 
     original_finalizer = local_composition_module._finalize_local_stream_graphs
@@ -84,6 +117,7 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
     def observed_finalizer(*args: object, **kwargs: object):
         sequence.append("eos")
         eos_hooks.append(kwargs["stage_terminal_executor"])
+        assert kwargs["provider_terminal_required"] is True
         return original_finalizer(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -117,7 +151,7 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
     assert sequence.index("factory") < sequence.index("source")
     assert pre_eos_stages
     assert sequence.index("source") < sequence.index("eos")
-    assert eos_hooks == [hook]
+    assert eos_hooks == hooks
 
     # Completion recovery returns before source preparation, runtime/factory
     # construction, or EOS execution. This is the outer no-duplicate-dispatch

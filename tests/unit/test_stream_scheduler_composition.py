@@ -20,6 +20,8 @@ from robata.application.canonical.bounded_media import (
     BoundedWindowPlan,
     CameraStreamFacts,
     CameraWindowPlan,
+    PacketReference,
+    PlannerEmission,
     PlannerFinish,
     WindowClosureReason,
     WindowMember,
@@ -54,6 +56,7 @@ from robata.queue.stream_models import (
     StreamWorkItemState,
     StreamWorkLease,
 )
+from robata.runtime.observability import RuntimeProfileRecorder
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -219,6 +222,161 @@ def _composition(
         clock=lambda: _NOW,
         boundary_observer=observer,
     )
+
+
+def test_append_emission_batches_window_append_plan_and_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    authority = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+    capture = _capture()
+    composition = _composition(
+        tmp_path,
+        capture=capture,
+        scheduler=authority,
+    )
+    emission = PlannerEmission(
+        packet=PacketReference(
+            traversal_index=0,
+            camera_id=CAMERA_IDS[0],
+            source_order=0,
+            source_sequence=0,
+            source_timestamp_ns=0,
+            aligned_timestamp_ns=0,
+            source_locator="memory://packet-0",
+            payload_sha256=_digest(90),
+            payload_bytes=1,
+            is_keyframe=True,
+        ),
+        closed_segments=(),
+        quality_targets=(),
+        windows=(_window(capture, 0), _window(capture, 1)),
+        watermark_ns=None,
+    )
+
+    def reject_full_window_scan(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise AssertionError("append emission must use bounded ordinal lookup")
+
+    persisted_count = composition._ledger.window_count
+    monkeypatch.setattr(composition._ledger, "windows", reject_full_window_scan)
+    monkeypatch.setattr(
+        composition._ledger,
+        "window_count",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("append emission must use indexed tail lookup")
+        ),
+    )
+    composition.append_emission(emission)
+
+    assert persisted_count(composition.plan_key) == 2
+    snapshot = recorder.snapshot()
+
+    def transactions(operation: str) -> int:
+        return sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.transactions"
+            and any(
+                attribute.name == "operation" and attribute.value == operation
+                for attribute in counter.attributes
+            )
+        )
+
+    assert transactions("authority.stream_work.append_windows") == 1
+    assert transactions("plan_many") == 1
+    assert transactions("authority.stream_work.mark_published_many") == 1
+
+
+def test_append_emission_rejects_batch_that_would_cross_depth_limit(
+    tmp_path: Path,
+) -> None:
+    authority = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    capture = _capture()
+    composition = _composition(
+        tmp_path,
+        capture=capture,
+        scheduler=authority,
+        backpressure_config=BackpressureConfig(
+            version="test-batch-pressure-v1",
+            queue_depth_threshold=4,
+            oldest_age_threshold_ms=60_000,
+            backlog_slope_threshold=100.0,
+        ),
+    )
+    emission = PlannerEmission(
+        packet=PacketReference(
+            traversal_index=0,
+            camera_id=CAMERA_IDS[0],
+            source_order=0,
+            source_sequence=0,
+            source_timestamp_ns=0,
+            aligned_timestamp_ns=0,
+            source_locator="memory://packet-0",
+            payload_sha256=_digest(91),
+            payload_bytes=1,
+            is_keyframe=True,
+        ),
+        closed_segments=(),
+        quality_targets=(),
+        windows=(_window(capture, 0), _window(capture, 1)),
+        watermark_ns=None,
+    )
+
+    with pytest.raises(StreamBackpressureThrottle) as caught:
+        composition.append_emission(emission)
+
+    assert caught.value.decision.signals == ("QUEUE_DEPTH",)
+    assert composition.declarations() == ()
+
+
+def test_seal_batches_final_windows_and_durably_records_planner_eos(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    authority = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+    capture = _capture()
+    composition = _composition(
+        tmp_path,
+        capture=capture,
+        scheduler=authority,
+    )
+    finish = PlannerFinish(
+        closed_segments=(),
+        quality_targets=(),
+        windows=(_window(capture, 0), _window(capture, 1)),
+        facts=_finish().facts,
+    )
+
+    composition.seal(finish)
+
+    snapshot = recorder.snapshot()
+
+    def transactions(operation: str) -> int:
+        return sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.transactions"
+            and any(
+                attribute.name == "operation" and attribute.value == operation
+                for attribute in counter.attributes
+            )
+        )
+
+    assert transactions("authority.stream_work.append_windows") == 1
+    assert transactions("plan_many") == 1
+    assert transactions("authority.stream_work.mark_published_many") == 1
+    with sqlite3.connect(authority.database_path) as connection:
+        planner_eos = connection.execute(
+            "SELECT planner_eos_sha256 FROM stream_plans"
+        ).fetchone()[0]
+    assert planner_eos is not None
 
 
 def _terminal_evidence(

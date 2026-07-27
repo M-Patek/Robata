@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ from robata.application.canonical.parallel_service import (
     CanonicalLocalRecordingService,
 )
 from robata.application.canonical.primary_completion import PreparedPrimaryCompletionCommand
-from robata.contracts.hashing import canonical_json_bytes
+from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
 from robata.queue.models import WorkAttemptOutcome, WorkItemState
 from robata.review.routing import ReviewRoutingDisposition
 from robata.runtime.observability import RuntimeProfileRecorder
@@ -595,6 +596,30 @@ def test_local_command_seals_inference_evidence_before_primary_completion(
     )
 
 
+
+    tampered_detail = prepared.detail_bytes + b" "
+    with pytest.raises(ValueError, match="detail bytes"):
+        replace(
+            prepared,
+            detail_bytes=tampered_detail,
+            detail_exact_bytes_sha256=exact_bytes_sha256(tampered_detail),
+        )
+
+    tampered_command = prepared.command_bytes + b" "
+    with pytest.raises(ValueError, match="command bytes"):
+        replace(
+            prepared,
+            command_bytes=tampered_command,
+            command_exact_bytes_sha256=exact_bytes_sha256(tampered_command),
+        )
+
+    tampered_processing_run = prepared.processing_run_bytes + b" "
+    with pytest.raises(ValueError, match="processing-run bytes"):
+        replace(
+            prepared,
+            processing_run_bytes=tampered_processing_run,
+            processing_run_exact_bytes_sha256=exact_bytes_sha256(tampered_processing_run),
+        )
 def test_failed_precommit_evidence_seal_publishes_no_primary_fact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -10,6 +10,7 @@ from robata.application.canonical.media_quality import (
     build_local_media_quality_report,
 )
 from robata.application.canonical.product_qa import (
+    CanonicalProductQAProjector,
     product_qa_context_from_media_quality_report,
 )
 from robata.contracts.cameras import CAMERA_IDS, CameraId
@@ -26,6 +27,8 @@ from robata.contracts.qa import (
     QAIssue,
     QAStatus,
 )
+from robata.qa_pipeline.coarse import CoarseQAResult
+from robata.qa_pipeline.completion import QACompletionResult, QACompletionStatus
 from robata.qa_pipeline.product import (
     ProductQACascadeProjector,
     ProductQACascadeStatus,
@@ -318,6 +321,28 @@ def test_product_cascade_supports_a_selected_abstained_class_without_erasing_no_
     assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].state is ProductQAClassState.ABSTAINED
     assert coverage[ProductQAIssue.ARM_HAND_OBSTRUCTED].reason_codes == ("SEMANTIC_ABSTAINED",)
     assert coverage[ProductQAIssue.BLACK_SCREEN].state is ProductQAClassState.NO_ISSUE
+
+
+def test_canonical_product_projector_rejects_foreign_candidate_reduction() -> None:
+    """Cross-stage event facts must be typed before product evidence reduction."""
+
+    # The projector validates the coarse/completion types first, then inspects
+    # candidate reduction. Constructing the two upstream envelopes is enough
+    # because the rejection must happen before their internals are read.
+    coarse = CoarseQAResult.model_construct(package_camera_results=())
+    completion = QACompletionResult.model_construct(
+        dense_result=None,
+        status=QACompletionStatus.QA_COMPLETE,
+    )
+
+    with pytest.raises(TypeError, match="candidate_reduction_result"):
+        CanonicalProductQAProjector().project(
+            recording_id="recording-1",
+            recording_duration_ns=10_000_000_000,
+            coarse_result=coarse,
+            qa_completion_result=completion,
+            candidate_reduction_result=object(),
+        )
 
 
 def test_media_quality_context_maps_direct_and_proxy_evidence_at_original_timestamp() -> None:

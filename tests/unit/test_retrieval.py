@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+from robata.application.canonical.projections import (
+    CANONICAL_EVENT_INDEX_PROJECTION_VERSION,
+    canonical_event_index_batch_projection,
+    canonical_event_index_revision_projection,
+)
+from robata.contracts.retrieval import VectorSearchHit
 from robata.retrieval import (
     ClipArtifact,
     ClipManifest,
@@ -101,6 +107,69 @@ def test_structured_filters_precede_lexical_semantic_ranking() -> None:
     assert result.items[0].semantic_score == 1.0
 
 
+class _VectorStore:
+    def __init__(self, hits: tuple[VectorSearchHit, ...]) -> None:
+        self.hits = hits
+        self.queries: list[object] = []
+
+    def search(self, query: object) -> tuple[VectorSearchHit, ...]:
+        self.queries.append(query)
+        return self.hits
+
+
+def test_vector_rerank_aggregates_artifacts_before_pagination() -> None:
+    index = EventIndex()
+    index.update_index(_revision("revision-1"), select=True)
+    index.update_index(
+        _revision("revision-2", event_id="event-2", label="bottle", start_ns=30),
+        select=True,
+    )
+    vector_store = _VectorStore(
+        (
+            VectorSearchHit(
+                projection_id="vector-1a",
+                event_revision_id="revision-1",
+                artifact_id="artifact-a",
+                embedding_id="embedding-v1",
+                score=0.4,
+                rank=0,
+            ),
+            VectorSearchHit(
+                projection_id="vector-1b",
+                event_revision_id="revision-1",
+                artifact_id="artifact-b",
+                embedding_id="embedding-v1",
+                score=0.9,
+                rank=1,
+            ),
+            VectorSearchHit(
+                projection_id="vector-2",
+                event_revision_id="revision-2",
+                embedding_id="embedding-v1",
+                score=0.8,
+                rank=2,
+            ),
+        )
+    )
+    service = RetrievalService(index=index, vector_store=vector_store)
+
+    result = service.semantic_search(
+        RetrievalQuery(embedding_id="embedding-v1", limit=1),
+        embedding_vector=[1.0],
+        tenant_id="tenant-a",
+    )
+
+    assert result.items[0].event_revision_id == "revision-1"
+    assert result.items[0].semantic_score == pytest.approx(0.9)
+    assert result.total == 2
+    assert result.has_more is True
+    assert vector_store.queries[0].candidate_event_revision_ids == (
+        "revision-1",
+        "revision-2",
+    )
+    assert vector_store.queries[0].tenant_id == "tenant-a"
+
+
 def test_current_selection_hides_superseded_revision() -> None:
     index = EventIndex()
     index.build_index(
@@ -196,3 +265,84 @@ def test_selection_rejects_wrong_ownership_and_sequence() -> None:
             selection_decision_id="decision-1",
             sequence=2,
         )
+
+
+
+def _canonical_publication() -> dict[str, object]:
+    return {
+        "payload": {
+            "recording_identity": "a" * 64,
+            "event_id": "event-terminal-1",
+            "mcap_id": "mcap-terminal-1",
+            "effective_interval": {"start_ns": 100, "end_ns": 250},
+            "action_label": "grasp",
+            "observation": "PROPOSED",
+            "event_status": "NEEDS_REVIEW",
+            "camera_sources": [
+                {"camera_id": "cam_01", "citation_status": "CITED"},
+                {"camera_id": "cam_02", "citation_status": "NOT_CITED"},
+            ],
+            "evidence_class": "LOCAL_CONFORMANCE",
+            "production_eligible": False,
+        },
+        "revision": {
+            "revision_id": "revision-terminal-1",
+            "revision_logical_key": "canonical-action-event-revision:one",
+            "semantic_sha256": "b" * 64,
+            "payload_sha256": "c" * 64,
+            "lineage_sha256": "d" * 64,
+        },
+        "lineage": {"fusion_reduction_logical_key": "fusion-reduction:one"},
+        "selection": {
+            "selection_decision_id": "selection-terminal-1",
+            "selection_sequence": 1,
+        },
+    }
+
+
+def test_canonical_terminal_projection_keeps_structured_identity_and_facets() -> None:
+    projected = canonical_event_index_revision_projection(_canonical_publication())
+
+    assert projected["projection_version"] == CANONICAL_EVENT_INDEX_PROJECTION_VERSION
+    assert projected["event_id"] == "event-terminal-1"
+    assert projected["event_revision_id"] == "revision-terminal-1"
+    assert projected["revision_semantic_sha256"] == "b" * 64
+    assert projected["start_ns"] == 100
+    assert projected["end_ns"] == 250
+    assert projected["camera_statuses"] == {"cam_01": "CITED", "cam_02": "NOT_CITED"}
+    assert projected["usable_camera_count"] == 1
+    assert projected["selection"]["selection_decision_id"] == "selection-terminal-1"
+
+
+def test_event_index_terminal_projection_is_replay_safe() -> None:
+    publication = _canonical_publication()
+    projection = canonical_event_index_batch_projection({"publications": [publication]})
+    assert canonical_event_index_batch_projection(projection) == projection
+    index = EventIndex()
+
+    first = index.apply_projection(projection)
+    second = index.apply_projection(projection)
+
+    assert first == second
+    assert index.revision_count == 1
+    assert index.membership_count == 1
+    assert index.selection_history("event-terminal-1") == (("selection-terminal-1", 1),)
+    assert index.membership("event-terminal-1", "revision-terminal-1") == first[0]
+
+    changed = dict(projection["event_revisions"][0])
+    changed["action_type"] = "release"
+    with pytest.raises(EventIndexError, match="cannot be mutated"):
+        index.apply_projection({"event_revisions": [changed]})
+
+
+def test_projection_and_index_reject_invalid_intervals_and_status_shapes() -> None:
+    invalid = _canonical_publication()
+    invalid["payload"] = dict(invalid["payload"])
+    invalid["payload"]["effective_interval"] = {"start_ns": 10, "end_ns": 10}
+    with pytest.raises(ValueError, match="non-empty"):
+        canonical_event_index_revision_projection(invalid)
+
+    malformed = _revision("revision-malformed")
+    malformed["camera_statuses"] = []
+    with pytest.raises(EventIndexError, match="camera_statuses"):
+        EventIndex().update_index(malformed)

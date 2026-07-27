@@ -507,3 +507,68 @@ def test_primary_schema_v1_is_migrated_without_losing_outbox(tmp_path: Path) -> 
     }
     assert stored_digest == exact_bytes_sha256(stored_bytes)
     assert reopened.list_outbox(stored_document["recording_identity"])[0].outbox_id == outbox_id
+
+
+def test_expired_final_attempt_enters_durable_dead_letter_without_reclaim(
+    tmp_path: Path,
+) -> None:
+    database_path, outbox_id, _ = _committed_outbox(tmp_path, run_value=90_011)
+    clock = _MutableClock(datetime(2026, 7, 21, 18, tzinfo=UTC))
+    store = SQLitePrimaryOutboxDeliveryStore(
+        database_path,
+        retry_policy=_policy(max_attempts=1),
+        clock=clock,
+    )
+
+    claim = store.claim(
+        worker_id="relay-crashed",
+        lease_duration=timedelta(seconds=10),
+    )
+    assert claim is not None
+    assert claim.delivery.attempt_count == 1
+    clock.advance(seconds=11)
+
+    # Claim maintenance is the recovery trigger. The abandoned final attempt
+    # must become terminal DLQ rather than being eligible for another claim.
+    assert store.claim(worker_id="relay-recovery", lease_duration=timedelta(seconds=10)) is None
+    dead = store.get(outbox_id)
+    assert dead is not None
+    assert dead.status is OutboxDeliveryStatus.DEAD_LETTER
+    assert dead.attempt_count == 1
+    assert dead.last_error == "delivery lease expired after final attempt"
+    assert dead.dead_lettered_at is not None
+    assert store.list_dead_letters() == (dead,)
+
+
+def test_record_failure_rejects_a_claim_superseded_after_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    database_path, outbox_id, _ = _committed_outbox(tmp_path, run_value=90_012)
+    clock = _MutableClock(datetime(2026, 7, 21, 19, tzinfo=UTC))
+    store = SQLitePrimaryOutboxDeliveryStore(
+        database_path,
+        retry_policy=_policy(),
+        clock=clock,
+    )
+
+    abandoned = store.claim(
+        worker_id="relay-old",
+        lease_duration=timedelta(seconds=10),
+    )
+    assert abandoned is not None
+    clock.advance(seconds=11)
+    replacement = store.claim(
+        worker_id="relay-new",
+        lease_duration=timedelta(seconds=10),
+    )
+    assert replacement is not None
+    assert replacement.delivery.lease_epoch == abandoned.delivery.lease_epoch + 1
+
+    with pytest.raises(OutboxFenceError, match="stale"):
+        store.record_failure(abandoned, "late publish failure")
+
+    current = store.get(outbox_id)
+    assert current is not None
+    assert current.status is OutboxDeliveryStatus.LEASED
+    assert current.fencing_token == replacement.delivery.fencing_token
+    assert current.last_error is None

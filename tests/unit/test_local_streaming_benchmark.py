@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from robata.runtime.benchmark import (
     RecordingWorkerBatchFacts,
+    RecordingWorkerConcurrency,
     RecordingWorkerQueueObservation,
     build_measured_recording_worker_scaling_report,
     run_measured_recording_worker_matrix,
@@ -344,6 +345,12 @@ def _worker_facts(
     recording_count: int = 4,
     named_shared_resource_limit: str | None = None,
     cancelled_recording_count: int = 0,
+    admission_rejection_count: int = 0,
+    lease_recovery_count: int = 0,
+    lease_recovery_succeeded_count: int = 0,
+    optional_work_offered_count: int = 0,
+    optional_work_shed_count: int = 0,
+    optional_work_shedding_actions: tuple[str, ...] = (),
 ) -> RecordingWorkerBatchFacts:
     return RecordingWorkerBatchFacts(
         successful_recording_count=recording_count - cancelled_recording_count,
@@ -374,6 +381,12 @@ def _worker_facts(
             ),
         ),
         named_shared_resource_limit=named_shared_resource_limit,
+        admission_rejection_count=admission_rejection_count,
+        lease_recovery_count=lease_recovery_count,
+        lease_recovery_succeeded_count=lease_recovery_succeeded_count,
+        optional_work_offered_count=optional_work_offered_count,
+        optional_work_shed_count=optional_work_shed_count,
+        optional_work_shedding_actions=optional_work_shedding_actions,
     )
 
 
@@ -534,3 +547,55 @@ def test_n_worker_saturation_reports_named_resource_limit() -> None:
     assert report.scale_out_outcome_explained is True
     assert report.n_worker_outcome_explained is True
     assert report.as_dict()["saturation_worker_count"] == 8
+
+
+def test_measured_worker_report_keeps_stage_concurrency_and_shedding_units() -> None:
+    hour_ns = 3_600_000_000_000
+    ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 9 * hour_ns))
+
+    report = run_measured_recording_worker_matrix(
+        lambda _worker_count: lambda: _worker_facts(
+            admission_rejection_count=2,
+            lease_recovery_count=1,
+            lease_recovery_succeeded_count=1,
+            optional_work_offered_count=10,
+            optional_work_shed_count=3,
+            optional_work_shedding_actions=("STOP_OPTIONAL_DEEP",),
+        ),
+        workload_id="s" * 64,
+        recording_count=4,
+        recording_duration_ns=hour_ns,
+        worker_counts=(1, 2, 4),
+        concurrency_factory=lambda worker_count: RecordingWorkerConcurrency(
+            media_worker_count=worker_count,
+            provider_worker_count=2,
+            completion_worker_count=1,
+            outbox_worker_count=1,
+        ),
+        clock_ns=lambda: next(ticks),
+    )
+
+    assert report.stage_concurrency_observed is True
+    assert report.optional_work_offered_count == 30
+    assert report.optional_work_shed_count == 9
+    assert report.optional_work_shed_fraction == pytest.approx(0.3)
+    assert report.optional_work_shedding_actions == ("STOP_OPTIONAL_DEEP",)
+    assert report.admission_rejection_count == 6
+    assert report.lease_recovery_reconciled is True
+    assert report.backlog_peak == 13
+    assert report.backlog_end == 0
+    assert report.as_dict()["runs"][0]["concurrency"] == {
+        "media_worker_count": 1,
+        "provider_worker_count": 2,
+        "completion_worker_count": 1,
+        "outbox_worker_count": 1,
+    }
+
+
+def test_measured_worker_facts_reject_unreconciled_recovery_or_shedding() -> None:
+    with pytest.raises(ValueError, match="lease recovery successes"):
+        _worker_facts(lease_recovery_count=1, lease_recovery_succeeded_count=2)
+    with pytest.raises(ValueError, match="optional work shed"):
+        _worker_facts(optional_work_offered_count=1, optional_work_shed_count=2)
+    with pytest.raises(ValueError, match="shedding requires"):
+        _worker_facts(optional_work_offered_count=1, optional_work_shed_count=1)

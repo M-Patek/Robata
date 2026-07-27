@@ -392,3 +392,109 @@ def test_non_graceful_stop_releases_queued_publish_lease_for_restart(tmp_path: P
     finally:
         release_publisher.set()
         queues.close(wait=True)
+
+
+def test_optional_work_is_shed_without_durable_mutation_or_drain_credit(tmp_path: Path) -> None:
+    scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    plans = tuple(_plan(value) for value in (80, 81, 82))
+    for plan in plans:
+        scheduler.plan(plan)
+    provider_started = Event()
+    release_provider = Event()
+
+    def provider(claim: object) -> str:
+        provider_started.set()
+        assert release_provider.wait(3)
+        return claim.work_item.work_item_id  # type: ignore[union-attr]
+
+    with _queues(
+        scheduler,
+        provider=provider,
+        publisher=lambda _claim, _result: None,
+        ingress_capacity=1,
+        provider_capacity=1,
+        publish_capacity=1,
+    ) as queues:
+        assert queues.admit(plans[0].work_item_id).admitted
+        assert provider_started.wait(3)
+        assert queues.admit(plans[1].work_item_id).admitted
+        _wait_for(lambda: queues.snapshot.provider.queued == 1)
+        shed = queues.admit_optional(plans[2].work_item_id)
+        assert shed.status is StreamQueueAdmissionStatus.SHED_OPTIONAL
+        assert scheduler.get(plans[2].work_item_id).state is WorkItemState.READY
+        assert queues.snapshot.optional_work_offered == 1
+        assert queues.snapshot.optional_work_shed == 1
+        assert queues.snapshot.backlog >= 1
+        assert queues.snapshot.optional_work_shedding_actions[0] == "STOP_OPTIONAL_DEEP"
+        assert queues.recover() == 0
+        assert queues.snapshot.optional_work_shed == 1
+        release_provider.set()
+        queues.cancel(plans[2].work_item_id, reason_code="TEST_SHED_CANCEL")
+        assert queues.recover() == 0
+        assert queues.snapshot.optional_work_shed == 1
+        assert queues.drain(timeout=3)
+        assert queues.snapshot.backlog_end == 0
+
+
+def test_optional_watermark_and_recovery_counters_are_visible(tmp_path: Path) -> None:
+    scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    plan = _plan(83)
+    scheduler.plan(plan)
+    with _queues(
+        scheduler,
+        provider=lambda claim: claim.work_item.work_item_id,  # type: ignore[union-attr]
+        publisher=lambda _claim, _result: None,
+    ) as queues:
+        assert queues.recover() == 1
+        assert queues.snapshot.recovery_count >= 1
+        assert queues.snapshot.recovery_admitted >= 1
+        assert queues.drain(timeout=3)
+
+
+def test_cancelling_close_discards_queued_publish_notifications(tmp_path: Path) -> None:
+    scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    plans = (_plan(84), _plan(85))
+    for plan in plans:
+        scheduler.plan(plan)
+    publisher_started = Event()
+    release_publisher = Event()
+
+    def provider(claim: object) -> str:
+        return claim.work_item.work_item_id  # type: ignore[union-attr]
+
+    def publisher(claim: object, _result: object) -> None:
+        if claim.work_item.work_item_id == plans[0].work_item_id:  # type: ignore[union-attr]
+            publisher_started.set()
+            assert release_publisher.wait(3)
+
+    queues = _queues(
+        scheduler,
+        provider=provider,
+        publisher=publisher,
+        ingress_capacity=1,
+        provider_capacity=1,
+        publish_capacity=1,
+        recovery_poll_seconds=60.0,
+    )
+    try:
+        assert queues.admit(plans[0].work_item_id).admitted
+        assert publisher_started.wait(3)
+        assert queues.admit(plans[1].work_item_id).admitted
+        _wait_for(lambda: queues.snapshot.publish.queued == 1)
+
+        queues.close(wait=False, cancel_pending=True)
+        snapshot = queues.snapshot
+        assert snapshot.ingress.queued == 0
+        assert snapshot.provider.queued == 0
+        assert snapshot.publish.queued == 0
+        assert snapshot.scheduled_work_count == 0
+        assert snapshot.backlog_end == 0
+        assert snapshot.publish.cancelled >= 1
+        assert scheduler.get(plans[0].work_item_id).state is WorkItemState.CANCELLED
+        assert scheduler.get(plans[1].work_item_id).state is WorkItemState.CANCELLED
+
+        release_publisher.set()
+        queues.close(wait=True)
+    finally:
+        release_publisher.set()
+        queues.close(wait=True, cancel_pending=True)

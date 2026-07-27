@@ -693,3 +693,121 @@ def test_coverage_planner_fails_closed_when_budget_would_erase_an_original_trigg
                 ),
             ),
         )
+
+
+def test_sentinel_triggers_are_canonicalized_and_deduplicated() -> None:
+    from robata.sampling.adaptive import (
+        AdaptiveSignal,
+        SignalTrigger,
+        adaptive_upgrade_requests_from_sentinel_triggers,
+    )
+
+    triggers = (
+        SignalTrigger(
+            signal_type=AdaptiveSignal.SCENE_CHANGE,
+            timestamp_ns=500,
+            strength=0.2,
+            confidence=0.5,
+            camera_id=CameraId.CAM_02,
+        ),
+        SignalTrigger(
+            signal_type=AdaptiveSignal.BLUR_CHANGE,
+            timestamp_ns=500,
+            strength=0.9,
+            confidence=0.9,
+            camera_id=CameraId.CAM_01,
+        ),
+        SignalTrigger(
+            signal_type=AdaptiveSignal.MOTION_ENERGY,
+            timestamp_ns=500,
+            strength=0.4,
+            confidence=0.6,
+            camera_id=CameraId.CAM_01,
+        ),
+        SignalTrigger(
+            signal_type=AdaptiveSignal.MOTION_ENERGY,
+            timestamp_ns=250,
+            strength=0.4,
+            confidence=0.6,
+            camera_id=CameraId.CAM_01,
+        ),
+    )
+
+    first = adaptive_upgrade_requests_from_sentinel_triggers(triggers)
+    replay = adaptive_upgrade_requests_from_sentinel_triggers(tuple(reversed(triggers)))
+
+    assert first == replay
+    assert tuple((request.camera_id, request.trigger_timestamp_ns) for request in first) == (
+        (CameraId.CAM_01, 250),
+        (CameraId.CAM_01, 500),
+        (CameraId.CAM_02, 500),
+    )
+    assert all(request.reason is AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL for request in first)
+
+
+def test_sentinel_trigger_bridge_fails_closed_for_unbound_or_excess_input() -> None:
+    from robata.sampling.adaptive import (
+        AdaptiveSignal,
+        SignalTrigger,
+        adaptive_upgrade_requests_from_sentinel_triggers,
+    )
+
+    unbound = SignalTrigger(
+        signal_type=AdaptiveSignal.MOTION_ENERGY,
+        timestamp_ns=100,
+        strength=1.0,
+        confidence=1.0,
+    )
+    with pytest.raises(ValueError, match="canonical camera_id"):
+        adaptive_upgrade_requests_from_sentinel_triggers((unbound,))
+
+    triggers = tuple(
+        SignalTrigger(
+            signal_type=AdaptiveSignal.MOTION_ENERGY,
+            timestamp_ns=timestamp_ns,
+            strength=1.0,
+            confidence=1.0,
+            camera_id=CameraId.CAM_01,
+        )
+        for timestamp_ns in (100, 200)
+    )
+    with pytest.raises(ValueError, match="exceed max_requests"):
+        adaptive_upgrade_requests_from_sentinel_triggers(triggers, max_requests=1)
+
+
+def test_sentinel_plan_expands_trigger_context_without_changing_proxy_reason() -> None:
+    from robata.sampling.adaptive import (
+        AdaptiveSignal,
+        SignalTrigger,
+        plan_sentinel_adaptive_coverage,
+    )
+
+    policy = _coverage_policy(
+        base_target_budget_per_camera=2,
+        context_offsets_ns=(-200, 200),
+        max_targets_per_camera=5,
+        max_targets_total=30,
+    )
+    trigger = SignalTrigger(
+        signal_type=AdaptiveSignal.MOTION_ENERGY,
+        timestamp_ns=500,
+        strength=1.0,
+        confidence=1.0,
+        camera_id=CameraId.CAM_01,
+    )
+
+    plan = plan_sentinel_adaptive_coverage(
+        policy,
+        NanosecondInterval(start_ns=0, end_ns=2_000),
+        (trigger,),
+    )
+
+    assert plan.upgrade_targets_added == 3
+    assert {
+        target.target_ns
+        for target in plan.targets
+        if target.camera_id is CameraId.CAM_01 and target.upgrade_provenance
+    } == {300, 500, 700}
+    assert {
+        provenance.reason for target in plan.targets for provenance in target.upgrade_provenance
+    } == {AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL}

@@ -414,6 +414,7 @@ def test_mcap_source_injects_pre_eos_stage_executor_into_incremental_finalizer(
     assert schema_refs.model_inference is not None
     assert schema_refs.model_inference.schema_id == MODEL_INFERENCE_SCHEMA_ID
     assert schema_refs.model_inference.version == "1.0.0"
+    assert schema_refs.provider_terminal_required is False
 
 
 

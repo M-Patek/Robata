@@ -60,3 +60,5 @@ def test_signal_detectors_use_explicit_dimensions_and_exact_view_timestamps() ->
 
     assert [trigger.timestamp_ns for trigger in motion] == [checkerboard.timestamp_ns]
     assert [trigger.timestamp_ns for trigger in blur] == [flat.timestamp_ns]
+    assert [trigger.camera_id for trigger in motion] == ["cam_01"]
+    assert [trigger.camera_id for trigger in blur] == ["cam_01"]
