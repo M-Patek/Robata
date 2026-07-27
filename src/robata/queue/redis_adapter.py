@@ -9,18 +9,23 @@ acknowledge work that has been reclaimed by another worker.
 from __future__ import annotations
 
 import base64
+import json
 import math
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol, cast
 
 from robata.ports.task_queue import (
+    InspectableTaskQueue,
     LeaseId,
     PipelineTask,
     TaskId,
     TaskQueueError,
     TaskQueueErrorCode,
+    TaskSnapshot,
     TaskStatus,
 )
+from robata.runtime.observability import RuntimeObserver, runtime_increment
 
 
 class RedisTaskQueueClient(Protocol):
@@ -277,6 +282,26 @@ if op == 'status' or op == 'result' then
   if r.result == nil then return {'ok', '0'} end
   return {'ok', '1', r.result}
 end
+if op == 'inspect' then
+  local r, e = load(ARGV[4])
+  if e == 'MISSING' then return err('TASK_NOT_FOUND') end
+  if e then return err(e) end
+  -- Return one JSON value so the adapter can validate the complete snapshot
+  -- without making a second, non-atomic read of the task record.
+  return {'ok', cjson.encode(r)}
+end
+if op == 'dead_letters' then
+  local limit = tonumber(ARGV[4])
+  if not limit or limit <= 0 then return err('CORRUPT') end
+  local tokens = redis.call('ZRANGE', k('dead-letters'), 0, limit - 1)
+  local records = {}
+  for _, token in ipairs(tokens) do
+    local r, e = load(token)
+    if e == 'CORRUPT' then return err(e) end
+    if r and r.status == 'DEAD_LETTER' then table.insert(records, r) end
+  end
+  return {'ok', cjson.encode(records)}
+end
 if op == 'depth' then return {'ok', tostring(redis.call('SCARD', k('active')))} end
 if op == 'sweep' then return {'ok', tostring(swept)} end
 return err('CORRUPT')
@@ -343,7 +368,7 @@ def _b64decode(value: str, field: str) -> bytes:
         raise ValueError(f"stored {field} is not valid base64") from error
 
 
-class RedisTaskQueue:
+class RedisTaskQueue(InspectableTaskQueue):
     """Redis implementation of ``TaskQueue`` with a client-injection seam.
 
     When no client is supplied, the optional ``redis`` dependency is loaded
@@ -360,9 +385,17 @@ class RedisTaskQueue:
         retry_backoff_seconds: float = 1.0,
         max_size: int | None = None,
         retired_lease_ttl_seconds: int = 86_400,
+        runtime_observer: RuntimeObserver | None = None,
+        failure_injector: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(key_prefix, str) or not key_prefix.strip():
             raise ValueError("key_prefix must be a non-empty string")
+        if runtime_observer is not None and not callable(
+            getattr(runtime_observer, "increment_counter", None)
+        ):
+            raise TypeError("runtime_observer must implement increment_counter")
+        if failure_injector is not None and not callable(failure_injector):
+            raise TypeError("failure_injector must be callable or None")
         if max_size is not None and (
             isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0
         ):
@@ -375,6 +408,8 @@ class RedisTaskQueue:
             "retired_lease_ttl_seconds",
         ) // 1_000_000
         self._client = client
+        self._runtime_observer = runtime_observer
+        self._failure_injector = failure_injector
         self._unavailable_reason: str | None = None
         if client is not None:
             return
@@ -528,18 +563,116 @@ class RedisTaskQueue:
 
         return self._integer(self._run("sweep"), 1, "sweep count")
 
+    def inspect(self, task_id: TaskId) -> TaskSnapshot:
+        """Return an atomic broker snapshot for one task."""
+
+        response = self._run("inspect", self._task_token(task_id))
+        if len(response) != 2:
+            self._unavailable("inspect returned an invalid response")
+        try:
+            document = json.loads(response[1])
+        except (TypeError, json.JSONDecodeError) as error:
+            self._unavailable("inspect returned malformed JSON", error)
+        try:
+            return self._snapshot_from_document(document)
+        except (TypeError, ValueError, OverflowError) as error:
+            self._unavailable("inspect returned malformed task state", error)
+
+    def list_dead_letters(self, *, limit: int = 100) -> tuple[TaskSnapshot, ...]:
+        """Return dead-letter snapshots in Redis insertion order."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        response = self._run("dead_letters", str(limit))
+        if len(response) != 2:
+            self._unavailable("dead_letters returned an invalid response")
+        try:
+            documents = json.loads(response[1])
+            if not isinstance(documents, list):
+                raise ValueError("dead_letters payload must be a list")
+            return tuple(self._snapshot_from_document(document) for document in documents)
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
+            self._unavailable("dead_letters returned malformed task state", error)
+
+    @staticmethod
+    def _snapshot_from_document(document: object) -> TaskSnapshot:
+        if not isinstance(document, dict):
+            raise ValueError("task snapshot must be an object")
+
+        def required_text(name: str) -> str:
+            value = document.get(name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"task snapshot {name} must be nonempty text")
+            return value
+
+        def required_int(name: str) -> int:
+            value = document.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"task snapshot {name} must be an integer")
+            return value
+
+        def optional_text(name: str) -> str | None:
+            value = document.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"task snapshot {name} must be optional text")
+            return value
+
+        status = TaskStatus(required_text("status"))
+        retry_count = required_int("retry_count")
+        max_retries = required_int("max_retries")
+        available_at = (
+            _from_microseconds(required_int("available_at"))
+            if status is TaskStatus.PENDING
+            else None
+        )
+        lease_value = optional_text("lease_id")
+        leased_by = optional_text("leased_by")
+        expires_value = document.get("lease_expires_at")
+        if expires_value is None:
+            lease_expires_at = None
+        elif isinstance(expires_value, bool) or not isinstance(expires_value, int):
+            raise ValueError("task snapshot lease_expires_at must be an integer")
+        else:
+            lease_expires_at = _from_microseconds(expires_value)
+        if status is TaskStatus.CLAIMED and (
+            lease_value is None or leased_by is None or lease_expires_at is None
+        ):
+            raise ValueError("claimed task snapshot lacks lease metadata")
+        result_value = document.get("result")
+        result = None if result_value is None else _b64decode(result_value, "result")
+        return TaskSnapshot(
+            task_id=TaskId(required_text("task_id")),
+            status=status,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            available_at=available_at,
+            lease_id=None if lease_value is None else LeaseId(lease_value),
+            leased_by=leased_by,
+            lease_expires_at=lease_expires_at,
+            failure_reason=optional_text("failure_reason"),
+            result=result,
+        )
     def _task_token(self, task_id: TaskId) -> str:
         if not isinstance(task_id, TaskId):
             raise TaskQueueError(TaskQueueErrorCode.INVALID_REQUEST, "task_id must be TaskId")
         return _token(task_id.value)
 
     def _run(self, operation: str, *arguments: str) -> tuple[str, ...]:
+        runtime_increment(
+            self._runtime_observer,
+            "redis.task_queue.operations",
+            attributes={"operation": operation},
+        )
         client = self._client
         if client is None:
             self._unavailable(self._unavailable_reason or "no Redis client is configured")
         if not callable(getattr(client, "eval", None)):
             self._unavailable("Redis client does not support EVAL")
         try:
+            if self._failure_injector is not None:
+                self._failure_injector(operation)
             raw = client.eval(
                 _SCRIPT,
                 1,
@@ -550,6 +683,11 @@ class RedisTaskQueue:
                 *arguments,
             )
         except Exception as error:
+            runtime_increment(
+                self._runtime_observer,
+                "redis.task_queue.failures",
+                attributes={"operation": operation},
+            )
             self._unavailable("Redis command failed", error)
         if not isinstance(raw, (list, tuple)):
             self._unavailable("Redis script returned a non-array response")
@@ -571,6 +709,11 @@ class RedisTaskQueue:
                 self._unavailable("Redis task queue state is corrupt", error)
         if response[0] != "ok":
             self._unavailable("Redis script returned an unknown response")
+        runtime_increment(
+            self._runtime_observer,
+            "redis.task_queue.successes",
+            attributes={"operation": operation},
+        )
         return response
 
     @staticmethod

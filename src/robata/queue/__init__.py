@@ -57,6 +57,7 @@ from robata.queue.outbox import (
 from robata.queue.redis_adapter import RedisTaskQueue
 from robata.queue.stage import Stage, StageStatus
 from robata.queue.stream_runtime import (
+    DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS,
     BoundedStreamWorkQueues,
     BoundedStreamWorkQueuesConfig,
     BoundedStreamWorkQueuesSnapshot,
@@ -89,6 +90,7 @@ from robata.queue.wire import (
 )
 
 __all__ = [
+    "DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS",
     "PERSISTED_BARRIER_PROJECTION_VERSION",
     "PERSISTED_BARRIER_SCHEMA_ID",
     "PERSISTED_BARRIER_SCHEMA_VERSION",

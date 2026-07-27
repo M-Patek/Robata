@@ -17,6 +17,7 @@ turning into an unbounded in-memory backlog.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from queue import Empty, Full, Queue
@@ -31,8 +32,18 @@ from robata.queue.models import (
     WorkLease,
     WorkLeaseClaim,
 )
+from robata.queue.stage import Stage
 
 _POLL_SECONDS = 0.02
+DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS = (
+    "STOP_OPTIONAL_DEEP",
+    "REDUCE_GPT_SHADOW",
+    "DEFER_EMBEDDING",
+    "AUTO_SCALE",
+    "THROTTLE_LEDGER",
+    "EMERGENCY_SAMPLING",
+    "QUARANTINE_CANDIDATE",
+)
 
 
 class DurableStreamWorkScheduler(Protocol):
@@ -123,6 +134,7 @@ class StreamQueueAdmissionStatus(StrEnum):
     INGRESS_FULL = "INGRESS_FULL"
     PROVIDER_FULL = "PROVIDER_FULL"
     PUBLISH_FULL = "PUBLISH_FULL"
+    SHED_OPTIONAL = "SHED_OPTIONAL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +165,12 @@ class StreamQueueLaneSnapshot:
     cancelled: int
     rejected: int
     maximum_queued: int
+    shed_optional: int = 0
+    backpressure_waits: int = 0
+
+    @property
+    def optional_work_shed(self) -> int:
+        return self.shed_optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +183,43 @@ class BoundedStreamWorkQueuesSnapshot:
     provider: StreamQueueLaneSnapshot
     publish: StreamQueueLaneSnapshot
     last_error: str | None
+    optional_work_offered: int = 0
+    optional_work_admitted: int = 0
+    optional_work_shed: int = 0
+    backpressure_waits: int = 0
+    recovery_count: int = 0
+    recovery_admitted: int = 0
+    recovery_shed: int = 0
+    backlog_count: int = 0
+    backlog_peak: int = 0
+    backlog_end: int = 0
+    lease_renewals: int = 0
+    lease_renewal_errors: int = 0
+    optional_work_shedding_actions: tuple[str, ...] = DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS
+
+    @property
+    def optional_offered(self) -> int:
+        return self.optional_work_offered
+
+    @property
+    def optional_admitted(self) -> int:
+        return self.optional_work_admitted
+
+    @property
+    def optional_shed(self) -> int:
+        return self.optional_work_shed
+
+    @property
+    def backpressure_events(self) -> int:
+        return self.backpressure_waits
+
+    @property
+    def recovery_runs(self) -> int:
+        return self.recovery_count
+
+    @property
+    def backlog(self) -> int:
+        return self.backlog_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +235,10 @@ class BoundedStreamWorkQueuesConfig:
     lease_duration_seconds: int = 60
     retry_delay_seconds: int = 0
     recovery_poll_seconds: float = 0.1
+    optional_shed_watermark: float = 1.0
+    optional_stages: tuple[Stage, ...] = ()
+    optional_work_predicate: Callable[[WorkItem], bool] | None = None
+    optional_work_shedding_actions: tuple[str, ...] = DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS
 
     def __post_init__(self) -> None:
         _require_nonempty(self.run_id, "run_id")
@@ -199,6 +258,36 @@ class BoundedStreamWorkQueuesConfig:
             or self.recovery_poll_seconds <= 0
         ):
             raise ValueError("recovery_poll_seconds must be a positive number")
+        if (
+            isinstance(self.optional_shed_watermark, bool)
+            or not isinstance(self.optional_shed_watermark, (int, float))
+            or self.optional_shed_watermark <= 0
+            or self.optional_shed_watermark > 1
+        ):
+            raise ValueError("optional_shed_watermark must be in (0, 1]")
+        if not isinstance(self.optional_stages, tuple):
+            raise TypeError("optional_stages must be a tuple")
+        if any(not isinstance(stage, Stage) for stage in self.optional_stages):
+            raise TypeError("optional_stages must contain Stage values")
+        if len(set(self.optional_stages)) != len(self.optional_stages):
+            raise ValueError("optional_stages must be unique")
+        if self.optional_work_predicate is not None and not callable(
+            self.optional_work_predicate
+        ):
+            raise TypeError("optional_work_predicate must be callable or None")
+        if not self.optional_work_shedding_actions:
+            raise ValueError("optional_work_shedding_actions must not be empty")
+        if self.optional_work_shedding_actions[0] != "STOP_OPTIONAL_DEEP":
+            raise ValueError("optional_work_shedding_actions must begin with STOP_OPTIONAL_DEEP")
+        if len(set(self.optional_work_shedding_actions)) != len(
+            self.optional_work_shedding_actions
+        ):
+            raise ValueError("optional_work_shedding_actions must be unique")
+        if any(
+            not isinstance(action, str) or not action.strip()
+            for action in self.optional_work_shedding_actions
+        ):
+            raise ValueError("optional_work_shedding_actions must contain non-empty strings")
 
 
 class StreamQueueRetryableError(RuntimeError):
@@ -244,6 +333,22 @@ class _LaneCounters:
     rejected: int = 0
     active: int = 0
     maximum_queued: int = 0
+    shed_optional: int = 0
+    backpressure_waits: int = 0
+
+
+@dataclass(slots=True)
+class _QueueTelemetryCounters:
+    optional_work_offered: int = 0
+    optional_work_admitted: int = 0
+    optional_work_shed: int = 0
+    backpressure_waits: int = 0
+    recovery_count: int = 0
+    recovery_admitted: int = 0
+    recovery_shed: int = 0
+    backlog_count: int = 0
+    lease_renewals: int = 0
+    lease_renewal_errors: int = 0
 
 
 class _LeaseHeartbeat:
@@ -262,9 +367,13 @@ class _LeaseHeartbeat:
         scheduler: DurableStreamWorkScheduler,
         lease: WorkLease,
         lease_duration_seconds: int,
+        on_renewal: Callable[[], None] | None = None,
+        on_error: Callable[[], None] | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._lease_duration_seconds = lease_duration_seconds
+        self._on_renewal = on_renewal
+        self._on_error = on_error
         self._lock = RLock()
         self._lease = lease
         self._error: Exception | None = None
@@ -306,10 +415,16 @@ class _LeaseHeartbeat:
             except Exception as error:
                 with self._lock:
                     self._error = error
+                if self._on_error is not None:
+                    with suppress(Exception):
+                        self._on_error()
                 self._stop.set()
                 return
             with self._lock:
                 self._lease = renewed
+            if self._on_renewal is not None:
+                with suppress(Exception):
+                    self._on_renewal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +483,10 @@ class BoundedStreamWorkQueues:
         # stop releases these renewers so another runtime can replay safely.
         self._heartbeats: set[_LeaseHeartbeat] = set()
         self._counters = {lane: _LaneCounters() for lane in StreamQueueLane}
+        self._telemetry = _QueueTelemetryCounters()
+        self._optional_work_ids: set[str] = set()
+        self._shed_optional_ids: set[str] = set()
+        self._backlog_peak = 0
         self._last_error: str | None = None
 
         workers: list[Thread] = [
@@ -416,6 +535,8 @@ class BoundedStreamWorkQueues:
         """Return a small bounded-lane snapshot without scanning durable work."""
 
         with self._lock:
+            backlog_end = len(self._scheduled_work_ids) + len(self._shed_optional_ids)
+            self._backlog_peak = max(self._backlog_peak, backlog_end)
             return BoundedStreamWorkQueuesSnapshot(
                 closed=self._closed,
                 scheduled_work_count=len(self._scheduled_work_ids),
@@ -423,9 +544,27 @@ class BoundedStreamWorkQueues:
                 provider=self._lane_snapshot(StreamQueueLane.PROVIDER, self._provider),
                 publish=self._lane_snapshot(StreamQueueLane.PUBLISH, self._publish),
                 last_error=self._last_error,
+                optional_work_offered=self._telemetry.optional_work_offered,
+                optional_work_admitted=self._telemetry.optional_work_admitted,
+                optional_work_shed=self._telemetry.optional_work_shed,
+                backpressure_waits=self._telemetry.backpressure_waits,
+                recovery_count=self._telemetry.recovery_count,
+                recovery_admitted=self._telemetry.recovery_admitted,
+                recovery_shed=self._telemetry.recovery_shed,
+                backlog_count=backlog_end,
+                backlog_peak=self._backlog_peak,
+                backlog_end=backlog_end,
+                lease_renewals=self._telemetry.lease_renewals,
+                lease_renewal_errors=self._telemetry.lease_renewal_errors,
+                optional_work_shedding_actions=self._config.optional_work_shedding_actions,
             )
 
-    def admit(self, work_item_id: str) -> StreamQueueAdmission:
+    def admit(
+        self,
+        work_item_id: str,
+        *,
+        optional: bool = False,
+    ) -> StreamQueueAdmission:
         """Admit one currently READY durable item into bounded ingress.
 
         The method never plans, mutates, or drops durable state.  A full lane
@@ -434,7 +573,13 @@ class BoundedStreamWorkQueues:
         """
 
         checked_id = _require_nonempty(work_item_id, "work_item_id")
+        if not isinstance(optional, bool):
+            raise TypeError("optional must be a boolean")
         with self._lock:
+            if optional:
+                self._optional_work_ids.add(checked_id)
+                if checked_id not in self._shed_optional_ids:
+                    self._telemetry.optional_work_offered += 1
             if checked_id in self._scheduled_work_ids:
                 return StreamQueueAdmission(checked_id, StreamQueueAdmissionStatus.DUPLICATE)
             if self._closed:
@@ -450,6 +595,11 @@ class BoundedStreamWorkQueues:
                 )
         return self._admit_ready(item, external=True)
 
+    def admit_optional(self, work_item_id: str) -> StreamQueueAdmission:
+        """Admit work marked optional; pressure may leave it durably READY."""
+
+        return self.admit(work_item_id, optional=True)
+
     def recover(self) -> int:
         """Recover expired/retryable work and fill ingress only to its bound.
 
@@ -461,6 +611,8 @@ class BoundedStreamWorkQueues:
 
         if self._stop.is_set():
             return 0
+        with self._lock:
+            self._telemetry.recovery_count += 1
         self._scheduler.reconcile()
         ready = self._scheduler.ready_for_run(
             self._config.run_id,
@@ -471,6 +623,12 @@ class BoundedStreamWorkQueues:
             outcome = self._admit_ready(item, external=False)
             if outcome.admitted:
                 admitted += 1
+                with self._lock:
+                    self._telemetry.recovery_admitted += 1
+                continue
+            if outcome.status is StreamQueueAdmissionStatus.SHED_OPTIONAL:
+                with self._lock:
+                    self._telemetry.recovery_shed += 1
                 continue
             if outcome.status in {
                 StreamQueueAdmissionStatus.INGRESS_FULL,
@@ -513,7 +671,7 @@ class BoundedStreamWorkQueues:
             else _require_nonempty(reason_detail, "reason_detail")
         )
         try:
-            return self._scheduler.cancel(
+            cancelled = self._scheduler.cancel(
                 checked_id,
                 reason_code=_require_nonempty(reason_code, "reason_code"),
                 reason_detail=checked_reason_detail,
@@ -523,6 +681,13 @@ class BoundedStreamWorkQueues:
                 with self._lock:
                     self._cancel_requested_ids.discard(checked_id)
             raise
+        with self._lock:
+            self._scheduled_work_ids.discard(checked_id)
+            self._optional_work_ids.discard(checked_id)
+            self._shed_optional_ids.discard(checked_id)
+            if not tracked:
+                self._cancel_requested_ids.discard(checked_id)
+        return cancelled
 
     def drain(self, *, timeout: float | None = None) -> bool:
         """Drive due retries/recovery until this run has no nonterminal work.
@@ -563,10 +728,23 @@ class BoundedStreamWorkQueues:
                 self._join_workers()
             return
         if cancel_pending:
-            self._cancel_admitted_work()
+            # Mark cancellation before stopping workers. A callback that is
+            # already active may still return, but it must observe the fence
+            # and skip publish/succeed. Stopping first also prevents recovery
+            # or forwarding loops from adding notifications while pending
+            # lanes are discarded.
+            work_item_ids = self._mark_cancel_pending()
+            with self._lock:
+                self._stop.set()
+            self._cancel_admitted_work(work_item_ids)
+            self._discard_pending_notifications(work_item_ids)
         elif wait:
             self.drain()
-        self._stop.set()
+            with self._lock:
+                self._stop.set()
+        else:
+            with self._lock:
+                self._stop.set()
         self._stop_all_heartbeats()
         if wait:
             self._join_workers()
@@ -587,8 +765,31 @@ class BoundedStreamWorkQueues:
             if self._stop.is_set():
                 return StreamQueueAdmission(work_item_id, StreamQueueAdmissionStatus.CLOSED)
             if item.state is not WorkItemState.READY:
+                self._optional_work_ids.discard(work_item_id)
+                self._shed_optional_ids.discard(work_item_id)
                 return StreamQueueAdmission(work_item_id, StreamQueueAdmissionStatus.NOT_READY)
+            optional = self._is_optional(item)
+            if optional and work_item_id not in self._optional_work_ids:
+                self._optional_work_ids.add(work_item_id)
+                self._telemetry.optional_work_offered += 1
+            pressure = self._optional_pressure()
+            if optional and pressure:
+                first_shed = work_item_id not in self._shed_optional_ids
+                self._shed_optional_ids.add(work_item_id)
+                if first_shed:
+                    self._telemetry.optional_work_shed += 1
+                    self._backlog_peak = max(
+                        self._backlog_peak,
+                        len(self._scheduled_work_ids) + len(self._shed_optional_ids),
+                    )
+                    self._counters[StreamQueueLane.INGRESS].shed_optional += 1
+                    self._observe("optional_work_shed")
+                return StreamQueueAdmission(
+                    work_item_id,
+                    StreamQueueAdmissionStatus.SHED_OPTIONAL,
+                )
 
+            self._shed_optional_ids.discard(work_item_id)
             # Downstream pressure is intentionally visible at ingress rather
             # than allowing all three buffers to fill before callers slow down.
             if self._publish.full():
@@ -600,6 +801,12 @@ class BoundedStreamWorkQueues:
             except Full:
                 return self._reject_ingress(work_item_id, StreamQueueAdmissionStatus.INGRESS_FULL)
             self._scheduled_work_ids.add(work_item_id)
+            self._backlog_peak = max(
+                self._backlog_peak,
+                len(self._scheduled_work_ids) + len(self._shed_optional_ids),
+            )
+            if optional:
+                self._telemetry.optional_work_admitted += 1
             counters = self._counters[StreamQueueLane.INGRESS]
             counters.admitted += 1
             counters.maximum_queued = max(counters.maximum_queued, self._ingress.qsize())
@@ -611,7 +818,63 @@ class BoundedStreamWorkQueues:
         status: StreamQueueAdmissionStatus,
     ) -> StreamQueueAdmission:
         self._counters[StreamQueueLane.INGRESS].rejected += 1
+        if status in {
+            StreamQueueAdmissionStatus.INGRESS_FULL,
+            StreamQueueAdmissionStatus.PROVIDER_FULL,
+            StreamQueueAdmissionStatus.PUBLISH_FULL,
+        }:
+            self._record_backpressure_wait(StreamQueueLane.INGRESS)
         return StreamQueueAdmission(work_item_id, status)
+
+    def _optional_pressure(self) -> bool:
+        watermark = self._config.optional_shed_watermark
+        occupancy = max(
+            self._ingress.qsize() / self._ingress.maxsize,
+            self._provider.qsize() / self._provider.maxsize,
+            self._publish.qsize() / self._publish.maxsize,
+        )
+        return occupancy >= watermark
+
+    def _is_optional(self, item: WorkItem) -> bool:
+        if item.work_item_id in self._optional_work_ids:
+            return True
+        if item.stage in self._config.optional_stages:
+            return True
+        predicate = self._config.optional_work_predicate
+        if predicate is None:
+            return False
+        try:
+            return bool(predicate(item))
+        except Exception as error:
+            self._record_error(error)
+            return False
+
+    def _observe(self, name: str) -> None:
+        observer = getattr(self._config, "runtime_observer", None)
+        if observer is None:
+            return
+        try:
+            observer.increment_counter(
+                f"stream_queue_{name}",
+                1,
+                {"run_id": self._config.run_id},
+            )
+        except Exception:
+            return
+
+    def _record_backpressure_wait(self, lane: StreamQueueLane) -> None:
+        with self._lock:
+            self._telemetry.backpressure_waits += 1
+            self._counters[lane].backpressure_waits += 1
+        self._observe("backpressure_wait")
+
+    def _record_lease_renewal(self) -> None:
+        with self._lock:
+            self._telemetry.lease_renewals += 1
+
+    def _record_lease_renewal_error(self) -> None:
+        with self._lock:
+            self._telemetry.lease_renewal_errors += 1
 
     def _run_ingress(self) -> None:
         while not self._stop.is_set():
@@ -660,6 +923,8 @@ class BoundedStreamWorkQueues:
                     scheduler=self._scheduler,
                     lease=claim.lease,
                     lease_duration_seconds=self._config.lease_duration_seconds,
+                    on_renewal=self._record_lease_renewal,
+                    on_error=self._record_lease_renewal_error,
                 )
                 self._track_heartbeat(heartbeat)
                 try:
@@ -788,11 +1053,14 @@ class BoundedStreamWorkQueues:
 
     def _put_provider(self, work_item_id: str) -> bool:
         while not self._stop.is_set():
-            if self._cancelled(work_item_id):
-                return False
             try:
-                self._provider.put(work_item_id, timeout=_POLL_SECONDS)
+                with self._lock:
+                    if self._stop.is_set() or self._cancelled(work_item_id):
+                        return False
+                    self._provider.put_nowait(work_item_id)
             except Full:
+                self._record_backpressure_wait(StreamQueueLane.PROVIDER)
+                sleep(_POLL_SECONDS)
                 continue
             self._enqueued(StreamQueueLane.PROVIDER, self._provider)
             return True
@@ -801,11 +1069,18 @@ class BoundedStreamWorkQueues:
     def _put_publish(self, task: _PublishTask) -> bool:
         work_item_id = task.claim.work_item.work_item_id
         while not self._stop.is_set():
-            if self._cancelled(work_item_id) or task.heartbeat.error is not None:
-                return False
             try:
-                self._publish.put(task, timeout=_POLL_SECONDS)
+                with self._lock:
+                    if (
+                        self._stop.is_set()
+                        or self._cancelled(work_item_id)
+                        or task.heartbeat.error is not None
+                    ):
+                        return False
+                    self._publish.put_nowait(task)
             except Full:
+                self._record_backpressure_wait(StreamQueueLane.PUBLISH)
+                sleep(_POLL_SECONDS)
                 continue
             self._enqueued(StreamQueueLane.PUBLISH, self._publish)
             return True
@@ -847,16 +1122,74 @@ class BoundedStreamWorkQueues:
             with self._lock:
                 self._counters[lane].failed += 1
 
-    def _cancel_admitted_work(self) -> None:
+    def _mark_cancel_pending(self) -> tuple[str, ...]:
         with self._lock:
-            work_item_ids = tuple(self._scheduled_work_ids)
+            # Optional work that was shed is durable READY work too, even
+            # though it never entered ``_scheduled_work_ids``.
+            work_item_ids = tuple(self._scheduled_work_ids | self._shed_optional_ids)
             self._cancel_requested_ids.update(work_item_ids)
+        return work_item_ids
+
+    def _cancel_admitted_work(self, work_item_ids: tuple[str, ...]) -> None:
         for work_item_id in work_item_ids:
             try:
                 self._scheduler.cancel(work_item_id, reason_code="RUNTIME_QUEUE_CANCELLED")
             except Exception as error:
                 if not _is_fence_error(error):
                     self._record_error(error)
+
+    def _discard_pending_notifications(self, cancelled_ids: tuple[str, ...]) -> None:
+        """Drop local notifications after a cancelling shutdown.
+
+        Queue entries are disposable hints; durable cancellation above is the
+        authority. ``Queue.task_done`` is still paired for every removed item,
+        and publish entries release their heartbeat so a close cannot strand a
+        renewal thread.
+        """
+
+        cancelled = set(cancelled_ids)
+        self._discard_queue(self._ingress, StreamQueueLane.INGRESS, cancelled)
+        self._discard_queue(self._provider, StreamQueueLane.PROVIDER, cancelled)
+        self._discard_queue(self._publish, StreamQueueLane.PUBLISH, cancelled)
+        with self._lock:
+            # A notification can be dequeued concurrently with the drain. A
+            # worker that owns such an item keeps its cancellation request;
+            # ``_finish_scheduled`` clears it when the callback/claim exits.
+            self._scheduled_work_ids.difference_update(cancelled)
+            self._optional_work_ids.difference_update(cancelled)
+            self._shed_optional_ids.difference_update(cancelled)
+
+    def _discard_queue(
+        self,
+        queue: Queue[str] | Queue[_PublishTask],
+        lane: StreamQueueLane,
+        cancelled_ids: set[str],
+    ) -> None:
+        while True:
+            try:
+                value = queue.get_nowait()
+            except Empty:
+                return
+            try:
+                work_item_id = (
+                    value
+                    if isinstance(value, str)
+                    else value.claim.work_item.work_item_id
+                )
+                if isinstance(value, _PublishTask):
+                    # The task no longer has a worker that can stop this
+                    # heartbeat in its normal finally block.
+                    self._stop_heartbeat(value.heartbeat)
+                with self._lock:
+                    if work_item_id in cancelled_ids:
+                        self._counters[lane].cancelled += 1
+                    else:
+                        self._counters[lane].rejected += 1
+                    self._scheduled_work_ids.discard(work_item_id)
+                    self._optional_work_ids.discard(work_item_id)
+                    self._shed_optional_ids.discard(work_item_id)
+            finally:
+                queue.task_done()
 
     def _cancelled(self, work_item_id: str) -> bool:
         with self._lock:
@@ -870,6 +1203,8 @@ class BoundedStreamWorkQueues:
     def _finish_scheduled(self, work_item_id: str) -> None:
         with self._lock:
             self._scheduled_work_ids.discard(work_item_id)
+            self._optional_work_ids.discard(work_item_id)
+            self._shed_optional_ids.discard(work_item_id)
             self._cancel_requested_ids.discard(work_item_id)
 
     def _track_heartbeat(self, heartbeat: _LeaseHeartbeat) -> None:
@@ -963,6 +1298,8 @@ class BoundedStreamWorkQueues:
             cancelled=counters.cancelled,
             rejected=counters.rejected,
             maximum_queued=counters.maximum_queued,
+            shed_optional=counters.shed_optional,
+            backpressure_waits=counters.backpressure_waits,
         )
 
     def _join_workers(self) -> None:
@@ -1037,6 +1374,7 @@ def _require_nonnegative_int(value: int, field: str) -> int:
 
 
 __all__ = [
+    "DEFAULT_OPTIONAL_WORK_SHEDDING_ACTIONS",
     "BoundedStreamWorkQueues",
     "BoundedStreamWorkQueuesConfig",
     "BoundedStreamWorkQueuesSnapshot",
