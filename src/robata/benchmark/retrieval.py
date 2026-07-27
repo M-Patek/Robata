@@ -510,6 +510,7 @@ async def run_embedding_backfill(
                     dimension=dimension,
                 )
                 disposition = await invoke(writer, write)
+                status: Literal["WRITTEN", "REUSED", "FAILED"]
                 if disposition is BackfillWriteDisposition.REUSED or disposition == "REUSED":
                     status = "REUSED"
                 elif (
@@ -695,7 +696,6 @@ def build_filter_metrics(
         return RetrievalFilterMetrics()
     return RetrievalFilterMetrics(
         query_count=len(observations),
-        structured_first=all(item.structured_first for item in observations),
         vector_selectivity=(
             sum(item.vector_count for item in observations)
             / sum(item.structured_count for item in observations)
@@ -794,6 +794,11 @@ class RetrievalQualificationProfile(StrictModel):
         dimension: int = 0,
         external_database_status: Literal["NOT_MEASURED", "MEASURED"] = "NOT_MEASURED",
     ) -> Self:
+        resolved_backfill = backfill or RetrievalBackfillCounters()
+        resolved_recall = recall or RetrievalRecallProfile()
+        resolved_latency = latency or RetrievalLatencyProfile()
+        resolved_cost = cost or RetrievalCostProfile()
+        resolved_filters = filters or RetrievalFilterMetrics()
         projection = retrieval_profile_projection(
             evidence_class=evidence_class,
             structured_authoritative=True,

@@ -167,7 +167,10 @@ class FakeBroker:
         if duration is None:
             duration = record.lease_duration_seconds
             if duration is None:
-                remaining = record.lease_expires_at - self._now()
+                lease_expires_at = record.lease_expires_at
+                if lease_expires_at is None:
+                    raise BrokerError(BrokerErrorCode.LEASE_EXPIRED, "broker lease has expired")
+                remaining = lease_expires_at - self._now()
                 duration = max(1, math.ceil(remaining.total_seconds()))
         if duration <= 0:
             raise BrokerError(BrokerErrorCode.LEASE_EXPIRED, "broker lease has expired")
