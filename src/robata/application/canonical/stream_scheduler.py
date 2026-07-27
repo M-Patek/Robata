@@ -16,6 +16,7 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from robata.adapters.sqlite_stream_work_ledger import (
+    NewStreamWindow,
     NewStreamWorkPlan,
     SQLiteStreamWorkLedger,
     StoredExpectedWindow,
@@ -393,12 +394,202 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         return self._expected_plan.plan_key
 
     def append_emission(self, emission: PlannerEmission) -> None:
-        """Commit every closed window before projecting child execution work."""
+        """Commit all windows from one planner emission as one bounded batch."""
 
         if not isinstance(emission, PlannerEmission):
             raise TypeError("emission must be PlannerEmission")
-        for window in emission.windows:
-            self.append_window(window)
+        self._append_window_batch(emission.windows)
+
+    def _append_window_batch(self, windows: Sequence[BoundedWindowPlan]) -> None:
+        """Commit a bounded sequence of windows as one durable batch."""
+
+        windows = tuple(windows)
+        if not windows:
+            return
+        if any(
+            not isinstance(window, BoundedWindowPlan)
+            or window.capture_scope_digest != self._expected_plan.capture_scope_digest
+            for window in windows
+        ):
+            raise StreamSchedulerCompositionError(
+                "emission contains a window from another capture scope"
+            )
+        ordinals = tuple(window.ordinal for window in windows)
+        if len(set(ordinals)) != len(ordinals) or ordinals != tuple(sorted(ordinals)):
+            raise StreamSchedulerCompositionError(
+                "emission windows must have unique ordered ordinals"
+            )
+
+        persisted_count = self._ledger.next_window_ordinal(self.plan_key)
+        lookup_ordinals = {ordinal for ordinal in ordinals if ordinal < persisted_count}
+        lookup_ordinals.update(ordinal - 1 for ordinal in ordinals if ordinal > 0)
+        persisted = self._ledger.windows_for_ordinals(
+            self.plan_key,
+            tuple(sorted(lookup_ordinals)),
+        )
+        persisted_by_ordinal = {row.ordinal: row for row in persisted}
+        next_new_ordinal = persisted_count
+        new_window_count = 0
+        for ordinal in ordinals:
+            if ordinal < persisted_count:
+                if ordinal not in persisted_by_ordinal:
+                    raise StreamSchedulerCompositionError(
+                        "persisted expected windows are not contiguous"
+                    )
+                continue
+            if ordinal != next_new_ordinal:
+                raise StreamSchedulerCompositionError(
+                    "expected windows must be appended in contiguous planner order"
+                )
+            new_window_count += 1
+            next_new_ordinal += 1
+        self._admit_window_batch(new_window_count)
+
+        existing_ordinals = tuple(ordinal for ordinal in ordinals if ordinal < persisted_count)
+        persisted_children = self._ledger.work_plans_for_ordinals(
+            self.plan_key,
+            existing_ordinals,
+        )
+        children_by_ordinal: dict[int, list[StoredStreamWorkPlan]] = {}
+        for row in persisted_children:
+            if row.expected_ordinal is not None:
+                children_by_ordinal.setdefault(row.expected_ordinal, []).append(row)
+
+        declarations_by_ordinal: dict[int, ExpectedWindowDeclaration] = {}
+        append_batch: list[NewStreamWindow] = []
+        work_item_ids: list[str] = []
+        existing_checks: list[tuple[StoredExpectedWindow, str]] = []
+        for window in windows:
+            wire_window = window.to_incremental_window(self._schema_refs.incremental_window)
+            if window.ordinal == 0:
+                previous_chain = None
+            elif window.ordinal - 1 in declarations_by_ordinal:
+                previous_chain = declarations_by_ordinal[window.ordinal - 1].append_chain_sha256
+            else:
+                previous_row = persisted_by_ordinal.get(window.ordinal - 1)
+                if previous_row is None:
+                    raise StreamSchedulerCompositionError(
+                        "expected windows must preserve contiguous predecessor state"
+                    )
+                previous = _parse_exact(
+                    previous_row.declaration_json,
+                    ExpectedWindowDeclaration,
+                    "previous declaration",
+                )
+                previous_chain = previous.append_chain_sha256
+            existing = persisted_by_ordinal.get(window.ordinal)
+            created_at: str | None = None
+            companion_rows = tuple(children_by_ordinal.get(window.ordinal, ()))
+            if existing is not None:
+                stored_declaration = _parse_exact(
+                    existing.declaration_json,
+                    ExpectedWindowDeclaration,
+                    "expected declaration",
+                )
+                stored_window = _parse_exact(
+                    existing.window_json,
+                    IncrementalWindow,
+                    "incremental window",
+                )
+                if len(companion_rows) != len(_WINDOW_DAG_STAGES):
+                    raise StreamSchedulerCompositionError(
+                        "expected-window replay lacks exact companion work"
+                    )
+                first_plan = _parse_exact(
+                    companion_rows[0].plan_json,
+                    StreamWorkItemPlan,
+                    "stream work plan",
+                )
+                created_at = first_plan.created_at
+            declaration = create_expected_window_declaration(
+                schema_ref=self._schema_refs.expected_declaration,
+                plan_key=self.plan_key,
+                ordinal=window.ordinal,
+                window_key=wire_window.window_key,
+                window_semantic_sha256=wire_window.window_semantic_sha256,
+                requested_interval=wire_window.requested_interval,
+                effective_interval=wire_window.effective_interval,
+                ordered_six_slot_segment_or_explicit_absence_closure=wire_window.camera_closure,
+                watermark_source_facts_sha256=_watermark_source_facts_sha256(window),
+                previous_append_chain_sha256=previous_chain,
+            )
+            if existing is not None and (
+                canonical_json_bytes(stored_declaration) != canonical_json_bytes(declaration)
+                or canonical_json_bytes(stored_window) != canonical_json_bytes(wire_window)
+            ):
+                raise StreamSchedulerCompositionError(
+                    "expected-window replay changed declaration source facts"
+                )
+            plans = self._window_work_plans(wire_window, created_at=created_at)
+            new_work = tuple(
+                _new_stored_work_plan(
+                    plan,
+                    expected_ordinal=window.ordinal,
+                    role_order=role_order,
+                    publication_state="PENDING",
+                )
+                for role_order, plan in enumerate(plans)
+            )
+            append_batch.append(
+                NewStreamWindow(
+                    ordinal=window.ordinal,
+                    declaration_json=canonical_json_bytes(declaration),
+                    window_json=canonical_json_bytes(wire_window),
+                    work_plans=new_work,
+                )
+            )
+            declarations_by_ordinal[window.ordinal] = declaration
+            work_item_ids.extend(plan.work_item_id for plan in plans)
+            if existing is not None:
+                existing_checks.append((existing, plans[-1].work_item_id))
+
+        inserted = self._ledger.append_windows(
+            plan_key=self.plan_key,
+            windows=tuple(append_batch),
+        )
+        for did_insert in inserted:
+            if did_insert:
+                self._observe("expected_declaration_durable")
+        published_rows = self._ledger.work_plans_for_ids(
+            tuple(work_item_ids),
+        )
+        self._publish_work_rows(published_rows)
+        for existing, reduction_id in existing_checks:
+            self._verify_existing_window_member(existing, reduction_id)
+
+    def _admit_window_batch(self, new_window_count: int) -> None:
+        """Apply admission in planner order without admitting past the queue bound."""
+
+        if isinstance(new_window_count, bool) or not isinstance(new_window_count, int):
+            raise TypeError("new_window_count must be an integer")
+        if new_window_count < 0:
+            raise ValueError("new_window_count must be nonnegative")
+        if new_window_count == 0:
+            return
+
+        pressure = self.backpressure_snapshot()
+        metrics = pressure.metrics
+        for _index in range(new_window_count):
+            decision = self._backpressure.should_admit(
+                _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
+                metrics,
+            )
+            if not decision.admitted:
+                self._observe("window_admission_throttled")
+                raise StreamBackpressureThrottle(decision)
+            projected_depth = metrics.depth + len(_WINDOW_DAG_STAGES)
+            depth_limit = self._backpressure_config.queue_depth_threshold
+            metrics = QueueMetrics(
+                depth=projected_depth,
+                oldest_age_ms=metrics.oldest_age_ms,
+                arrival_rate=metrics.arrival_rate,
+                service_rate=metrics.service_rate,
+                backlog_slope=metrics.backlog_slope,
+                provider_quota=metrics.provider_quota,
+                worker_utilization=(
+                    0.0 if depth_limit == 0 else projected_depth / depth_limit
+                ),
+            )
 
     def append_window(self, window: BoundedWindowPlan) -> ExpectedWindowDeclaration:
         """Idempotently append one expected window and its fixed local DAG."""
@@ -408,7 +599,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         if window.capture_scope_digest != self._expected_plan.capture_scope_digest:
             raise StreamSchedulerCompositionError("window belongs to another capture scope")
         wire_window = window.to_incremental_window(self._schema_refs.incremental_window)
-        stored_window_count = self._ledger.window_count(self.plan_key)
+        stored_window_count = self._ledger.next_window_ordinal(self.plan_key)
         if window.ordinal > stored_window_count:
             raise StreamSchedulerCompositionError(
                 "expected windows must be appended in contiguous planner order"
@@ -510,8 +701,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
 
         if not isinstance(finish, PlannerFinish):
             raise TypeError("finish must be PlannerFinish")
-        for window in finish.windows:
-            self.append_window(window)
+        self._append_window_batch(finish.windows)
         finish_sha256 = _planner_finish_sha256(finish)
         self._ledger.set_planner_eos(self.plan_key, finish_sha256)
         self._observe("planner_eos_durable")
@@ -662,8 +852,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         )
         plans_by_key = {plan.work_logical_key: plan for plan in parsed}
         projections = tuple(
-            self._internal_execution_projection(plan, plans_by_key=plans_by_key)
-            for plan in parsed
+            self._internal_execution_projection(plan, plans_by_key=plans_by_key) for plan in parsed
         )
         self._execution_scheduler.plan_many(projections)
         for _plan in parsed:
@@ -777,14 +966,12 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
 
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id must be non-empty")
-        if isinstance(lease_duration_seconds, bool) or not isinstance(
-            lease_duration_seconds, int
-        ):
+        if isinstance(lease_duration_seconds, bool) or not isinstance(lease_duration_seconds, int):
             raise TypeError("lease_duration_seconds must be an integer")
         if lease_duration_seconds <= 0:
             raise ValueError("lease_duration_seconds must be positive")
         stored = self._stored_work_row(work_item_id, require_published=True)
-        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
         execution = self._execution_scheduler.get(work_item_id)
         if (
             execution.state not in {WorkItemState.LEASED, WorkItemState.RUNNING}
@@ -807,14 +994,14 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 lease_duration_seconds,
                 now=checked_now,
             )
-            execution = self.start(renewed, now=checked_now)
+            execution_item = self.start(renewed, now=checked_now)
         except WorkFenceError:
             # A concurrent authority transition won the race.  Do not steal the
             # work or create a new attempt; the ordinary scheduler path decides
             # whether it becomes claimable later.
             return None
         return StreamWorkLeaseClaim(
-            work_item=self._stream_item_from(plan, execution, evidence=None),
+            work_item=execution_item,
             lease=renewed,
         )
 

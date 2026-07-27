@@ -10,9 +10,11 @@ canonical identity or persisted result payload.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import time
 from collections.abc import Awaitable, Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -278,25 +280,46 @@ class CanonicalLocalProviderQueue:
             raise ValueError("timeout must be nonnegative or None")
         future: Future[object] = Future()
         work = _ProviderWork(callback=callback, future=future)
-        with self._lock:
-            if self._closed:
-                self._rejected += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    "provider queue is closed",
-                )
-            try:
-                self._queue.put(work, block=block, timeout=timeout if block else None)
-            except Full as error:
-                if count_full_rejection:
+        deadline = None if not block or timeout is None else time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if self._closed:
                     self._rejected += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    f"provider queue is full (capacity {self._queue_capacity})",
-                ) from error
-            self._admitted += 1
-            self._max_queue_depth = max(self._max_queue_depth, self._queue.qsize())
-        return future
+                    raise CanonicalLocalCompositionError(
+                        CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                        "provider queue is closed",
+                    )
+                try:
+                    # Never hold the service lock while waiting for capacity.
+                    # Provider workers need this lock to finish the item that
+                    # frees the queue slot.
+                    self._queue.put_nowait(work)
+                except Full as error:
+                    if not block:
+                        if count_full_rejection:
+                            self._rejected += 1
+                        raise CanonicalLocalCompositionError(
+                            CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                            f"provider queue is full (capacity {self._queue_capacity})",
+                        ) from error
+                else:
+                    self._admitted += 1
+                    self._max_queue_depth = max(self._max_queue_depth, self._queue.qsize())
+                    return future
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if count_full_rejection:
+                        with self._lock:
+                            self._rejected += 1
+                    raise CanonicalLocalCompositionError(
+                        CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                        f"provider queue is full (capacity {self._queue_capacity})",
+                    )
+                time.sleep(min(0.001, remaining))
+            else:
+                time.sleep(0.001)
 
     def _worker(self) -> None:
         while True:
@@ -316,13 +339,23 @@ class CanonicalLocalProviderQueue:
                 try:
                     result = work.callback()
                 except BaseException as error:
+                    # A caller can cancel an asyncio wrapper while this
+                    # provider callback is still running. The underlying
+                    # concurrent Future may then already be terminal when the
+                    # callback returns; publishing again must not escape the
+                    # worker thread or strand Queue.join. The callback still
+                    # reached a terminal provider outcome, so preserve its
+                    # failed/completed accounting; cancelled is reserved for
+                    # work cancelled before execution begins.
                     with self._lock:
                         self._failed += 1
-                    work.future.set_exception(error)
+                    with contextlib.suppress(InvalidStateError):
+                        work.future.set_exception(error)
                 else:
                     with self._lock:
                         self._completed += 1
-                    work.future.set_result(result)
+                    with contextlib.suppress(InvalidStateError):
+                        work.future.set_result(result)
                 finally:
                     with self._lock:
                         self._active -= 1
@@ -536,7 +569,18 @@ class CanonicalLocalRecordingService:
         self,
         jobs: Sequence[CanonicalLocalFixtureJob],
     ) -> tuple[CanonicalLocalRunReceipt, ...]:
-        futures = tuple(self._submit(job, block=True) for job in jobs)
+        futures: list[Future[CanonicalLocalRunReceipt]] = []
+        for job in jobs:
+            while True:
+                try:
+                    future = self._submit(job, block=False)
+                except CanonicalLocalCompositionError as error:
+                    if self._closed or "recording ingress queue is full" not in str(error):
+                        raise
+                    await asyncio.sleep(0.001)
+                else:
+                    futures.append(future)
+                    break
         results = await asyncio.gather(*(asyncio.wrap_future(future) for future in futures))
         return tuple(results)
 
@@ -598,44 +642,55 @@ class CanonicalLocalRecordingService:
             recording_key=recording_key,
             future=future,
         )
-        with self._lock:
-            if self._closed:
-                self._rejected += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    "recording service is closed",
-                )
-            if state_dir in self._claimed_state_dirs:
-                self._rejected += 1
-                self._state_dir_claim_conflicts += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    f"state directory is already assigned to an active recording: {state_dir}",
-                )
-            if recording_key in self._claimed_recording_keys:
-                self._rejected += 1
-                self._recording_key_claim_conflicts += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    "recording shard is already assigned to an active worker",
-                )
-            self._claimed_state_dirs.add(state_dir)
-            self._claimed_recording_keys.add(recording_key)
-            try:
-                self._queue.put(work, block=block)
-            except Full as error:
-                self._claimed_state_dirs.discard(state_dir)
-                self._claimed_recording_keys.discard(recording_key)
-                self._rejected += 1
-                raise CanonicalLocalCompositionError(
-                    CanonicalLocalCompositionErrorCode.BACKPRESSURE,
-                    f"recording ingress queue is full (capacity {self._queue.maxsize})",
-                ) from error
-            self._admitted += 1
-            self._state_dirs_seen.add(state_dir)
-            self._recording_keys_seen.add(recording_key)
-            self._max_ingress_depth = max(self._max_ingress_depth, self._queue.qsize())
-        return future
+        claimed = False
+        while True:
+            with self._lock:
+                if self._closed:
+                    if claimed:
+                        self._claimed_state_dirs.discard(state_dir)
+                        self._claimed_recording_keys.discard(recording_key)
+                    self._rejected += 1
+                    raise CanonicalLocalCompositionError(
+                        CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                        "recording service is closed",
+                    )
+                if not claimed:
+                    if state_dir in self._claimed_state_dirs:
+                        self._rejected += 1
+                        self._state_dir_claim_conflicts += 1
+                        raise CanonicalLocalCompositionError(
+                            CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                            "state directory is already assigned to an active recording: "
+                            f"{state_dir}",
+                        )
+                    if recording_key in self._claimed_recording_keys:
+                        self._rejected += 1
+                        self._recording_key_claim_conflicts += 1
+                        raise CanonicalLocalCompositionError(
+                            CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                            "recording shard is already assigned to an active worker",
+                        )
+                    self._claimed_state_dirs.add(state_dir)
+                    self._claimed_recording_keys.add(recording_key)
+                    claimed = True
+                try:
+                    self._queue.put_nowait(work)
+                except Full as error:
+                    if not block:
+                        self._claimed_state_dirs.discard(state_dir)
+                        self._claimed_recording_keys.discard(recording_key)
+                        self._rejected += 1
+                        raise CanonicalLocalCompositionError(
+                            CanonicalLocalCompositionErrorCode.BACKPRESSURE,
+                            f"recording ingress queue is full (capacity {self._queue.maxsize})",
+                        ) from error
+                else:
+                    self._admitted += 1
+                    self._state_dirs_seen.add(state_dir)
+                    self._recording_keys_seen.add(recording_key)
+                    self._max_ingress_depth = max(self._max_ingress_depth, self._queue.qsize())
+                    return future
+            time.sleep(0.001)
 
     def _cancel_pending_recordings(self) -> int:
         cancelled = 0
@@ -687,7 +742,8 @@ class CanonicalLocalRecordingService:
                 except BaseException as error:
                     with self._lock:
                         self._failed += 1
-                    work.future.set_exception(error)
+                    with contextlib.suppress(InvalidStateError):
+                        work.future.set_exception(error)
                 else:
                     with self._lock:
                         self._completed += 1
@@ -695,7 +751,8 @@ class CanonicalLocalRecordingService:
                             self._replayed_receipts += 1
                         else:
                             self._fresh_receipts += 1
-                    work.future.set_result(result)
+                    with contextlib.suppress(InvalidStateError):
+                        work.future.set_result(result)
                 finally:
                     with self._lock:
                         self._active -= 1

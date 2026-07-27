@@ -178,6 +178,9 @@ from robata.application.canonical.primary_completion import (
     create_primary_completion_command as create_primary_completion_command,
 )
 from robata.application.canonical.projections import (
+    CANONICAL_EVENT_INDEX_PROJECTION_VERSION as CANONICAL_EVENT_INDEX_PROJECTION_VERSION,
+)
+from robata.application.canonical.projections import (
     CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION as CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION,  # noqa: E501
 )
 from robata.application.canonical.projections import (
@@ -202,6 +205,24 @@ from robata.application.canonical.projections import (
     _stable_uuid as _stable_uuid,
 )
 from robata.application.canonical.projections import (
+    canonical_event_index_batch_projection as canonical_event_index_batch_projection,
+)
+from robata.application.canonical.projections import (
+    canonical_event_index_projection as canonical_event_index_projection,
+)
+from robata.application.canonical.projections import (
+    canonical_event_index_projection_batch as canonical_event_index_projection_batch,
+)
+from robata.application.canonical.projections import (
+    canonical_event_index_projection_values as canonical_event_index_projection_values,
+)
+from robata.application.canonical.projections import (
+    canonical_event_index_revision_projection as canonical_event_index_revision_projection,
+)
+from robata.application.canonical.projections import (
+    canonical_event_index_row_projection as canonical_event_index_row_projection,
+)
+from robata.application.canonical.projections import (
     canonical_execution_policy_projection as canonical_execution_policy_projection,
 )
 from robata.application.canonical.projections import (
@@ -215,6 +236,9 @@ from robata.application.canonical.projections import (
 )
 from robata.application.canonical.projections import (
     canonical_root_window_projection_values as canonical_root_window_projection_values,
+)
+from robata.application.canonical.projections import (
+    canonical_terminal_event_index_projection as canonical_terminal_event_index_projection,
 )
 from robata.application.canonical.reduction import (
     CanonicalFusionClaimSource as CanonicalFusionClaimSource,
@@ -273,6 +297,7 @@ __all__ = [
     "CANONICAL_CALL_BARRIER_IDENTITY_POLICY_VERSION",
     "CANONICAL_CALL_PART_IDENTITY_POLICY_VERSION",
     "CANONICAL_EVENT_HYPOTHESIS_IDENTITY_POLICY_VERSION",
+    "CANONICAL_EVENT_INDEX_PROJECTION_VERSION",
     "CANONICAL_EXECUTION_POLICY_SEMANTIC_PROJECTION_VERSION",
     "CANONICAL_INPUT_PLAN_IDENTITY_POLICY_VERSION",
     "CANONICAL_OFFLINE_PIPELINE_VERSION",
@@ -334,6 +359,12 @@ __all__ = [
     "canonical_dense_qa_execution_membership_lineage",
     "canonical_enrichment_logical_node",
     "canonical_event_hypothesis_logical_node",
+    "canonical_event_index_batch_projection",
+    "canonical_event_index_projection",
+    "canonical_event_index_projection_batch",
+    "canonical_event_index_projection_values",
+    "canonical_event_index_revision_projection",
+    "canonical_event_index_row_projection",
     "canonical_execution_policy_projection",
     "canonical_fusion_reduction_logical_node",
     "canonical_fusion_reduction_projection",
@@ -348,6 +379,7 @@ __all__ = [
     "canonical_root_window_projection_values",
     "canonical_selected_output_logical_node",
     "canonical_selection_logical_node",
+    "canonical_terminal_event_index_projection",
     "create_primary_completion_command",
     "prepare_initial_action_event_publications",
 ]

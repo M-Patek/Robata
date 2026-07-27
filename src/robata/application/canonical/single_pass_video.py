@@ -719,9 +719,15 @@ class DurableSinglePassVideoProducer:
             )
 
         selected_count = 0
+        last_traversal_index: int | None = None
         while heap:
             _index, _camera_value, camera_id, envelope = heapq.heappop(heap)
             packet = envelope.packet
+            if last_traversal_index is not None and packet.traversal_index <= last_traversal_index:
+                raise SinglePassVideoProductionError(
+                    'sealed spool traversal indexes are not strictly increasing'
+                )
+            last_traversal_index = packet.traversal_index
             if packet.camera_id is not camera_id or packet.source_order != observed[camera_id]:
                 raise SinglePassVideoProductionError(
                     f"sealed spool ordering differs for {camera_id.value}"

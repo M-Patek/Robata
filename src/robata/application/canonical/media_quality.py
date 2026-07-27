@@ -152,6 +152,10 @@ class FrameQualityObservation:
     edge_energy_milli: int
     frame_delta_milli: int | None
     flags: tuple[LocalQualityFlag, ...]
+    # Supplemental visual facts remain internal until a registered wire schema is added.
+    blur_score_milli: int | None = None
+    motion_energy_milli: int | None = None
+    scene_change_milli: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +306,12 @@ class LocalFrameQualityAnalyzer:
         edge_energy_milli = _edge_energy_milli(gray, dimensions)
         if self._previous_dimensions is not None and dimensions != self._previous_dimensions:
             raise ValueError("decoded frame view dimensions must remain stable per analyzer")
+        blur_score_milli = _blur_score_milli(gray, dimensions)
+        scene_change_milli = (
+            None
+            if self._previous_gray is None
+            else _scene_change_milli(gray, self._previous_gray)
+        )
         frame_delta_milli = (
             None
             if self._previous_gray is None
@@ -350,6 +360,9 @@ class LocalFrameQualityAnalyzer:
             edge_energy_milli=edge_energy_milli,
             frame_delta_milli=frame_delta_milli,
             flags=tuple(sorted(flags, key=lambda value: value.value)),
+            blur_score_milli=blur_score_milli,
+            motion_energy_milli=frame_delta_milli,
+            scene_change_milli=scene_change_milli,
         )
 
 
@@ -593,6 +606,48 @@ def _edge_energy_milli(gray: bytes, dimensions: tuple[int, int]) -> int:
         return 0
     return _rounded_ratio((horizontal + vertical) * 1_000, comparisons)
 
+
+def _blur_score_milli(gray: bytes, dimensions: tuple[int, int]) -> int:
+    """Return a compact Laplacian-variance proxy for selected sentinel pixels."""
+
+    width, height = dimensions
+    if width < 3 or height < 3:
+        return 0
+    laplacian: list[int] = []
+    for row in range(1, height - 1):
+        for column in range(1, width - 1):
+            index = row * width + column
+            center = gray[index]
+            laplacian.append(
+                4 * center
+                - gray[index - 1]
+                - gray[index + 1]
+                - gray[index - width]
+                - gray[index + width]
+            )
+    if not laplacian:
+        return 0
+    mean = sum(laplacian) / len(laplacian)
+    variance = sum((value - mean) ** 2 for value in laplacian) / len(laplacian)
+    return max(0, int(variance * 1_000 + 0.5))
+
+
+def _scene_change_milli(current: bytes, previous: bytes) -> int:
+    """Return a bounded 16-bin histogram distance for a pair of sentinel views."""
+
+    if len(current) != len(previous) or not current:
+        return 0
+    current_hist = [0] * 16
+    previous_hist = [0] * 16
+    for value in current:
+        current_hist[min(15, value // 16)] += 1
+    for value in previous:
+        previous_hist[min(15, value // 16)] += 1
+    distance = sum(
+        abs(left - right)
+        for left, right in zip(current_hist, previous_hist, strict=True)
+    )
+    return _rounded_ratio(distance * 1_000, len(current))
 
 def _cadence_gaps(
     camera_id: CameraId,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Self
 
-from pydantic import model_validator
+from pydantic import ValidationInfo, model_validator
 
 from robata.application.canonical.boundary_windows import CanonicalBoundaryRefinementWindow
 from robata.application.canonical.logical_nodes import (
@@ -920,7 +920,17 @@ class CanonicalOfflineRunResult(StrictModel):
     error: CanonicalOfflineError | None
 
     @model_validator(mode="after")
-    def validate_result(self) -> Self:
+    def validate_result(self, info: ValidationInfo) -> Self:
+        # ``canonical-primary-completion-detail`` v4 predates the internal
+        # product-QA context/result bridge. Its published bytes cannot be
+        # changed in place, so completion-detail recovery validates the
+        # persisted upstream closure with an explicit compatibility context.
+        # Fresh canonical runs still use the default strict path below and must
+        # retain the complete 21-class product projection before completion.
+        validation_context = info.context if isinstance(info.context, dict) else {}
+        allow_missing_product_qa = (
+            validation_context.get("allow_missing_product_qa", False) is True
+        )
         expected_run_status = CanonicalProcessingRunPrimaryStatus(self.status.value)
         if (
             self.processing_run.run_id != self.run_id
@@ -1123,7 +1133,7 @@ class CanonicalOfflineRunResult(StrictModel):
                             )
         product_context = self.product_qa_context
         product_result = self.product_qa_result
-        if product_result is not None:
+        if not allow_missing_product_qa and product_result is not None:
             if (
                 product_context is None
                 or self.coarse_qa_result is None
@@ -1157,7 +1167,11 @@ class CanonicalOfflineRunResult(StrictModel):
             )
             if product_result != expected_product_result:
                 raise ValueError("product QA result differs from retained canonical evidence")
-        elif product_context is not None and self.qa_completion_result is not None:
+        elif (
+            not allow_missing_product_qa
+            and product_context is not None
+            and self.qa_completion_result is not None
+        ):
             raise ValueError("retained product QA context requires a complete local projection")
         final_fusion_context = self.final_fusion_context
         if final_fusion_context is not None:
@@ -1407,6 +1421,13 @@ class CanonicalOfflineRunResult(StrictModel):
             or self.qa_completion_result.status is not QACompletionStatus.QA_COMPLETE
         ):
             raise ValueError("completed run requires a QA_COMPLETE prerequisite")
+        if not allow_missing_product_qa and completed and (
+            self.product_qa_context is None
+            or self.product_qa_result is None
+        ):
+            raise ValueError(
+                "completed run requires its complete 21-class product QA projection"
+            )
         if self.input_plan is not None and (
             self.qa_completion_result is None
             or self.qa_completion_result.status is not QACompletionStatus.QA_COMPLETE

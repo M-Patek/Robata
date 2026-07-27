@@ -175,44 +175,50 @@ class CanonicalPrimaryCompletionDetail(StrictModel):
             )
         else:
             compatibility = (None, None, None, None, None, None)
-        CanonicalOfflineRunResult(
-            schema_version="1.0",
-            run_id=self.run_id,
-            processing_run=self.processing_run,
-            run_memberships=self.run_memberships,
-            recording_identity=self.recording_identity,
-            mcap_id=self.mcap_id,
-            execution_policy_sha256=self.execution_policy_sha256,
-            status=CanonicalOfflineRunStatus(self.status),
-            window=self.window,
-            materialized_package_ids=tuple(item.package_id for item in self.package_set.members),
-            package_set=self.package_set,
-            coarse_qa_result=self.coarse_qa_result,
-            dense_qa_executions=self.dense_qa_executions,
-            qa_completion_result=self.qa_completion_result,
-            event_proposal_result=self.event_proposal_result,
-            candidate_reduction_result=self.candidate_reduction_result,
-            action_evidence_executions=self.action_evidence_executions,
-            provisional_fusion_result=self.provisional_fusion_result,
-            boundary_refinement_executions=self.boundary_refinement_executions,
-            final_fusion_context=self.final_fusion_context,
-            input_plan=self.input_plan,
-            reference_catalog=self.reference_catalog,
-            part_results=self.part_results,
-            barrier_reduction=self.barrier_reduction,
-            fusion_reduction=self.fusion_reduction,
-            terminal=compatibility[0],
-            selection=compatibility[1],
-            raw_response=compatibility[2],
-            parsed_claims=compatibility[3],
-            selected_output=compatibility[4],
-            enriched_output=compatibility[5],
-            output_decision=self.output_decision,
-            hypotheses=self.hypotheses,
-            identity_result=None,
-            attempt_count=sum(item.orchestration_attempt_count for item in self.part_results),
-            adapter_infer_calls=0,
-            error=None,
+        CanonicalOfflineRunResult.model_validate(
+            CanonicalOfflineRunResult.model_construct(
+                schema_version="1.0",
+                run_id=self.run_id,
+                processing_run=self.processing_run,
+                run_memberships=self.run_memberships,
+                recording_identity=self.recording_identity,
+                mcap_id=self.mcap_id,
+                execution_policy_sha256=self.execution_policy_sha256,
+                status=CanonicalOfflineRunStatus(self.status),
+                window=self.window,
+                materialized_package_ids=tuple(
+                    item.package_id for item in self.package_set.members
+                ),
+                package_set=self.package_set,
+                coarse_qa_result=self.coarse_qa_result,
+                dense_qa_executions=self.dense_qa_executions,
+                qa_completion_result=self.qa_completion_result,
+                event_proposal_result=self.event_proposal_result,
+                candidate_reduction_result=self.candidate_reduction_result,
+                action_evidence_executions=self.action_evidence_executions,
+                provisional_fusion_result=self.provisional_fusion_result,
+                boundary_refinement_executions=self.boundary_refinement_executions,
+                final_fusion_context=self.final_fusion_context,
+                input_plan=self.input_plan,
+                reference_catalog=self.reference_catalog,
+                part_results=self.part_results,
+                barrier_reduction=self.barrier_reduction,
+                fusion_reduction=self.fusion_reduction,
+                terminal=compatibility[0],
+                selection=compatibility[1],
+                raw_response=compatibility[2],
+                parsed_claims=compatibility[3],
+                selected_output=compatibility[4],
+                enriched_output=compatibility[5],
+                output_decision=self.output_decision,
+                hypotheses=self.hypotheses,
+                identity_result=None,
+                attempt_count=sum(item.orchestration_attempt_count for item in self.part_results),
+                adapter_infer_calls=0,
+                error=None,
+            ).model_dump(mode="python"),
+            strict=True,
+            context={"allow_missing_product_qa": True},
         )
 
         if self.action_event_publications.recording_identity != self.recording_identity or any(
@@ -381,6 +387,21 @@ class PreparedPrimaryCompletionCommand:
             )
         ):
             raise TypeError("prepared primary completion bytes must be bytes")
+
+        if exact_bytes_sha256(self.detail_bytes) != self.detail_exact_bytes_sha256:
+            raise ValueError("prepared detail bytes do not match their exact digest")
+        if exact_bytes_sha256(self.command_bytes) != self.command_exact_bytes_sha256:
+            raise ValueError("prepared command bytes do not match their exact digest")
+        if exact_bytes_sha256(self.processing_run_bytes) != self.processing_run_exact_bytes_sha256:
+            raise ValueError("prepared processing-run bytes do not match their exact digest")
+        if self.detail_bytes != canonical_json_bytes(self.command.detail):
+            raise ValueError("prepared detail bytes do not match the typed command detail")
+        if self.command_bytes != canonical_json_bytes(self.command):
+            raise ValueError("prepared command bytes do not match the typed command")
+        if self.processing_run_bytes != canonical_json_bytes(self.command.detail.processing_run):
+            raise ValueError(
+                "prepared processing-run bytes do not match the typed command processing run"
+            )
 
     @property
     def is_canonical_preparation(self) -> bool:
@@ -597,7 +618,17 @@ def _create_primary_completion_command(
     detail_fields["semantic_sha256"] = semantic_sha256(
         canonical_primary_completion_detail_projection(draft_detail)
     )
-    detail = CanonicalPrimaryCompletionDetail.model_validate(detail_fields, strict=True)
+    # Completion-detail v4 is a published wire shape and intentionally does
+    # not carry the newer internal product-QA context/result fields. Validate
+    # the fresh run before this boundary (the result model requires the full
+    # 21-class projection), then validate the persisted v4 closure with its
+    # explicit compatibility context so replay does not invent or drop wire
+    # fields.
+    detail = CanonicalPrimaryCompletionDetail.model_validate(
+        detail_fields,
+        strict=True,
+        context={"allow_missing_product_qa": True},
+    )
     active_registry.validate_pinned(detail.schema_ref, detail.model_dump(mode="json"))
 
     detail_bytes = canonical_json_bytes(detail)

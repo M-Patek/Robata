@@ -9,7 +9,7 @@ closure plus its retained quality context.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, TypeVar
 
 from pydantic import StringConstraints, model_validator
 
@@ -47,6 +47,7 @@ from robata.qa_pipeline.product import (
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 
 
+StrictModelT = TypeVar("StrictModelT", bound=StrictModel)
 class CanonicalProductQAContext(StrictModel):
     """Local visual/structural facts supplied to the canonical QA reduction."""
 
@@ -149,16 +150,58 @@ class CanonicalProductQAProjector:
     ) -> ProductQACascadeResult:
         """Reduce all available facts while preserving exact upstream references."""
 
+        # Check argument types before touching any nested fields so callers
+        # get a deterministic programming-error response even when another
+        # envelope is malformed.  Then re-validate every retained envelope at
+        # this reduction boundary.  A typed object can still have been
+        # assembled with model_construct or deserialized from an untrusted
+        # local cache; consuming its fields directly would let a forged claim
+        # or lineage reference reach the complete product projection.
         if not isinstance(coarse_result, CoarseQAResult):
             raise TypeError("coarse_result must be a CoarseQAResult")
         if not isinstance(qa_completion_result, QACompletionResult):
             raise TypeError("qa_completion_result must be a QACompletionResult")
-        if context is None:
-            context = CanonicalProductQAContext()
-        if not isinstance(context, CanonicalProductQAContext):
+        if context is not None and not isinstance(context, CanonicalProductQAContext):
             raise TypeError("context must be CanonicalProductQAContext or None")
+        if candidate_reduction_result is not None and not isinstance(
+            candidate_reduction_result,
+            CandidateReductionResult,
+        ):
+            raise TypeError(
+                "candidate_reduction_result must be a CandidateReductionResult or None"
+            )
+        for action_evidence_result in action_evidence_results:
+            if not isinstance(action_evidence_result, ActionEvidenceResult):
+                raise TypeError("action_evidence_results must contain ActionEvidenceResult")
+        for boundary_result in boundary_results:
+            if not isinstance(boundary_result, BoundaryRefinementResult):
+                raise TypeError("boundary_results must contain BoundaryRefinementResult")
         if not isinstance(pipeline_incomplete, bool) or not isinstance(pipeline_abstained, bool):
             raise TypeError("pipeline terminal flags must be bool")
+
+        coarse_result = _validated_instance(coarse_result, CoarseQAResult, "coarse_result")
+        qa_completion_result = _validated_instance(
+            qa_completion_result,
+            QACompletionResult,
+            "qa_completion_result",
+        )
+        if context is None:
+            context = CanonicalProductQAContext()
+        context = _validated_instance(context, CanonicalProductQAContext, "context")
+        if candidate_reduction_result is not None:
+            candidate_reduction_result = _validated_instance(
+                candidate_reduction_result,
+                CandidateReductionResult,
+                "candidate_reduction_result",
+            )
+        checked_action_results = tuple(
+            _validated_instance(item, ActionEvidenceResult, "action_evidence_results")
+            for item in action_evidence_results
+        )
+        checked_boundary_results = tuple(
+            _validated_instance(item, BoundaryRefinementResult, "boundary_results")
+            for item in boundary_results
+        )
 
         observed = list(context.observed_evidence)
         incomplete_reasons = list(context.incomplete_reason_codes)
@@ -193,13 +236,9 @@ class CanonicalProductQAProjector:
 
         if candidate_reduction_result is not None:
             observed.extend(_candidate_evidence(candidate_reduction_result))
-        for action_result in action_evidence_results:
-            if not isinstance(action_result, ActionEvidenceResult):
-                raise TypeError("action_evidence_results must contain ActionEvidenceResult")
+        for action_result in checked_action_results:
             observed.extend(_action_evidence(action_result))
-        for boundary in boundary_results:
-            if not isinstance(boundary, BoundaryRefinementResult):
-                raise TypeError("boundary_results must contain BoundaryRefinementResult")
+        for boundary in checked_boundary_results:
             mapped = _boundary_evidence(boundary)
             if mapped is not None:
                 observed.append(mapped)
@@ -216,6 +255,21 @@ class CanonicalProductQAProjector:
             incomplete_reason_codes=tuple(sorted(set(incomplete_reasons))),
             abstained_reason_codes=tuple(sorted(set(abstained_reasons))),
         )
+
+
+def _validated_instance(
+    value: StrictModelT,
+    expected_type: type[StrictModelT],
+    label: str,
+) -> StrictModelT:
+    """Return a strict, detached copy of one canonical upstream envelope."""
+
+    if not isinstance(value, expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
+    try:
+        return expected_type.model_validate(value.model_dump(mode="python"), strict=True)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} failed immutable contract validation") from exc
 
 
 def _media_quality_evidence(

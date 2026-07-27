@@ -29,6 +29,7 @@ from robata.adapters.sqlite_inference_evidence import (
 from robata.adapters.sqlite_outbox import SQLiteIdempotentOutboxSink
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
+from robata.adapters.sqlite_stream_work_ledger import SQLiteStreamWorkLedgerError
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkSchedulerError
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.action_event_revision import (
@@ -125,7 +126,10 @@ from robata.application.canonical.stream_recording_reduction import (
     LocalStreamRecordingResultV3,
     LocalStreamRecordingResultV4,
 )
-from robata.application.canonical.stream_scheduler import DurableStreamWindowScheduler
+from robata.application.canonical.stream_scheduler import (
+    DurableStreamWindowScheduler,
+    StreamSchedulerCompositionError,
+)
 from robata.application.canonical_run_membership import CanonicalProcessingRunContext
 from robata.contracts.cameras import CameraId
 from robata.contracts.common import NanosecondInterval, StrictModel
@@ -763,10 +767,23 @@ def run_local_canonical_mcap(
                 stream_run_id=stream_run_id,
                 stream_artifact_root=state_root / "stream-artifacts",
                 stage_terminal_executor=resolved_stage_terminal_executor,
+                # A factory-installed provider-neutral executor owns every
+                # eligible QA/event item in the P5 path. A typed terminal is
+                # therefore required; direct conformance callers retain their
+                # own explicit fallback policy.
+                provider_terminal_required=pre_eos_executor_factory is not None,
             )
         except CanonicalMcapSourceError as error:
+            # Stream graph persistence is local state, even when the MCAP bridge
+            # wraps its scheduler exception in CanonicalMcapSourceError. Do not
+            # report a damaged/replayed graph as invalid source bytes.
+            code = (
+                CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED
+                if _has_local_stream_state_cause(error)
+                else CanonicalLocalCompositionErrorCode.SOURCE_INVALID
+            )
             raise CanonicalLocalCompositionError(
-                CanonicalLocalCompositionErrorCode.SOURCE_INVALID,
+                code,
                 str(error),
             ) from error
 
@@ -1185,6 +1202,7 @@ def _run_local_canonical_inner(
                 bundle=bundle,
                 canonical_result=result,
                 stage_terminal_executor=resolved_stage_terminal_executor,
+                provider_terminal_required=pre_eos_executor_factory is not None,
             )
         runtime_increment(
             runtime_observer,
@@ -1291,9 +1309,11 @@ def _run_local_canonical_inner(
     except (
         SQLiteBarrierStorageError,
         SQLiteInferenceEvidenceLedgerError,
+        SQLiteStreamWorkLedgerError,
         LocalStreamFinalizationError,
         LogicalNodeRegistryError,
         WorkSchedulerError,
+        StreamSchedulerCompositionError,
         CanonicalDurableWorkError,
     ) as error:
         raise CanonicalLocalCompositionError(
@@ -2089,6 +2109,7 @@ def _finalize_local_stream_graphs(
     bundle: _CanonicalSourceInputs,
     canonical_result: CanonicalOfflineRunResult,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
+    provider_terminal_required: bool = False,
 ) -> tuple[LocalStreamFinalizationOutcome, ...]:
     if not schedulers:
         return ()
@@ -2149,6 +2170,7 @@ def _finalize_local_stream_graphs(
             MODEL_INFERENCE_SCHEMA_ID,
             "1.0.0",
         ).ref,
+        provider_terminal_required=provider_terminal_required,
     )
     ready = bundle.admitted_context.ready_manifest
     final_recording = FinalRecordingFacts(
@@ -2375,6 +2397,28 @@ def _run_id(
 
 def _stable_uuid(namespace: str, value: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"robata:{namespace}:{value}"))
+
+
+def _has_local_stream_state_cause(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                SQLiteBarrierStorageError,
+                SQLiteInferenceEvidenceLedgerError,
+                SQLiteStreamWorkLedgerError,
+                WorkSchedulerError,
+                LocalStreamFinalizationError,
+                CanonicalDurableWorkError,
+                StreamSchedulerCompositionError,
+            ),
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _require_provider_dispatcher(

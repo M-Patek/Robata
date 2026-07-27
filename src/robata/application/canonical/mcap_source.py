@@ -653,6 +653,7 @@ def load_canonical_mcap_source(
     stage_terminal_executor: (
         Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
     ) = None,
+    provider_terminal_required: bool = False,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
 
@@ -666,6 +667,8 @@ def load_canonical_mcap_source(
             raise ValueError("execution_scheduler and stream_run_id must be configured together")
         if stage_terminal_executor is not None and not callable(stage_terminal_executor):
             raise TypeError("stage_terminal_executor must be callable or None")
+        if not isinstance(provider_terminal_required, bool):
+            raise TypeError("provider_terminal_required must be bool")
         if stage_terminal_executor is not None and execution_scheduler is None:
             raise ValueError(
                 "stage_terminal_executor requires execution_scheduler and stream_run_id"
@@ -693,6 +696,7 @@ def load_canonical_mcap_source(
                 None if stream_artifact_root is None else Path(stream_artifact_root)
             ),
             stage_terminal_executor=stage_terminal_executor,
+            provider_terminal_required=provider_terminal_required,
         )
     except CanonicalMcapSourceError:
         raise
@@ -717,6 +721,7 @@ def _load_canonical_mcap_source(
     stage_terminal_executor: (
         Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
     ),
+    provider_terminal_required: bool,
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
     stage_attributes = {"camera_count": len(CAMERA_IDS)}
@@ -755,6 +760,7 @@ def _load_canonical_mcap_source(
             stream_run_id=stream_run_id,
             stream_artifact_root=stream_artifact_root,
             stage_terminal_executor=stage_terminal_executor,
+            provider_terminal_required=provider_terminal_required,
         )
         publication = prepared_publication.publication
         inspection = prepared_publication.inspection
@@ -1138,6 +1144,7 @@ def _export_registered_videos(
     stage_terminal_executor: (
         Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
     ),
+    provider_terminal_required: bool,
 ) -> _PreparedVideoPublication:
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
@@ -1246,6 +1253,7 @@ def _export_registered_videos(
                         if stage_terminal_executor is not None
                         else None
                     ),
+                    provider_terminal_required=provider_terminal_required,
                 ),
                 window_purpose=StreamPurpose.EVENT_PROPOSAL,
                 recover_graph_before_execute=False,

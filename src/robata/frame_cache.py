@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -101,6 +102,55 @@ class FeedOnceResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameCacheReconciliation:
+    '''A bounded visibility and crash-leftover report for one local frame cache.'''
+
+    manifest_count: int
+    visible_manifest_count: int
+    missing_frame_refs: tuple[str, ...] = ()
+    corrupt_frame_refs: tuple[str, ...] = ()
+    invalid_manifest_paths: tuple[Path, ...] = ()
+    orphan_blob_paths: tuple[Path, ...] = ()
+    partial_blob_paths: tuple[Path, ...] = ()
+    removed_paths: tuple[Path, ...] = ()
+    failed_removal_paths: tuple[Path, ...] = ()
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_frame_refs)
+
+    @property
+    def corrupt_count(self) -> int:
+        return len(self.corrupt_frame_refs)
+
+    @property
+    def orphan_count(self) -> int:
+        return len(self.orphan_blob_paths)
+
+    @property
+    def partial_count(self) -> int:
+        return len(self.partial_blob_paths) + len(self.invalid_manifest_paths)
+
+    @property
+    def issue_count(self) -> int:
+        return (
+            self.missing_count
+            + self.corrupt_count
+            + self.orphan_count
+            + self.partial_count
+            + len(self.failed_removal_paths)
+        )
+
+    @property
+    def reconciled(self) -> bool:
+        return self.issue_count == 0
+
+    @property
+    def ok(self) -> bool:
+        return self.reconciled
+
+
+@dataclass(frozen=True, slots=True)
 class FrameCacheCapacityEstimate:
     """Storage estimate for a retention window; it is an assumption, not a bill."""
 
@@ -168,7 +218,7 @@ class SharedFrameCache:
         Concurrent callers for the same video serialize on a per-video lock.  If a manifest
         already exists, the decoder is not invoked and ``cache_hit`` is true.
         """
-        self._validate_id(video_id, "video_id")
+        self._validate_video_id(video_id)
         self._validate_id(source_uri, "source_uri")
         if (
             isinstance(frame_rate, bool)
@@ -177,7 +227,14 @@ class SharedFrameCache:
         ):
             raise ValueError("frame_rate must be positive")
         with self._lock:
-            existing = self._manifests.get(video_id) or self._load_manifest(video_id)
+            existing = self._manifests.get(video_id) or self._load_manifest_for_reuse(video_id)
+            if existing is not None and existing.cache_key != self._cache_key(
+                video_id,
+                source_uri,
+            ):
+                raise ValueError('video_id is already bound to a different source URI')
+            if existing is not None and not self._manifest_visible(existing):
+                existing = None
             if existing is not None:
                 self._manifests[video_id] = existing
                 self._cache_hits += 1
@@ -185,7 +242,14 @@ class SharedFrameCache:
             lock = self._video_locks.setdefault(video_id, threading.Lock())
         with lock:
             with self._lock:
-                existing = self._manifests.get(video_id) or self._load_manifest(video_id)
+                existing = self._manifests.get(video_id) or self._load_manifest_for_reuse(video_id)
+                if existing is not None and existing.cache_key != self._cache_key(
+                    video_id,
+                    source_uri,
+                ):
+                    raise ValueError('video_id is already bound to a different source URI')
+                if existing is not None and not self._manifest_visible(existing):
+                    existing = None
                 if existing is not None:
                     self._manifests[video_id] = existing
                     self._cache_hits += 1
@@ -214,7 +278,7 @@ class SharedFrameCache:
             return FeedOnceResult(manifest, False)
 
     def put_frame(self, video_id: str, ordinal: int, payload: FramePayload) -> FrameRef:
-        self._validate_id(video_id, "video_id")
+        self._validate_video_id(video_id)
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
             raise ValueError("ordinal must be a non-negative integer")
         if not isinstance(payload, FramePayload):
@@ -223,7 +287,10 @@ class SharedFrameCache:
         directory = self._root / video_id
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{digest}.bin"
-        if not path.exists():
+        if (
+            not path.exists()
+            or self._frame_path_state(path, digest, len(payload.data)) != 'VISIBLE'
+        ):
             self._atomic_write(path, payload.data)
         frame_id = payload.frame_id or f"{video_id}:{ordinal}:{digest[:16]}"
         return FrameRef(
@@ -244,7 +311,7 @@ class SharedFrameCache:
         return data
 
     def get_manifest(self, video_id: str) -> FrameFeedManifest | None:
-        self._validate_id(video_id, "video_id")
+        self._validate_video_id(video_id)
         with self._lock:
             manifest = self._manifests.get(video_id) or self._load_manifest(video_id)
             if manifest is not None:
@@ -265,7 +332,7 @@ class SharedFrameCache:
 
     def clear_video(self, video_id: str) -> None:
         """Remove derived frame artifacts for a video; source recordings remain untouched."""
-        self._validate_id(video_id, "video_id")
+        self._validate_video_id(video_id)
         with self._lock:
             self._manifests.pop(video_id, None)
             manifest_path = self._manifest_path(video_id)
@@ -278,6 +345,224 @@ class SharedFrameCache:
                     path.unlink()
             directory.rmdir()
 
+    def reconcile(
+        self,
+        *,
+        remove_orphans: bool = False,
+        remove_partials: bool = False,
+        strict: bool = False,
+    ) -> FrameCacheReconciliation:
+        '''Reconcile persisted manifests, frame bytes, and crash leftovers.
+
+        A manifest is visible only when every referenced frame remains a regular file
+        with the recorded exact hash and size. Unreferenced files are retained by
+        default so an operator can repair or inspect a failed publication.
+        '''
+
+        for name, value in (
+            ('remove_orphans', remove_orphans),
+            ('remove_partials', remove_partials),
+            ('strict', strict),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f'{name} must be a boolean')
+
+        manifest_paths = sorted(
+            self._root.glob('*.manifest.json'),
+            key=lambda path: path.as_posix(),
+        )
+        missing: list[str] = []
+        corrupt: list[str] = []
+        invalid_manifests: list[Path] = []
+        referenced_paths: set[Path] = set()
+        valid_manifests: dict[str, FrameFeedManifest] = {}
+        visible_manifests = 0
+        for manifest_path in manifest_paths:
+            try:
+                manifest = FrameFeedManifest.model_validate_json(
+                    manifest_path.read_bytes(),
+                    strict=True,
+                )
+            except Exception:
+                invalid_manifests.append(manifest_path)
+                continue
+            expected_name = f'{manifest.video_id}.manifest.json'
+            if manifest_path.name != expected_name:
+                invalid_manifests.append(manifest_path)
+                continue
+            visible = True
+            seen_ordinals: set[int] = set()
+            seen_frame_ids: set[str] = set()
+            for expected_ordinal, frame in enumerate(manifest.frames):
+                frame_key = f'{manifest.video_id}:{frame.ordinal}'
+                if (
+                    frame.video_id != manifest.video_id
+                    or frame.ordinal != expected_ordinal
+                    or frame.ordinal in seen_ordinals
+                    or frame.frame_id in seen_frame_ids
+                ):
+                    corrupt.append(frame_key)
+                    visible = False
+                    continue
+                seen_ordinals.add(frame.ordinal)
+                seen_frame_ids.add(frame.frame_id)
+                path = self._safe_frame_path(frame.uri)
+                if path is None:
+                    corrupt.append(frame_key)
+                    visible = False
+                    continue
+                referenced_paths.add(path)
+                state = self._frame_path_state(path, frame.content_sha256, frame.size_bytes)
+                if state == 'MISSING':
+                    missing.append(frame_key)
+                    visible = False
+                elif state != 'VISIBLE':
+                    corrupt.append(frame_key)
+                    visible = False
+            if not manifest.frames:
+                invalid_manifests.append(manifest_path)
+                visible = False
+            valid_manifests[manifest.video_id] = manifest
+            if visible:
+                visible_manifests += 1
+
+        orphan: list[Path] = []
+        partial: list[Path] = []
+        for video_directory in sorted(self._root.iterdir(), key=lambda path: path.as_posix()):
+            if video_directory.name.endswith('.manifest.json'):
+                continue
+            try:
+                directory_stat = video_directory.lstat()
+            except OSError:
+                partial.append(video_directory)
+                continue
+            if video_directory.is_symlink() or not stat.S_ISDIR(directory_stat.st_mode):
+                partial.append(video_directory)
+                continue
+            for path in sorted(video_directory.rglob('*'), key=lambda value: value.as_posix()):
+                try:
+                    file_stat = path.lstat()
+                except OSError:
+                    partial.append(path)
+                    continue
+                if stat.S_ISDIR(file_stat.st_mode):
+                    continue
+                if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                    partial.append(path)
+                elif self._safe_frame_path(path.as_posix()) not in referenced_paths:
+                    if path.name.startswith('tmp') or path.name.startswith('.tmp'):
+                        partial.append(path)
+                    else:
+                        orphan.append(path)
+
+        cleanup: list[Path] = []
+        if remove_orphans:
+            cleanup.extend(orphan)
+        if remove_partials:
+            cleanup.extend(partial)
+            cleanup.extend(invalid_manifests)
+        removed, failed = self._remove_paths(cleanup)
+        removed_set = set(removed)
+        orphan = [path for path in orphan if path not in removed_set]
+        partial = [path for path in partial if path not in removed_set]
+        invalid_manifests = [path for path in invalid_manifests if path not in removed_set]
+        with self._lock:
+            self._manifests.update(valid_manifests)
+            for video_id, manifest in tuple(self._manifests.items()):
+                if manifest.video_id not in valid_manifests:
+                    self._manifests.pop(video_id, None)
+        report = FrameCacheReconciliation(
+            manifest_count=len(manifest_paths),
+            visible_manifest_count=visible_manifests,
+            missing_frame_refs=tuple(sorted(set(missing))),
+            corrupt_frame_refs=tuple(sorted(set(corrupt))),
+            invalid_manifest_paths=tuple(
+                sorted(invalid_manifests, key=lambda path: path.as_posix())
+            ),
+            orphan_blob_paths=tuple(sorted(orphan, key=lambda path: path.as_posix())),
+            partial_blob_paths=tuple(sorted(partial, key=lambda path: path.as_posix())),
+            removed_paths=tuple(sorted(removed, key=lambda path: path.as_posix())),
+            failed_removal_paths=tuple(sorted(failed, key=lambda path: path.as_posix())),
+        )
+        if strict and not report.reconciled:
+            raise ValueError('frame cache reconciliation found unresolved storage discrepancies')
+        return report
+
+    def reconcile_storage(self, **kwargs: object) -> FrameCacheReconciliation:
+        '''Compatibility alias for callers naming the backing store explicitly.'''
+
+        return self.reconcile(**kwargs)  # type: ignore[arg-type]
+
+    def _safe_frame_path(self, uri: str) -> Path | None:
+        try:
+            candidate = Path(uri)
+            resolved = candidate.resolve(strict=False)
+            root = self._root.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        return resolved
+
+    def _manifest_visible(self, manifest: FrameFeedManifest) -> bool:
+        if not manifest.frames:
+            return False
+        seen_ordinals: set[int] = set()
+        seen_frame_ids: set[str] = set()
+        for expected_ordinal, frame in enumerate(manifest.frames):
+            if (
+                frame.video_id != manifest.video_id
+                or frame.ordinal != expected_ordinal
+                or frame.ordinal in seen_ordinals
+                or frame.frame_id in seen_frame_ids
+            ):
+                return False
+            seen_ordinals.add(frame.ordinal)
+            seen_frame_ids.add(frame.frame_id)
+            path = self._safe_frame_path(frame.uri)
+            if path is None or self._frame_path_state(
+                path,
+                frame.content_sha256,
+                frame.size_bytes,
+            ) != 'VISIBLE':
+                return False
+        return True
+
+    @staticmethod
+    def _frame_path_state(path: Path, expected_sha256: str, expected_bytes: int) -> str:
+        try:
+            file_stat = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                return 'CORRUPT'
+            if file_stat.st_size != expected_bytes:
+                return 'CORRUPT'
+            digest = hashlib.sha256()
+            with path.open('rb') as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            return 'VISIBLE' if digest.hexdigest() == expected_sha256 else 'CORRUPT'
+        except FileNotFoundError:
+            return 'MISSING'
+        except OSError:
+            return 'CORRUPT'
+
+    def _remove_paths(self, paths: list[Path]) -> tuple[list[Path], list[Path]]:
+        removed: list[Path] = []
+        failed: list[Path] = []
+        seen: set[Path] = set()
+        root = self._root.resolve(strict=True)
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                path.resolve(strict=False).relative_to(root)
+                path.unlink()
+            except (OSError, ValueError):
+                failed.append(path)
+            else:
+                removed.append(path)
+        return removed, failed
+
     def _cache_key(self, video_id: str, source_uri: str) -> str:
         return hashlib.sha256(f"{self.namespace}:{video_id}:{source_uri}".encode()).hexdigest()
 
@@ -288,6 +573,12 @@ class SharedFrameCache:
         path = self._manifest_path(manifest.video_id)
         payload = manifest.model_dump_json().encode("utf-8")
         self._atomic_write(path, payload)
+
+    def _load_manifest_for_reuse(self, video_id: str) -> FrameFeedManifest | None:
+        try:
+            return self._load_manifest(video_id)
+        except ValueError:
+            return None
 
     def _load_manifest(self, video_id: str) -> FrameFeedManifest | None:
         path = self._manifest_path(video_id)
@@ -310,6 +601,18 @@ class SharedFrameCache:
     def _validate_id(value: str, name: str) -> None:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{name} must be a non-empty string")
+
+    @staticmethod
+    def _validate_video_id(value: str) -> None:
+        """Keep caller-controlled video IDs inside the cache namespace."""
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("video_id must be a non-empty string")
+        if value in {".", ".."} or "\x00" in value or "/" in value or "\\" in value:
+            raise ValueError("video_id must be a single safe path component")
+        candidate = Path(value)
+        if candidate.is_absolute() or candidate.name != value:
+            raise ValueError("video_id must be a single safe path component")
 
 
 # Compatibility method names used by orchestration code.
@@ -347,6 +650,7 @@ __all__ = [
     "FeedOnceResult",
     "FrameCache",
     "FrameCacheCapacityEstimate",
+    'FrameCacheReconciliation',
     "FrameCacheStats",
     "FrameFeedCoordinator",
     "FrameFeedManifest",

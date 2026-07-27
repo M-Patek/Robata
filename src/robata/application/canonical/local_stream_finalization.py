@@ -22,6 +22,7 @@ from robata.adapters.sqlite_stream_delivery import (
     PreparedWindowReductionEvidence,
     SQLiteStreamDeliveryAuthority,
 )
+from robata.application.canonical.pre_eos_execution import _stream_terminal_outcome
 from robata.application.canonical.result_validation import CanonicalOfflineRunResult
 from robata.application.canonical.stream_recording_reduction import (
     LOCAL_STREAM_RECORDING_RESULT_SCHEMA_ID,
@@ -167,6 +168,10 @@ class LocalStreamFinalizationSchemaRefs:
     # LOCAL_CONFORMANCE receipt. Keeping this optional preserves the fast
     # conformance-only mode and avoids changing published local-stream schemas.
     model_inference: SchemaRef | None = None
+    # Direct local MCAP composition may install an observation hook that declines
+    # a stage (returns ``None``); the provider-neutral P5 path sets this to true
+    # so a pinned model-inference schema cannot silently fall back.
+    provider_terminal_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,7 +413,10 @@ class LocalConformanceStreamFinalizer:
         self._scheduler = scheduler
         self._delivery = delivery_authority
         self._artifacts = _ExactLocalArtifactStore(Path(artifact_root))
+        if not isinstance(schema_refs.provider_terminal_required, bool):
+            raise TypeError("schema_refs.provider_terminal_required must be bool")
         self._schema_refs = schema_refs
+        self._provider_terminal_required = schema_refs.provider_terminal_required
         self._final_recording = final_recording
         self._canonical_result = canonical_result
         self._source_timeline_origin_ns = source_timeline_origin_ns
@@ -538,6 +546,18 @@ class LocalConformanceStreamFinalizer:
                 recover_graph=False,
             )
             if claim is None:
+                # A crash may leave finalization RUNNING under this worker's
+                # still-live lease after the artifact/outbox facts were
+                # persisted but before the scheduler terminal transition.
+                # Resume that exact fence instead of creating a second attempt;
+                # another worker's lease remains non-stealable and fails closed.
+                claim = self._scheduler.resume_owned_active(
+                    self._worker_id,
+                    self._lease_seconds,
+                    work_item_id=final_plan.work_item_id,
+                    now=self._now(),
+                )
+            if claim is None:
                 raise LocalStreamFinalizationError(
                     "finalization gate is closed but finalization work is not claimable"
                 )
@@ -596,6 +616,11 @@ class LocalConformanceStreamFinalizer:
             for item in bounded_scope
             if item.terminal_evidence is not None
         }
+        terminal_outcomes_by_key = {
+            item.plan.work_logical_key: item.terminal_evidence.outcome
+            for item in bounded_scope
+            if item.terminal_evidence is not None
+        }
         pending = {
             item.plan.work_item_id: item.plan
             for item in bounded_scope
@@ -643,6 +668,7 @@ class LocalConformanceStreamFinalizer:
                     plan,
                     plans_by_key,
                     terminal_refs_by_key,
+                    terminal_outcomes_by_key,
                     declarations_by_window,
                 )
                 evidence = prepared.terminal_evidence
@@ -670,6 +696,7 @@ class LocalConformanceStreamFinalizer:
                 else:
                     self._scheduler.complete(claim.lease, evidence, now=self._now())
                 terminal_refs_by_key[plan.work_logical_key] = evidence.evidence_ref
+                terminal_outcomes_by_key[plan.work_logical_key] = evidence.outcome
                 executed += 1
                 del pending[plan.work_item_id]
                 progress = True
@@ -687,6 +714,7 @@ class LocalConformanceStreamFinalizer:
         plan: StreamWorkItemPlan,
         plans_by_key: dict[str, StreamWorkItemPlan],
         terminal_refs_by_key: dict[str, ArtifactEvidenceRef],
+        terminal_outcomes_by_key: dict[str, TerminalOutcome],
         declarations_by_window: dict[str, ExpectedWindowDeclaration],
     ) -> _PreparedStreamWorkCompletion:
         if plan.stage is StreamStage.WINDOW_REDUCTION:
@@ -700,6 +728,7 @@ class LocalConformanceStreamFinalizer:
                 declaration,
                 plans_by_key,
                 terminal_refs_by_key,
+                terminal_outcomes_by_key,
             )
         # The normal local path intentionally remains a deterministic mock.
         # When a P5 provider-neutral executor is configured, however, it gets
@@ -729,7 +758,24 @@ class LocalConformanceStreamFinalizer:
                     raise LocalStreamFinalizationError(
                         "provider-neutral terminal violates the stream terminal policy"
                     )
+                inference = self._provider_model_inference(
+                    checked_terminal.evidence_ref,
+                    expected_task=_PRE_EOS_PROVIDER_TASK_BY_STAGE[plan.stage],
+                )
+                expected_outcome = _stream_terminal_outcome(inference)[0]
+                if checked_terminal.outcome is not expected_outcome:
+                    raise LocalStreamFinalizationError(
+                        'provider terminal outcome conflicts with its model inference'
+                    )
                 return _PreparedStreamWorkCompletion(terminal_evidence=checked_terminal)
+        if (
+            self._provider_terminal_required
+            and plan.stage in _PRE_EOS_PROVIDER_TASK_BY_STAGE
+            and self._schema_refs.model_inference is not None
+        ):
+            raise LocalStreamFinalizationError(
+                "provider-neutral execution must provide a model inference terminal"
+            )
         receipt = self._receipt(plan, plans_by_key, terminal_refs_by_key)
         receipt_ref = self._artifacts.put(
             canonical_json_bytes(receipt), self._schema_refs.local_work_receipt
@@ -749,11 +795,13 @@ class LocalConformanceStreamFinalizer:
         declaration: ExpectedWindowDeclaration,
         plans_by_key: dict[str, StreamWorkItemPlan],
         terminal_refs_by_key: dict[str, ArtifactEvidenceRef],
+        terminal_outcomes_by_key: dict[str, TerminalOutcome],
     ) -> _PreparedStreamWorkCompletion:
-        upstream = self._causal_upstream_stage_evidence(
+        upstream, degraded_upstream = self._causal_upstream_stage_evidence(
             plan,
             plans_by_key,
             terminal_refs_by_key,
+            terminal_outcomes_by_key,
         )
         closure_digest = semantic_sha256(
             {
@@ -787,7 +835,11 @@ class LocalConformanceStreamFinalizer:
             )
             for slot in declaration.ordered_six_slot_segment_or_explicit_absence_closure
         )
-        semantic_status: LocalStreamWindowSemanticStatus = "PROPOSED" if has_media else "NO_EVENTS"
+        semantic_status: LocalStreamWindowSemanticStatus = (
+            "ABSTAINED"
+            if degraded_upstream
+            else ("PROPOSED" if has_media else "NO_EVENTS")
+        )
         semantic_evidence = create_local_stream_window_semantic_evidence_v2(
             schema_ref=self._schema_refs.window_semantic_evidence_v2,
             plan=inference_plan,
@@ -874,7 +926,11 @@ class LocalConformanceStreamFinalizer:
             canonical_json_bytes(inference_terminal),
             self._schema_refs.stream_inference_terminal,
         )
-        outcome = TerminalOutcome.SUCCEEDED if has_media else TerminalOutcome.NO_EVENTS
+        outcome = (
+            TerminalOutcome.ABSTAINED
+            if degraded_upstream
+            else (TerminalOutcome.SUCCEEDED if has_media else TerminalOutcome.NO_EVENTS)
+        )
         result = create_stream_window_result(
             schema_ref=self._schema_refs.stream_window_result,
             window_subject=plan.subject,
@@ -917,8 +973,10 @@ class LocalConformanceStreamFinalizer:
         plan: StreamWorkItemPlan,
         plans_by_key: dict[str, StreamWorkItemPlan],
         terminal_refs_by_key: dict[str, ArtifactEvidenceRef],
-    ) -> tuple[LocalStreamStageEvidenceReference, ...]:
+        terminal_outcomes_by_key: dict[str, TerminalOutcome],
+    ) -> tuple[tuple[LocalStreamStageEvidenceReference, ...], bool]:
         by_stage: dict[StreamStage, LocalStreamStageEvidenceReference] = {}
+        degraded = False
         for dependency in plan.ordered_dependencies:
             upstream_plan = plans_by_key.get(dependency.upstream_work_logical_key)
             if upstream_plan is None:
@@ -930,11 +988,36 @@ class LocalConformanceStreamFinalizer:
                 raise LocalStreamFinalizationError(
                     "causal window reduction lacks terminal upstream evidence"
                 )
+            terminal_outcome = terminal_outcomes_by_key.get(upstream_plan.work_logical_key)
+            if terminal_outcome is None:
+                raise LocalStreamFinalizationError(
+                    'causal window reduction lacks upstream terminal outcome'
+                )
             expected_provider_task = _PRE_EOS_PROVIDER_TASK_BY_STAGE.get(upstream_plan.stage)
+            provider_schema_ref = self._schema_refs.model_inference
+            allowed_provider_refs: set[SchemaRef]
+            if provider_schema_ref is None:
+                allowed_provider_refs = {self._schema_refs.local_work_receipt}
+            elif self._provider_terminal_required:
+                allowed_provider_refs = {provider_schema_ref}
+            else:
+                allowed_provider_refs = {
+                    provider_schema_ref,
+                    self._schema_refs.local_work_receipt,
+                }
             if (
                 expected_provider_task is not None
-                and self._schema_refs.model_inference is not None
-                and reference.schema_ref == self._schema_refs.model_inference
+                and provider_schema_ref is not None
+                and reference.schema_ref not in allowed_provider_refs
+            ):
+                raise LocalStreamFinalizationError(
+                    "causal upstream provider evidence must reference either the "
+                    "registered model inference or local receipt artifact"
+                )
+            if (
+                expected_provider_task is not None
+                and provider_schema_ref is not None
+                and reference.schema_ref == provider_schema_ref
             ):
                 try:
                     inference = ProviderModelInference.model_validate_json(
@@ -945,14 +1028,31 @@ class LocalConformanceStreamFinalizer:
                     raise LocalStreamFinalizationError(
                         "causal upstream provider evidence is not a model inference"
                     ) from error
+                expected_outcome = _stream_terminal_outcome(inference)[0]
+                if terminal_outcome is not expected_outcome:
+                    raise LocalStreamFinalizationError(
+                        'causal upstream terminal outcome conflicts with its model inference'
+                    )
                 if (
-                    inference.stage is not expected_provider_task
-                    or inference.status is not ProviderInferenceStatus.SUCCEEDED
-                    or not inference.output_valid
+                    inference.status is ProviderInferenceStatus.SUCCEEDED
+                    and not inference.output_valid
                 ):
                     raise LocalStreamFinalizationError(
-                        "causal upstream model inference is not a valid successful stage terminal"
+                        'successful provider model inference has invalid output'
                     )
+                if inference.stage is not expected_provider_task:
+                    raise LocalStreamFinalizationError(
+                        "causal upstream model inference task does not match its stage"
+                    )
+                if (
+                    terminal_outcome
+                    not in {TerminalOutcome.SUCCEEDED, TerminalOutcome.NO_EVENTS}
+                    or not inference.output_valid
+                ):
+                    # Provider stages are DEGRADABLE dependencies. Preserve the
+                    # exact terminal in the causal plan, but make the reduction
+                    # explicitly abstain so EOS can still close truthfully.
+                    degraded = True
                 evidence_stage = upstream_plan.stage
                 evidence_key = upstream_plan.work_logical_key
                 evidence_sha = semantic_sha256(inference.model_dump(mode="json"))
@@ -998,7 +1098,34 @@ class LocalConformanceStreamFinalizer:
             raise LocalStreamFinalizationError(
                 "causal window reduction lacks its complete upstream stage closure"
             )
-        return tuple(by_stage[stage] for stage in stages)
+        return tuple(by_stage[stage] for stage in stages), degraded
+
+    def _provider_model_inference(
+        self,
+        reference: ArtifactEvidenceRef,
+        *,
+        expected_task: ProviderVisionTask,
+    ) -> ProviderModelInference:
+        '''Load and bind one exact provider artifact to its expected stream stage.'''
+
+        try:
+            inference = ProviderModelInference.model_validate_json(
+                self._artifacts.read(reference),
+                strict=True,
+            )
+        except ValueError as error:
+            raise LocalStreamFinalizationError(
+                'causal upstream provider evidence is not a model inference'
+            ) from error
+        if inference.stage is not expected_task:
+            raise LocalStreamFinalizationError(
+                'causal upstream model inference task does not match its stage'
+            )
+        if inference.status is ProviderInferenceStatus.SUCCEEDED and not inference.output_valid:
+            raise LocalStreamFinalizationError(
+                'successful provider model inference has invalid output'
+            )
+        return inference
 
     def _receipt(
         self,
@@ -1064,7 +1191,11 @@ class LocalConformanceStreamFinalizer:
             if (
                 result.window_subject != plan.subject
                 or result.terminal_outcome
-                not in {TerminalOutcome.SUCCEEDED, TerminalOutcome.NO_EVENTS}
+                not in {
+                    TerminalOutcome.SUCCEEDED,
+                    TerminalOutcome.NO_EVENTS,
+                    TerminalOutcome.ABSTAINED,
+                }
                 or result.reduction_policy_version != LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION
                 or len(result.accepted_terminals) != 1
             ):
@@ -1089,9 +1220,12 @@ class LocalConformanceStreamFinalizer:
                 raise LocalStreamFinalizationError(
                     "window result causal artifacts are invalid"
                 ) from error
-            expected_status = (
-                "PROPOSED" if result.terminal_outcome is TerminalOutcome.SUCCEEDED else "NO_EVENTS"
-            )
+            status_by_outcome: dict[TerminalOutcome, LocalStreamWindowSemanticStatus] = {
+                TerminalOutcome.SUCCEEDED: "PROPOSED",
+                TerminalOutcome.NO_EVENTS: "NO_EVENTS",
+                TerminalOutcome.ABSTAINED: "ABSTAINED",
+            }
+            expected_status = status_by_outcome[result.terminal_outcome]
             if intent.dispatch_policy_version != self._mock_policy:
                 raise LocalStreamFinalizationError(
                     "window result conflicts with the local executor policy"
