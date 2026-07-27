@@ -457,6 +457,8 @@ def _validate_claim(
             or evidence.camera_ordinal != item.camera_ordinal
             or evidence.frame_id != item.frame_id
             or evidence.frame_ordinal != item.frame_ordinal
+            or evidence.aligned_timestamp_ns != item.aligned_timestamp_ns
+            or evidence.source_timestamp_ns != item.source_timestamp_ns
             or evidence.source_artifact_sha256 != item.source_artifact_sha256
         ):
             raise CoarseQAProjectionError("QA evidence does not resolve to the input plan")

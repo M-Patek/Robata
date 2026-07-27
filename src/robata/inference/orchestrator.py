@@ -1529,7 +1529,9 @@ class InferenceOrchestrator:
         """Validate the immutable winner returned by a ledger append race."""
 
         try:
-            checked = InferenceAttemptSelection.model_validate(selection.model_dump(mode="python"))
+            checked = InferenceAttemptSelection.model_validate(
+                cast(Any, selection).model_dump(mode="python")
+            )
         except (AttributeError, TypeError, ValueError) as exc:
             raise InferenceLedgerError("persisted attempt selection is invalid") from exc
         if (
@@ -1646,6 +1648,7 @@ class InferenceOrchestrator:
             self._orchestrated_selection.set(winner)
             return stored
         stored = self._ledger.append_terminal(inference)
+        persisted_selection: InferenceAttemptSelection | None
         try:
             persisted_selection = self._ledger.append_selection(selection)
         except InferenceLedgerError:
@@ -1710,12 +1713,14 @@ class InferenceOrchestrator:
         policy = self._policy(task)
         try:
             checked_selection = InferenceAttemptSelection.model_validate(
-                selection.model_dump(mode="python")
+                cast(Any, selection).model_dump(mode="python")
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise InferenceLedgerError("persisted attempt selection is invalid") from exc
         try:
-            checked_terminal = ModelInference.model_validate(terminal.model_dump(mode="python"))
+            checked_terminal = ModelInference.model_validate(
+                cast(Any, terminal).model_dump(mode="python")
+            )
         except (AttributeError, TypeError, ValueError) as exc:
             raise InferenceLedgerError("selected terminal attempt is invalid") from exc
         if (
@@ -1835,9 +1840,10 @@ class InferenceOrchestrator:
                 raise InferenceLedgerError("successful invocation has no persisted selection")
             selected_terminal = terminal
             if selection.inference_id != terminal.inference_id:
-                selected_terminal = self._ledger.get_terminal(selection.inference_id)
-                if selected_terminal is None:
+                fetched_terminal = self._ledger.get_terminal(selection.inference_id)
+                if fetched_terminal is None:
                     raise InferenceLedgerError("persisted selection has no terminal attempt")
+                selected_terminal = fetched_terminal
             selected_terminal, checked_selection = self._validate_orchestrated_selection(
                 task=task,
                 terminal=selected_terminal,

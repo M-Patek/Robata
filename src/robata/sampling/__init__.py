@@ -24,7 +24,9 @@ from robata.sampling.adaptive import (
     SignalDetector,
     SignalTrigger,
     adaptive_target_plan_semantic_projection,
+    adaptive_upgrade_requests_from_sentinel_triggers,
     plan_adaptive_coverage,
+    plan_sentinel_adaptive_coverage,
     resolve_frozen_adaptive_targets,
 )
 from robata.sampling.dense import (
@@ -147,11 +149,13 @@ __all__ = [
     "TemporalPackageSetMember",
     "TemporalWindow",
     "adaptive_target_plan_semantic_projection",
+    "adaptive_upgrade_requests_from_sentinel_triggers",
     "derive_temporal_package_id",
     "frame_counts_for_interval",
     "package_semantic_projection",
     "plan_adaptive_coverage",
     "plan_interval_parts",
+    "plan_sentinel_adaptive_coverage",
     "resolve_frozen_adaptive_targets",
     "sampling_plan_digest",
     "sampling_plan_projection",

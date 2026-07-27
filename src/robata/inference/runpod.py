@@ -1710,7 +1710,10 @@ class RunPodVisionAdapter:
         selected_image_count = sum(
             item.artifact.media_type.startswith("image/") for item in selected_items
         )
-        if selected_image_count > self._capabilities.max_images_per_request:
+        max_images_per_request = self._capabilities.max_images_per_request
+        if max_images_per_request is None:
+            return "RunPod capabilities do not declare an image limit"
+        if selected_image_count > max_images_per_request:
             return "RunPod input plan exceeds pinned image limit"
         if any(
             item.artifact.media_type not in self._capabilities.accepted_media_types
@@ -1719,7 +1722,10 @@ class RunPodVisionAdapter:
             return "RunPod input plan contains media outside pinned capabilities"
         part_ordinal = request.input_plan_part_ordinal or 0
         measured_input_tokens = plan.call_plan.parts[part_ordinal].measured_input_tokens
-        if measured_input_tokens > self._capabilities.max_input_tokens:
+        max_input_tokens = self._capabilities.max_input_tokens
+        if max_input_tokens is None:
+            return "RunPod capabilities do not declare an input-token limit"
+        if measured_input_tokens > max_input_tokens:
             return "RunPod input plan exceeds pinned input-token limit"
         if session is not None:
             matching_contracts = tuple(

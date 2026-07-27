@@ -490,8 +490,7 @@ def _bounded_grid_targets(
         if target_count <= 1:
             return ((first_target_ns + last_target_ns) // 2,)
         return tuple(
-            first_target_ns
-            + (ordinal * (last_target_ns - first_target_ns)) // (target_count - 1)
+            first_target_ns + (ordinal * (last_target_ns - first_target_ns)) // (target_count - 1)
             for ordinal in range(target_count)
         )
 
@@ -1012,6 +1011,91 @@ __all__ = [
     "SignalDetector",
     "SignalTrigger",
     "adaptive_target_plan_semantic_projection",
+    "adaptive_upgrade_requests_from_sentinel_triggers",
     "plan_adaptive_coverage",
+    "plan_sentinel_adaptive_coverage",
     "resolve_frozen_adaptive_targets",
 ]
+
+
+def adaptive_upgrade_requests_from_sentinel_triggers(
+    triggers: Iterable[SignalTrigger],
+    *,
+    max_requests: int = 1_024,
+) -> tuple[AdaptiveUpgradeRequest, ...]:
+    """Convert bounded sentinel observations into canonical coverage upgrades.
+
+    A sentinel is a low-cost proxy, so every admitted observation maps to the
+    source-quality reason. Detector-specific signal names remain in the
+    runtime ``SignalTrigger`` result and are deliberately not promoted into
+    the coverage contract. The conversion binds each trigger to its camera,
+    canonicalizes detector order, and removes duplicate camera/timestamp
+    coordinates before the coverage planner expands context.
+
+    ``islice`` bounds consumption before sorting, which keeps an accidentally
+    unbounded detector iterable from materializing in memory. The caller may
+    pass the policy budget directly so the conversion and planner share the
+    same fail-closed request limit.
+    """
+
+    if isinstance(max_requests, bool) or not isinstance(max_requests, int):
+        raise TypeError("max_requests must be an integer")
+    if max_requests <= 0:
+        raise ValueError("max_requests must be positive")
+
+    bounded = tuple(islice(triggers, max_requests + 1))
+    if len(bounded) > max_requests:
+        raise ValueError("sentinel triggers exceed max_requests")
+
+    normalized: list[SignalTrigger] = []
+    for trigger in bounded:
+        if not isinstance(trigger, SignalTrigger):
+            raise TypeError("sentinel triggers must contain SignalTrigger values")
+        if trigger.camera_id is None:
+            raise ValueError("sentinel triggers require a canonical camera_id")
+        normalized.append(trigger)
+
+    # Detector registration order is an implementation detail. Stable
+    # ordering and coordinate de-duplication make replay independent of it.
+    canonical = sorted(
+        normalized,
+        key=lambda trigger: (
+            trigger.camera_id.value if trigger.camera_id is not None else "",
+            trigger.timestamp_ns,
+            trigger.signal_type.value,
+            trigger.strength,
+            trigger.confidence,
+        ),
+    )
+    seen_coordinates: set[tuple[CameraId, int]] = set()
+    requests: list[AdaptiveUpgradeRequest] = []
+    for trigger in canonical:
+        assert trigger.camera_id is not None
+        coordinate = (trigger.camera_id, trigger.timestamp_ns)
+        if coordinate in seen_coordinates:
+            continue
+        seen_coordinates.add(coordinate)
+        requests.append(
+            AdaptiveUpgradeRequest(
+                camera_id=trigger.camera_id,
+                trigger_timestamp_ns=trigger.timestamp_ns,
+                reason=AdaptiveUpgradeReason.SOURCE_QUALITY_SIGNAL,
+            )
+        )
+    return tuple(requests)
+
+
+def plan_sentinel_adaptive_coverage(
+    policy: AdaptiveCoveragePolicy,
+    interval: NanosecondInterval,
+    triggers: Iterable[SignalTrigger] = (),
+) -> AdaptiveCoveragePlan:
+    """Plan bounded base/context coverage from one sentinel trigger pass."""
+
+    if not isinstance(policy, AdaptiveCoveragePolicy):
+        raise TypeError("policy must be an AdaptiveCoveragePolicy")
+    requests = adaptive_upgrade_requests_from_sentinel_triggers(
+        triggers,
+        max_requests=policy.max_upgrade_requests,
+    )
+    return AdaptiveCoveragePlanner(policy).plan(interval, requests)

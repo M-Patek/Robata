@@ -18,6 +18,7 @@ else:
     except ModuleNotFoundError:  # optional signal-detector dependency
         np = None
 
+from robata.contracts.cameras import CameraId
 from robata.ports.decoded_frame import DecodedFrameView
 from robata.sampling.adaptive import AdaptiveSignal, SignalDetector, SignalTrigger
 
@@ -81,6 +82,7 @@ class MotionEnergyDetector(SignalDetector):
                             timestamp_ns=frame.timestamp_ns,
                             strength=float(diff),
                             confidence=min(diff / (self._threshold * 2), 1.0),
+                            camera_id=CameraId(camera_id),
                         )
                     )
             prev_gray = gray
@@ -123,6 +125,7 @@ class SceneChangeDetector(SignalDetector):
                             timestamp_ns=frame.timestamp_ns,
                             strength=float(distance),
                             confidence=min(distance / (self._threshold * 2), 1.0),
+                            camera_id=CameraId(camera_id),
                         )
                     )
             prev_hist = hist
@@ -168,6 +171,7 @@ class BlurDetector(SignalDetector):
                             timestamp_ns=frame.timestamp_ns,
                             strength=drop,
                             confidence=min(drop / (self._threshold * 2), 1.0),
+                            camera_id=CameraId(camera_id),
                         )
                     )
             prev_variance = variance
