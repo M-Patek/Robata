@@ -9,7 +9,7 @@ closure plus its retained quality context.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Annotated, Literal, Self, TypeVar
+from typing import Annotated, Literal, Self
 
 from pydantic import StringConstraints, model_validator
 
@@ -47,7 +47,6 @@ from robata.qa_pipeline.product import (
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 
 
-StrictModelT = TypeVar("StrictModelT", bound=StrictModel)
 class CanonicalProductQAContext(StrictModel):
     """Local visual/structural facts supplied to the canonical QA reduction."""
 
@@ -257,7 +256,7 @@ class CanonicalProductQAProjector:
         )
 
 
-def _validated_instance(
+def _validated_instance[StrictModelT: StrictModel](
     value: StrictModelT,
     expected_type: type[StrictModelT],
     label: str,
