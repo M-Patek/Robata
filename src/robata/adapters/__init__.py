@@ -1,5 +1,13 @@
 """Concrete local adapters for optional ingestion dependencies."""
 
+from robata.adapters.fake_broker import FakeBroker, FakeBrokerPort, InMemoryBroker
+from robata.adapters.fake_object_store import (
+    FakeObjectStore,
+    InMemoryObjectStore,
+    ObjectReconciliationIssue,
+    ObjectReconciliationReport,
+    R2FakeObjectStore,
+)
 from robata.adapters.in_memory_task_queue import InMemoryTaskQueue
 from robata.adapters.local_artifact_registry import (
     LocalArtifactRegistry,
@@ -86,6 +94,14 @@ except ImportError:
     OfficialMcapInspector = None  # type: ignore[misc,assignment]
 
 __all__ = [
+    "FakeBroker",
+    "FakeBrokerPort",
+    "InMemoryBroker",
+    "FakeObjectStore",
+    "InMemoryObjectStore",
+    "ObjectReconciliationIssue",
+    "ObjectReconciliationReport",
+    "R2FakeObjectStore",
     "EXPORTER_NAME",
     "EXPORTER_VERSION",
     "EXPORT_CONFIG",

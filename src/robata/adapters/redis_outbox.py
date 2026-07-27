@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
 from typing import Any, Protocol, cast
 
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.queue.outbox import OutboxDeliveryError, OutboxMessage
+from robata.runtime.observability import RuntimeObserver, runtime_increment
 
 
 class RedisCommandClient(Protocol):
@@ -25,9 +27,17 @@ class RedisIdempotentOutboxSink:
         *,
         client: RedisCommandClient | None = None,
         key_prefix: str = "robata:outbox:v1",
+        runtime_observer: RuntimeObserver | None = None,
+        failure_injector: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(key_prefix, str) or not key_prefix.strip():
             raise ValueError("key_prefix must be a non-empty string")
+        if runtime_observer is not None and not callable(
+            getattr(runtime_observer, "increment_counter", None)
+        ):
+            raise TypeError("runtime_observer must implement increment_counter")
+        if failure_injector is not None and not callable(failure_injector):
+            raise TypeError("failure_injector must be callable or None")
         if client is None:
             if not isinstance(redis_url, str) or not redis_url.strip():
                 raise ValueError("redis_url is required when client is not supplied")
@@ -44,6 +54,8 @@ class RedisIdempotentOutboxSink:
         if client is None:
             raise AssertionError("Redis client resolution unexpectedly returned None")
         self._client = client
+        self._runtime_observer = runtime_observer
+        self._failure_injector = failure_injector
         self._key_prefix = key_prefix.rstrip(":")
 
     def publish(self, message: OutboxMessage) -> None:
@@ -51,26 +63,59 @@ class RedisIdempotentOutboxSink:
             raise TypeError("message must be OutboxMessage")
         key = f"{self._key_prefix}:{_key_component(message.outbox_id)}"
         encoded = self._encode(message)
+        runtime_increment(
+            self._runtime_observer,
+            "redis.outbox.publish_attempts",
+            attributes={"outcome": "attempt"},
+        )
         try:
+            if self._failure_injector is not None:
+                self._failure_injector("publish")
             inserted = self._client.set(key, encoded, nx=True)
             if inserted:
+                runtime_increment(
+                    self._runtime_observer,
+                    "redis.outbox.publish_successes",
+                    attributes={"outcome": "inserted"},
+                )
                 return
             existing = self._client.get(key)
         except Exception as error:
+            runtime_increment(
+                self._runtime_observer,
+                "redis.outbox.publish_failures",
+                attributes={"outcome": "transport"},
+            )
             raise OutboxDeliveryError(f"Redis outbox publish failed: {error}") from error
         if existing is None:
             raise OutboxDeliveryError(
                 "Redis outbox acknowledgement disappeared before verification"
             )
         if self._decode(existing) != self._identity(message):
+            runtime_increment(
+                self._runtime_observer,
+                "redis.outbox.publish_failures",
+                attributes={"outcome": "conflict"},
+            )
             raise OutboxDeliveryError(
                 "Redis outbox ID is already bound to different immutable message bytes"
             )
+        runtime_increment(
+            self._runtime_observer,
+            "redis.outbox.publish_successes",
+            attributes={"outcome": "replayed"},
+        )
 
     @staticmethod
     def _identity(message: OutboxMessage) -> dict[str, object]:
         return {
+            # The outbox ID is only idempotency addressing.  Every immutable
+            # field participates in the replay comparison so an ID cannot be
+            # reused for a different completion graph or ordering position.
             "outbox_id": message.outbox_id,
+            "completion_run_id": message.completion_run_id,
+            "recording_identity": message.recording_identity,
+            "outbox_ordinal": message.outbox_ordinal,
             "topic": message.topic,
             "key": message.key,
             "payload_sha256": message.payload_sha256,

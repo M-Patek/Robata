@@ -26,6 +26,7 @@ from robata.ports.artifact_registry import (
     ArtifactBlobSource,
     ArtifactRegistryError,
     ArtifactRegistryErrorCode,
+    ArtifactRegistryReconciliation,
     PublishedArtifactDerivation,
 )
 from robata.runtime.observability import (
@@ -551,6 +552,233 @@ class LocalArtifactRegistry:
                 f"content-addressed blob has invalid shape: {blob_path}",
             )
         return blob_path
+
+    def reconcile(
+        self,
+        *,
+        remove_orphans: bool = False,
+        remove_partials: bool = False,
+        remove_duplicates: bool = False,
+        strict: bool = False,
+    ) -> ArtifactRegistryReconciliation:
+        '''Reconcile registry metadata with exact blobs and crash leftovers.
+
+        SQLite metadata remains authoritative. Missing or corrupt registered blobs are
+        reported and never deleted; only unreferenced files can be removed, and cleanup
+        is opt-in. This makes a restart after blob-first publication deterministic while
+        preserving evidence for an operator or a later object-store repair.
+        '''
+
+        for name, value in (
+            ('remove_orphans', remove_orphans),
+            ('remove_partials', remove_partials),
+            ('remove_duplicates', remove_duplicates),
+            ('strict', strict),
+        ):
+            if not isinstance(value, bool):
+                raise ArtifactRegistryError(
+                    ArtifactRegistryErrorCode.INVALID_REQUEST,
+                    f'{name} must be a boolean',
+                )
+
+        self._assert_storage_layout()
+        with runtime_span(self._runtime_observer, 'sqlite.artifact_registry.reconcile'):
+            metadata = self._registered_blob_metadata()
+            expected_digests = {digest for _artifact_id, digest, _bytes in metadata}
+            missing: list[str] = []
+            corrupt: list[str] = []
+            visible = 0
+            for artifact_id, digest, byte_count in metadata:
+                if _SHA256_PATTERN.fullmatch(digest) is None:
+                    # Corrupt registry metadata is an observed issue, not a
+                    # reason for reconciliation itself to crash before reporting.
+                    corrupt.append(artifact_id)
+                    continue
+                path = self._blob_path(digest)
+                try:
+                    self._verify_blob_file(
+                        path,
+                        expected_sha256=digest,
+                        expected_bytes=byte_count,
+                        error_code=ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                    )
+                except ArtifactRegistryError:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        missing.append(artifact_id)
+                    except OSError:
+                        corrupt.append(artifact_id)
+                    else:
+                        corrupt.append(artifact_id)
+                else:
+                    visible += 1
+
+            orphan, partial, duplicate = self._scan_blob_paths(expected_digests)
+            cleanup_candidates: list[Path] = []
+            if remove_orphans:
+                cleanup_candidates.extend(orphan)
+            if remove_partials:
+                cleanup_candidates.extend(partial)
+            if remove_duplicates:
+                cleanup_candidates.extend(duplicate)
+            removed, failed_removal = self._remove_reconciliation_paths(cleanup_candidates)
+            removed_set = set(removed)
+            orphan = [path for path in orphan if path not in removed_set]
+            partial = [path for path in partial if path not in removed_set]
+            duplicate = [path for path in duplicate if path not in removed_set]
+            report = ArtifactRegistryReconciliation(
+                registered_artifact_count=len(metadata),
+                visible_artifact_count=visible,
+                missing_artifact_ids=tuple(sorted(missing)),
+                corrupt_artifact_ids=tuple(sorted(corrupt)),
+                orphan_blob_paths=tuple(sorted(orphan, key=lambda path: path.as_posix())),
+                partial_blob_paths=tuple(sorted(partial, key=lambda path: path.as_posix())),
+                duplicate_blob_paths=tuple(sorted(duplicate, key=lambda path: path.as_posix())),
+                removed_blob_paths=tuple(sorted(removed, key=lambda path: path.as_posix())),
+                failed_removal_paths=tuple(
+                    sorted(failed_removal, key=lambda path: path.as_posix())
+                ),
+            )
+            runtime_increment(
+                self._runtime_observer,
+                'sqlite.artifact_registry.reconciliation_runs',
+                attributes={'strict': strict},
+            )
+            if report.issue_count:
+                runtime_increment(
+                    self._runtime_observer,
+                    'sqlite.artifact_registry.reconciliation_issues',
+                    value=report.issue_count,
+                    attributes={'strict': strict},
+                )
+            if report.removed_blob_paths:
+                runtime_increment(
+                    self._runtime_observer,
+                    'sqlite.artifact_registry.reconciliation_removed',
+                    value=len(report.removed_blob_paths),
+                    attributes={'strict': strict},
+                )
+
+        if strict and not report.reconciled:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                'artifact registry reconciliation found unresolved storage discrepancies',
+            )
+        return report
+
+    def reconcile_storage(self, **kwargs: object) -> ArtifactRegistryReconciliation:
+        '''Compatibility alias for callers naming the backing store explicitly.'''
+
+        return self.reconcile(**kwargs)  # type: ignore[arg-type]
+
+    def reconcile_blobs(self, **kwargs: object) -> ArtifactRegistryReconciliation:
+        '''Compatibility alias for blob-oriented repair tooling.'''
+
+        return self.reconcile(**kwargs)  # type: ignore[arg-type]
+
+    def _registered_blob_metadata(self) -> tuple[tuple[str, str, int], ...]:
+        connection = self._connect()
+        try:
+            with self._observed_transaction_scope(
+                connection,
+                operation='reconcile_metadata',
+                write=False,
+            ):
+                rows = connection.execute(
+                    '''
+                    SELECT artifact_id, exact_sha256, byte_count
+                    FROM artifacts
+                    ORDER BY artifact_id
+                    '''
+                ).fetchall()
+                return tuple(
+                    (
+                        _row_text(row, 'artifact_id'),
+                        _row_text(row, 'exact_sha256'),
+                        _row_int(row, 'byte_count'),
+                    )
+                    for row in rows
+                )
+        except ArtifactRegistryError:
+            raise
+        except sqlite3.Error as error:
+            raise ArtifactRegistryError(
+                ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                f'cannot read artifact metadata for reconciliation: {error}',
+            ) from error
+        finally:
+            connection.close()
+
+    def _scan_blob_paths(
+        self,
+        registered_digests: set[str],
+    ) -> tuple[list[Path], list[Path], list[Path]]:
+        orphan: list[Path] = []
+        partial: list[Path] = []
+        duplicate: list[Path] = []
+        for path in sorted(self._blob_root.rglob('*'), key=lambda value: value.as_posix()):
+            try:
+                file_stat = path.lstat()
+            except OSError:
+                partial.append(path)
+                continue
+            if stat.S_ISDIR(file_stat.st_mode):
+                continue
+            if path.is_symlink():
+                partial.append(path)
+                continue
+            relative = path.relative_to(self._blob_root)
+            name = path.name
+            if name.startswith('.put-'):
+                partial.append(path)
+                continue
+            digest_match = _SHA256_PATTERN.fullmatch(name)
+            canonical = len(relative.parts) == 2 and relative.parts[0] == name[:2]
+            if digest_match is None:
+                orphan.append(path)
+                continue
+            digest = name
+            if digest in registered_digests:
+                expected_path = self._blob_path(digest)
+                if path != expected_path:
+                    duplicate.append(path)
+                continue
+            if not canonical:
+                orphan.append(path)
+                continue
+            try:
+                self._verify_blob_file(
+                    path,
+                    expected_sha256=digest,
+                    expected_bytes=file_stat.st_size,
+                    error_code=ArtifactRegistryErrorCode.INTEGRITY_ERROR,
+                )
+            except ArtifactRegistryError:
+                partial.append(path)
+            else:
+                orphan.append(path)
+        return orphan, partial, duplicate
+
+    def _remove_reconciliation_paths(
+        self,
+        paths: list[Path],
+    ) -> tuple[list[Path], list[Path]]:
+        removed: list[Path] = []
+        failed: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                path.relative_to(self._blob_root)
+                path.unlink()
+            except (OSError, ValueError):
+                failed.append(path)
+            else:
+                removed.append(path)
+        return removed, failed
 
     def verify_derivation(
         self,

@@ -15,7 +15,7 @@ from typing import cast
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkFenceError
 
 _EXTENSION_NAME = "stream-work-ledger"
-_EXTENSION_SCHEMA_VERSION = 1
+_EXTENSION_SCHEMA_VERSION = 2
 _EXTENSION_OBJECT_NAMES = frozenset(
     {
         "stream_plans",
@@ -87,6 +87,51 @@ _ADDITIVE_INDEX_STATEMENTS = (
     WHERE publication_state = 'PUBLISHED'
     """,
 )
+_EXTENSION_REQUIRED_COLUMNS = {
+    "stream_plans": frozenset(
+        {
+            "plan_key",
+            "plan_json",
+            "source_subject_json",
+            "composition_config_json",
+            "planner_eos_sha256",
+            "seal_json",
+            "terminal_closure_json",
+            "export_manifest_sha256",
+            "export_member_count",
+        }
+    ),
+}
+_EXTENSION_REQUIRED_COLUMNS["expected_windows"] = frozenset(
+    {
+        "plan_key",
+        "ordinal",
+        "declaration_json",
+        "window_json",
+        "terminal_member_json",
+    }
+)
+_EXTENSION_REQUIRED_COLUMNS["stream_work_plans"] = frozenset(
+    {
+        "work_item_id",
+        "work_logical_key",
+        "plan_key",
+        "expected_ordinal",
+        "role_order",
+        "stage",
+        "plan_json",
+        "publication_state",
+        "terminal_evidence_json",
+        "pending_terminal_json",
+        "pending_lease_epoch",
+        "pending_fencing_token",
+    }
+)
+_V1_TO_V2_PENDING_COLUMNS = (
+    ("pending_terminal_json", "BLOB"),
+    ("pending_lease_epoch", "INTEGER"),
+    ("pending_fencing_token", "TEXT"),
+)
 
 
 class SQLiteStreamWorkLedgerError(RuntimeError):
@@ -129,6 +174,7 @@ class StoredStreamWorkPlan:
     stage: str
     plan_json: bytes
     publication_state: str
+
     terminal_evidence_json: bytes | None = None
     pending_terminal_json: bytes | None = None
     pending_lease_epoch: int | None = None
@@ -168,6 +214,16 @@ class NewStreamWorkPlan:
     stage: str
     plan_json: bytes
     publication_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class NewStreamWindow:
+    """One immutable expected-window append and its child work plans."""
+
+    ordinal: int
+    declaration_json: bytes
+    window_json: bytes
+    work_plans: tuple[NewStreamWorkPlan, ...]
 
 
 class SQLiteStreamWorkLedger:
@@ -243,18 +299,46 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="plans", operation=operation)
 
-    def append_window(
+    def append_windows(
         self,
         *,
         plan_key: str,
-        ordinal: int,
-        declaration_json: bytes,
-        window_json: bytes,
-        work_plans: Sequence[NewStreamWorkPlan],
-    ) -> bool:
-        """Atomically append declaration and children; return false for exact replay."""
+        windows: Sequence[NewStreamWindow],
+    ) -> tuple[bool, ...]:
+        """Atomically append a contiguous batch of windows.
 
-        def operation(connection: sqlite3.Connection) -> bool:
+        Existing members are checked as exact replays. New members are inserted in
+        ordinal order and remain PENDING until the scheduler projects their
+        execution plans, so a crash between those boundaries is recoverable.
+        """
+
+        if isinstance(windows, (str, bytes)) or not isinstance(windows, Sequence):
+            raise TypeError("windows must be a sequence")
+        checked = tuple(windows)
+        if not checked:
+            return ()
+        for window in checked:
+            if not isinstance(window, NewStreamWindow):
+                raise TypeError("windows must contain NewStreamWindow values")
+            if (
+                isinstance(window.ordinal, bool)
+                or not isinstance(window.ordinal, int)
+                or window.ordinal < 0
+            ):
+                raise ValueError("window ordinal must be a nonnegative integer")
+            if not isinstance(window.declaration_json, bytes) or not isinstance(
+                window.window_json, bytes
+            ):
+                raise TypeError("window JSON payloads must be bytes")
+            if any(work.expected_ordinal != window.ordinal for work in window.work_plans):
+                raise SQLiteStreamWorkLedgerConflict(
+                    "stream child work ordinal does not match its window"
+                )
+        ordinals = tuple(window.ordinal for window in checked)
+        if len(set(ordinals)) != len(ordinals) or ordinals != tuple(sorted(ordinals)):
+            raise SQLiteStreamWorkLedgerConflict("window batch ordinals must be unique and ordered")
+
+        def operation(connection: sqlite3.Connection) -> tuple[bool, ...]:
             plan = connection.execute(
                 """
                 SELECT planner_eos_sha256, seal_json
@@ -264,55 +348,93 @@ class SQLiteStreamWorkLedger:
             ).fetchone()
             if plan is None:
                 raise SQLiteStreamWorkLedgerError("expected plan is not registered")
-            existing = connection.execute(
+            tail = connection.execute(
                 """
-                SELECT * FROM expected_windows WHERE plan_key = ? AND ordinal = ?
+                SELECT ordinal FROM expected_windows
+                WHERE plan_key = ?
+                ORDER BY ordinal DESC
+                LIMIT 1
                 """,
-                (plan_key, ordinal),
+                (plan_key,),
             ).fetchone()
-            if existing is not None:
-                stored = _window_from_row(existing)
-                if stored.declaration_json != declaration_json or stored.window_json != window_json:
-                    raise SQLiteStreamWorkLedgerConflict(
-                        "expected-window replay changed exact bytes"
+            next_ordinal = 0 if tail is None else _int(tail, "ordinal") + 1
+            inserted: list[bool] = []
+            for window in checked:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM expected_windows
+                    WHERE plan_key = ? AND ordinal = ?
+                    """,
+                    (plan_key, window.ordinal),
+                ).fetchone()
+                if existing is not None:
+                    stored = _window_from_row(existing)
+                    if (
+                        stored.declaration_json != window.declaration_json
+                        or stored.window_json != window.window_json
+                    ):
+                        raise SQLiteStreamWorkLedgerConflict(
+                            "expected-window replay changed exact bytes"
+                        )
+                    _verify_existing_work_rows(
+                        connection,
+                        plan_key=plan_key,
+                        expected_ordinal=window.ordinal,
+                        expected=window.work_plans,
                     )
-                _verify_existing_work_rows(
-                    connection,
-                    plan_key=plan_key,
-                    expected_ordinal=ordinal,
-                    expected=work_plans,
-                )
-                return False
-            if plan["planner_eos_sha256"] is not None or plan["seal_json"] is not None:
-                raise SQLiteStreamWorkLedgerConflict("cannot append a new window after planner EOS")
-            count = cast(
-                int,
+                    inserted.append(False)
+                    continue
+                if plan["planner_eos_sha256"] is not None or plan["seal_json"] is not None:
+                    raise SQLiteStreamWorkLedgerConflict(
+                        "cannot append a new window after planner EOS"
+                    )
+                if next_ordinal != window.ordinal:
+                    raise SQLiteStreamWorkLedgerConflict(
+                        "expected windows must be appended in contiguous planner order"
+                    )
                 connection.execute(
-                    "SELECT COUNT(*) FROM expected_windows WHERE plan_key = ?", (plan_key,)
-                ).fetchone()[0],
-            )
-            if count != ordinal:
-                raise SQLiteStreamWorkLedgerConflict(
-                    "expected windows must be appended in contiguous planner order"
+                    """
+                    INSERT INTO expected_windows (
+                        plan_key, ordinal, declaration_json, window_json, terminal_member_json
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        plan_key,
+                        window.ordinal,
+                        sqlite3.Binary(window.declaration_json),
+                        sqlite3.Binary(window.window_json),
+                    ),
                 )
-            connection.execute(
-                """
-                INSERT INTO expected_windows (
-                    plan_key, ordinal, declaration_json, window_json, terminal_member_json
-                ) VALUES (?, ?, ?, ?, NULL)
-                """,
-                (
-                    plan_key,
-                    ordinal,
-                    sqlite3.Binary(declaration_json),
-                    sqlite3.Binary(window_json),
-                ),
-            )
-            for work in work_plans:
-                _insert_work(connection, plan_key, work)
-            return True
+                for work in window.work_plans:
+                    _insert_work(connection, plan_key, work)
+                next_ordinal += 1
+                inserted.append(True)
+            return tuple(inserted)
 
-        return self._run(write=True, operation_name="append_window", operation=operation)
+        return self._run(write=True, operation_name="append_windows", operation=operation)
+
+    def append_window(
+        self,
+        *,
+        plan_key: str,
+        ordinal: int,
+        declaration_json: bytes,
+        window_json: bytes,
+        work_plans: Sequence[NewStreamWorkPlan],
+    ) -> bool:
+        """Atomically append one declaration and its children."""
+
+        return self.append_windows(
+            plan_key=plan_key,
+            windows=(
+                NewStreamWindow(
+                    ordinal=ordinal,
+                    declaration_json=declaration_json,
+                    window_json=window_json,
+                    work_plans=tuple(work_plans),
+                ),
+            ),
+        )[0]
 
     def windows(self, plan_key: str) -> tuple[StoredExpectedWindow, ...]:
         def operation(connection: sqlite3.Connection) -> tuple[StoredExpectedWindow, ...]:
@@ -326,6 +448,43 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="windows", operation=operation)
 
+    def windows_for_ordinals(
+        self,
+        plan_key: str,
+        ordinals: Sequence[int],
+    ) -> tuple[StoredExpectedWindow, ...]:
+        """Load only the expected-window rows needed for a bounded append/replay."""
+
+        if isinstance(ordinals, (str, bytes)) or not isinstance(ordinals, Sequence):
+            raise TypeError("ordinals must be a sequence")
+        checked = tuple(ordinals)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in checked
+        ):
+            raise ValueError("ordinals must contain nonnegative integers")
+        if len(set(checked)) != len(checked):
+            raise ValueError("ordinals must be unique")
+        if not checked:
+            return ()
+        placeholders = ", ".join("?" for _value in checked)
+
+        def operation(connection: sqlite3.Connection) -> tuple[StoredExpectedWindow, ...]:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM expected_windows
+                WHERE plan_key = ? AND ordinal IN ({placeholders})
+                ORDER BY ordinal
+                """,
+                (plan_key, *checked),
+            ).fetchall()
+            return tuple(_window_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="windows_for_ordinals",
+            operation=operation,
+        )
+
     def window_count(self, plan_key: str) -> int:
         def operation(connection: sqlite3.Connection) -> int:
             row = connection.execute(
@@ -337,6 +496,29 @@ class SQLiteStreamWorkLedger:
             return _int(row, "count")
 
         return self._run(write=False, operation_name="window_count", operation=operation)
+
+    def next_window_ordinal(self, plan_key: str) -> int:
+        """Return the next append ordinal through the ordered window index."""
+
+        def operation(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                """
+                SELECT ordinal FROM expected_windows
+                WHERE plan_key = ?
+                ORDER BY ordinal DESC
+                LIMIT 1
+                """,
+                (plan_key,),
+            ).fetchone()
+            if row is None:
+                return 0
+            return _int(row, "ordinal") + 1
+
+        return self._run(
+            write=False,
+            operation_name="next_window_ordinal",
+            operation=operation,
+        )
 
     def window_at(self, plan_key: str, ordinal: int) -> StoredExpectedWindow | None:
         def operation(connection: sqlite3.Connection) -> StoredExpectedWindow | None:
@@ -613,6 +795,75 @@ class SQLiteStreamWorkLedger:
             return None if row is None else _work_from_row(row)
 
         return self._run(write=False, operation_name="next_ready_work", operation=operation)
+
+    def work_plans_for_ordinals(
+        self,
+        plan_key: str,
+        ordinals: Sequence[int],
+    ) -> tuple[StoredStreamWorkPlan, ...]:
+        """Load child plans for a bounded set of window ordinals in one lookup."""
+
+        if isinstance(ordinals, (str, bytes)) or not isinstance(ordinals, Sequence):
+            raise TypeError("ordinals must be a sequence")
+        checked = tuple(ordinals)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in checked
+        ):
+            raise ValueError("ordinals must contain nonnegative integers")
+        if len(set(checked)) != len(checked):
+            raise ValueError("ordinals must be unique")
+        if not checked:
+            return ()
+        placeholders = ", ".join("?" for _value in checked)
+
+        def operation(connection: sqlite3.Connection) -> tuple[StoredStreamWorkPlan, ...]:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM stream_work_plans
+                WHERE plan_key = ? AND expected_ordinal IN ({placeholders})
+                ORDER BY expected_ordinal, role_order, work_item_id
+                """,
+                (plan_key, *checked),
+            ).fetchall()
+            return tuple(_work_from_row(row) for row in rows)
+
+        return self._run(
+            write=False,
+            operation_name="work_plans_for_ordinals",
+            operation=operation,
+        )
+
+    def work_plans_for_ids(
+        self,
+        work_item_ids: Sequence[str],
+    ) -> tuple[StoredStreamWorkPlan, ...]:
+        """Load a bounded set of stream rows through the primary-key index."""
+
+        if isinstance(work_item_ids, (str, bytes)) or not isinstance(work_item_ids, Sequence):
+            raise TypeError("work_item_ids must be a sequence")
+        checked_ids = tuple(work_item_ids)
+        if any(not isinstance(value, str) or not value for value in checked_ids):
+            raise ValueError("work_item_ids must contain non-empty strings")
+        if len(set(checked_ids)) != len(checked_ids):
+            raise ValueError("work_item_ids must be unique")
+        if not checked_ids:
+            return ()
+        placeholders = ", ".join("?" for _value in checked_ids)
+
+        def operation(connection: sqlite3.Connection) -> tuple[StoredStreamWorkPlan, ...]:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM stream_work_plans
+                WHERE work_item_id IN ({placeholders})
+                """,
+                checked_ids,
+            ).fetchall()
+            by_id = {_text(row, "work_item_id"): _work_from_row(row) for row in rows}
+            if set(by_id) != set(checked_ids):
+                raise SQLiteStreamWorkLedgerError("stream work lookup row is absent")
+            return tuple(by_id[value] for value in checked_ids)
+
+        return self._run(write=False, operation_name="work_plans_for_ids", operation=operation)
 
     def work_plans_for_ordinal(
         self,
@@ -1159,12 +1410,27 @@ class SQLiteStreamWorkLedger:
                 )
             else:
                 version = _int(metadata, "schema_version")
+                if version == 1:
+                    if existing_objects != _EXTENSION_OBJECT_NAMES:
+                        raise SQLiteStreamWorkLedgerError(
+                            "stream extension v1 schema inventory changed"
+                        )
+                    _migrate_v1_to_v2(connection)
+                    cursor = connection.execute(
+                        "UPDATE stream_extension_metadata SET schema_version = ? "
+                        "WHERE extension_name = ? AND schema_version = 1",
+                        (_EXTENSION_SCHEMA_VERSION, _EXTENSION_NAME),
+                    )
+                    if cursor.rowcount != 1:
+                        raise SQLiteStreamWorkLedgerError("stream migration metadata row missing")
+                    version = _EXTENSION_SCHEMA_VERSION
                 if version != _EXTENSION_SCHEMA_VERSION:
                     raise SQLiteStreamWorkLedgerError(
                         "stream extension belongs to another schema version"
                     )
                 if existing_objects != _EXTENSION_OBJECT_NAMES:
                     raise SQLiteStreamWorkLedgerError("stream extension schema inventory changed")
+            _validate_extension_columns(connection)
             for statement in _ADDITIVE_INDEX_STATEMENTS:
                 connection.execute(statement)
 
@@ -1186,6 +1452,29 @@ class SQLiteStreamWorkLedger:
             operation_name=f"stream_work.{operation_name}",
             operation=operation,
         )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    table = "stream_work_plans"
+    columns = _table_columns(connection, table)
+    for name, declaration in _V1_TO_V2_PENDING_COLUMNS:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
+def _validate_extension_columns(connection: sqlite3.Connection) -> None:
+    for table, required in _EXTENSION_REQUIRED_COLUMNS.items():
+        missing = required.difference(_table_columns(connection, table))
+        if missing:
+            missing_text = ", ".join(sorted(missing))
+            raise SQLiteStreamWorkLedgerError(
+                f"{table} is missing required columns: {missing_text}"
+            )
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> frozenset[str]:
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return frozenset(_text(row, "name") for row in rows)
 
 
 def _insert_work(
@@ -1344,6 +1633,7 @@ def _optional_int(row: sqlite3.Row, field: str) -> int | None:
 
 
 __all__ = [
+    "NewStreamWindow",
     "NewStreamWorkPlan",
     "SQLiteStreamWorkLedger",
     "SQLiteStreamWorkLedgerConflict",

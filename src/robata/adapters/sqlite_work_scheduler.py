@@ -771,7 +771,6 @@ class SQLiteWorkScheduler:
         checked_lease = _require_model(lease, WorkLease, "lease")
         duration = _positive_int(lease_duration_seconds, "lease_duration_seconds")
         checked_now = _checked_now(now)
-        self.reconcile(now=checked_now)
 
         def operation(connection: sqlite3.Connection) -> WorkLease:
             item = self._require_lease(connection, checked_lease, checked_now)
@@ -803,7 +802,11 @@ class SQLiteWorkScheduler:
                 lease_expires_at=expires_at,
             )
 
-        return self._transaction(write=True, operation_name="heartbeat", operation=operation)
+        try:
+            return self._transaction(write=True, operation_name="heartbeat", operation=operation)
+        except WorkFenceError:
+            self._reconcile_exact_due_state(checked_lease.work_item_id, checked_now)
+            raise
 
     def succeed(
         self,
@@ -876,7 +879,6 @@ class SQLiteWorkScheduler:
             raise TypeError("retryable must be a boolean")
         delay = _nonnegative_int(retry_delay_seconds, "retry_delay_seconds")
         checked_now = _checked_now(now)
-        self.reconcile(now=checked_now)
 
         def operation(connection: sqlite3.Connection) -> WorkItem:
             item = self._require_lease(connection, checked_lease, checked_now)
@@ -937,7 +939,11 @@ class SQLiteWorkScheduler:
                 self._maintain(connection, checked_now)
             return self._load_item(connection, item.work_item_id)
 
-        return self._transaction(write=True, operation_name="fail", operation=operation)
+        try:
+            return self._transaction(write=True, operation_name="fail", operation=operation)
+        except WorkFenceError:
+            self._reconcile_exact_due_state(checked_lease.work_item_id, checked_now)
+            raise
 
     def cancel(
         self,
@@ -1019,9 +1025,14 @@ class SQLiteWorkScheduler:
             None if reason_detail is None else _nonempty(reason_detail, "reason_detail")
         )
         checked_now = _checked_now(now)
-        self.reconcile(now=checked_now)
 
         def operation(connection: sqlite3.Connection) -> WorkItem:
+            self._expire_hard_deadlines(
+                connection, checked_now, work_item_id=work_item_id
+            )
+            self._recover_expired_leases(
+                connection, checked_now, work_item_id=work_item_id
+            )
             item = self._load_item(connection, work_item_id)
             if item.state is state:
                 return item
@@ -1091,7 +1102,7 @@ class SQLiteWorkScheduler:
         # A restart/reconciliation must repair any historical partial projection. On
         # ordinary claim/terminal traffic, direct predecessor transitions below keep
         # readiness current without repeatedly walking every older PLANNED row.
-        if refresh_all_planned or changed:
+        if refresh_all_planned:
             changed += self._refresh_planned(connection, now)
         return changed
 
@@ -1175,6 +1186,9 @@ class SQLiteWorkScheduler:
                 reason_code="EXECUTION_EXPIRED",
                 reason_detail=None,
             )
+            self._refresh_downstream_for_upstreams(
+                connection, now, (item.work_item_id,)
+            )
             changed += 1
         return changed
 
@@ -1257,6 +1271,9 @@ class SQLiteWorkScheduler:
                     now,
                     reason_code="LEASE_ATTEMPTS_EXHAUSTED",
                     reason_detail=None,
+                )
+                self._refresh_downstream_for_upstreams(
+                    connection, now, (item.work_item_id,)
                 )
             changed += 1
         return changed
