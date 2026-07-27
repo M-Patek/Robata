@@ -44,3 +44,9 @@ tmp/
 /data/source/
 /.playwright-mcp/
 .claude/
+
+# Temporary patches, test artifacts, and scratch directories
+.patch*.txt
+.tmp-*/
+.pytest-basetemp-*/
+.repo-link/

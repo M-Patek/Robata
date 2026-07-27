@@ -9,7 +9,10 @@ tests without turning documentation into a process.
 1. To design a roadmap, read the [blueprint template](BLUEPRINT_TEMPLATE.md).
 2. The architecture agent creates `BLUEPRINT.md` only when a concrete roadmap is
    requested; it is not a pre-created file and never replaces the template.
-3. To implement a phase, read the applicable file in [modules/](modules/), plus the
+3. For non-authoritative production targets and capacity assumptions, read
+   [REQUIREMENTS.md](REQUIREMENTS.md). It does not override schemas, source, tests, or
+   the current blueprint.
+4. To implement a phase, read the applicable file in [modules/](modules/), plus the
    relevant `BLUEPRINT.md` section when that output exists.
 
 These documents are local navigation aids. The implementation, tests, and published
