@@ -1,104 +1,142 @@
-import { useEffect, useRef, useCallback } from 'react'
-import { usePipelineStore } from '@/store'
-import { StreamEvent } from '@/types'
-import { MOCK_EVENT_STREAM } from '@/data/mock_stream_events'
+import { useEffect, useRef, useState } from 'react'
+import {
+  ApiProtocolError,
+  type RunSnapshotResponse,
+  parseRunSnapshotMessage,
+  runWebSocketUrl,
+} from '@/api/runs'
 
-// ── Simulates a live stream by replaying mock events with configurable speed ──
+export type RunSocketStatus = 'idle' | 'connecting' | 'committed' | 'reconnecting' | 'disconnected'
 
-interface SimulationConfig {
-  speed: number // 1.0 = real-time, 2.0 = 2x, etc.
-  onEvent: (event: StreamEvent) => void
-  onComplete: () => void
+export interface RunSocketState {
+  status: RunSocketStatus
+  detail: string | null
+  retryCount: number
 }
 
-function runSimulation(config: SimulationConfig): () => void {
-  const { speed, onEvent, onComplete } = config
-  const events = [...MOCK_EVENT_STREAM]
-  let idx = 0
-  let timeouts: ReturnType<typeof setTimeout>[] = []
-
-  // Schedule events with small delays to simulate streaming
-  // In a real implementation, events would have timestamps and we'd pace accordingly
-  const scheduleNext = () => {
-    if (idx >= events.length) {
-      onComplete()
-      return
-    }
-
-    const event = events[idx]
-    onEvent(event)
-    idx++
-
-    // Delay between events — faster for demo
-    const delay = Math.max(50, 200 / speed)
-    const timeout = setTimeout(scheduleNext, delay)
-    timeouts.push(timeout)
-  }
-
-  // Start immediately
-  const initialTimeout = setTimeout(scheduleNext, 500)
-  timeouts.push(initialTimeout)
-
-  // Cleanup function
-  return () => {
-    timeouts.forEach(clearTimeout)
-    timeouts = []
-  }
+interface UseWebSocketOptions {
+  runId: string | null
+  onSnapshot: (snapshot: RunSnapshotResponse) => void
 }
 
-export function useWebSocket() {
-  const setWsConnected = usePipelineStore((s) => s.setWsConnected)
-  const setSimulating = usePipelineStore((s) => s.setSimulating)
-  const simulationSpeed = usePipelineStore((s) => s.streamView.simulation_speed)
-  const ingestEvent = usePipelineStore((s) => s.ingestEvent)
-  const resetStreamView = usePipelineStore((s) => s.resetStreamView)
+const INITIAL_STATE: RunSocketState = {
+  status: 'idle',
+  detail: null,
+  retryCount: 0,
+}
 
-  const cleanupRef = useRef<(() => void) | null>(null)
+const MAX_RETRY_DELAY_MS = 15_000
 
-  const startSimulation = useCallback(() => {
-    // Reset any previous state
-    resetStreamView()
-    setSimulating(true)
+function retryDelay(retryCount: number): number {
+  return Math.min(1_000 * 2 ** Math.min(retryCount, 4), MAX_RETRY_DELAY_MS)
+}
 
-    cleanupRef.current = runSimulation({
-      speed: simulationSpeed,
-      onEvent: (event) => {
-        ingestEvent(event)
-      },
-      onComplete: () => {
-        setSimulating(false)
-      },
-    })
-  }, [ingestEvent, resetStreamView, setSimulating, simulationSpeed])
-
-  const stopSimulation = useCallback(() => {
-    if (cleanupRef.current) {
-      cleanupRef.current()
-      cleanupRef.current = null
-    }
-    setSimulating(false)
-  }, [setSimulating])
+/**
+ * Subscribes to committed snapshots for the selected run. The REST snapshot is
+ * fetched separately by the view so the viewer remains usable when streaming
+ * transport is temporarily unavailable.
+ */
+export function useWebSocket({ runId, onSnapshot }: UseWebSocketOptions): RunSocketState {
+  const [state, setState] = useState<RunSocketState>(INITIAL_STATE)
+  const snapshotHandlerRef = useRef(onSnapshot)
 
   useEffect(() => {
-    // Try to connect to real WebSocket (not implemented yet)
-    let ws: WebSocket | null = null
-    try {
-      ws = new WebSocket('ws://localhost:8000/ws/pipeline')
-      ws.onopen = () => setWsConnected(true)
-      ws.onclose = () => setWsConnected(false)
-      ws.onerror = () => {
-        setWsConnected(false)
-        ws?.close()
-      }
-    } catch {
-      setWsConnected(false)
+    snapshotHandlerRef.current = onSnapshot
+  }, [onSnapshot])
+
+  useEffect(() => {
+    if (!runId) {
+      setState(INITIAL_STATE)
+      return undefined
     }
+
+    let disposed = false
+    let socket: WebSocket | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let retryCount = 0
+    let closeDetail: string | null = null
+
+    const scheduleReconnect = (detail: string | null) => {
+      if (disposed) {
+        return
+      }
+
+      const delay = retryDelay(retryCount)
+      retryCount += 1
+      setState({ status: 'reconnecting', detail, retryCount })
+      retryTimer = setTimeout(connect, delay)
+    }
+
+    const connect = () => {
+      if (disposed) {
+        return
+      }
+
+      setState({
+        status: retryCount === 0 ? 'connecting' : 'reconnecting',
+        detail: null,
+        retryCount,
+      })
+
+      closeDetail = null
+      try {
+        socket = new WebSocket(runWebSocketUrl(runId))
+      } catch {
+        scheduleReconnect('The committed update connection could not be opened.')
+        return
+      }
+
+      socket.onopen = () => {
+        if (!disposed) {
+          retryCount = 0
+          setState({ status: 'connecting', detail: null, retryCount })
+        }
+      }
+
+      socket.onmessage = (event) => {
+        if (disposed || typeof event.data !== 'string') {
+          return
+        }
+
+        try {
+          const message = parseRunSnapshotMessage(JSON.parse(event.data) as unknown)
+          if (message.snapshot.run.run_id !== runId) {
+            throw new ApiProtocolError('The committed update belongs to a different run.')
+          }
+          snapshotHandlerRef.current(message.snapshot)
+          setState({ status: 'committed', detail: null, retryCount })
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'The committed update could not be read.'
+          closeDetail = detail
+          setState({ status: 'disconnected', detail, retryCount })
+          socket?.close()
+        }
+      }
+
+      socket.onerror = () => {
+        if (!disposed) {
+          closeDetail = 'The committed update connection encountered an error.'
+          setState({ status: 'disconnected', detail: closeDetail, retryCount })
+        }
+      }
+
+      socket.onclose = () => {
+        if (!disposed) {
+          scheduleReconnect(closeDetail ?? 'The committed update connection is unavailable.')
+        }
+      }
+    }
+
+    connect()
 
     return () => {
-      ws?.close()
-      stopSimulation()
+      disposed = true
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+      }
+      socket?.close()
     }
-  }, [setWsConnected, stopSimulation])
+  }, [runId])
 
-  return { startSimulation, stopSimulation }
+  return state
 }

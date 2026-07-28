@@ -245,6 +245,30 @@ python scripts/run_canonical_mcap.py \
     --max-duration-seconds 180
 ```
 
+### Local Committed Run Workbench
+
+The web workbench exposes only immutable, committed primary completions. It does
+not control workers, open a writable repository, or synthesize in-flight
+pipeline state. After producing local state with one of the commands above,
+start the API in one terminal:
+
+```bash
+uv sync --locked --extra web
+python scripts/run_web_api.py --state-dir tmp/canonical-state
+```
+
+Then start the Vite client in another terminal:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. Vite proxies the versioned REST and WebSocket
+paths to `http://127.0.0.1:8000`; a same-origin reverse proxy or the two
+`VITE_ROBATA_*_BASE` variables can be used outside local development.
+
 ### Containerized Local Worker
 
 The checked-in container is a one-shot CPU worker for the existing local-conformance

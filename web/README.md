@@ -1,127 +1,71 @@
-# Robata Web UI
+# Robata Committed Run Workbench
 
-Streaming-architecture visual interface for the Robata canonical pipeline.
+A read-only operational workbench for committed canonical-run projections. It does
+not start pipelines, replay data, or manufacture client-side run state.
 
-## Features
+## Local Development
 
-- **Two-plane layout** — Plane A (Media + Inference) and Plane B (Durable Window DAG)
-- **Event-time timeline** — Visual bands for segments, windows, and watermark progression
-- **Live simulation** — Mock stream events replay with configurable speed
-- **Subject inspection** — Click any subject to see its complete identity (SHA-256, keys, digests)
-- **Backpressure monitoring** — Queue depth, oldest age, and pressure class visualization
-
-## Architecture
-
-The frontend reflects the streaming-throughput rearchitecture (WP0–WP7):
-
-| UI Component | Backend Counterpart | Contract |
-|---|---|---|
-| `CaptureScopeCard` | `PreEosCaptureSubject` | `stream_source.py` |
-| `SegmentTimeline` | `StreamSegment` | `stream_source.py` |
-| `WindowCard` | `IncrementalWindow` | `stream_window.py` |
-| `InferenceCard` | `StreamInference` | `stream_window.py` |
-| `ExpectedWindowPlanCard` | `ExpectedWindowPlan` | `stream_planning.py` |
-| `TerminalClosureCard` | `WindowTerminalClosure` | `stream_finalization.py` |
-| `FinalizationCard` | `RecordingFinalizationMap` | `stream_finalization.py` |
-| `TimelineBand` | Event-time / watermark | `stream_common.py` |
-| `WatermarkBar` | Backpressure state | `stream_common.py` |
-
-## Tech Stack
-
-- React + TypeScript + Vite
-- Zustand — State management
-- Tailwind CSS — Styling
-
-## Quick Start
+Create or reuse local canonical state, then start the read-only API from the
+repository root:
 
 ```bash
-# Install dependencies
+uv sync --locked --extra web
+python scripts/run_canonical_fixture.py tests/fixtures/canonical/source-recording.json --state-dir tmp/canonical-state --run-key primary
+python scripts/run_web_api.py --state-dir tmp/canonical-state
+```
+
+In a second terminal, install the frontend dependencies and run Vite from this
+directory:
+
+```bash
 npm install
-
-# Development server
 npm run dev
+```
 
-# Production build
+Vite serves the UI at `http://localhost:5173` and proxies `/api` and `/ws` to the
+local API service at `http://127.0.0.1:8000` during development. The production
+build is verified with:
+
+```bash
 npm run build
-npm run preview
 ```
 
-The dev server runs at **http://localhost:5173** by default.
+## API Contract
 
-## Mock Data
+The viewer consumes only the versioned read projection exposed by the backend:
 
-The demo uses a deterministic mock event stream for a 40.89-second six-camera recording:
+- `GET /api/v1/runs`
+- `GET /api/v1/runs/{run_id}/snapshot`
+- `WS /ws/v1/runs/{run_id}`
 
-- **40 segments** per camera (1-second logical chunks)
-- **39 windows** (2s width, 1s hop)
-- **Multiple inferences** per window (QA_COARSE, QA_DENSE, EVENT_PROPOSAL, etc.)
-- **Expected window plan** with sealed manifest
-- **Terminal closure** with reconciled outcomes
-- **Recording finalization** mapping
+The WebSocket sends a `snapshot` envelope when a committed cursor is available
+and whenever that cursor changes. The UI first fetches the REST snapshot and
+then subscribes to the selected run. A transport failure leaves the committed
+snapshot visible and reports the update connection as unavailable.
 
-Mock data is generated in `src/data/mock_stream_events.ts` and mirrors the Python contract shapes.
+Intervals and durations stay decimal strings in transport. The UI formats them
+with `BigInt`, so nanosecond values retain their exact precision.
 
-## Two-Plane Model
+## Configuration
 
-### Plane A: Media + Inference (Replaceable)
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VITE_ROBATA_API_BASE` | `/api/v1` | Base URL for the REST projection API. |
+| `VITE_ROBATA_WS_BASE` | `/ws/v1` | Base URL for committed-snapshot WebSocket updates. |
 
-Shows the live execution of one window. This plane is replaceable because the same window identity can be produced by PyAV (local) or DeepStream/Triton (accelerated).
+Leave both unset for same-origin deployment or Vite proxy development. Absolute
+HTTP(S) and WS(S) overrides are supported for a separately hosted API.
 
-```
-CaptureScope
-  ├── Segment[0..5] (one per camera)
-  ├── Window (purpose, interval, semantic SHA-256)
-  ├── Inference (attempt, terminal outcome)
-  └── WindowResult (evidence ref)
-```
+For Vite development only, `ROBATA_API_DEV_TARGET` and
+`ROBATA_WS_DEV_TARGET` select the proxy upstream. They default to the local
+API listener and are not included in the browser bundle.
 
-### Plane B: Durable Window DAG (Persistent)
+## Workbench Behavior
 
-Shows the append-only expected-window plan and its terminal closure. This plane survives restarts and is the authority for recording finalization.
-
-```
-ExpectedWindowPlan
-  ├── Declarations (appended before child publication)
-  ├── Sealed manifest (at EOS)
-  └── Terminal closure (reconciled after execution)
-
-RecordingFinalizationMap
-  ├── Capture scope → Final source identity
-  └── Incremental windows → Recording-scoped identities
-```
-
-## Evidence Class
-
-All displayed runs are mock/local views and must not be interpreted as production evidence.
-
-## Next Steps
-
-1. **Backend API integration** - Connect the UI only after a supported API contract is available.
-2. **Real-time updates** — Replace mock simulation with live stream events
-3. **Video player** — Embed six-video player in segment detail
-4. **Metrics dashboard** — Real-time capacity and SLO charts
-
-## Project Structure
-
-```
-web/
-├── src/
-│   ├── data/
-│   │   └── mock_stream_events.ts   # Mock event stream data
-│   ├── hooks/
-│   │   └── useWebSocket.ts         # WebSocket + simulation hook
-│   ├── panels/
-│   │   ├── PlaneAView.tsx          # Media + Inference plane
-│   │   ├── PlaneBView.tsx          # Durable Window DAG plane
-│   │   ├── TimelineBand.tsx        # Event-time timeline
-│   │   ├── WatermarkBar.tsx        # Watermark + backpressure
-│   │   └── SubjectDetailDrawer.tsx # Subject identity inspector
-│   ├── types.ts                    # Domain types (mirrors Python contracts)
-│   ├── store.ts                    # Zustand store (StreamViewState)
-│   ├── App.tsx                     # Two-plane layout
-│   └── main.tsx                    # Entry point
-├── dist/                           # Production build
-├── index.html
-├── package.json
-└── README.md
-```
+- Uses a compact committed-run picker; one run selects automatically, otherwise
+  selection remains explicit.
+- Organizes true committed intervals in a shared timeline and Source & QA /
+  Decision & delivery planes. An interval, stage, object, integrity field, or
+  evidence reference opens an on-demand detail drawer.
+- Uses only backend responses. There is no mock data, simulation timer, replay,
+  control endpoint, in-flight progress, watermark, or backpressure display.
