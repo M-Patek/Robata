@@ -7,6 +7,11 @@ A contract-first streaming pipeline for six-camera video QA and physical-action 
 > - **Agent navigation**: Start at `AGENTS.md`, then use the blueprint template and module guides in `governance/`.
 > - **Local archive**: `archive/` is non-authoritative historical context. It cannot define or override a contract.
 
+> **Deployment posture**
+> - This repository currently provides local-conformance behavior and production-shaped adapter boundaries. It is not a deployed production topology or a production-capacity claim.
+> - `governance/REQUIREMENTS.md` records target architecture and qualification assumptions. It does not authorize a release or override schemas, source, tests, or conformance fixtures.
+> - Read [Deployment Status and Target Topology](#deployment-status-and-target-topology) before provisioning cloud resources or exposing an endpoint.
+
 ---
 
 ## Overview
@@ -22,6 +27,7 @@ Robata implements a deterministic, replayable streaming architecture for process
 | Evidence Chain | 74 registered schemas, content-addressed |
 | Replay | Exact replay verified (deterministic) |
 | Evidence Class | `LOCAL_CONFORMANCE`, `NOT_PRODUCTION_QUALIFIED` |
+| Deployment Scope | Local worker and local read-only workbench; optional cloud adapters are not yet composed into a service |
 
 ---
 
@@ -90,6 +96,68 @@ Robata implements a deterministic, replayable streaming architecture for process
 | **Evidence Storage** | SQLite + content-addressed blobs | Local durability, exact replay |
 | **Schema Governance** | 74 pinned schemas, atomic registration | Wire compatibility, evolution safety |
 | **Lease Fencing** | Epoch + token per work item | Prevents split-brain in recovery |
+
+## Deployment Status and Target Topology
+
+### Current Status
+
+Robata currently has a local-conformance pipeline and production-shaped adapter
+boundaries. It does not yet have a production composition root, a cloud deployment,
+or qualified service-capacity evidence. Qualification artifacts deliberately retain
+`production_eligible: false`; technical evidence cannot self-authorize a release.
+
+| Boundary | Available in the repository | Still deployment-owned or unqualified |
+|----------|-----------------------------|---------------------------------------|
+| Canonical pipeline | Deterministic local worker, SQLite state, replay, recovery, and outbox proofs | Multi-host composition, durable operational ownership, and representative load |
+| Cloudflare R2 | HTTPS S3-compatible adapter with versioned idempotent writes, exact-byte checks, range reads, and reconciliation logic | Bucket policy, lifecycle, real object I/O, cache retention, and R2-to-worker throughput |
+| PostgreSQL / pgvector | Optional `psycopg` runtime, `verify-full` TLS, required RLS, and separate primary/worker roles | Reviewed DDL and policy deployment, tenant-claim integration, real database verification, and migrations |
+| Redis / broker | Task-queue and idempotent-outbox adapter boundaries | A durable broker selection, composition, operations, and real fault evidence |
+| RunPod | HTTPS provider transport with authentication, idempotency keys, bounded retries, concurrency controls, and qualification bindings | vLLM handler, model image, endpoint configuration, GPU topology, and real endpoint qualification |
+| Web workbench | Local read-only REST/WebSocket explorer over committed SQLite completions | Authentication, tenant authorization, public API contract, production data source, and an Internet-facing deployment |
+| Docker / Compose | Read-only, one-shot local CPU fixture and recovery workers | API, frontend, GPU service, broker, persistent application services, ingress, and production health checks |
+
+The production targets in [governance/REQUIREMENTS.md](governance/REQUIREMENTS.md)
+are useful deployment and qualification context. They are not a claim that the
+target stack, 500 recording-hours/day, T+1/T+3, or two-H100 capacity is already
+available.
+
+### Target Topology (Operator-Owned, Not Yet Deployed)
+
+```text
+                         Browser
+                            |
+                TLS proxy + authenticated API
+                            |
+                 Web/API application service
+                   |                    |
+                   |                    +---- Supabase/PostgreSQL
+                   |                           Auth, result data, pgvector/RLS
+                   |
+                   +---- durable broker / task authority
+                            |
+                     CPU/NVMe worker
+                       |
+                       +---- RunPod GPU endpoint
+                       |       vLLM / model inference
+                       |
+                  Cloudflare R2
+          source video, immutable artifacts, frame-cache objects
+```
+
+This is a target deployment boundary, not the current `compose.yaml`:
+
+- **R2 is object storage only.** It cannot run the Docker worker, host the API, or expose an application port.
+- **RunPod is a provider boundary.** A GPU pod does not supply the product API, authentication, durable queue, database policy, or release evidence.
+- **The browser must not receive R2 administrative credentials, database passwords, or RunPod API keys.** Secrets stay in a deployment secret manager and are injected only into the required server-side process.
+- **The local SQLite state and local Web API are not cluster authority.** Do not mount a developer state directory into a public service or treat the local explorer as the production API.
+
+### Production Release Boundary
+
+An environment is eligible for a governed release only after the target topology is
+implemented and the representative external gates are evidenced. Local tests, adapter
+construction, and a successful configuration preflight remain useful prerequisites,
+but they do not establish storage durability, model quality, provider capacity, or
+service-level compliance.
 
 ### Determinism and Replay
 
@@ -196,14 +264,20 @@ This is dated local evidence, not a release or production-capacity claim. Re-run
 
 **Test Coverage**: 1,800 windows, 9,001 work items, 6 injected failures recovered.
 
-### Not Covered (External Dependencies)
+### External and Production Qualification Status
 
-| Item | Blocker | Impact |
-|------|---------|--------|
-| Real model (Qwen 7B + vLLM) | No qualified endpoint | Throughput unvalidated |
-| Cloud deployment (R2/RunPod/Supabase) | No infrastructure | Production topology unknown |
-| Long-soak stability | Time | Durability unproven beyond 30min |
-| Failover design | O-14 policy | Recovery ownership undefined |
+The following table separates code that exists in this repository from evidence
+that must be produced in a real staging or production-like environment.
+
+| Area | Current repository evidence | Required before a governed release |
+|------|-----------------------------|------------------------------------|
+| Real model and vLLM | Provider-neutral and RunPod transport boundaries; no qualified endpoint | Pinned model/runtime/topology, response-contract check, quality review, saturation, latency, and cost evidence |
+| Cloudflare R2 | Optional `boto3` adapter with local-double tests and configuration preflight | Bucket policy, lifecycle, real PUT/GET/range/reconcile faults, retention, and throughput evidence |
+| PostgreSQL / pgvector | TLS/RLS/primary-worker adapter boundary and target-verification path | Reviewed DDL, tenant policy, migrations, real RLS isolation test, backup, and restore evidence |
+| Redis / broker | Task-queue and idempotent-outbox adapter boundaries | Chosen durable service, composition, availability model, fault handling, and operator ownership |
+| Web/API | Local committed-run explorer only | Authenticated, authorized, observable public service with a production data source and TLS ingress |
+| Capacity and deadlines | Dated fixture-backed local snapshot | Representative 500 recording-hours/day equivalent, T+1/T+3, p95/p99, utilization, and cost evidence |
+| Reliability and recovery | Local restart/replay and injected-fault coverage | Storage/provider faults, backup/restore, incident ownership, and the declared soak duration |
 
 ---
 
@@ -213,6 +287,7 @@ This is dated local evidence, not a release or production-capacity claim. Re-run
 
 - Python >=3.12, <3.14
 - uv (dependency management)
+- Node.js (required only for the local Vite workbench)
 - (Optional) FFmpeg, PyAV for MCAP processing
 
 ### Installation
@@ -269,6 +344,12 @@ Open `http://localhost:5173`. Vite proxies the versioned REST and WebSocket
 paths to `http://127.0.0.1:8000`; a same-origin reverse proxy or the two
 `VITE_ROBATA_*_BASE` variables can be used outside local development.
 
+The local API defaults to a loopback listener and provides no authentication or
+tenant authorization. A same-origin proxy or base URL is only a transport choice,
+not a public-deployment security model. Do not expose this explorer to the Internet
+or connect it to production data until a separate authenticated, authorized service
+and production read model exist.
+
 ### Containerized Local Worker
 
 The checked-in container is a one-shot CPU worker for the existing local-conformance
@@ -291,10 +372,14 @@ project volume before an independent recovery scenario. Both workers run read-on
 `10001`; application layers are root-owned and only the declared state mount is writable.
 
 This is local regression execution, not a production topology or qualification result.
-R2, PostgreSQL/pgvector, and RunPod are outbound dependencies that must be explicitly
-injected by a future production composition root; they are not silently created by
-Compose. Cloudflare R2 is object storage and cannot host this Docker worker or expose
-an application port.
+R2, PostgreSQL/pgvector, Redis or another broker, and RunPod are outbound dependencies
+that must be explicitly injected by a production composition root; they are not silently
+created by Compose. Cloudflare R2 is object storage and cannot host this Docker worker
+or expose an application port.
+
+The checked-in image is not an API, frontend, GPU, or vLLM image. It does not package
+the `web/` client, run a public service, declare GPU resources, or provision a database
+or broker. Do not promote this Compose project to staging or production unchanged.
 
 ### Optional Adapter Preflight
 
@@ -315,9 +400,57 @@ the process. The non-verifying `require` and hostname-skipping `verify-ca` modes
 
 `--verify-pgvector` is different: it connects to the configured target and verifies
 pgvector, the configured vector dimension, RLS flags, policy presence, and the separate
-worker role. Run it only after reviewed DDL and RLS policy have been applied. R2 object
-read/write/reconciliation faults and the RunPod endpoint still require their separate
-external qualification runs; a successful preflight remains `NOT_MEASURED`.
+worker role. Run it only after reviewed DDL and RLS policy have been applied.
+
+The R2 path in this command validates configuration and constructs the optional SDK client;
+it performs no R2 object read, write, range-read, or reconciliation operation. The repository
+does not yet provide an equivalent RunPod deployment preflight. Real R2 faults, the RunPod
+endpoint, and all provider/storage capacity claims remain separate external qualification work.
+A successful preflight remains `NOT_MEASURED`.
+
+### Pre-Production Inputs
+
+Provision the following outside the repository before building a staging composition. Use
+separate staging and production resources. Do not put any secret in Git, a frontend build,
+or a browser-accessible environment variable.
+
+| Boundary | Operator-provided inputs | Minimum safety boundary |
+|----------|--------------------------|-------------------------|
+| Cloudflare R2 | Per-environment bucket and prefix, endpoint, scoped access key, lifecycle/retention policy | Separate prefixes; least-privilege server-side credentials; tested restore and deletion procedure |
+| PostgreSQL / Supabase | Project/database endpoint, CA certificate, app and worker roles, RLS tenant policy, pgvector dimension/index choice | `verify-full` TLS; distinct app/worker identities; policy review before target verification |
+| Redis or broker | Managed endpoint, TLS/authentication, retention/dead-letter and availability settings | No implicit local queue; ownership, retry, and incident behavior defined |
+| RunPod | API credential, HTTPS endpoint, handler image, model/version/precision, topology, concurrency and timeout limits | Secret remains server-side; endpoint contract, model license, and failure behavior are pinned |
+| Application edge | CPU/NVMe host, image registry, domain/DNS, TLS proxy, secret manager, logging/metrics and alert ownership | Public API is authenticated and authorized; no public SQLite explorer or direct admin credential exposure |
+| Qualification corpus | Representative recordings, governed labels, workload manifest, acceptance thresholds, and cost constraints | Data lineage and tenant/data handling are reviewed before testing |
+
+### Staging Verification Sequence
+
+1. Build separate application, worker, and GPU/handler deployment artifacts. Do not reuse the
+   checked-in local Compose project as a staging manifest.
+2. Apply reviewed PostgreSQL/pgvector DDL and RLS policy, then run
+   `python scripts/preflight_optional_adapters.py --pgvector --verify-pgvector --env-file <secure-env-file>`.
+3. Exercise an isolated R2 prefix with real immutable write, HEAD, full GET, range GET,
+   reconciliation, retry, and deletion/retention scenarios.
+4. Pin a RunPod model/runtime/topology and verify request/response, idempotency, timeout,
+   partial failure, concurrency, and evidence capture against the real endpoint.
+5. Run a representative one-hour workload before estimating capacity, then execute the declared
+   soak, recovery, backlog-drain, and cost measurements under the frozen scope.
+
+### Release Qualification Gates
+
+The [P15 external gates](governance/BLUEPRINT.md#p15---run-the-representative-pareto-and-external-qualification-gates)
+are the release-evidence checklist. An unexecuted gate remains `NOT_MEASURED`; a measured
+failure remains recorded as a failure; no technical artifact can self-promote the release.
+
+| Gate | Required decision evidence |
+|------|----------------------------|
+| E0 | Frozen code, schema, workload, policy, hardware, provider, storage, and cost scope |
+| E1 | Governed QA/event/boundary quality and calibration evidence on frozen labels |
+| E2 | Target media/storage parity, durability, and object-store fault/reconciliation evidence |
+| E3 | Real model/runtime/hardware correctness, saturation, latency, retry, and cost evidence |
+| E4 | Representative arrivals, recovery/fault injection, backlog drain, and declared soak evidence |
+| E5 | 500 recording-hours/day equivalent, T+1/T+3, utilization, p95/p99, and unit-cost evidence |
+| E6 | Independent go/no-go review with security, retention, incident, and unresolved-risk evidence |
 
 ### Verification
 
@@ -329,9 +462,16 @@ python -m ruff format --check .
 python -m mypy
 python scripts/verify_schema_registry.py
 
-# Minimal validation (production)
+# Minimum local regression baseline (not production qualification)
 python -m pytest -q
+uv lock --check
+docker compose config --quiet
 ```
+
+The checked-in CI validates the Python tree, schemas, documentation, and a tracked-source
+archive. It does not build the Vite client, build or publish a container image, deploy an
+environment, or run cloud qualification. Add those controls to a separate deployment pipeline
+before treating a Git push as a release.
 
 ---
 
@@ -392,6 +532,12 @@ Artifacts stored by SHA-256 digest:
 - Terminal evidence (JSON with schema refs)
 - Source segments (MCAP chunks)
 
+An object-storage URI is a contract abstraction, not proof that the local canonical
+composition has written to Cloudflare R2. The checked-in local path uses local state and
+does not inject an R2-backed frame cache or object-store composition. A staging deployment
+must provide that composition, configure bucket/prefix ownership, and qualify real storage
+durability and reconciliation before treating R2 as authoritative.
+
 Lookup: `semantic_sha256 → filesystem path or object storage URI`
 
 ### Recovery Procedure
@@ -419,16 +565,31 @@ Local architecture, requirement, and historical materials remain optional contex
 
 ---
 
-## Evidence Classes
+## Evidence and Qualification Status
 
-| Class | Meaning | Production Eligible |
+Evidence class and measurement status are separate. Neither a local result nor a
+successful adapter configuration automatically grants release authority.
+
+### Evidence Classes
+
+| Class | Meaning | Release implication |
 |-------|---------|---------------------|
-| `LOCAL_CONFORMANCE` | Local mechanism verified | No |
-| `SYNTHETIC_LOCAL` | Simulation-based | No |
-| `NOT_MEASURED` | Awaiting representative load | No |
-| `MEASURED` | Qualified workload evidence | Pending |
+| `LOCAL_CONFORMANCE` | Deterministic local behavior and conformance fixtures | Not production evidence |
+| `LOCAL_BENCHMARK` | Measured local benchmark under an explicit scope | Not representative or production evidence |
+| `REPRESENTATIVE_BENCHMARK` | Representative workload measurement without external release qualification | Requires the remaining external gates |
+| `EXTERNAL_QUALIFICATION` | Evidence from a real provider, storage target, hardware, or governed dataset | Pending gate review and release decision |
+| `PRODUCTION_QUALIFIED` | Classification available only after governed qualification evidence | Does not replace the independent E6 release decision |
 
-Current status: **LOCAL_CONFORMANCE**, **NOT_PRODUCTION_QUALIFIED**.
+### Measurement Status
+
+| Status | Meaning |
+|--------|---------|
+| `NOT_MEASURED` | The required representative or external observation has not been run |
+| `MEASURED` | An observation exists with a bound scope; it can still fail its threshold or remain pending review |
+
+Current repository status: `LOCAL_CONFORMANCE`; real hardware, external storage/provider,
+representative labels, long soak, and production capacity remain `NOT_MEASURED`.
+The repository is `NOT_PRODUCTION_QUALIFIED`.
 
 ---
 
@@ -440,11 +601,14 @@ This software is provided for evaluation and development purposes.
 Production use requires explicit qualification of real models,
 infrastructure, and operational policies not included in this repository.
 
-See LICENSE for full terms (if present) or contact the maintainers.
+See [LICENSE](LICENSE) for full terms, or contact the maintainers via a tracked GitHub issue.
 
 ---
 
 ## Contact
 
-For production qualification inquiries: [maintainer contact]
-For development issues: Open an issue with `LOCAL_CONFORMANCE` evidence.
+For production qualification inquiries: open a GitHub issue on
+[M-Patek/Robata](https://github.com/M-Patek/Robata) with the `production-qualification`
+label and the relevant evidence class.
+For development issues: open an issue and attach your `LOCAL_CONFORMANCE` evidence
+(commit, run key, and reproduction command).
