@@ -1,1004 +1,1029 @@
-# Robata Production-Ready Throughput, Quality, and Deployment Blueprint
+# Robata Evidence-First Throughput and Quality Optimization Blueprint
 
-**Cycle:** six-camera quality delivery, adaptive evidence, and production-boundary qualification
-**Planning date:** 2026-07-26
-**Revision:** replacement plan; this file supersedes the previous BLUEPRINT.md
-**Dispatch unit:** one phase or explicitly named cross-module phase per main-agent window
+**Cycle:** measured throughput, quality, and qualification optimization
+**Planning date:** 2026-07-27
+**Source guide:** `ARCHITECTURE_OPTIMIZATION_GUIDE.md`
+**Dispatch unit:** one numbered phase per main-agent window
 
-## Authority and evidence boundary
+## Authority and Evidence Boundary
 
-This is a local construction map, not an approval workflow or production certificate.
+This file is a local execution map, not a product contract or production certificate.
 
-- schemas/**, schemas/schema-catalog.json, the registered schema workflow, tracked source,
-  tests, and conformance fixtures are the contract and behavior truth.
-- governance/REQUIREMENTS.md is a production target/capacity reference. Its cloud choices,
-  500 recording-hours/day, T+1/T+3, two-H100 estimates, costs, and model suggestions are
-  hypotheses or targets until measured.
-- Evidence classes are explicit: LOCAL_CONFORMANCE, LOCAL_BENCHMARK,
-  REPRESENTATIVE_BENCHMARK, EXTERNAL_QUALIFICATION, and PRODUCTION_QUALIFIED.
-- Real H100/vLLM, NVDEC, R2, broker/object-store, Supabase/Postgres, representative labels,
-  and long-run soak evidence remain NOT_MEASURED.
+- Published schemas and `schemas/schema-catalog.json` govern wire contracts.
+- Tracked source, tests, and conformance fixtures govern executable behavior.
+- `governance/` explains navigation and execution order only.
+- Released schema bytes are immutable. Identity, hash, logical-key, idempotency-key,
+  fence, semantic-projection, or wire changes require an explicit version or migration
+  decision before implementation.
+- The optimization guide supplies audited hypotheses. A phase may promote a claim only
+  through a workload-bound measurement artifact.
 
-## Current observed baseline and decisions
+## Current Observed Baseline
 
-These are dated local fresh-path references, not production claims. They use a 40.8335
-recording-second, six-camera fixture, PyAV CPU decode, and deterministic offline provider.
+These observations are investigation inputs, not production capacity evidence. Parent and
+child profile spans overlap and must not be added together.
 
-- Event-driven fresh timing is about 118.75 wall seconds versus 161.03 seconds for the
-  earlier hot-loop; scheduler transactions are about 3,559 versus 18,193 and read I/O
-  about 2.67 GiB versus 6.41 GiB.
-- source.prepare is a parent envelope (about 77.38 seconds) containing inspect,
-  capture/publish, publication validation, ledger/metadata, frame indexing, quality timing,
-  materialization, and quality publication. It is not one algorithm and must not be added
-  to child spans.
-- Fresh-path action remains concentrated in source.stream.capture_publish (about 53.05
-  seconds; window append/publish/drain), source.materialize (about 22.33 seconds;
-  decode/PNG/hash/fsync/read amplification), inference-evidence SQLite scope, and
-  completion auditing/serialization. Replay needs an independent profile.
-- MCAP single-pass, six-camera materialization, local WAL recovery, provider-neutral calls,
-  adaptive sampling, evidence lineage, completion/outbox, review routing, and local
-  qualification scaffolding exist. Current dirty-tree behavior must be reprofiled by P0.
-- Traditional low-cost visual signals already exist; extend the decoded-frame/adaptive
-  bridge instead of creating another pixel pipeline.
-- Fisheye undistortion, perspective correction, and Egocentric preprocessing are new,
-  optional derived views. They require camera calibration, policy versions, exact lineage,
-  and representative quality/cost evidence before becoming defaults.
-- R2 stores objects, RunPod supplies GPU/provider execution, Supabase supplies database/Auth,
-  and pgvector stores/searches vectors. None supplies CPU/NVMe workers, durable scheduler
-  semantics, an embedding encoder, or production qualification.
+### Fresh source profile
+
+The current local profile observation uses a 40.8335-second, six-camera recording fixture,
+PyAV CPU media processing, and a deterministic offline provider. The source report date,
+commit, and digest are not carried in this Blueprint, so these values are unbound historical
+planning observations. The runtime profile family is `LOCAL_CONFORMANCE`,
+`NOT_MEASURED`, and `NOT_PRODUCTION_QUALIFIED`; P0 must rerun it before
+any before/after claim.
+
+| Metric | Local observation | Status |
+| --- | ---: | --- |
+| Elapsed | 118.750 s | local profile only |
+| Source-time ratio | 2.908 wall-sec/source-sec | local profile only |
+
+### Actual local-mock smoke
+
+The separate 30-minute fixture-backed smoke uses provider traffic `MOCKED`, execution mode
+`ACTUAL_LOCAL_MOCK`, authority `AUTHORITATIVE_LOCAL_MOCK_SMOKE`, measurement status
+`NOT_MEASURED`, and qualification status `NOT_PRODUCTION_QUALIFIED`.
+
+| Metric | Local observation | Status |
+| --- | ---: | --- |
+| Throughput | 2.162 rec-sec/wall-sec | local regression evidence |
+| Eligible-to-terminal p95 | 3.908 s | local regression evidence |
+| Active backlog at end | 0 | local regression evidence |
+| No-growing-backlog gate | met | local regression evidence |
+| Windows | 1,800 | workload descriptor |
+| Work items | 9,001 | workload descriptor |
+
+### Profile attribution
+
+| Scope | Wall time | Interpretation |
+| --- | ---: | --- |
+| `source.prepare` | about 77.38 s | parent envelope; do not add to children |
+| `source.stream.capture_publish` | about 53.05 s | append, publication, drain, and related work |
+| `source.materialize` | about 22.33 s | media materialization path |
+
+The observations do not establish H100, NVDEC, vLLM, R2, representative quality, long-run,
+or production capacity. Those environments and gates remain `NOT_MEASURED`.
 
 ## Product Outcome
 
-**Outcome:** Robata converts six-camera recordings into complete evidence-bound 21-class
-clip QA, event proposals, and annotation/search inputs through a bounded, replayable
-pipeline, with local substitutes and explicitly qualified production adapters.
+**Outcome:** Robata processes six-camera recordings with measurably better throughput and
+quality while preserving complete evidence, deterministic replay, durable recovery, and
+transport-independent identity.
 
-**Why now:** Source preparation and media I/O dominate the measured fresh path. The next
-cycle must lower transaction, decode, provider, and storage cost without hiding source
-failures, changing warning/fail semantics, or changing published identity.
+**Why now:** The current unbound local profile observation concentrates work in source preparation, stream
+capture/publication, and materialization, while the production provider, target media,
+representative quality, and long-run capacity boundaries remain unqualified. Optimization
+must therefore begin with measurement and correctness rather than projected multipliers.
 
 **Success measures:**
 
-- Every eligible clip has a complete result; sparse calls never silently remove a clip,
-  camera, interval, or source failure.
-- Full source integrity remains observable: camera mapping, packet/timestamp order, decode
-  gaps, missing intervals, and provenance.
-- Profiles report recording-hours and camera-hours separately, plus decoded/selected images,
-  provider images/calls/HTTP/tokens, CPU/GPU/NVMe, queue/backlog, and I/O.
-- Local fresh/replay/crash/duplicate proofs are reproducible and evidence classes visible.
-- Adaptive sampling reports quality, abstention/incomplete coverage, dense-upgrade rate,
-  provider amplification, and cost together.
-- Only an external gate may promote a frozen report to 500 recording-hours/day, QA T+1,
-  annotation T+3, and PRODUCTION_QUALIFIED.
+- Fresh source-time ratio and actual-local-mock throughput remain separate, correctly
+  named report surfaces.
+- Every performance phase records a like-for-like before/after profile and semantic parity.
+- Every quality phase reports per-class, calibration, abstention/incomplete, temporal, and
+  boundary effects applicable to that phase.
+- No optimization weakens artifact durability, pending-terminal recovery, lease fencing,
+  completion immutability, or inference evidence closure.
+- Target NVDEC, real provider, external database/storage, representative labels, soak, and
+  production capacity remain `NOT_MEASURED` until their named gate runs.
+- An executed gate that misses a threshold retains measured evidence, records failure, and
+  remains `NOT_PRODUCTION_QUALIFIED`.
 
 **Non-goals for this cycle:**
 
-- No released schema or identity formula is edited in place.
-- No full-frame RGB persistence or full-recording undistortion becomes the default.
-- Local recording-affine SQLite is not replaced merely to claim scale.
-- No business quality thresholds are invented before governed labels and sign-off.
-- Embedding/search, optional crops, and shadow work cannot block authoritative QA completion.
-- R2, RunPod, Supabase, NVDEC, and two H100s are not declared supported before proof.
+- No universal 10x, 30x, FPS, latency, or accuracy promise is inferred from local smoke.
+- No released schema, identity formula, semantic projection, or completion root is edited
+  in place.
+- No QA-cleanliness signal is used as proof of `NO_EVENTS`.
+- No cross-invocation inference terminal is reused through the current selection contract.
+- No lossy encoding or target backend becomes the default before parity qualification.
+- No web-product work is included unless a later phase creates a versioned client contract.
 
-## Non-negotiable invariants
+## Non-Negotiable Invariants
 
 | Boundary | Invariant |
 | --- | --- |
-| Contract | Released schema bytes/catalog pins are immutable; changes use registered version and migration/upcast. |
-| Source | Original MCAP/compressed authority, timestamps, mapping, decode facts, and provenance are never rewritten or hidden. |
-| Media | Derived/corrected/cropped artifacts bind source frame/time, exact bytes, policy, and calibration. |
-| Sampling | Base coverage and escalation reasons are explainable; visual proxies are not semantic truth. |
-| QA | Every eligible clip gets a complete 21-class projection, including explicit unknown/abstained/incomplete. |
-| Events | Candidate/proposal/boundary evidence retains lineage and deterministic replay. |
-| Inference | Intent, raw, parsed, selection, accepted lineage, retry, and replay facts close in the ledger. |
-| Stream | Work, barriers, leases, fences, retry/DLQ/backpressure, and recovery remain durable. |
-| Identity/delivery | Logical identity is transport-independent; one terminal truth, no lost/duplicate completion/outbox/review. |
-| Evidence | Local, representative, external, and production evidence are never conflated. |
+| Source | Original MCAP bytes, timestamps, mapping, decode facts, and provenance are never rewritten. |
+| Media | Derived artifacts bind source/time, exact bytes, and all semantics-affecting policies. |
+| QA | Every eligible clip retains a complete 21-class projection with explicit unresolved states. |
+| Events | Window and recording evidence retains source ordinals, digests, and deterministic replay. |
+| Inference | Intent, raw, parsed, selection, accepted evidence, retry, and replay lineage closes. |
+| Stream | Plans, readiness, leases, fences, pending terminals, acceptance, EOS, and recovery stay durable. |
+| Completion | Published completion is complete, immutable, schema-valid, and semantically hashed. |
+| Retrieval | Structured retrieval remains authoritative; vector rows are optional derived projections. |
+| Evidence | Local, synthetic, measured, failed-gate, external, and production states are not conflated. |
 
 ## Overall Roadmap
 
 | Phase | Outcome | Main module(s) | Depends on | Local proof | External follow-up |
 | --- | --- | --- | --- | --- | --- |
-| P0 - contract and measurement truth | Scope fingerprint, units, evidence classes, immutable baseline | contract-governance, qualification-ops | None | schema/profile/replay baseline | None |
-| P1 - source and stream spine | Single-pass source plus message-independent window/work scheduling | source-media, stream-control, canonical-integration | P0 | scheduler/source/replay/crash profile | Broker later |
-| P2 - feed-once media and visual sentinel | One decode supplies integrity, traditional-CV signals, bounded evidence | source-media, sampling-qa, qualification-ops | P1 | media/adaptive/I/O/RSS profile | R2/target decode |
-| P3 - adaptive QA/event and evidence lineage | Base/coarse/dense/context/event execution is provider-neutral/replayable | sampling-qa, event-semantics, inference-evidence | P2 | QA/event/inference delayed-provider tests | Real VLM |
-| P4 - complete product closure | Complete 21-class result and evidence-bound event boundaries | sampling-qa, event-semantics, canonical-integration | P3 | product/event/canonical/Pareto tests | Governed labels |
-| P5 - terminal truth and recovery | Pre-EOS, completion, outbox, review, replay preserve one graph | identity-delivery, stream-control, canonical-integration | P1,P3,P4 | crash/retry/duplicate/recovery tests | Production delivery |
-| P6 - parallel service/backpressure | Recording-affine workers scale with bounded queues and saturation evidence | stream-control, canonical-integration, qualification-ops | P1-P5 | 1/2/4 worker/backlog report | Capacity sizing |
-| P7 - object/broker adapters | R2 and broker/outbox preserve bytes, leases, fences, reconciliation | contract-governance, source-media, stream-control, identity-delivery | P5,P6 | fake-client failure/replay contracts | Real services |
-| P8 - target media and RunPod qualification | NVDEC/CPU and two-H100/vLLM measured under adaptive workload | source-media, inference-evidence, qualification-ops | P2,P3,P6,P7 | qualification harness/replay | H100/NVDEC/RunPod |
-| P9 - Supabase/pgvector projection | Structured-first retrieval plus async versioned vector search | contract-governance, canonical-integration, qualification-ops | P4,P7 | fake DB/vector/replay contracts | Supabase/Postgres/RLS |
-| P10 - representative production gate | Frozen quality/capacity/reliability/deadline/cost/soak report | qualification-ops, canonical-integration, event-semantics | P2-P9 | local qualification package | Labels, soak, sign-off |
+| P0 - freeze measurement truth | Bound baseline, units, scope, and identity-impact register | `qualification-ops`, `contract-governance` | None | profile and benchmark tests | None |
+| P1 - profile SQLite boundaries | Operation-level transaction/lock profile and safe batch candidates | `stream-control`, `qualification-ops` | P0 | scheduler transaction tests | Multi-process load later |
+| P2 - artifact durability barrier | Batched publication without volatile committed references | `source-media`, `canonical-integration` | P0 | crash/reconciliation tests | Target filesystem/R2 |
+| P3 - completion root cost | Preserve v3 ordered-root semantics while removing proven overhead | `identity-delivery`, `canonical-integration` | P0 | completion contract/integration tests | None |
+| P4 - target decode and media reuse | Real backend qualification plus layer-specific reuse profile | `source-media`, `qualification-ops` | P0,P2 | NVDEC/media parity tests | Target GPU/codec matrix |
+| P5 - alternate encoding experiment | Versioned PNG/JPEG policy and representative parity report | `source-media`, `sampling-qa`, `inference-evidence` | P0,P2 | media/input-plan tests | Representative labels/provider |
+| P6 - stream-safe provider microbatching | Qualified single/concurrent/native envelopes without recording-wide accumulation or cross-invocation result, cache, or evidence reuse | `inference-evidence`, `qualification-ops` | P0 | RunPod/orchestrator/replay tests | Real provider/H100 |
+| P7 - durable executor concurrency | Concurrent ready-work execution with unchanged terminal truth | `stream-control`, `canonical-integration` | P1 | ordering/recovery tests | Saturation run |
+| P8 - measured adaptive backpressure | Observable rate inputs and restart-safe bounded controller | `stream-control`, `qualification-ops` | P7 | queue/backlog tests | Production arrivals/quotas |
+| P9 - Product QA calibration | Auditable calibration bridge with explicit schema decision | `sampling-qa`, `inference-evidence`, `contract-governance` | P0 | QA/metrics/schema tests | Governed labels |
+| P10 - causal adaptive sampling | Persisted upgrade decisions and only proven no-work paths | `sampling-qa`, `event-semantics`, `canonical-integration` | P9 | adaptive/QA/event tests | Recall qualification |
+| P11 - event association and temporal signal | Extend existing recording merge without hidden identity change | `event-semantics`, `canonical-integration`, `identity-delivery` | P0 | reduction/event tests | Representative events |
+| P12 - boundary estimator qualification | Robust estimator with raw observations and explicit fallback | `event-semantics`, `sampling-qa` | P9,P11 | event/boundary tests | Boundary labels |
+| P13 - active-learning selector | Immutable pool-level review selection and dataset lineage | `identity-delivery`, `sampling-qa`, `qualification-ops` | P9 | review/split tests | Annotation cycles |
+| P14 - vector adapter qualification | Existing structured-first vector path qualified on real backend | `canonical-integration`, `contract-governance`, `qualification-ops` | P0 | vector/retrieval tests | Encoder/pgvector/RLS |
+| P15 - representative Pareto gate | Frozen throughput, quality, reliability, cost, and E0-E6 report | `qualification-ops`, all changed modules | P2-P14 | local qualification package | Labels, hardware, soak, review |
 
 ## Module Phases
 
-### contract-governance - P0/P7/P9: contract and adapter boundaries
-
-**Result**
-
-Schema, port, object-locator, calibration, broker, and vector projections evolve without
-in-place wire or identity changes.
-
-**Primary paths and entry points**
-
-- schemas/**, schemas/schema-catalog.json, scripts/register_schema.py
-- src/robata/contracts/**, src/robata/ports/**
-- src/robata/ports/artifact_registry.py, src/robata/frame_cache.py
-- tests/unit/test_register_schema.py, test_schema_immutability.py,
-  tests/contract/test_schema_release_policy.py
-
-**Implementation outline**
-
-1. Freeze a scope digest over code revision, catalog, workload, policies, and identity.
-2. Add minimal ports for calibration/preprocess, R2, broker, and vector projections;
-   unfinished adapters fail closed.
-3. Map R2 version/ETag/presigned URL as locator metadata, never content identity.
-4. Register a new schema for a published semantic/preprocessing shape change.
-
-**Keep intact**
-
-Schema bytes, catalog pins, exact/semantic hashing, logical keys, idempotency keys,
-fences, and transport-independent identity.
-
-**Done when**
-
-- [ ] Scope/evidence register reproduces fresh and replay profiles.
-- [ ] Release tests reject mutation/unregistered changes.
-- [ ] Adapter/preprocess metadata is internal-only or versioned.
-- [ ] Local proofs need no cloud SDK.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_register_schema.py tests/unit/test_schema_immutability.py
-python -m pytest tests/contract/test_schema_catalog.py tests/contract/test_schema_release_policy.py tests/contract/test_schema_upcasting.py
-~~~
-
-**Next boundary**
-
-P1 consumes frozen identity; P7/P9 consume versioned ports.
-
-### source-media - P1/P2/P7/P8: single-pass media and artifact ports
-
-**Result**
-
-One verified source traversal produces compressed authority, bounded quality facts, and
-content-addressed artifacts; CPU, hardware, and R2 share media ports.
-
-**Primary paths and entry points**
-
-- src/robata/application/canonical/mcap_source.py, single_pass_video.py, bounded_media.py,
-  media_quality.py
-- src/robata/adapters/mcap_single_pass.py, pyav_*.py, parallel_*.py, nvdec_*.py
-- src/robata/frame_cache.py, src/robata/ports/artifact_registry.py
-- tests/unit/test_mcap_single_pass.py, test_pyav_interval_spool.py, test_bounded_media.py,
-  test_canonical_media_quality.py, tests/integration/test_canonical_mcap_source.py
-
-**Implementation outline**
-
-1. Add nested source.prepare, capture/publish, drain, decode, render, hash, fsync, and
-   materialization spans; remove repeated whole-file reads.
-2. Fuse selected evidence and low-cost sentinel observations in one decode; never persist
-   unbounded RGB.
-3. Extend existing quality signals with optional lens/geometry triggers.
-4. Add versioned CameraCalibrationProfile and FramePreprocessPolicy; apply fisheye/
-   perspective/Egocentric views only to selected windows/model inputs until measured.
-5. Implement R2 blob-first exact-hash publication and orphan/visibility reconciliation.
-
-**Keep intact**
-
-MCAP authority, frame IDs/timestamps, sidecar verification, artifact lineage, CPU fallback,
-and frame/video ports.
-
-**Done when**
-
-- [ ] Fresh/replay have separate profiles and no source loss.
-- [ ] Read amplification is <=10x on the fixture, target 8x, or codec/GOP lower bound is
-  attributed.
-- [ ] Sentinel and selected evidence share decode with bounded RSS and no raw-RGB store.
-- [ ] Derived geometry binds source/time, calibration digest, policy, resolution, exact bytes.
-- [ ] CPU and hardware adapters pass the same timestamp/artifact contract.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_mcap_single_pass.py tests/unit/test_pyav_interval_spool.py tests/unit/test_bounded_media.py tests/unit/test_canonical_media_quality.py tests/unit/test_media_quality_supplemental.py
-python -m pytest tests/integration/test_real_mcap_single_pass.py tests/integration/test_canonical_mcap_source.py
-~~~
-
-**Next boundary**
-
-P2 feeds sampling; P7 maps artifacts to R2; P8 measures hardware.
-
-### sampling-qa - P2/P3/P4: adaptive coverage and product projection
-
-**Result**
-
-Explainable base/coarse/dense/context sampling reduces expensive work while preserving
-complete 21-class clip projection.
-
-**Primary paths and entry points**
-
-- src/robata/sampling/adaptive.py, signals.py, grid.py, materializer.py
-- src/robata/qa_pipeline/fast_detector.py, coarse.py, dense.py, product.py
-- src/robata/application/canonical/media_quality_source_binding.py,
-  media_quality_supplemental.py, supplemental_qa_evidence.py, product_qa.py
-- tests/unit/test_sampling_adaptive.py, test_qa_pipeline_core.py, test_local_qa_product.py,
-  test_media_quality_supplemental.py, tests/integration/test_canonical_offline.py
-
-**Implementation outline**
-
-1. Keep base coverage and bounded pre/post context for every camera/clip.
-2. Map source-quality, uncertainty, cross-camera disagreement, event, and boundary reasons
-   to deterministic upgrades.
-3. Keep traditional CV as signal/trigger; full-frame context remains QA evidence.
-4. Treat ROI/undistorted/Egocentric views as supplemental until equivalence is proven.
-5. Project all 21 classes, warning marks, fail, abstained, and incomplete.
-
-**Keep intact**
-
-QA vocabulary, warning/fail semantics, clip times, provenance, and policy/version identity.
-
-**Done when**
-
-- [ ] Every eligible clip has deterministic 21-class projection.
-- [ ] Upgrades preserve timestamps/context.
-- [ ] Three or more policies have a quality/cost Pareto report.
-- [ ] Optional embedding/crop/geometry cannot block completion.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_sampling_adaptive.py tests/unit/test_qa_pipeline_core.py tests/unit/test_local_qa_product.py tests/unit/test_media_quality_supplemental.py
-python -m pytest tests/integration/test_canonical_offline.py
-~~~
-
-**Next boundary**
-
-P3 consumes call plans; P4 consumes QA/event facts.
-
-### event-semantics - P3/P4: evidence-bound event semantics
-
-**Result**
-
-Candidates, proposals, and boundary revisions remain evidence-bound, deterministic, and replayable.
-
-**Primary paths and entry points**
-
-- src/robata/event_pipeline/candidate.py, evidence.py, proposer.py, boundary_refinement.py
-- tests/unit/test_event_pipeline_core.py, test_event_projection_guards.py,
-  test_supplemental_temporal_package.py
-- tests/integration/test_canonical_action_event_revision.py
-
-**Implementation outline**
-
-1. Build candidates from base/coarse/dense facts and context triggers.
-2. Refine onset/offset locally while retaining upstream evidence and source timestamps.
-3. Preserve proposal/revision ordering; distinguish abstention from no-event.
-4. Coordinate identity changes with contract-governance and identity-delivery.
-
-**Keep intact**
-
-Event identity/revision formulas, temporal roles, evidence references, and replay order.
-
-**Done when**
-
-- [ ] Boundary events acquire pre/post context.
-- [ ] No unbound or duplicate revision is created.
-- [ ] Replay identities are identical.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_event_pipeline_core.py tests/unit/test_event_projection_guards.py tests/unit/test_supplemental_temporal_package.py
-python -m pytest tests/integration/test_canonical_action_event_revision.py
-~~~
-
-**Next boundary**
-
-P4 reduction and P5 completion.
-
-### inference-evidence - P3/P8: provider-neutral inference and replay
-
-**Result**
-
-Provider-neutral calls and evidence lineage are bounded and replayable; RunPod is a later
-qualified adapter, not a new canonical path.
-
-**Primary paths and entry points**
-
-- src/robata/inference/input_plan.py, preparation.py, orchestrator.py, evidence.py,
-  adapter.py, runpod.py
-- src/robata/adapters/sqlite_inference_evidence.py
-- tests/unit/test_inference_input_plan.py, test_inference_orchestrator.py,
-  test_sqlite_inference_evidence.py, test_runpod_adapter.py
-
-**Implementation outline**
-
-1. Keep call identity transport-independent and batch only compatible groups.
-2. Measure existing lifecycle connection/cache behavior before changing append granularity.
-3. Persist intent, raw, parsed, selection, lineage, retry, timeout, and partial failure.
-4. Pin provider model/version/engine/quantization/topology/limits/retry for P8.
-
-**Keep intact**
-
-Request identity, accepted lineage, raw responses, and single-request fallback.
-
-**Done when**
-
-- [ ] Delayed provider proves ordering, batch, timeout, retry, partial failure.
-- [ ] Remaining call-proportional connection/transaction work is attributed.
-- [ ] Real reports include queue/TTFT/E2E/tokens/retry/OOM/memory/utilization.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_inference_input_plan.py tests/unit/test_inference_orchestrator.py tests/unit/test_sqlite_inference_evidence.py tests/unit/test_runpod_adapter.py
-python -m pytest tests/integration/test_canonical_offline.py
-~~~
-
-**Next boundary**
-
-P3 canonical reduction; P8 real provider.
-
-### stream-control - P1/P5/P6/P7: durable scheduling and backpressure
-
-**Result**
-
-Local durable scheduling remains authoritative while bounded queues and a production broker
-preserve leases, fences, retries, DLQ, and backpressure.
-
-**Primary paths and entry points**
-
-- src/robata/queue/**
-- src/robata/adapters/sqlite_work_scheduler.py, sqlite_stream_work_ledger.py,
-  sqlite_stream_delivery.py, sqlite_barrier.py
-- src/robata/queue/redis_adapter.py
-- src/robata/application/canonical/durable_work.py, stream_scheduler.py,
-  stream_recording_reduction.py, parallel_service.py
-- tests/unit/test_barrier.py, test_sqlite_barrier.py, test_sqlite_work_scheduler.py,
-  test_stream_recording_reduction.py, test_redis_task_queue.py
-
-**Implementation outline**
-
-1. Keep source messages in memory until window/state transitions; batch append/plan/publish.
-2. Drain only newly ready work; reserve full scans for restart/reconciliation.
-3. Keep recording-affine bounded queues and explicit optional-work shedding.
-4. Add broker delivery only as a projection over the authoritative scheduler.
-
-**Keep intact**
-
-SQLite WAL same-host scope, work identities, lease/fence semantics, and locator independence.
-
-**Done when**
-
-- [ ] Transactions scale with windows/transitions, not messages.
-- [ ] Queue admission/rejection/retry/lease/DLQ/backlog metrics are deterministic.
-- [ ] Duplicate/delayed-ack/restart/stale-lease preserve terminal truth.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_barrier.py tests/unit/test_sqlite_barrier.py tests/unit/test_sqlite_work_scheduler.py tests/unit/test_stream_recording_reduction.py tests/unit/test_redis_task_queue.py
-python -m pytest tests/integration/test_canonical_local_command.py
-~~~
-
-**Next boundary**
-
-P1 source, P6 scaling, P7 broker.
-
-### identity-delivery - P5/P7: terminal completion and delivery
-
-**Result**
-
-One terminal result is durably completed, delivered, reviewed, and reconciled under crashes
-and duplicates.
-
-**Primary paths and entry points**
-
-- src/robata/adapters/sqlite_primary_completion.py, sqlite_event_identity_registry.py,
-  sqlite_outbox.py, sqlite_review_queue.py
-- src/robata/application/canonical/logical_nodes.py, primary_completion.py,
-  local_outbox_delivery.py, local_review_routing.py
-- src/robata/admission/**, src/robata/review/**
-- tests/unit/test_event_identity_registry.py, test_admission_ledgers.py, test_review_routing.py,
-  test_redis_outbox.py
-- tests/integration/test_sqlite_primary_completion.py, tests/integration/test_sqlite_outbox_relay.py,
-  tests/integration/test_canonical_local_review_routing.py
-
-**Implementation outline**
-
-1. Carry prevalidated bytes/digests/identities/evidence into completion.
-2. Replace repeated scans only with incremental seal/run verification; retain offline audit.
-3. Exercise crash-before/after commit, timeout, stale lease, duplicate and different-bytes.
-4. Map production delivery only after local recovery proof.
-
-**Keep intact**
-
-Logical/revision identity, command bytes, terminal meaning, outbox idempotency, review routing.
-
-**Done when**
-
-- [ ] Fresh/replay terminal/result/outbox/review digests are identical.
-- [ ] Crash/duplicate creates no lost or duplicate terminal.
-- [ ] Completion spans are attributed and improved without weaker durability.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_event_identity_registry.py tests/unit/test_admission_ledgers.py tests/unit/test_review_routing.py tests/unit/test_redis_outbox.py
-python -m pytest tests/integration/test_sqlite_primary_completion.py tests/integration/test_sqlite_outbox_relay.py tests/integration/test_canonical_local_review_routing.py
-~~~
-
-**Next boundary**
-
-P6 parallel service; P7 production delivery.
-
-### canonical-integration - P1/P4/P5/P6/P9/P10: canonical composition and closure
-
-**Result**
-
-The canonical runner advances source, stream, media, QA, event, inference, completion, and
-retrieval deterministically with explicit local/external adapters.
-
-**Primary paths and entry points**
-
-- src/robata/application/canonical/{runner,runner_support,local_composition,result_validation,
-  models,projections,reduction,output_admission,boundary_windows,mcap_source,durable_work,
-  primary_completion,logical_nodes,pre_eos_execution}.py
-- src/robata/application/canonical_offline.py
-- tests/unit/test_canonical_offline_reducer.py, test_canonical_run_membership.py,
-  test_canonical_offline_call_part_concurrency.py
-- tests/integration/test_canonical_offline.py, tests/integration/test_canonical_local_command.py
-
-**Implementation outline**
-
-1. Make the graph explicit: integrity -> media/sentinel -> adaptive evidence -> provider
-   inference -> QA/event reduction -> completion/outbox/review.
-2. Execute eligible windows pre-EOS while EOS remains authoritative and replayable.
-3. Turn degraded provider/source input into explicit abstention/incomplete, never false success.
-4. Index retrieval only after terminal closure; indexing failure cannot reopen QA completion.
-
-**Keep intact**
-
-Stage ordering, reduction determinism, compatibility facades, replay equivalence, terminal semantics.
-
-**Done when**
-
-- [ ] Fresh/replay/restart/duplicate-window converge to one graph.
-- [ ] Provider failure and incomplete source facts are visible.
-- [ ] Retrieval cannot block or rewrite QA/event completion.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_canonical_offline_reducer.py tests/unit/test_canonical_run_membership.py tests/unit/test_canonical_offline_call_part_concurrency.py
-python -m pytest tests/integration/test_canonical_offline.py tests/integration/test_canonical_local_command.py
-~~~
-
-**Next boundary**
-
-P5/P6 consume terminals; P9 consumes closed events; P10 qualifies assembly.
-
-### qualification-ops - P0/P2/P6/P8/P10: measurement and production qualification
-
-**Result**
-
-Every profile states workload, evidence class, hardware/provider, units, quality, resources,
-costs, and unresolved gaps.
-
-**Primary paths and entry points**
-
-- src/robata/runtime/{capacity,canonical_profile,benchmark,local_streaming_benchmark}.py
-- src/robata/benchmark/{metrics,pareto,splits,promotion,qualification,provider_qualification,evidence}.py
-- tests/unit/test_runtime_capacity.py, test_canonical_profile.py, test_benchmark.py,
-  test_benchmark_qualification.py, test_provider_qualification.py
-- tests/unit/test_representative_production_qualification.py,
-  tests/integration/test_canonical_recovery_qualification_evidence.py
-
-**Implementation outline**
-
-1. Use one profile schema for fresh/replay and local/representative/external evidence;
-   report recording-hours and camera-hours separately.
-2. Attribute demux, decode, resize/colorspace, CV, encoding, hashing, SQLite, provider,
-   completion, delivery, queue, and backlog.
-3. Produce Pareto reports for sampling, geometry, provider batching, workers, and shedding.
-4. Keep production_eligible false until external gates pass.
-
-**Keep intact**
-
-Evidence labels, denominator-safe capacity math, split/leakage rules, and NOT_MEASURED.
-
-**Done when**
-
-- [ ] Fresh and replay cannot be confused.
-- [ ] Claims include workload/config/hardware/duration and before/after timing.
-- [ ] Quality/capacity/reliability/I/O/token/cost axes appear together.
-
-**Run locally**
-
-~~~powershell
-python -m pytest tests/unit/test_runtime_capacity.py tests/unit/test_canonical_profile.py tests/unit/test_benchmark.py tests/unit/test_benchmark_qualification.py tests/unit/test_provider_qualification.py
-python -m pytest tests/unit/test_local_streaming_benchmark.py tests/unit/test_representative_production_qualification.py
-~~~
-
-**Next boundary**
-
-P8-P10 and external review.
+Every phase in this cycle crosses a contract or evidence boundary, so the implementable
+details are collected under `Cross-Module Phases`. This map identifies the module card to
+read before dispatch.
+
+| Module | Phases | Primary responsibility |
+| --- | --- | --- |
+| `contract-governance` | P0,P9,P14,P15 | version/migration decisions, schema/catalog proof, adapter contracts |
+| `source-media` | P2,P4,P5,P15 | decode, artifact durability, encoding, media parity |
+| `sampling-qa` | P5,P9,P10,P12,P13,P15 | complete QA, calibration consumption, sampling, quality metrics |
+| `event-semantics` | P10,P11,P12,P15 | event merge/association, temporal and boundary semantics |
+| `inference-evidence` | P5,P6,P9,P15 | input identity, provider envelopes, ledger/replay, calibration lineage |
+| `stream-control` | P1,P7,P8,P15 | transactions, durable work concurrency, backpressure, recovery |
+| `identity-delivery` | P3,P11,P13,P15 | immutable completion, event identity, review selection and delivery |
+| `canonical-integration` | P2,P3,P7,P10,P11,P14,P15 | cross-module composition, replay, validation, end-to-end proof |
+| `qualification-ops` | P0,P1,P4,P6,P8-P15 | profiles, benchmark context, promotion and qualification evidence |
 
 ## Cross-Module Phases
 
-### P0 - Contract, workload, and evidence truth
+### P0 - Freeze Measurement and Contract Truth
 
-**Participating modules:** contract-governance, qualification-ops
+**Participating modules:** `qualification-ops`, `contract-governance`
 
-**End-to-end result:** Every timing/quality claim identifies source, schema, policy, provider,
-hardware, workload, and evidence class.
+**End-to-end result:** Every later optimization compares against a reproducible, correctly
+named baseline and declares its identity/schema impact before implementation.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| contract-governance | Scope digest, schema/identity baseline, seam versions | schemas/**, contracts/**, ports/** | catalog/immutability |
-| qualification-ops | Workload fingerprint, fresh/replay profile, units/counters | runtime/**, benchmark/** | profile/capacity |
+| `qualification-ops` | Separate fresh profile from actual-local-mock smoke and bind workload context | `src/robata/runtime/local_streaming_benchmark.py`, `local_streaming_smoke.py`, `canonical_profile.py` | runtime/profile tests |
+| `contract-governance` | Record affected schema, identity, hash, and migration decisions | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema immutability tests |
 
 **Implementation outline**
 
-1. Record source duration, six-camera load, frame counts, bytes, images/calls/tokens,
-   CPU/GPU/NVMe, queues, and terminals.
-2. Digest code, catalog, policies, and workload; date historical snapshots.
-3. Never promote local fixtures or old smoke snapshots to production evidence.
+1. Freeze commit, catalog digest, fixtures, policies, provider mode, hardware, warm/cold
+   state, and repeated-run method.
+2. Report fresh source-time ratio in wall-sec/source-sec and throughput in
+   rec-sec/wall-sec as separate surfaces.
+3. Capture stage wall time, transactions by operation, I/O, queue/backlog, provider calls,
+   artifacts, and completion time without summing parent/child spans.
+4. Create an identity-impact register for P1-P15; unresolved changes block their phase.
 
-**Compatibility notes:** No existing wire change; report scope is internal or registered.
+**Keep intact**
 
-**Combined proof**
+Existing typed report modes and statuses. `ACTUAL_LOCAL_MOCK` is not virtual simulation or
+production capacity.
+
+**Done when**
+
+- [ ] Fresh and smoke artifacts reproduce from documented commands.
+- [ ] Units, workload, provider mode, authority, and qualification status are explicit.
+- [ ] P1-P15 each has a recorded contract decision or `no contract change` result.
+- [ ] No projected multiplier appears as measured evidence.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_register_schema.py tests/unit/test_schema_immutability.py tests/unit/test_runtime_capacity.py tests/unit/test_canonical_profile.py tests/unit/test_benchmark.py
+python -m pytest tests/unit/test_local_streaming_benchmark.py tests/unit/test_local_streaming_smoke.py
+python -m pytest tests/unit/test_canonical_profile.py tests/unit/test_runtime_capacity.py tests/unit/test_benchmark_qualification.py
+python -m pytest tests/unit/test_schema_immutability.py tests/contract/test_schema_release_policy.py
 ~~~
 
-### P1 - Source single-pass and durable stream spine
+**Next boundary:** P1-P14 consume the frozen measurement and identity context.
 
-**Participating modules:** source-media, stream-control, canonical-integration
+### P1 - Profile and Bound SQLite Transactions
 
-**End-to-end result:** MCAP is traversed once into verified authority while work is emitted at
-bounded window transitions, not per source message.
+**Participating modules:** `stream-control`, `qualification-ops`, `canonical-integration`
+
+**End-to-end result:** Remaining SQLite cost is attributed by authority and operation;
+only measured, same-authority batch or connection changes proceed.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| source-media | H264 spools and packet/timestamp/decode facts | mcap_source.py, single_pass_video.py, mcap_single_pass.py | mcap/source tests |
-| stream-control | batch append/plan/publish and indexed lookup | sqlite_work_scheduler.py, sqlite_stream_work_ledger.py, stream_scheduler.py | scheduler tests |
-| canonical-integration | source-to-stream recovery bridge | local_composition.py, durable_work.py | canonical local command |
-
-**Compatibility notes:** Preserve leases, fences, idempotency, window/work identities, and
-local SQLite recovery.
-
-**Combined proof**
-
-~~~powershell
-python -m pytest tests/unit/test_mcap_single_pass.py tests/unit/test_sqlite_work_scheduler.py tests/unit/test_stream_recording_reduction.py
-python -m pytest tests/integration/test_canonical_mcap_source.py tests/integration/test_canonical_local_command.py
-~~~
-
-### P2 - Feed-once media, traditional CV, and optional geometry
-
-**Participating modules:** source-media, sampling-qa, qualification-ops
-
-**End-to-end result:** One decode supplies structural/visual facts and bounded artifacts;
-signals reduce provider work without hiding source evidence.
-
-**Change map**
-
-| Module | Expected contribution | Key paths | Local check |
-| --- | --- | --- | --- |
-| source-media | Feed-once decode, sentinel facts, and versioned derived geometry | mcap_source.py, bounded_media.py, media_quality.py, artifact_registry.py | media/lineage tests |
-| sampling-qa | Deterministic coverage, upgrade triggers, and class projection | sampling/adaptive.py, signals.py, qa_pipeline/** | sampling/QA tests |
-| qualification-ops | I/O, RSS, provider-amplification, and Pareto measurements | runtime/**, benchmark/** | media/adaptive profile |
+| `stream-control` | Transaction, lock, retry, and rollback observability | `src/robata/adapters/sqlite_work_scheduler.py`, `sqlite_stream_work_ledger.py`, `sqlite_stream_delivery.py` | scheduler transaction tests |
+| `canonical-integration` | Preserve pending/succeed/accept recovery boundaries | `src/robata/application/canonical/stream_scheduler.py` | composition/recovery tests |
+| `qualification-ops` | Compare operation counts and wall time on frozen workload | `src/robata/runtime/canonical_profile.py` | profile tests |
 
 **Implementation outline**
 
-1. Run raw structural checks before correction.
-2. Compute low-resolution black/freeze/exposure/edge/blur/motion/scene facts in the current
-   observer; add lens/geometry triggers only as supplemental facts.
-3. Apply fisheye/perspective/Egocentric views only to selected windows/model inputs with
-   cached maps and deterministic pass-through.
-4. Bind derived frame IDs to source/time, calibration digest, policy, resolution, exact bytes.
-5. Compare baseline, sentinel-only, and selective-geometry quality/cost/I/O/RSS policies.
+1. Baseline existing `append_windows`, `plan_many`, `mark_published_many`, and atomic
+   window-reduction delivery rather than reimplementing them.
+2. Measure connection setup, lock wait, transaction duration, fsync, row count, retry, and
+   rollback per stable operation name.
+3. Select at most one proven bottleneck for connection residency, prepared statements, or
+   a writer queue; document thread/process ownership and acknowledgement timing.
+4. Test in-process and multi-process contention before changing `busy_timeout`.
 
-**Compatibility notes:** Keep media-quality v1 proxy fields; new published semantic fields
-require registration. Full-frame context and raw authority remain mandatory.
+**Keep intact**
 
-**Combined proof**
+Pending-terminal crash intent, exact conflict detection, leases, fences, row-version CAS,
+and same-database atomic publication.
+
+**Done when**
+
+- [ ] Existing batch operations have explicit baseline counts.
+- [ ] The chosen change reduces measured cost on the frozen workload.
+- [ ] Crash injection passes before and after every commit boundary.
+- [ ] Provider and media work never runs inside a SQLite transaction.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_canonical_media_quality.py tests/unit/test_sampling_adaptive.py tests/unit/test_media_quality_supplemental.py
+python -m pytest tests/unit/test_sqlite_work_scheduler.py tests/unit/test_sqlite_stream_work_ledger.py
+python -m pytest tests/unit/test_stream_scheduler_composition.py tests/integration/test_canonical_local_command.py
+~~~
+
+**Next boundary:** P7 uses the proven write/claim envelope for concurrent execution.
+
+### P2 - Publish Artifacts Behind a Durability Barrier
+
+**Participating modules:** `source-media`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** Batching writes or fsync cannot leave a committed manifest or
+terminal referencing volatile or missing bytes.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `source-media` | Staging, hash verification, flush, directory sync, atomic exposure | `src/robata/adapters/pyav_frame_materializer.py`, `src/robata/adapters/local_artifact_registry.py` | artifact/media tests |
+| `canonical-integration` | Commit authority only after durable publication | `src/robata/application/canonical/runner.py`, `mcap_source.py` | canonical MCAP tests |
+| `qualification-ops` | Fault points and fsync/write profile | `src/robata/benchmark/media_qualification.py` | media qualification tests |
+
+**Implementation outline**
+
+1. Define the publication unit and promised durability model for each supported filesystem.
+2. Stage files, verify byte count and exact hash, flush and `fsync` each file, then sync the
+   staging directory.
+3. Atomically rename the complete publication, sync the destination parent directory, and
+   only then commit database authority that references it.
+4. Reconcile abandoned staging, missing final files, partial publication, and corruption.
+5. Introduce bounded batching only after the barrier and fault model are tested.
+
+**Keep intact**
+
+Exact-byte identity and artifact lineage. A hash proves content, not persistence; the stream
+pending-terminal protocol is not substituted for media durability.
+
+**Done when**
+
+- [ ] Every crash point produces either no visible publication or a complete durable one.
+- [ ] Restart reconciliation is idempotent and detects corruption.
+- [ ] No committed authority references transient tmpfs-only bytes.
+- [ ] Before/after write, fsync, latency, and end-to-end measurements are recorded.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_local_artifact_registry_observability.py tests/unit/test_staged_registered_video_export.py
+python -m pytest tests/integration/test_canonical_mcap_source.py tests/unit/test_media_qualification.py
+~~~
+
+**Next boundary:** P4 and P5 publish new backend/encoding artifacts through this barrier.
+
+### P3 - Profile Completion Root Construction
+
+**Participating modules:** `identity-delivery`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** Proven completion overhead is reduced without mutable v3 records or
+a changed ordered-collection digest formula.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `identity-delivery` | Preserve immutable v3 persistence | `src/robata/adapters/sqlite_primary_completion.py`, `src/robata/contracts/primary_completion.py` | completion contract tests |
+| `canonical-integration` | Profile sort/serialize/hash/artifact/commit scopes | `src/robata/application/canonical/primary_completion.py` | completion integration tests |
+| `qualification-ops` | Size-stratified completion report | `src/robata/runtime/canonical_profile.py` | profile tests |
+
+**Implementation outline**
+
+1. Attribute sorting, serialization, collection-root hashing, schema validation, artifact
+   persistence, and database commit separately.
+2. If leaf preparation is material, spool digests in each collection's exact existing
+   canonical order. External sorting is allowed only by the existing canonical collection
+   key, never by digest bytes.
+3. Continue passing the complete ordered digest list to
+   `canonical_collection_digest_root` for v3.
+4. Treat any subtree-root algorithm or placeholder/backfill model as a new versioned design.
+
+**Keep intact**
+
+All eleven required count/root pairs, synchronous semantic validation, immutable table
+triggers, and complete publication before outbox use.
+
+**Done when**
+
+- [ ] A profile proves which completion sub-scope is material.
+- [ ] Zero, large, duplicate, and ordering cases reproduce current v3 roots exactly.
+- [ ] Restart and artifact-write failures cannot publish partial completion.
+- [ ] Any new root formula has a separate approved schema/projection migration phase.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/contract/test_primary_completion_contract.py
+python -m pytest tests/integration/test_sqlite_primary_completion.py tests/unit/test_canonical_profile.py
+~~~
+
+**Next boundary:** P15 consumes unchanged completion semantics and measured cost.
+
+### P4 - Qualify Target Decode and Layered Media Reuse
+
+**Participating modules:** `source-media`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** A real target decode implementation is selectable behind the
+existing port, and reuse removes only duplication proven in the canonical path.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `source-media` | Target backend, explicit fallback, layer-specific cache keys | `src/robata/adapters/nvdec_backend.py`, `nvdec_frame_materializer.py`, `nvdec_video_export.py`, `src/robata/frame_cache.py` | NVDEC/media unit tests |
+| `canonical-integration` | Correct backend selection and publication ordering | `src/robata/application/canonical/mcap_source.py` | MCAP integration tests |
+| `qualification-ops` | Codec/timestamp/artifact/resource parity matrix | `src/robata/benchmark/media_qualification.py` | media qualification tests |
+
+**Implementation outline**
+
+1. Profile decode, selection, encode, cache lookup, and package binding separately; do not
+   assume overlapping windows cause repeated decode.
+2. Implement the real backend behind the existing target interface and define supported
+   codec/profile/resolution combinations.
+3. Record media runtime provenance separately from inference `CapabilitySnapshot`.
+4. Define raw-frame, encoded-artifact, and manifest cache equivalence independently.
+5. Permit fallback only before dependent publication and record its reason.
+
+**Keep intact**
+
+Whole-MCAP identity, derived spool identity, frame/package/input-plan identities, source
+timestamps, and the P2 durability barrier. Changed derived bytes require parity or versioning.
+
+**Done when**
+
+- [ ] Local fake-target and fallback paths pass malformed-input and restart tests.
+- [ ] Target matrix reports timestamp, selected-frame, dimension, exact-byte, and semantic parity.
+- [ ] Cache hit/miss, memory, eviction, cleanup, and corruption behavior are bounded.
+- [ ] Target throughput/resource claims stay `NOT_MEASURED` until real hardware runs.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_nvdec_media_adapters.py tests/unit/test_media_qualification.py
+python -m pytest tests/unit/test_mcap_single_pass.py tests/integration/test_canonical_mcap_source.py
+~~~
+
+**Next boundary:** P5 consumes the media policy boundary; P15 consumes target evidence.
+
+### P5 - Evaluate a Versioned Alternate Encoding Policy
+
+**Participating modules:** `source-media`, `sampling-qa`, `inference-evidence`, `contract-governance`
+
+**End-to-end result:** PNG and experimental JPEG paths can be compared without silently
+changing package, provider-input, or Product QA semantics.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `source-media` | Opt-in encoder policy and exact provenance | `src/robata/adapters/pyav_frame_materializer.py`, `src/robata/application/canonical/mcap_source.py` | MCAP/media tests |
+| `sampling-qa` | Update PNG-only validation only under approved policy | `src/robata/qa_pipeline/supplemental.py` | QA pipeline tests |
+| `inference-evidence` | Bind media type/bytes/config into input plan and replay | `src/robata/inference/input_plan.py` | input-plan tests |
+| `contract-governance` | Decide policy-only change versus new published version | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema tests |
+
+**Implementation outline**
+
+1. Record a P0 contract decision before adding JPEG to any canonical policy.
+2. Pin the encoder implementation and version, quality, chroma, resize, color conversion,
+   and metadata.
+3. Keep PNG as default while the alternate path is an explicit experiment.
+4. Verify provider acceptance and exact request recording/replay.
+5. Compare actual selected-frame sizes plus per-class QA/event/boundary outcomes.
+
+**Keep intact**
+
+Source identity does not authorize reuse of changed derived bytes. Artifact, package, and
+input-plan identities must reflect encoding differences.
+
+**Done when**
+
+- [ ] Every PNG-only producer, validator, consumer, fixture, and error path is enumerated.
+- [ ] Opt-in encoding has complete provenance and deterministic replay behavior.
+- [ ] Representative parity criteria are signed before any default change.
+- [ ] Speed, size, quality, and end-to-end deltas are reported independently.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_inference_input_plan.py tests/unit/test_qa_pipeline_core.py
 python -m pytest tests/integration/test_canonical_mcap_source.py tests/integration/test_canonical_offline.py
+python -m pytest tests/unit/test_schema_immutability.py
 ~~~
 
-### P3 - Adaptive provider-neutral QA/event cascade
+**Next boundary:** P6 consumes the exact provider media envelope; P15 decides promotion.
 
-**Participating modules:** sampling-qa, event-semantics, inference-evidence, canonical-integration
+### P6 - Qualify Stream-Safe Provider Concurrency, Client Microbatching, and Native Batch Envelopes
 
-**End-to-end result:** Base/coarse/dense/context/event work is one provider-neutral,
-lineage-complete execution graph.
+**Participating modules:** `inference-evidence`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** Single, concurrent-single, bounded client-microbatch, and native-batch
+modes have explicit wire/replay semantics and a measured provider capacity/latency/cost envelope
+without turning the recording stream into a recording-wide batch job. Compatible ready invocations
+may share one bounded dispatch envelope while their identities, terminal outcomes, and evidence stay separate.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| sampling-qa | coverage/upgrade and coarse/dense evidence | sampling/adaptive.py, qa_pipeline/coarse.py, dense.py | QA tests |
-| event-semantics | candidate/proposal/boundary evidence | event_pipeline/** | event tests |
-| inference-evidence | intent/raw/parsed/selection/retry | inference/**, sqlite_inference_evidence.py | inference tests |
-| canonical-integration | stage order and pre-EOS execution | runner.py, pre_eos_execution.py, local_stream_finalization.py | delayed-provider |
-
-**Compatibility notes:** Batching changes grouping only, not call identity, lineage, event identity,
-or terminal semantics.
-
-**Combined proof**
-
-~~~powershell
-python -m pytest tests/unit/test_sampling_adaptive.py tests/unit/test_qa_pipeline_core.py tests/unit/test_event_pipeline_core.py tests/unit/test_inference_orchestrator.py tests/unit/test_sqlite_inference_evidence.py
-python -m pytest tests/integration/test_canonical_offline.py tests/integration/test_pre_eos_factory_wiring.py
-~~~
-
-### P4 - Complete 21-class and event closure
-
-**Participating modules:** sampling-qa, event-semantics, canonical-integration
-
-**End-to-end result:** Complete clip QA and evidence-bound event revisions exist for eligible
-input, including explicit abstention/incomplete.
-
-**Change map**
-
-| Module | Expected contribution | Key paths | Local check |
-| --- | --- | --- | --- |
-| sampling-qa | 21-class projection with warning/fail/abstained/incomplete states | qa_pipeline/product.py, application/canonical/product_qa.py | QA product tests |
-| event-semantics | Candidate boundaries, proposals, revisions, and evidence references | event_pipeline/** | event guard tests |
-| canonical-integration | Deterministic reduction and canonical result admission | canonical/reduction.py, projections.py, runner.py | canonical offline tests |
+| `inference-evidence` | Envelope, item association, failure isolation, evidence closure | `src/robata/inference/orchestrator.py`, `runpod.py`, `sqlite_inference_evidence.py` | RunPod/orchestrator tests |
+| `canonical-integration` | Bounded call-part concurrency and replay | `src/robata/application/canonical/parallel_service.py`, `runner.py` | call-part concurrency tests |
+| `qualification-ops` | Concurrency/batch/latency/error/token/cost matrix | `src/robata/benchmark/**` | benchmark tests |
 
 **Implementation outline**
 
-1. Preserve 21 classes, warning marks, whole-recording fail semantics, and exact times.
-2. Distinguish no-event, abstained, incomplete, warning, and fail.
-3. Refine candidate-local boundaries and add signed thresholds only after governed labels.
+1. Baseline the local canonical composition defaults: 8-item/5 ms client microbatching and
+   6-call-part concurrency, with explicit single-request and concurrency controls. A microbatch
+   contains only independently ready, compatibility-key-matched requests and flushes on its item
+   limit or configured delay from its first queued item. Queued cancellation removes only that
+   member; cancellation after provider dispatch settles against the resulting item outcome. It
+   never waits for recording EOS or a recording-wide batch.
+2. Enable native batches only for an endpoint handler that declares exact support and passes
+   the streaming wait/deadline gate; otherwise retain single or concurrent-single dispatch.
+3. Record/replay the exact HTTP request form and associate each item with its own evidence.
+4. Test partial, out-of-order, duplicate, malformed, timeout, and retry outcomes.
+5. Measure prefix caching only under the deployed server/model/prompt configuration.
 
-**Compatibility notes:** No new result meaning without schema/version decision; ROI/corrected
-views remain supplemental until representative equivalence.
+**Keep intact**
 
-**Combined proof**
+Logical invocation identity, per-request evidence, selection/terminal ownership, accepted-call
+closure, and streaming progress. Cross-invocation result, cache, and evidence reuse, plus
+recording-wide accumulation, are outside the current contract; sharing a bounded HTTP envelope
+never merges logical invocation identity or item evidence.
+
+**Done when**
+
+- [ ] All three modes pass exact replay and item-association tests.
+- [ ] Native batch remains opt-in until representative endpoint evidence passes.
+- [ ] Batch formation is bounded by count and queue-delay gates, never recording completion.
+- [ ] Failed items cannot adopt successful sibling evidence.
+- [ ] The selected operating point states throughput, p95/p99, errors, and cost.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_local_qa_product.py tests/unit/test_event_projection_guards.py tests/unit/test_supplemental_temporal_package.py
-python -m pytest tests/integration/test_canonical_offline.py tests/integration/test_canonical_action_event_revision.py
+python -m pytest tests/unit/test_runpod_adapter.py tests/unit/test_inference_orchestrator.py
+python -m pytest tests/unit/test_sqlite_inference_evidence.py tests/unit/test_inference_input_plan.py
+python -m pytest tests/unit/test_inference_microbatch.py
+python -m pytest tests/unit/test_canonical_offline_call_part_concurrency.py
 ~~~
 
-### P5 - Durable terminal truth and recovery
+**Next boundary:** P7 uses the measured provider concurrency limit; P15 reruns on real hardware.
 
-**Participating modules:** identity-delivery, stream-control, canonical-integration
+### P7 - Execute Ready Durable Work Concurrently
 
-**End-to-end result:** Pre-EOS/EOS, completion, outbox, review, and replay produce one graph
-under crash, retry, duplicate, and lease expiry.
+**Participating modules:** `stream-control`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** Stage-affine workers increase overlap by claiming durable ready work,
+without replacing authority with in-memory queues or inventing cross-window dependencies.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| identity-delivery | Terminal completion, outbox, review, and identity equality | primary_completion.py, sqlite_primary_completion.py, sqlite_outbox.py | completion/outbox tests |
-| stream-control | Leases, fences, barriers, retry/DLQ, and recovery inputs | durable_work.py, sqlite_work_scheduler.py, sqlite_barrier.py | scheduler/recovery tests |
-| canonical-integration | Pre-EOS/EOS closure and crash/replay orchestration | pre_eos_execution.py, local_stream_finalization.py | recovery integration |
+| `stream-control` | Concurrent claims, leases, fences, terminal acceptance | `src/robata/application/canonical/stream_scheduler.py`, `src/robata/adapters/sqlite_work_scheduler.py` | scheduler tests |
+| `canonical-integration` | Bounded executor pools and deterministic finalization | `src/robata/application/canonical/local_stream_finalization.py`, `parallel_service.py` | integration tests |
+| `qualification-ops` | Stage queue-wait/execution/backlog profile | `src/robata/runtime/canonical_profile.py` | profile tests |
 
 **Implementation outline**
 
-1. Carry prevalidated bytes/digests/evidence into completion.
-2. Replace scans only with incremental seal/run verification; keep offline audit.
-3. Inject crash-before/after commit, timeout, stale lease, duplicate window/outbox, and
-   different-bytes conflicts.
-4. Keep optional/degraded branches non-blocking and explicit.
+1. Instrument actual executor work rather than assigning guessed CPU/GPU roles to stage names.
+2. Add one bounded worker per measured stage/executor, then tune only bottleneck pools.
+3. Use in-memory queues only after durable claim and retain durable terminal acceptance.
+4. Preserve the existing per-window DAG; add no window-N to window-N+1 edge.
+5. Exercise randomized completion, expiry, duplicates, crash/restart, and EOS races.
 
-**Compatibility notes:** Logical keys, fences, exact bytes, outbox IDs, review routing, and
-terminal status meaning stay unchanged.
+**Keep intact**
 
-**Combined proof**
+Plans, readiness, dependency semantics, leases/fences, pending terminals, closure, and one
+finalization after EOS.
+
+**Done when**
+
+- [ ] Concurrency one exactly reproduces the prior result.
+- [ ] Higher concurrency reproduces semantic results under randomized ordering.
+- [ ] Memory and backlog remain bounded under overload.
+- [ ] Before/after stage and end-to-end profiles use the P0 workload.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_sqlite_work_scheduler.py tests/unit/test_local_stream_finalization.py tests/unit/test_review_routing.py
-python -m pytest tests/integration/test_sqlite_primary_completion.py tests/integration/test_sqlite_outbox_relay.py tests/integration/test_canonical_recovery_qualification_evidence.py
+python -m pytest tests/unit/test_stream_scheduler_composition.py tests/unit/test_bounded_stream_work_queues.py
+python -m pytest tests/unit/test_sqlite_work_scheduler.py tests/integration/test_canonical_local_command.py
 ~~~
 
-### P6 - Recording-level parallelism and bounded backpressure
+**Next boundary:** P8 controls the proven concurrent executor; P15 measures integrated capacity.
 
-**Participating modules:** canonical-integration, stream-control, qualification-ops
+### P8 - Feed Measured Signals into Restart-Safe Backpressure
 
-**End-to-end result:** Recording-affine workers share bounded provider capacity, shed optional
-work in a stated order, and expose saturation/backlog.
+**Participating modules:** `stream-control`, `canonical-integration`, `qualification-ops`
+
+**End-to-end result:** Admission and concurrency limits respond to measured queue/provider
+conditions through one observable, bounded controller whose state survives restart.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| canonical-integration | Recording worker lifecycle, admission, cancellation, and drain | parallel_service.py, runner.py, local_composition.py | parallel-service tests |
-| stream-control | Bounded queues, lease renewal, backpressure, and shedding | queue/**, stream_scheduler.py, durable_work.py | queue/scheduler tests |
-| qualification-ops | 1/2/4-worker profiles, saturation, and sizing math | runtime/local_streaming_benchmark.py, runtime/capacity.py | capacity profile |
+| `stream-control` | Rate observations, decisions, ownership, persisted controller state | `src/robata/queue/backpressure.py`, `src/robata/queue/stream_runtime.py`, `src/robata/adapters/sqlite_work_scheduler.py`, `src/robata/adapters/sqlite_stream_work_ledger.py` | queue/scheduler tests |
+| `canonical-integration` | Supply real scheduler metrics and enforce timing-only actions | `src/robata/application/canonical/stream_scheduler.py` | stream composition tests |
+| `qualification-ops` | Arrival/service/backlog/utilization stability report | `src/robata/runtime/observability.py`, `src/robata/runtime/benchmark.py`, `src/robata/runtime/capacity.py`, `src/robata/runtime/canonical_profile.py` | capacity/profile tests |
 
 **Implementation outline**
 
-1. One recording per CPU/NVMe worker; never share SQLite WAL over network storage.
-2. Measure 1/2/4 workers; separate media/provider/completion/outbox concurrency.
-3. Verify admission, rejection, cancellation, lease recovery, backlog drain, and shedding.
-4. Convert measured throughput to deployment sizing, not production qualification.
+1. Baseline the fixed P7 limits under steady, burst, overload, provider-quota, and drain
+   workloads before introducing an adaptive limit.
+2. Define observation windows and clock semantics for arrivals, accepted terminals, queue
+   age/depth, backlog slope, provider quota, and worker utilization. Unknown rates must not
+   be silently supplied as zero. The current `QueueMetrics` fields are non-negative;
+   a signed drain slope requires a versioned model rather than overloading zero.
+3. Persist policy version, owner/fence, current limit, last decision, and sufficient sample
+   state for deterministic restart; use one controller owner per declared provider/partition.
+4. Start with a measured fixed limit. If AIMD is selected, specify minimum/maximum, increase
+   and decrease rules, cooldown/hysteresis, restart value, quota response, and recording
+   fairness before enabling it.
+5. Keep shedding actions operational. Any action that changes sampling or result semantics
+   is dispatched through P10 with a new policy/identity decision.
 
-**Compatibility notes:** Process topology and queue locators are not canonical identity.
+**Keep intact**
 
-**Combined proof**
+Durable ledger authority, leases, fences, terminal acceptance, per-recording fairness, and
+logical identities. Runtime timing and transient utilization do not enter result identity.
+
+**Done when**
+
+- [ ] Default snapshots no longer present unknown rate/quota signals as measured zeros.
+- [ ] Identical persisted state and observations reproduce the same decision after restart.
+- [ ] Multi-process ownership, quota changes, overload, oscillation, fairness, and drain pass.
+- [ ] The adaptive controller beats or matches the fixed baseline without semantic drift.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_local_streaming_benchmark.py tests/unit/test_runtime_capacity.py tests/unit/test_canonical_parallel_service.py
+python -m pytest tests/unit/test_bounded_stream_work_queues.py tests/unit/test_stream_scheduler_composition.py
+python -m pytest tests/unit/test_sqlite_work_scheduler.py tests/unit/test_runtime_capacity.py
 python -m pytest tests/integration/test_canonical_local_command.py
 ~~~
 
-### P7 - R2 artifact and broker/outbox boundaries
+**Next boundary:** P15 uses the selected stable controller and its backlog evidence.
 
-**Participating modules:** contract-governance, source-media, stream-control, identity-delivery
+### P9 - Establish an Auditable Product QA Calibration Bridge
 
-**End-to-end result:** Object and delivery services implement existing ports without changing
-artifact lineage, scheduler authority, completion, or outbox semantics.
+**Participating modules:** `sampling-qa`, `inference-evidence`, `contract-governance`,
+`qualification-ops`
+
+**End-to-end result:** Calibrated scores, when applicable, are traceable to a frozen
+calibration artifact and cannot silently change Product QA decisions or published meaning.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| contract-governance | Versioned object/broker ports and locator contracts | contracts/**, ports/**, schemas/** | contract/release tests |
-| source-media | Exact-byte blob-first publication and artifact reconciliation | ports/artifact_registry.py, frame_cache.py | artifact registry tests |
-| stream-control | Broker projection for leases, fences, retry, DLQ, and stale acknowledgements | queue/redis_adapter.py, sqlite_stream_delivery.py | queue/reconciliation tests |
-| identity-delivery | Idempotent outbox/review delivery and duplicate handling | sqlite_outbox.py, local_outbox_delivery.py, local_review_routing.py | outbox/review tests |
+| `sampling-qa` | Consume applicable calibration without conflating raw/model/policy scores | `src/robata/qa_pipeline/aggregate.py`, `src/robata/qa_pipeline/product.py`, `src/robata/application/canonical/product_qa.py`, `src/robata/contracts/qa.py` | QA pipeline/product tests |
+| `inference-evidence` | Calibration artifact lineage on provider-neutral evidence | `src/robata/contracts/confidence.py`, `src/robata/inference/enrichment.py`, `src/robata/inference/models.py`, `src/robata/inference/orchestrator.py` | inference evidence tests |
+| `contract-governance` | Decide inference-only reuse versus a new Product QA/detail version | `schemas/v1/model-inference.schema.json`, `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema release tests |
+| `qualification-ops` | Leakage-safe fit/evaluation and per-class reports | `src/robata/benchmark/metrics.py`, `src/robata/benchmark/qualification.py`, `src/robata/benchmark/splits.py` | metrics/split tests |
 
 **Implementation outline**
 
-1. R2 uses versioned object keys/manifests, exact SHA-256/size checks, and signed URLs as
-   locators only.
-2. Blob-first publish precedes metadata/DAG commit; reconcile orphan/partial/visibility/
-   retention/duplicate cases.
-3. SQLite work/terminal ledgers remain authoritative until broker lease/heartbeat/fence/
-   retry/DLQ/stale-ack/reconciliation behavior is proven.
-4. Add metrics and failure injection to Redis/managed broker and outbox.
+1. Record the contract branch first. Existing calibrated-confidence types and ECE/Brier
+   calculators do not mean that Product QA currently emits calibrated values or lineage.
+2. Freeze score family, model/runtime/preprocess revisions, fitting method, parameters,
+   training population, grouped split, applicability, and artifact digest.
+3. Populate existing inference calibration lineage only when its applicability matches.
+   Keep Product QA wire values uncalibrated unless a registered Product QA/detail
+   version adds an explicit calibrated kind/field and semantic projection.
+4. Fit on development/calibration data and evaluate once on frozen grouped test data. Keep
+   raw score, calibrated probability, deterministic features, and policy decision distinct.
+5. Gate any threshold/policy change separately from calibration quality so improved ECE
+   cannot be reported as improved classification by implication.
 
-**Compatibility notes:** ETags/version IDs are not content identity; new message shapes use
-registered schemas.
+**Keep intact**
 
-**Combined proof**
+The complete 21-class Product QA projection and its `OBSERVED`, `NO_ISSUE`,
+`ABSTAINED`, and `INCOMPLETE_INPUT` semantics. `InferenceAttemptSelection` remains a
+single accepted attempt, not an ensemble contract.
+
+**Done when**
+
+- [ ] The chosen contract branch and any required schema/upcaster decision are recorded.
+- [ ] Calibration artifacts are immutable, content-addressed, applicable, and replayable.
+- [ ] Per-class reliability, ECE/Brier, abstention, subgroup, temporal, and drift reports run.
+- [ ] Missing, stale, or inapplicable calibration fails closed to the declared raw-score path.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_local_artifact_registry_observability.py tests/unit/test_redis_task_queue.py tests/unit/test_redis_outbox.py
-python -m pytest tests/integration/test_redis_outbox_reconciliation.py tests/integration/test_sqlite_outbox_relay.py
+python -m pytest tests/unit/test_inference_enrichment.py tests/unit/test_qa_pipeline_core.py tests/unit/test_local_qa_product.py tests/unit/test_qa_completion.py
+python -m pytest tests/unit/test_benchmark_metrics_promotion.py tests/unit/test_benchmark_splits.py tests/unit/test_representative_production_qualification.py
+python -m pytest tests/unit/test_schema_immutability.py tests/contract/test_schema_catalog.py tests/contract/test_schema_release_policy.py tests/contract/test_schema_upcasting.py
 ~~~
 
-### P8 - Target media and two-H100 RunPod qualification
+**Next boundary:** P10 may consume accepted calibrated evidence; P12 may evaluate it as a
+camera-quality input; P13 may use it as one selection term.
 
-**Participating modules:** source-media, inference-evidence, qualification-ops
+### P10 - Persist Causal Adaptive Sampling and Proven No-Work Decisions
 
-**End-to-end result:** Target media and real RunPod/vLLM are measured under the adaptive
-workload with a safe envelope and no automatic promotion.
+**Participating modules:** `sampling-qa`, `event-semantics`, `canonical-integration`,
+`contract-governance`, `qualification-ops`
+
+**End-to-end result:** Additional sampling is caused by accepted upstream evidence and
+replays from a frozen decision; work is skipped only when a domain result already proves it
+unnecessary.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| source-media | CPU/NVDEC decode and materialization parity with timestamp/artifact checks | adapters/pyav_*.py, adapters/nvdec_*.py | media adapter tests |
-| inference-evidence | RunPod/vLLM mapping, batching, retry, telemetry, and replay | inference/adapter.py, inference/runpod.py | provider adapter tests |
-| qualification-ops | Topology/concurrency matrix, quality/capacity counters, and safe envelope | benchmark/provider_qualification.py, benchmark/qualification.py | qualification tests |
+| `sampling-qa` | Versioned upgrade decision, budgets, exact target provenance | `src/robata/sampling/adaptive.py`, `src/robata/sampling/materializer.py`, `src/robata/qa_pipeline/completion.py`, `src/robata/qa_pipeline/dense.py` | adaptive/QA tests |
+| `event-semantics` | Preserve event evidence; define any future event-presence gate separately | `src/robata/event_pipeline/evidence.py`, `src/robata/event_pipeline/proposer.py` | event tests |
+| `canonical-integration` | Add the bridge, seal the decision before extra work, and replay it on restart | `src/robata/application/canonical/mcap_source.py`, `src/robata/application/canonical/runner.py`, `src/robata/application/canonical/result_validation.py`, `src/robata/application/canonical/local_supplemental_qa.py` | canonical tests |
+| `contract-governance` | Version changed reason vocabulary, plans, skip semantics, or projections | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema tests |
+| `qualification-ops` | Measure quality/compute tradeoffs on grouped evidence | `src/robata/benchmark/metrics.py`, `src/robata/benchmark/splits.py` | metric/split tests |
 
 **Implementation outline**
 
-1. Freeze model/version/engine/quantization/topology/contracts/limits/batch/concurrency/retry.
-2. Measure CPU/NVDEC decode, resize, and materialization at 125 camera-seconds/s average
-   and 150 margin; capture codec/resolution/FPS/GOP/transfer path.
-3. Compare two single-card replicas and tensor parallel only when justified; scan concurrency
-   and capture queue, TTFT, E2E P50/P95/P99, images/calls/tokens, retries, rejects, OOM,
-   memory, KV/cache, and utilization.
-4. Exercise restart/timeout/invalid output/partial failure in fresh namespaces.
-5. Keep production_eligible false until external review.
+1. Freeze the base coverage plan before model feedback and retain its safety coverage.
+2. The current `AdaptiveCoveragePlan` and `ResolvedAdaptivePlan` are pure
+   models, not a decision store or complete base-plan binding. Define the internal durable
+   decision schema and storage boundary, or register a published version if the decision
+   crosses a wire. Bind accepted evidence, base-plan digest, policy, per-camera/total budget,
+   trigger provenance, and selected additional timestamps.
+3. Persist or publish that decision before extra targets execute. Replay consumes the stored
+   decision and accepted evidence rather than asking a stochastic provider again.
+4. Preserve existing explicit dense-QA not-needed outcomes only where coarse-complete
+   semantics already prove them; every skipped item still receives an unambiguous terminal.
+5. Keep event proposal work unless a separately versioned event-presence gate is trained and
+   passes a representative recall bound. QA-clean video is never proof of `NO_EVENTS`.
 
-**Compatibility notes:** Recorded responses replay through validators/ledger; credentials and
-endpoint locators never enter request identity.
+**Keep intact**
 
-**Combined proof**
+Exact rational grid semantics, plan sealing, bounded targets, accepted evidence lineage,
+domain-specific terminal meanings, event recall, and completion validation. A policy version
+is immutable during a run.
+
+**Done when**
+
+- [ ] Duplicate/out-of-order triggers reduce to one bounded canonical decision.
+- [ ] Restart and replay reproduce the same target coordinates and identities.
+- [ ] Abstention, incomplete input, exhausted budgets, and late feedback are explicit.
+- [ ] No-work tests include clear-video events and cannot map a scheduler skip to `NO_EVENTS`.
+- [ ] Local tests prove deterministic decisions; representative quality/compute deltas are
+      an explicit P15 qualification input before promotion.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_runpod_adapter.py tests/unit/test_provider_qualification.py tests/unit/test_provider_qualification_count_binding.py tests/unit/test_runtime_capacity.py
-python -m pytest tests/unit/test_representative_production_qualification.py
+python -m pytest tests/unit/test_sampling_adaptive.py tests/unit/test_adaptive_sampler_runtime.py tests/unit/test_supplemental_temporal_package.py
+python -m pytest tests/unit/test_qa_pipeline_core.py tests/unit/test_qa_completion.py tests/unit/test_local_qa_product.py
+python -m pytest tests/unit/test_event_pipeline_core.py tests/unit/test_event_projection_guards.py tests/integration/test_canonical_offline.py
 ~~~
 
-### P9 - Supabase/Postgres/pgvector retrieval projection
+**Next boundary:** P11 consumes accepted event evidence; P12 consumes exact adaptive boundary
+packages; P15 evaluates recall and compute jointly.
 
-**Participating modules:** contract-governance, canonical-integration, qualification-ops
+### P11 - Add Recording Association and a Nonblocking Temporal Signal
 
-**End-to-end result:** Structured retrieval remains authoritative while async versioned
-text/vision vectors are added without blocking QA completion.
+**Participating modules:** `event-semantics`, `canonical-integration`,
+`identity-delivery`, `contract-governance`, `qualification-ops`
+
+**End-to-end result:** Recording-level association adds explainable track/continuity evidence
+beyond the existing same-label interval merge, without silently changing primary completion.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| contract-governance | Versioned embedding/vector projection, locator, and retention contracts | contracts/**, ports/**, schemas/** | schema/retrieval contract tests |
-| canonical-integration | Terminal-to-structured EventIndex projection and replay-safe membership | canonical/projections.py, reduction.py | membership/retrieval tests |
-| qualification-ops | Async backfill, vector recall, filtering, latency, and cost profiles | benchmark/**, retrieval/** | retrieval profile tests |
+| `event-semantics` | Versioned association rules, confidence, merge/split explanations | `src/robata/event_pipeline/candidate.py`, `src/robata/event_pipeline/evidence.py`, `src/robata/event_pipeline/provisional_fusion.py`, `src/robata/event_pipeline/proposer.py`, `src/robata/event_pipeline/fusion.py`, `src/robata/event_pipeline/boundary_refinement.py` | event/temporal tests |
+| `canonical-integration` | Project exact accepted window evidence into recording association | `src/robata/application/canonical/stream_recording_reduction.py` | reduction tests |
+| `identity-delivery` | Publish an asynchronous derived report linked to run/revisions | `src/robata/contracts/revisions.py`, `src/robata/application/canonical/logical_nodes.py`, `src/robata/application/canonical/local_outbox_delivery.py`, `src/robata/adapters/sqlite_outbox.py` | revision/outbox tests |
+| `contract-governance` | Version any track, event identity, stage, wire, or completion change | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema/projection tests |
+| `qualification-ops` | Produce fixture metrics and defer representative claims to P15 | `src/robata/benchmark/metrics.py` | benchmark metric tests |
 
 **Implementation outline**
 
-1. Keep EventIndex and structured/facet retrieval as the first usable search path.
-2. Define a Postgres/Supabase projection for selected revisions, clips, labels, provenance,
-   vectors, RLS, retention, backfill, and replay.
-3. pgvector stores/indexes/searches vectors; an explicit CPU/API/RunPod encoder creates them.
-4. Make embedding writes async/idempotent by event revision/artifact identity; outages do
-   not reopen or delay QA completion.
-5. Add vector recall plus structured facet filtering/reranking.
+1. Freeze V3/V4 baseline behavior: `LocalStreamMergedHypothesis` already merges same-label
+   touching/overlapping intervals and retains source ordinals and proposal digests.
+2. Define only the added semantics: association across justified gaps or label transitions,
+   using time, camera/evidence overlap, explicit confidence, and deterministic tie-breaking.
+3. Retain every input hypothesis plus the policy term that explains each merge, split,
+   ambiguity, or unassociated result.
+4. V4 does not contain camera-overlap or confidence fields; load those facts from accepted
+   evidence or add a new versioned input contract rather than inferring them from a digest.
+5. Initially publish association and temporal consistency as an asynchronous derived report
+   linked to the completed run and exact source evidence. Do not add `EVENT_TRACKING` to
+   released `StreamStage` or fields to v4 completion in place.
+6. If association must govern event identity or primary completion, stop and register a new
+   event/detail/projection version with migration and replay rules.
 
-**Compatibility notes:** Embedding ID/model/dimension/index policy are versioned metadata;
-structured retrieval and canonical identities stay unchanged.
+**Keep intact**
 
-**Combined proof**
+Existing recording reduction, source ordinals/digests, deterministic replay, immutable
+event revisions, and nonblocking primary completion.
+
+**Done when**
+
+- [ ] Existing V3/V4 fixtures reproduce byte-for-byte when association is disabled.
+- [ ] Gaps, label changes, long events, overlaps, duplicates, ambiguity, and replay are tested.
+- [ ] Derived reports cite exact source evidence and cannot mutate historical events.
+- [ ] Local fixture metrics are produced; representative precision/recall, association quality,
+      boundary effects, and review yield are explicit P15 inputs.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_retrieval.py tests/unit/test_canonical_run_membership.py
-python -m pytest tests/integration/test_canonical_offline.py
+python -m pytest tests/unit/test_stream_recording_reduction.py tests/unit/test_event_pipeline_core.py tests/unit/test_event_projection_guards.py
+python -m pytest tests/unit/test_supplemental_temporal_package.py tests/unit/test_event_projection_guards.py
+python -m pytest tests/unit/test_event_identity_registry.py tests/integration/test_sqlite_primary_completion.py tests/integration/test_sqlite_outbox_relay.py tests/contract/test_primary_completion_contract.py
+python -m pytest tests/integration/test_canonical_action_event_revision.py
 ~~~
 
-Supabase/RLS/index/retention/cost evidence remains external.
+**Next boundary:** P12 evaluates boundaries on associated events; P15 evaluates temporal
+quality without making the derived report a hidden completion dependency.
 
-### P10 - Representative production qualification and operating gate
+### P12 - Qualify a Quality-Aware Boundary Estimator
 
-**Participating modules:** qualification-ops, canonical-integration, event-semantics, source-media,
-sampling-qa, inference-evidence, stream-control, identity-delivery
+**Participating modules:** `event-semantics`, `sampling-qa`, `canonical-integration`,
+`qualification-ops`, `contract-governance`
 
-**End-to-end result:** One frozen report demonstrates quality, capacity, recovery, deadlines,
-cost, and operations on representative data and selected external services.
+**End-to-end result:** A representative benchmark selects a robust boundary policy that
+retains raw camera observations, exclusions, uncertainty, and deterministic replay.
 
 **Change map**
 
 | Module | Expected contribution | Key paths | Local check |
 | --- | --- | --- | --- |
-| qualification-ops | Frozen manifest, quality/capacity/reliability evidence, and gate report | benchmark/qualification.py, evidence.py, promotion.py | qualification tests |
-| canonical-integration | End-to-end run, terminal/recovery/replay aggregation | canonical/runner.py, local_composition.py | canonical recovery tests |
-| source-media | Representative codec/camera/geometry media matrix | adapters/mcap_*.py, adapters/pyav_*.py, application/canonical/media_quality.py | source/media tests |
-| sampling-qa | All classes, sampler policies, calibration, and leakage-safe splits | sampling/adaptive.py, qa_pipeline/product.py | QA/Pareto tests |
-| event-semantics | Candidate/proposal/boundary metrics and temporal adjudication | event_pipeline/candidate.py, proposer.py, boundary_refinement.py | event/temporal quality tests |
-| inference-evidence | Provider latency/error/token/cost evidence | inference/**, inference/runpod.py | provider qualification tests |
-| stream-control | Arrival, backlog, lease, failure, and soak behavior | queue/**, durable_work.py | stress/recovery tests |
-| identity-delivery | Deadline, outbox, review, and terminal integrity | primary_completion.py, sqlite_outbox.py, review/** | completion tests |
+| `event-semantics` | Baseline and candidate reducers with explicit missing-data behavior | `src/robata/event_pipeline/boundary.py`, `src/robata/event_pipeline/boundary_refinement.py` | event core/projection tests |
+| `sampling-qa` | Applicable camera-quality evidence without treating QA as geometry | `src/robata/qa_pipeline/aggregate.py` | QA pipeline tests |
+| `canonical-integration` | Exact role windows, package lineage, and revision projection | `src/robata/application/canonical/boundary_windows.py`, `src/robata/application/canonical/action_event_revision.py` | action revision tests |
+| `qualification-ops` | Onset/offset error and uncertainty coverage by class/condition | `src/robata/benchmark/metrics.py` | benchmark metrics tests |
+| `contract-governance` | Reducer/policy/projection version decision | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema tests |
 
 **Implementation outline**
 
-1. Freeze code/catalog/media/calibration/sampler/preprocess/prompt/model/provider/hardware/
-   adapters/arrival distribution/split.
-2. Cover codec/resolution/FPS/GOP, fisheye/Egocentric views, all 21 classes, warning/fail,
-   missing/decode gaps, and event boundaries.
-3. Set signed thresholds only after adjudicated labels and leakage-safe splits.
-4. Run 500 recording-hours/day-equivalent arrivals, QA T+1, annotation T+3, provider/
-   storage/broker failures, crashes, lease expiry, duplicates, backlog drain, and 24h soak.
-5. Report recording-hours/camera-hours, provider images/calls/tokens, CPU/GPU/NVMe,
-   queues/backlog, R2 storage/egress, DB/queue cost, P50/P95/P99, and recovery.
-6. External review alone may promote PRODUCTION_QUALIFIED.
+1. Inventory both current paths before editing: legacy `BoundaryRefiner` permits an
+   explicit candidate fallback, while canonical dual-role
+   `median-low-max-envelope-v1` has `fallback_enabled=False`.
+2. Freeze their current median-low center, maximum-uncertainty envelope, minimum-camera,
+   missing-observation, alignment, and identity behavior.
+3. Compare robust estimators and an explicit camera-exclusion rule on governed boundary
+   labels. Persist every raw observation, quality input, exclusion reason, estimate, and
+   uncertainty interval used by the chosen reducer.
+4. When quality evidence is missing or inapplicable, retain the selected path's current
+   estimator and record that quality weighting was not applied; do not invent a coarse-event
+   fallback for the no-fallback canonical path.
+5. Register a new reducer/policy and any required wire/projection version before changed
+   estimates can become authoritative. Reject weighting that narrows uncertainty without
+   a calibrated coverage argument.
 
-**External qualification gates (not local completion)**
+**Keep intact**
 
-| Gate | Required evidence | Current boundary |
+Exact package-camera coordinates, verified alignment, raw evidence, role separation,
+determinism, and action-event revision lineage.
+
+**Done when**
+
+- [ ] Baseline fixtures reproduce unchanged outputs under the current reducer version.
+- [ ] Missing/degraded cameras, outliers, ties, contradictions, and no-fallback cases pass.
+- [ ] Onset/offset error and uncertainty coverage are reported by class and camera condition.
+- [ ] Any authoritative semantic change has an approved version and migration/replay plan.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_event_pipeline_core.py tests/unit/test_event_projection_guards.py
+python -m pytest tests/unit/test_qa_pipeline_core.py tests/unit/test_benchmark_metrics_promotion.py
+python -m pytest tests/integration/test_canonical_action_event_revision.py
+~~~
+
+**Next boundary:** P15 compares the selected estimator with the frozen P0 quality baseline.
+
+### P13 - Select Active-Learning Work from an Immutable Review Pool
+
+**Participating modules:** `identity-delivery`, `sampling-qa`, `qualification-ops`,
+`contract-governance`
+
+**End-to-end result:** A versioned pool-level selector chooses bounded annotation work while
+retaining existing trigger priority, immutable selection evidence, and leakage-safe lineage.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `identity-delivery` | Eligible pool snapshot, deterministic ranking, append-only decision | `src/robata/review/models.py`, `src/robata/review/routing.py`, `src/robata/adapters/sqlite_review_queue.py` | review/queue tests |
+| `sampling-qa` | Auditable uncertainty/disagreement/coverage terms | `src/robata/application/canonical/local_review_routing.py` | local routing tests |
+| `qualification-ops` | Grouped splits, selection-bias and held-out-yield reports | `src/robata/benchmark/splits.py`, `src/robata/benchmark/metrics.py` | split/metrics tests |
+| `contract-governance` | Persistence/identity decision for selection and annotation lineage | `schemas/schema-catalog.json`, `src/robata/contracts/**` | schema tests |
+
+**Implementation outline**
+
+1. Preserve committed per-completion routing and its QA degradation, low-confidence, and
+   sampling priorities as eligibility/priority inputs; do not replace them with one score.
+2. Freeze a pool digest and budget, then rank with versioned uncertainty, disagreement,
+   coverage, diversity, recency, and existing-priority terms plus deterministic tie-breaks.
+3. Append an immutable decision binding the pool, policy/model revisions, term values,
+   selected task IDs, budget, and reason for every selected item. Historical routes do not
+   change when annotations or models arrive.
+4. Link annotation artifacts and adjudication to selection and dataset lineage without
+   making review block primary completion.
+5. Keep development, calibration, and frozen evaluation groups disjoint by recording,
+   connected capture/camera/time groups, and declared leakage policy.
+
+**Keep intact**
+
+Review remains nonblocking, task idempotency/conflict rules remain exact, and annotation
+arrival never auto-promotes a model or rewrites an earlier decision.
+
+**Done when**
+
+- [ ] The same pool/policy/budget produces the same ordered selection.
+- [ ] Duplicate tasks, concurrent selection, restart, exhausted budget, and late labels pass.
+- [ ] Split validation prevents connected recordings from crossing train/calibration/test.
+- [ ] Yield, coverage, subgroup balance, agreement, and frozen held-out quality are reported.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_review_routing.py tests/integration/test_sqlite_review_queue.py
+python -m pytest tests/integration/test_canonical_local_review_routing.py
+python -m pytest tests/unit/test_benchmark_splits.py tests/unit/test_benchmark_metrics_promotion.py
+~~~
+
+**Next boundary:** Governed P13 labels feed future training cycles; P15 consumes only frozen
+evaluation evidence, never the selection pool itself.
+
+### P14 - Qualify the Existing Structured-First Vector Boundary
+
+**Participating modules:** `canonical-integration`, `contract-governance`,
+`qualification-ops`, `identity-delivery`
+
+**End-to-end result:** A real encoder and pgvector-compatible adapter can asynchronously
+rerank bounded structured candidates without becoming source of truth or crossing tenants.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `canonical-integration` | Preserve structured candidate authority and revision linkage | `src/robata/retrieval/service.py`, `src/robata/retrieval/index.py` | retrieval tests |
+| `contract-governance` | Physical adapter, access policy, versioned vector identity | `src/robata/ports/vector_projection.py`, `src/robata/contracts/retrieval.py` | projection contract tests |
+| `qualification-ops` | Backfill/search/recall/latency/selectivity/cost evidence | `src/robata/benchmark/retrieval.py` | retrieval profile tests |
+| `identity-delivery` | Async revision projection and idempotent backfill/retry | `src/robata/application/canonical/projections.py` | projection/replay tests |
+
+**Implementation outline**
+
+1. Baseline the existing in-memory contract: structured filters produce a bounded candidate
+   set first; vector scoring is optional and non-authoritative.
+2. Implement the encoder separately from storage and pin model/revision, dimension,
+   preprocessing, normalization, distance metric, and embedding identity.
+3. Implement a physical adapter behind `VectorProjectionStore` with immutable event
+   revision linkage, existing idempotency/conflict semantics, explicit FAILED/retry state,
+   and restartable cursor backfill.
+4. Enforce tenant access in both structured and vector paths. An unbound query is not an
+   administrative cross-tenant shortcut; verify database RLS in addition to application checks.
+5. Qualify exact index type/parameters, build/rebuild, stale revisions, duplicate writes,
+   missing vectors, adapter failure, pagination, and deterministic tie-breaking.
+
+**Keep intact**
+
+`EventIndex` and structured filtering remain authoritative. Vector projection is
+asynchronous, revision-bound, nonblocking, and unable to self-promote production eligibility.
+
+**Done when**
+
+- [ ] In-memory and physical adapters pass the same projection/idempotency contract.
+- [ ] Projection failure falls back to structured results without corrupting authority.
+- [ ] Tenant isolation is proven at application and database layers.
+- [ ] Representative recall at k, latency, selectivity, build/backfill, and cost are recorded.
+
+**Run locally**
+
+~~~powershell
+python -m pytest tests/unit/test_vector_projection_contract.py tests/unit/test_retrieval.py
+python -m pytest tests/unit/test_retrieval_profile.py
+python -m pytest tests/integration/test_canonical_action_event_revision.py
+~~~
+
+**Next boundary:** P15 records the real adapter as optional product evidence, not as a
+primary completion dependency.
+
+### P15 - Run the Representative Pareto and External Qualification Gates
+
+**Participating modules:** `qualification-ops` and every module changed by P1-P14
+
+**End-to-end result:** One content-addressed evidence package selects an operating point
+from throughput, quality, reliability, deadline, resource, and cost tradeoffs; unresolved
+external gates remain explicit.
+
+**Change map**
+
+| Module | Expected contribution | Key paths | Local check |
+| --- | --- | --- | --- |
+| `qualification-ops` | Frozen scope, Pareto report, representative gate aggregate | `src/robata/benchmark/pareto.py`, `src/robata/benchmark/qualification.py`, `src/robata/runtime/capacity.py` | Pareto/qualification tests |
+| changed modules | Export exact policy, identity, recovery, quality, and resource evidence | phase paths above | phase-local tests |
+| `contract-governance` | Catalog digest and release/version proof | `schemas/schema-catalog.json` | schema/release tests |
+
+**External gates**
+
+| Gate | Required evidence | Promotion condition |
 | --- | --- | --- |
-| E0 - evidence freeze | Code/catalog, workload, model, sampler, preprocess, hardware, and data digests | Local preparation; external freeze pending |
-| E1 - quality sign-off | Governed labels, leakage-safe splits, per-class/temporal metrics, calibration, abstention/incomplete review | Representative labels NOT_MEASURED |
-| E2 - media and storage | Target codec/NVDEC parity plus R2 exact-byte, range, retention, and reconciliation runs | External media/R2 NOT_MEASURED |
-| E3 - provider qualification | RunPod/vLLM two-H100 topology, safe concurrency, latency/error/token and cost envelope | Real H100/provider NOT_MEASURED |
-| E4 - reliability and soak | Crash/retry/lease/outbox proofs, managed-service faults, backlog drain, and 24-hour soak | External soak NOT_MEASURED |
-| E5 - capacity/SLA/cost | 500 recording-hours/day-equivalent arrivals, QA T+1, annotation T+3, resource and cost bounds | Production capacity NOT_MEASURED |
-| E6 - go/no-go | Independent review of the frozen report and runbook; only then set production_eligible | Must remain false until E0-E5 pass |
+| E0 - evidence freeze | Commit, schema catalog, workload/benchmark manifests, governed corpus, grouped splits, policies, hardware/provider/storage and cost assumptions | Scope is immutable and reproducible before tuning |
+| E1 - quality sign-off | QA/event/boundary/calibration metrics, abstention/incomplete states, subgroup/temporal coverage and leakage audit | Registered per-class and aggregate gates pass on frozen labels |
+| E2 - media and storage | Target codec/camera matrix, NVDEC/fallback parity, artifact durability, target filesystem/object-store faults and reconciliation | Exact/semantic parity and promised durability pass |
+| E3 - provider | Real model/runtime/hardware, single/concurrent/native envelopes, replay, saturation, partial failure, latency and cost | Selected topology passes correctness and operating envelope |
+| E4 - reliability and soak | Representative arrivals, restart/retry/fence, provider/storage fault injection, backlog/drain and at least the declared soak duration | No lost/duplicate authority; error and backlog gates pass |
+| E5 - capacity, deadlines, cost | 500 recording-hours per 24 hours equivalent, six-camera accounting, QA T+1, annotation T+3, p95/p99, utilization and unit cost | Preferred point sustains the declared service envelope |
+| E6 - independent go/no-go | Complete E0-E5 artifacts, unresolved-risk register, security/retention/incident evidence and independent review | Reviewer records the release decision; Robata never self-promotes it |
 
-**Compatibility notes:** Qualification freezes semantics; it does not create a second path or
-relax a failed threshold.
+**Implementation outline**
 
-**Combined proof**
+1. Freeze E0 before selecting thresholds or an operating point. Keep recording-hours and
+   camera-hours separate and preserve both source-time ratio and throughput units.
+2. Run phase-local tests, grouped quality evaluation, recovery/fault scenarios, repeated
+   capacity points, and cost/resource collection under the exact frozen scope.
+3. Build the Pareto set without collapsing throughput, quality, latency, reliability, and
+   cost into an unsupported scalar. Record dominated points and the reason for preference.
+4. Attach E1-E5 supporting artifacts by digest. An unexecuted gate remains
+   `NOT_MEASURED`; an executed failure retains its measurement artifact and unresolved
+   threshold failure, and never becomes `PRODUCTION_QUALIFIED`.
+5. Leave E6 `PENDING_INDEPENDENT_REVIEW` until an independent reviewer makes the decision.
+
+**Keep intact**
+
+Typed evidence status, immutable qualification scope, external gate order, schema/catalog
+authority, and the rule that technical evidence cannot self-authorize production release.
+
+**Done when**
+
+- [ ] The local package validates and names every external item still `NOT_MEASURED`.
+- [ ] Every selected point cites exact workload, code, policies, hardware, provider, and runs.
+- [ ] Quality, capacity, deadlines, recovery, resource, and cost populations cross-check.
+- [ ] E0-E5 each has a valid artifact or explicit unresolved state; E6 remains independent.
+- [ ] No missed threshold is hidden by relabeling measured evidence as unmeasured.
+
+**Run locally**
 
 ~~~powershell
-python -m pytest tests/unit/test_benchmark_qualification.py tests/unit/test_representative_production_qualification.py tests/unit/test_runtime_capacity.py
-python -m pytest tests/integration/test_canonical_recovery_qualification_evidence.py tests/integration/test_canonical_local_command.py
+python -m pytest tests/unit/test_benchmark_pareto.py tests/unit/test_benchmark_qualification.py
+python -m pytest tests/unit/test_representative_production_qualification.py
+python -m pytest tests/unit/test_runtime_capacity.py tests/integration/test_canonical_recovery_qualification_evidence.py
+python -m pytest tests/unit/test_schema_immutability.py tests/contract/test_schema_release_policy.py
 ~~~
+
+**Next boundary:** Independent E6 review and an explicit release decision.
 
 ## Blockers and External Dependencies
 
 | Condition | What can still be completed locally | Temporary substitute | Later external proof |
 | --- | --- | --- | --- |
-| Real VLM/two H100s | Request mapping, batch/retry, evidence, telemetry, replay | Delayed deterministic HTTP provider | Endpoint/topology matrix and safe envelope |
-| Target media/NVDEC | CPU port equivalence and attribution | PyAV CPU | Target SKU/driver/SDK/codec/GOP/resolution throughput |
-| R2/object store | Exact-hash artifact/feed-once contract, blob-first/reconciliation | Local registry/filesystem cache | PUT/GET/HEAD/range/multipart/visibility/retention/egress/failure |
-| Durable broker | SQLite authority, fake/Redis lease/fence/retry/DLQ tests | Local Redis/fake client | Managed broker outage/stale-ack/duplicate/recovery |
-| Supabase/Postgres/pgvector | Structured EventIndex, projection/fake-vector contract, async failure | In-memory index | RLS/auth/ANN/retention/backfill/cost/failover |
-| Representative labels/media | Split/metric/Pareto framework and fixture regression | Versioned local corpus | Governed adjudication and per-class/temporal quality |
-| Arrival/deadline/soak | Burst/backlog/failure harness and runbook draft | Short local stress | Production arrival, T+1/T+3, 24h soak |
-| Product thresholds | Metric and acceptance-register implementation | Empty/unpromoted thresholds | Product-owner signed thresholds |
+| Target NVIDIA codec/GPU matrix | Backend selection, fake-target behavior, fallback, provenance and parity harness | PyAV plus deterministic fake target | E2 codec/profile/resolution/driver matrix on target hardware |
+| Real provider and H100 topology | Envelope, replay, timeout/retry, partial-failure and evidence closure | Deterministic offline/mock provider | E3 saturation, latency, error and cost report |
+| Production filesystem/object store | Staging barrier, crash points, reconciliation and local fault tests | Local durable filesystem | E2 durability/fault run on deployment storage and R2 when used |
+| Governed representative recordings and labels | Deterministic fixtures, split validation and metric calculators | Versioned local/conformance fixtures | E1 blinded QA/event/boundary/calibration review |
+| Real encoder, pgvector and tenant policy | Ports, in-memory contract, backfill/retry and isolation fixtures | In-memory vector store/fake encoder | Physical adapter, index and database RLS qualification |
+| Representative arrivals and long-run capacity | Capacity harness, bounded overload and recovery scenarios | Short local smoke/profile | E4 soak and E5 500 recording-hours per 24 hours service run |
+| Independent release authority | Complete content-addressed E0-E5 package and risk register | None | E6 signed go/no-go decision |
 
 ## Acceptance and Verification
 
-- [ ] Schema/wire/identity/hash/logical-key/idempotency/fence/semantic changes have a
-  registered version/migration decision.
-- [ ] Fresh/replay and local/representative/external/production evidence are distinct.
-- [ ] Throughput claims include workload fingerprint, hardware/provider/configuration,
-  duration, before/after timing, queues/resources, and separate recording/camera units.
-- [ ] Quality claims include data manifest, leakage-safe split, model/sampler/preprocess
-  versions, per-class metrics, abstention/incomplete, calibration, and boundary metrics.
-- [ ] Traditional-CV/geometry claims include quality impact and removed provider work; no
-  proxy silently becomes semantic truth.
-- [ ] Artifact claims include exact bytes/hash, timestamps, provenance, reuse, and reconcile.
-- [ ] Crash/retry/duplicate/lease-expiry proofs show no lost/duplicate completion, outbox,
-  review, or accepted evidence.
-- [ ] External limits stay NOT_MEASURED until the required run is performed and reviewed.
-- [ ] Final gate includes quality, capacity, reliability, deadline, cost, security/retention,
-  and runbook evidence.
+- [ ] Every dispatched phase reads its module cards and changes only its named paths/boundary.
+- [ ] Focused unit tests cover changed decisions and deterministic replay.
+- [ ] A focused integration, crash-recovery, smoke, or profile proves each changed boundary.
+- [ ] Published schema, wire, logical identity, exact-byte, semantic projection, and root
+      changes use an explicit version/upcaster/migration decision.
+- [ ] Performance claims include a P0-like before/after measurement with units and context.
+- [ ] Quality claims use governed grouped splits and report abstention/incomplete outcomes.
+- [ ] External limits remain `NOT_MEASURED` or unresolved until their named gate runs.
+- [ ] Failed measured gates retain evidence and cannot be presented as qualified.
+- [ ] The guide, Blueprint, tests, and resulting qualification artifacts agree on terminology.
 
 ## Suggested Dispatch Prompt
 
 ~~~text
-Work on contract-governance + qualification-ops / P0 - contract and measurement truth.
-Read AGENTS.md, governance/BLUEPRINT.md, the template, and module cards. Freeze scope,
-workload/evidence units, and contract identity. Preserve schema/hash/idempotency/fence rules.
-Run focused P0 proofs and report fingerprints and external blockers.
-~~~
+Work on <module-id> / P<n> - <phase name>.
 
-~~~text
-Work on source-media + stream-control + canonical-integration / P1 - source and stream spine.
-Reduce message-proportional transactions and repeated reads while preserving source/timestamp/
-decode provenance and durable work. Run P1 proofs; report transactions, wall time, I/O,
-fresh/replay/crash behavior.
-~~~
-
-~~~text
-Work on source-media + sampling-qa / P2 - feed-once media and visual sentinel.
-Reuse one decode for structural facts, traditional-CV signals, selected evidence, and optional
-versioned geometry views. Preserve raw authority/full-frame context/lineage/bounded memory.
-Report I/O, RSS, selected images, upgrade rate, and quality class.
-~~~
-
-~~~text
-Work on sampling-qa + event-semantics + inference-evidence + canonical-integration / P3-P4.
-Implement adaptive provider-neutral QA/event plans, evidence lineage, boundary context, and
-complete 21-class projection. Preserve replay, warning/fail, and explicit abstention/incomplete.
-Report provider/image/call amplification.
-~~~
-
-~~~text
-Work on identity-delivery + stream-control + canonical-integration / P5.
-Optimize completion inputs without changing terminal meaning. Exercise crash, retry, duplicate,
-lease expiry, outbox, review, and replay. Report terminal/outbox/review identity equality.
-~~~
-
-~~~text
-Work on canonical-integration + stream-control + qualification-ops / P6.
-Measure 1/2/4 workers, bounded queues, saturation, optional-work shedding, cancellation,
-and backlog drain. Never share SQLite WAL over network storage. Report the named bottleneck.
-~~~
-
-~~~text
-Work on contract-governance + source-media + stream-control + identity-delivery / P7.
-Implement R2/object, broker, and outbox ports with fake failure/reconciliation fixtures.
-Preserve exact bytes, identity, lease/fence/retry/DLQ, and local authority; do not claim
-production support without external evidence.
-~~~
-
-~~~text
-Work on source-media + inference-evidence + qualification-ops / P8.
-Freeze media/provider configuration, run target decode and two-H100 matrices, capture telemetry
-and safe saturation, and replay recorded responses. Keep production_eligible false until review.
-~~~
-
-~~~text
-Work on contract-governance + canonical-integration + qualification-ops / P9.
-Keep structured retrieval authoritative; make embedding/indexing async, versioned, idempotent,
-and non-blocking. Treat pgvector as vector storage/search, not an encoder. Report external
-database/RLS/index/retention blockers.
-~~~
-
-~~~text
-Work on qualification-ops + canonical-integration / P10.
-Freeze inputs, run governed quality/capacity/recovery/deadline/cost/soak evidence, and produce
-one promotion report. Do not self-promote PRODUCTION_QUALIFIED; report every unresolved gap.
+Read AGENTS.md, governance/BLUEPRINT.md, and every governance/modules/<module-id>.md named
+by the phase. Implement only that phase's end-to-end result and named contract decision.
+Primary paths: <copy the phase change-map paths>.
+Preserve: <copy the phase Keep intact boundary>.
+Run locally: <copy the phase commands>.
+Report: changed files, command results, before/after measurement when claimed, schema or
+identity decision, and any external blocker. Do not expand beyond this phase.
 ~~~

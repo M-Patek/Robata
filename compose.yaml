@@ -1,0 +1,78 @@
+name: robata-local
+
+services:
+  canonical-fixture:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robata-cpu-worker:local
+    environment:
+      HOME: /tmp/robata-home
+    command:
+      - scripts/run_canonical_fixture.py
+      - /app/tests/fixtures/canonical/source-recording.json
+      - --state-dir
+      - /tmp/robata/fixture
+      - --run-key
+      - compose-fixture
+    volumes:
+      - type: bind
+        source: ./tests/fixtures/canonical
+        target: /app/tests/fixtures/canonical
+        read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    read_only: true
+    restart: "no"
+
+  canonical-recovery:
+    profiles: ["recovery"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robata-cpu-worker:local
+    depends_on:
+      init-canonical-state:
+        condition: service_completed_successfully
+    environment:
+      HOME: /tmp/robata-home
+    command:
+      - scripts/run_canonical_fixture.py
+      - /app/tests/fixtures/canonical/source-recording.json
+      - --state-dir
+      - /var/lib/robata/fixture
+      - --run-key
+      - compose-recovery
+    volumes:
+      - type: bind
+        source: ./tests/fixtures/canonical
+        target: /app/tests/fixtures/canonical
+        read_only: true
+      - type: volume
+        source: canonical-fixture-state
+        target: /var/lib/robata
+    tmpfs:
+      - /tmp:mode=1777
+    read_only: true
+    restart: "no"
+
+  init-canonical-state:
+    profiles: ["recovery"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robata-cpu-worker:local
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        install -d -o 10001 -g 10001 -m 0750 /var/lib/robata
+        chown -R 10001:10001 /var/lib/robata
+    user: "0:0"
+    volumes:
+      - type: volume
+        source: canonical-fixture-state
+        target: /var/lib/robata
+    restart: "no"
+
+volumes:
+  canonical-fixture-state:

@@ -8,6 +8,10 @@ from robata.application.canonical.projections import (
     canonical_event_index_revision_projection,
 )
 from robata.contracts.retrieval import VectorSearchHit
+from robata.ports.vector_projection import (
+    VectorProjectionError,
+    VectorProjectionErrorCode,
+)
 from robata.retrieval import (
     ClipArtifact,
     ClipManifest,
@@ -117,6 +121,15 @@ class _VectorStore:
         return self.hits
 
 
+class _FailingVectorStore:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def search(self, query: object) -> tuple[VectorSearchHit, ...]:
+        del query
+        raise self._error
+
+
 def test_vector_rerank_aggregates_artifacts_before_pagination() -> None:
     index = EventIndex()
     index.update_index(_revision("revision-1"), select=True)
@@ -151,7 +164,11 @@ def test_vector_rerank_aggregates_artifacts_before_pagination() -> None:
             ),
         )
     )
-    service = RetrievalService(index=index, vector_store=vector_store)
+    service = RetrievalService(
+        index=index,
+        vector_store=vector_store,
+        structured_result_authorizer=lambda _item, tenant: tenant == "tenant-a",
+    )
 
     result = service.semantic_search(
         RetrievalQuery(embedding_id="embedding-v1", limit=1),
@@ -168,6 +185,77 @@ def test_vector_rerank_aggregates_artifacts_before_pagination() -> None:
         "revision-2",
     )
     assert vector_store.queries[0].tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        VectorProjectionError(VectorProjectionErrorCode.RETRYABLE, "temporary adapter failure"),
+        RuntimeError("database connection dropped"),
+    ),
+)
+def test_vector_failures_fall_back_to_the_authorized_structured_page(error: Exception) -> None:
+    index = EventIndex()
+    index.update_index(_revision("revision-tenant-a"), select=True)
+    index.update_index(
+        _revision("revision-tenant-b", event_id="event-2", label="bottle", start_ns=30),
+        select=True,
+    )
+    service = RetrievalService(
+        index=index,
+        vector_store=_FailingVectorStore(error),
+        structured_result_authorizer=lambda item, tenant: (
+            tenant == "tenant-a" and item.event_revision_id == "revision-tenant-a"
+        ),
+    )
+
+    result = service.semantic_search(
+        RetrievalQuery(embedding_id="embedding-v1", limit=1, offset=0),
+        embedding_vector=[1.0],
+        tenant_id="tenant-a",
+    )
+
+    assert result.total == 1
+    assert [item.event_revision_id for item in result.items] == ["revision-tenant-a"]
+    assert result.items[0].semantic_score is None
+
+
+def test_tenant_scoped_retrieval_requires_structured_authorization() -> None:
+    index = EventIndex()
+    index.update_index(_revision("revision-1"), select=True)
+    service = RetrievalService(index=index, vector_store=_VectorStore(()))
+
+    with pytest.raises(RetrievalCapabilityError, match="structured_result_authorizer"):
+        service.semantic_search(
+            RetrievalQuery(embedding_id="embedding-v1"),
+            embedding_vector=[1.0],
+            tenant_id="tenant-a",
+        )
+
+
+def test_untrusted_vector_hits_fall_back_without_changing_structured_candidates() -> None:
+    index = EventIndex()
+    index.update_index(_revision("revision-1"), select=True)
+    vector_store = _VectorStore(
+        (
+            VectorSearchHit(
+                projection_id="untrusted-vector",
+                event_revision_id="revision-not-in-structured-candidates",
+                embedding_id="embedding-v1",
+                score=1.0,
+                rank=0,
+            ),
+        )
+    )
+    service = RetrievalService(index=index, vector_store=vector_store)
+
+    result = service.semantic_search(
+        RetrievalQuery(embedding_id="embedding-v1"),
+        embedding_vector=[1.0],
+    )
+
+    assert [item.event_revision_id for item in result.items] == ["revision-1"]
+    assert result.items[0].semantic_score is None
 
 
 def test_current_selection_hides_superseded_revision() -> None:
@@ -265,7 +353,6 @@ def test_selection_rejects_wrong_ownership_and_sequence() -> None:
             selection_decision_id="decision-1",
             sequence=2,
         )
-
 
 
 def _canonical_publication() -> dict[str, object]:

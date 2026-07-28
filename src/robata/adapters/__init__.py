@@ -18,6 +18,24 @@ from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
 from robata.adapters.nvdec_backend import NvdecBackendUnavailableError, NvdecFallbackReason
 from robata.adapters.nvdec_frame_materializer import NvdecFrameMaterializer
 from robata.adapters.nvdec_video_export import NvdecH264Mp4Exporter
+from robata.adapters.pgvector_runtime import (
+    PgVectorConnectionConfig,
+    PgVectorCredentials,
+    PgVectorRuntimeConfig,
+    create_pgvector_projection_store,
+    create_pgvector_projection_store_from_environment,
+    create_psycopg_connection_factory,
+    create_verified_pgvector_projection_store,
+    create_verified_pgvector_projection_store_from_environment,
+)
+from robata.adapters.r2_object_store import (
+    R2Credentials,
+    R2ObjectStore,
+    R2ObjectStoreConfig,
+    R2S3Client,
+    create_boto3_r2_client,
+    create_r2_object_store_from_environment,
+)
 from robata.adapters.redis_outbox import RedisIdempotentOutboxSink
 from robata.adapters.sqlite_barrier import SQLiteBarrierStorage, SQLiteBarrierStorageError
 from robata.adapters.sqlite_capture_authority import (
@@ -117,9 +135,16 @@ __all__ = [
     "OfficialMcapInspector",
     "ParallelPyAvFrameMaterializer",
     "ParallelSixCameraVideoExportService",
+    "PgVectorConnectionConfig",
+    "PgVectorCredentials",
+    "PgVectorRuntimeConfig",
     "PyAvFrameMaterializer",
     "PyAvH264DecoderProbe",
     "PyAvH264Mp4Exporter",
+    "R2Credentials",
+    "R2ObjectStore",
+    "R2ObjectStoreConfig",
+    "R2S3Client",
     "RedisIdempotentOutboxSink",
     "SQLiteBarrierStorage",
     "SQLiteBarrierStorageError",
@@ -146,5 +171,12 @@ __all__ = [
     "WorkStateError",
     "WorkStorageError",
     "allocate_local_artifact_id",
+    "create_boto3_r2_client",
+    "create_pgvector_projection_store",
+    "create_pgvector_projection_store_from_environment",
+    "create_psycopg_connection_factory",
+    "create_r2_object_store_from_environment",
+    "create_verified_pgvector_projection_store",
+    "create_verified_pgvector_projection_store_from_environment",
     "deterministic_local_artifact_id",
 ]

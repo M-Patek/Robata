@@ -245,6 +245,56 @@ python scripts/run_canonical_mcap.py \
     --max-duration-seconds 180
 ```
 
+### Containerized Local Worker
+
+The checked-in container is a one-shot CPU worker for the existing local-conformance
+composition. It deliberately has no public HTTP port. The default service uses disposable
+in-container state, so each invocation is a fresh fixture regression:
+
+```bash
+docker compose up --build canonical-fixture
+```
+
+An explicit recovery profile uses a persistent named volume and initializes its ownership
+before the non-root worker starts:
+
+```bash
+docker compose --profile recovery up --build canonical-recovery
+```
+
+Use the recovery profile only when replaying the same durable state is intended. Remove its
+project volume before an independent recovery scenario. Both workers run read-only as UID
+`10001`; application layers are root-owned and only the declared state mount is writable.
+
+This is local regression execution, not a production topology or qualification result.
+R2, PostgreSQL/pgvector, and RunPod are outbound dependencies that must be explicitly
+injected by a future production composition root; they are not silently created by
+Compose. Cloudflare R2 is object storage and cannot host this Docker worker or expose
+an application port.
+
+### Optional Adapter Preflight
+
+The explicit R2 and pgvector variable names are listed in
+[`.env.example`](.env.example). Copy it to a local ignored file, replace every placeholder,
+then choose that file explicitly. The command never auto-loads `.env` or injects it into
+Compose:
+
+```bash
+Copy-Item .env.example .env
+uv sync --locked --extra r2 --extra pgvector
+python scripts/preflight_optional_adapters.py --r2 --pgvector --env-file .env
+```
+
+The pgvector runtime accepts only `verify-full` TLS and requires separate primary and worker
+CA certificate paths (`PGVECTOR_SSLROOTCERT` and `PGVECTOR_WORKER_SSLROOTCERT`) readable by
+the process. The non-verifying `require` and hostname-skipping `verify-ca` modes are rejected.
+
+`--verify-pgvector` is different: it connects to the configured target and verifies
+pgvector, the configured vector dimension, RLS flags, policy presence, and the separate
+worker role. Run it only after reviewed DDL and RLS policy have been applied. R2 object
+read/write/reconciliation faults and the RunPod endpoint still require their separate
+external qualification runs; a successful preflight remains `NOT_MEASURED`.
+
 ### Verification
 
 ```bash

@@ -802,11 +802,11 @@ class RetrievalQualificationProfile(StrictModel):
         projection = retrieval_profile_projection(
             evidence_class=evidence_class,
             structured_authoritative=True,
-            backfill=backfill or RetrievalBackfillCounters(),
-            recall=recall or RetrievalRecallProfile(),
-            latency=latency or RetrievalLatencyProfile(),
-            cost=cost or RetrievalCostProfile(),
-            filters=filters or RetrievalFilterMetrics(),
+            backfill=resolved_backfill,
+            recall=resolved_recall,
+            latency=resolved_latency,
+            cost=resolved_cost,
+            filters=resolved_filters,
             workload_fingerprint=workload_fingerprint,
             encoder=encoder,
             model_version=model_version,
@@ -815,7 +815,24 @@ class RetrievalQualificationProfile(StrictModel):
             production_eligible=False,
             external_database_status=external_database_status,
         )
-        return cls(profile_digest=semantic_sha256(projection), **projection)
+        return cls(
+            schema_version="1.0",
+            evidence_class=evidence_class,
+            structured_authoritative=True,
+            backfill=resolved_backfill,
+            recall=resolved_recall,
+            latency=resolved_latency,
+            cost=resolved_cost,
+            filters=resolved_filters,
+            workload_fingerprint=workload_fingerprint,
+            encoder=encoder,
+            model_version=model_version,
+            dimension=dimension,
+            embeddings_non_blocking=True,
+            production_eligible=False,
+            external_database_status=external_database_status,
+            profile_digest=semantic_sha256(projection),
+        )
 
     @model_validator(mode="after")
     def validate_digest(self) -> Self:

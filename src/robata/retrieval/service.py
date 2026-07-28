@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from robata.contracts.cameras import CAMERA_ID_VALUES
-from robata.contracts.retrieval import VectorSearchQuery
+from robata.contracts.retrieval import VectorSearchHit, VectorSearchQuery
 from robata.ports.vector_projection import VectorProjectionError, VectorProjectionStore
 from robata.retrieval.index import EventIndex, EventIndexError, EventIndexMembership
 from robata.retrieval.models import (
@@ -24,6 +24,7 @@ class RetrievalCapabilityError(RuntimeError):
 ClipResolver = Callable[[str, tuple[str, ...] | None], ClipManifest]
 ProvenanceResolver = Callable[[str], dict[str, Any]]
 SemanticReranker = Callable[[RetrievalResult, Sequence[float]], RetrievalResult]
+StructuredResultAuthorizer = Callable[[RetrievalResultItem, str], bool]
 
 
 class RetrievalService:
@@ -42,12 +43,14 @@ class RetrievalService:
         provenance_resolver: ProvenanceResolver | None = None,
         semantic_reranker: SemanticReranker | None = None,
         vector_store: VectorProjectionStore | None = None,
+        structured_result_authorizer: StructuredResultAuthorizer | None = None,
     ) -> None:
         self._index = index or EventIndex()
         self._clip_resolver = clip_resolver
         self._provenance_resolver = provenance_resolver
         self._semantic_reranker = semantic_reranker
         self._vector_store = vector_store
+        self._structured_result_authorizer = structured_result_authorizer
         self._clips: dict[tuple[str, tuple[str, ...] | None], ClipManifest] = {}
         self._provenance: dict[str, dict[str, Any]] = {}
 
@@ -93,10 +96,76 @@ class RetrievalService:
             sequence=sequence,
         )
 
-    def query_events(self, query: RetrievalQuery) -> RetrievalResult:
+    @staticmethod
+    def _page_result(result: RetrievalResult, query: RetrievalQuery) -> RetrievalResult:
+        """Apply a public page after candidate authorization or reranking."""
+
+        items = result.items[query.offset : query.offset + query.limit]
+        return result.model_copy(
+            update={
+                "query": query,
+                "items": items,
+                "offset": query.offset,
+                "limit": query.limit,
+                "has_more": query.offset + len(items) < result.total,
+            }
+        )
+
+    def _authorize_structured_result(
+        self,
+        result: RetrievalResult,
+        *,
+        tenant_id: str | None,
+    ) -> RetrievalResult:
+        """Filter an already-bounded candidate set before any vector lookup."""
+
+        authorizer = self._structured_result_authorizer
+        if authorizer is None:
+            if tenant_id is not None:
+                raise RetrievalCapabilityError(
+                    "tenant-scoped retrieval requires a structured_result_authorizer"
+                )
+            return result
+        if tenant_id is None:
+            raise RetrievalCapabilityError(
+                "tenant_id is required when structured tenant authorization is configured"
+            )
+        try:
+            authorized = tuple(item for item in result.items if authorizer(item, tenant_id))
+        except Exception as exc:
+            raise RetrievalCapabilityError(
+                f"structured tenant authorization failed: {exc}"
+            ) from exc
+        return result.model_copy(
+            update={
+                "items": authorized,
+                "total": len(authorized),
+                "offset": 0,
+                "limit": 1000,
+                "has_more": False,
+            }
+        )
+
+    def query_events(
+        self,
+        query: RetrievalQuery,
+        *,
+        tenant_id: str | None = None,
+    ) -> RetrievalResult:
         if not isinstance(query, RetrievalQuery):
             raise EventIndexError("query must be a RetrievalQuery")
-        return self._index.query_index(query)
+        if self._structured_result_authorizer is None and tenant_id is None:
+            return self._index.query_index(query)
+        if query.offset + query.limit > 1000:
+            raise RetrievalCapabilityError(
+                "tenant-authorized structured queries are bounded to 1000 candidates"
+            )
+        candidate_query = query.model_copy(update={"offset": 0, "limit": 1000})
+        result = self._index.query_index(candidate_query)
+        return self._page_result(
+            self._authorize_structured_result(result, tenant_id=tenant_id),
+            query,
+        )
 
     def semantic_search(
         self,
@@ -106,37 +175,26 @@ class RetrievalService:
         tenant_id: str | None = None,
     ) -> RetrievalResult:
         if embedding_vector is None:
-            return self.query_events(query)
+            return self.query_events(query, tenant_id=tenant_id)
 
         # Vector reranking must see the structured candidate set before
         # pagination; otherwise a high-scoring candidate on a later structured
         # page can never reach the requested result page.  The query contract
         # bounds this local candidate pool at 1000 rows.
         candidate_query = query.model_copy(update={"offset": 0, "limit": 1000})
-        result = self.query_events(candidate_query)
-
-        def page(reranked: RetrievalResult) -> RetrievalResult:
-            items = reranked.items[query.offset : query.offset + query.limit]
-            return reranked.model_copy(
-                update={
-                    "query": query,
-                    "items": items,
-                    "offset": query.offset,
-                    "limit": query.limit,
-                    "has_more": query.offset + len(items) < reranked.total,
-                }
-            )
+        result = self.query_events(candidate_query, tenant_id=tenant_id)
 
         if self._vector_store is not None:
             # A structured query with no candidates is authoritative and must
             # not trigger an unbounded vector scan (or require an embedding
             # family that cannot affect an empty result).
             if not result.items:
-                return page(result)
+                return self._page_result(result, query)
             if query.embedding_id is None:
-                raise RetrievalCapabilityError(
-                    "vector search requires RetrievalQuery.embedding_id"
-                )
+                raise RetrievalCapabilityError("vector search requires RetrievalQuery.embedding_id")
+            candidate_event_revision_ids = tuple(
+                sorted({item.event_revision_id for item in result.items})
+            )
             try:
                 vector_result = self._vector_store.search(
                     VectorSearchQuery(
@@ -146,18 +204,27 @@ class RetrievalService:
                         # VectorSearchQuery requires canonical sorted/unique
                         # candidate IDs; structured result order remains the
                         # deterministic tie-breaker below.
-                        candidate_event_revision_ids=tuple(
-                            sorted({item.event_revision_id for item in result.items})
-                        ),
-                         limit=max(len(result.items), 1),
+                        candidate_event_revision_ids=candidate_event_revision_ids,
+                        limit=max(len(result.items), 1),
                     )
                 )
-            except VectorProjectionError as exc:
-                raise RetrievalCapabilityError(str(exc)) from exc
-            except Exception as exc:
+            except VectorProjectionError:
+                # Projection infrastructure is optional. The structured set is
+                # authoritative, so failure cannot turn valid retrieval into an
+                # error or expand its tenant-bound candidate population.
+                return self._page_result(result, query)
+            except Exception:
                 # A configured adapter is still optional infrastructure.  Do not
-                # leak provider/database exceptions through the application API.
-                raise RetrievalCapabilityError(f"vector search failed: {exc}") from exc
+                # leak provider/database exceptions through the application API
+                # or make optional projection availability an authority gate.
+                return self._page_result(result, query)
+            if not isinstance(vector_result, tuple) or any(
+                not isinstance(hit, VectorSearchHit)
+                or hit.embedding_id != query.embedding_id
+                or hit.event_revision_id not in candidate_event_revision_ids
+                for hit in vector_result
+            ):
+                return self._page_result(result, query)
             # A revision may have several derived artifact/package vectors.
             # Collapse them by the strongest matching artifact so a later,
             # lower-scoring row cannot overwrite the best score.
@@ -181,7 +248,10 @@ class RetrievalService:
                     pair[0],
                 )
             )
-            return page(result.model_copy(update={"items": tuple(item for _, item in ranked)}))
+            return self._page_result(
+                result.model_copy(update={"items": tuple(item for _, item in ranked)}),
+                query,
+            )
         if self._semantic_reranker is None:
             raise RetrievalCapabilityError(
                 "embedding reranking is unavailable without a configured semantic_reranker"
@@ -189,7 +259,7 @@ class RetrievalService:
         reranked = self._semantic_reranker(result, tuple(embedding_vector))
         if not isinstance(reranked, RetrievalResult):
             raise RetrievalCapabilityError("semantic_reranker returned an invalid result")
-        return page(reranked)
+        return self._page_result(reranked, query)
 
     @staticmethod
     def _camera_mask(camera_mask: list[str] | None) -> tuple[str, ...] | None:

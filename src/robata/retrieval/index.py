@@ -8,7 +8,7 @@ as a separate selection projection.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -402,20 +402,26 @@ class EventIndex:
             )
 
             projection = canonical_event_index_revision_projection(projection)
+        revisions: Sequence[object]
+        selections: Sequence[object]
         if "event_id" in projection and "event_revision_id" in projection:
             # Accept a single canonical row as a convenience; terminal
             # adapters normally send the batch shape below.
             revisions = (projection,)
             selections = ()
         else:
-            revisions = projection.get(
+            revisions_value = projection.get(
                 "event_revisions", projection.get("revisions", projection.get("events", ()))
             )
-            selections = projection.get(
+            selections_value = projection.get(
                 "current_selections", projection.get("selections", projection.get("current", ()))
             )
-        if not isinstance(revisions, (list, tuple)) or not isinstance(selections, (list, tuple)):
-            raise EventIndexError("projection revisions and selections must be sequences")
+            if not isinstance(revisions_value, (list, tuple)) or not isinstance(
+                selections_value, (list, tuple)
+            ):
+                raise EventIndexError("projection revisions and selections must be sequences")
+            revisions = revisions_value
+            selections = selections_value
         snapshot = (
             dict(self._revisions),
             {event_id: list(items) for event_id, items in self._by_event.items()},
