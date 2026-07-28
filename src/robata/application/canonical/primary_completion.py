@@ -9,12 +9,13 @@ performs no writes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Annotated, Final, Literal, Protocol, Self
+from typing import Annotated, Final, Literal, Protocol, Self, cast
 from uuid import NAMESPACE_URL, uuid5
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from robata.application.canonical.action_event_revision import (
     PreparedInitialActionEventRevisionBatch,
@@ -73,6 +74,7 @@ from robata.inference.enrichment import ProviderReferenceCatalog
 from robata.inference.input_plan import InferenceInputPlan
 from robata.qa_pipeline.coarse import CoarseQAResult
 from robata.qa_pipeline.completion import QACompletionResult
+from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 
 CANONICAL_PRIMARY_COMPLETION_DETAIL_SCHEMA_ID: Final = (
     "https://schemas.robata.dev/canonical-primary-completion-detail"
@@ -146,7 +148,7 @@ class CanonicalPrimaryCompletionDetail(StrictModel):
     action_event_publications: PreparedInitialActionEventRevisionBatch
 
     @model_validator(mode="after")
-    def validate_detail(self) -> Self:
+    def validate_detail(self, info: ValidationInfo) -> Self:
         if (
             self.schema_ref.schema_id != CANONICAL_PRIMARY_COMPLETION_DETAIL_SCHEMA_ID
             or self.schema_ref.version != CANONICAL_PRIMARY_COMPLETION_DETAIL_SCHEMA_VERSION
@@ -237,17 +239,24 @@ class CanonicalPrimaryCompletionDetail(StrictModel):
             ):
                 raise ValueError("successful completion lacks identity or revision facts")
             assert prepared is not None
-            hypothesis_bindings = tuple(
-                (item.event_hypothesis_logical_key, item.semantic_sha256)
-                for item in sorted(
-                    self.hypotheses,
-                    key=lambda item: (
-                        item.effective_start_ns,
-                        item.effective_end_ns,
-                        item.event_hypothesis_logical_key,
-                    ),
-                )
+            observer = (
+                info.context.get("runtime_observer") if isinstance(info.context, dict) else None
             )
+            with runtime_span(
+                observer,
+                "completion.command.detail.hypothesis_binding_sort",
+            ):
+                hypothesis_bindings = tuple(
+                    (item.event_hypothesis_logical_key, item.semantic_sha256)
+                    for item in sorted(
+                        self.hypotheses,
+                        key=lambda item: (
+                            item.effective_start_ns,
+                            item.effective_end_ns,
+                            item.event_hypothesis_logical_key,
+                        ),
+                    )
+                )
             assignment_bindings = tuple(
                 (
                     item.event_hypothesis_logical_key,
@@ -530,6 +539,7 @@ def _create_primary_completion_command(
     action_event_publications: PreparedInitialActionEventRevisionBatch,
     evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
     registry: SchemaRegistry | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> tuple[PrimaryCompletionCommand, bytes]:
     """Create a validated command and retain the detail bytes used to bind it."""
 
@@ -615,23 +625,36 @@ def _create_primary_completion_command(
     draft_detail = CanonicalPrimaryCompletionDetail.model_construct(
         **detail_fields  # type: ignore[arg-type]
     )
-    detail_fields["semantic_sha256"] = semantic_sha256(
-        canonical_primary_completion_detail_projection(draft_detail)
-    )
+    with runtime_span(runtime_observer, "completion.command.detail.semantic_hash"):
+        detail_fields["semantic_sha256"] = semantic_sha256(
+            canonical_primary_completion_detail_projection(draft_detail)
+        )
     # Completion-detail v4 is a published wire shape and intentionally does
     # not carry the newer internal product-QA context/result fields. Validate
     # the fresh run before this boundary (the result model requires the full
     # 21-class projection), then validate the persisted v4 closure with its
     # explicit compatibility context so replay does not invent or drop wire
     # fields.
-    detail = CanonicalPrimaryCompletionDetail.model_validate(
-        detail_fields,
-        strict=True,
-        context={"allow_missing_product_qa": True},
-    )
-    active_registry.validate_pinned(detail.schema_ref, detail.model_dump(mode="json"))
+    with runtime_span(runtime_observer, "completion.command.detail.schema_validate"):
+        with runtime_span(runtime_observer, "completion.command.detail.model_validate"):
+            detail = CanonicalPrimaryCompletionDetail.model_validate(
+                detail_fields,
+                strict=True,
+                context={
+                    "allow_missing_product_qa": True,
+                    "runtime_observer": runtime_observer,
+                },
+            )
+        with runtime_span(runtime_observer, "completion.command.detail.registry_validate"):
+            active_registry.validate_pinned(detail.schema_ref, detail.model_dump(mode="json"))
 
-    detail_bytes = canonical_json_bytes(detail)
+    with runtime_span(runtime_observer, "completion.command.detail.serialize"):
+        detail_bytes = canonical_json_bytes(detail)
+    runtime_increment(
+        runtime_observer,
+        "completion.command.detail_bytes",
+        len(detail_bytes),
+    )
     detail_exact_digest = exact_bytes_sha256(detail_bytes)
     detailed_reference = DetailedResultArtifactReference(
         artifact_id=_detailed_result_artifact_id(detail_exact_digest),
@@ -644,12 +667,18 @@ def _create_primary_completion_command(
         PRIMARY_COMPLETION_RECORD_SCHEMA_ID,
         PRIMARY_COMPLETION_RECORD_SCHEMA_VERSION,
     ).ref
-    completion = _primary_completion_record_from_detail(
-        detail,
-        schema_ref=completion_ref,
-        detailed_result=detailed_reference,
-    )
-    validate_registered_primary_completion_record(completion, active_registry)
+    with runtime_span(runtime_observer, "completion.command.ordered_roots"):
+        completion = _primary_completion_record_from_detail(
+            detail,
+            schema_ref=completion_ref,
+            detailed_result=detailed_reference,
+            runtime_observer=runtime_observer,
+        )
+    with (
+        runtime_span(runtime_observer, "completion.command.completion.schema_validate"),
+        runtime_span(runtime_observer, "completion.command.completion.registry_validate"),
+    ):
+        validate_registered_primary_completion_record(completion, active_registry)
     command_fields: dict[str, object] = {
         "schema_version": "1.0",
         "semantic_projection_version": (CANONICAL_PRIMARY_COMPLETION_COMMAND_PROJECTION_VERSION),
@@ -661,10 +690,15 @@ def _create_primary_completion_command(
     draft_command = PrimaryCompletionCommand.model_construct(
         **command_fields  # type: ignore[arg-type]
     )
-    command_fields["command_sha256"] = semantic_sha256(
-        primary_completion_command_projection(draft_command)
-    )
-    command = PrimaryCompletionCommand.model_validate(command_fields, strict=True)
+    with runtime_span(runtime_observer, "completion.command.command.semantic_hash"):
+        command_fields["command_sha256"] = semantic_sha256(
+            primary_completion_command_projection(draft_command)
+        )
+    with (
+        runtime_span(runtime_observer, "completion.command.command.schema_validate"),
+        runtime_span(runtime_observer, "completion.command.command.model_validate"),
+    ):
+        command = PrimaryCompletionCommand.model_validate(command_fields, strict=True)
     return command, detail_bytes
 
 
@@ -675,6 +709,7 @@ def create_primary_completion_command(
     action_event_publications: PreparedInitialActionEventRevisionBatch,
     evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
     registry: SchemaRegistry | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> PrimaryCompletionCommand:
     """Create and schema-validate one exact aggregate command without writes."""
 
@@ -684,6 +719,7 @@ def create_primary_completion_command(
         action_event_publications=action_event_publications,
         evidence_references=evidence_references,
         registry=registry,
+        runtime_observer=runtime_observer,
     )
     return command
 
@@ -695,6 +731,7 @@ def prepare_primary_completion_command(
     action_event_publications: PreparedInitialActionEventRevisionBatch,
     evidence_references: tuple[PrimaryCompletionEvidenceReference, ...] = (),
     registry: SchemaRegistry | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> PreparedPrimaryCompletionCommand:
     """Prepare one local command for the adjacent authoritative repository.
 
@@ -710,9 +747,22 @@ def prepare_primary_completion_command(
         action_event_publications=action_event_publications,
         evidence_references=evidence_references,
         registry=registry,
+        runtime_observer=runtime_observer,
     )
-    command_bytes = canonical_json_bytes(command)
-    processing_run_bytes = canonical_json_bytes(command.detail.processing_run)
+    with runtime_span(runtime_observer, "completion.command.command.serialize"):
+        command_bytes = canonical_json_bytes(command)
+    runtime_increment(
+        runtime_observer,
+        "completion.command.command_bytes",
+        len(command_bytes),
+    )
+    with runtime_span(runtime_observer, "completion.command.processing_run.serialize"):
+        processing_run_bytes = canonical_json_bytes(command.detail.processing_run)
+    runtime_increment(
+        runtime_observer,
+        "completion.command.processing_run_bytes",
+        len(processing_run_bytes),
+    )
     return PreparedPrimaryCompletionCommand(
         command=command,
         detail_bytes=detail_bytes,
@@ -730,6 +780,7 @@ def _primary_completion_record_from_detail(
     *,
     schema_ref: SchemaRef,
     detailed_result: DetailedResultArtifactReference,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> PrimaryCompletionRecord:
     prepared = detail.prepared_identities
     mutation = prepared.mutation if prepared is not None else None
@@ -778,40 +829,66 @@ def _primary_completion_record_from_detail(
         output_admission_policy_sha256=output_policy_sha256,
         run_membership_count=len(detail.run_memberships),
         run_membership_digest_root=_model_collection_root(
-            "run-memberships", detail.run_memberships
+            "run-memberships",
+            detail.run_memberships,
+            runtime_observer=runtime_observer,
         ),
         barrier_member_count=len(detail.part_results),
-        barrier_member_digest_root=canonical_collection_digest_root(
-            "barrier-members",
-            tuple(item.completion.completion_semantic_sha256 for item in detail.part_results),
+        barrier_member_digest_root=_instrumented_collection_digest_root(
+            collection="barrier-members",
+            prepare_ordered_digests=lambda: tuple(
+                item.completion.completion_semantic_sha256 for item in detail.part_results
+            ),
+            runtime_observer=runtime_observer,
         ),
         hypothesis_count=len(detail.hypotheses),
-        hypothesis_digest_root=canonical_collection_digest_root(
-            "event-hypotheses", tuple(item.semantic_sha256 for item in detail.hypotheses)
+        hypothesis_digest_root=_instrumented_collection_digest_root(
+            collection="event-hypotheses",
+            prepare_ordered_digests=lambda: tuple(
+                item.semantic_sha256 for item in detail.hypotheses
+            ),
+            runtime_observer=runtime_observer,
         ),
         identity_assignment_count=len(assignments),
-        identity_assignment_digest_root=canonical_collection_digest_root(
-            "identity-assignments",
-            tuple(item.assignment_semantic_sha256 for item in assignments),
+        identity_assignment_digest_root=_instrumented_collection_digest_root(
+            collection="identity-assignments",
+            prepare_ordered_digests=lambda: tuple(
+                item.assignment_semantic_sha256 for item in assignments
+            ),
+            runtime_observer=runtime_observer,
         ),
         new_identity_count=len(new_identities),
-        new_identity_digest_root=_model_collection_root("new-identities", new_identities),
+        new_identity_digest_root=_model_collection_root(
+            "new-identities",
+            new_identities,
+            runtime_observer=runtime_observer,
+        ),
         identity_relation_count=len(relations),
-        identity_relation_digest_root=_model_collection_root("identity-relations", relations),
+        identity_relation_digest_root=_model_collection_root(
+            "identity-relations",
+            relations,
+            runtime_observer=runtime_observer,
+        ),
         revision_count=len(publications),
-        revision_digest_root=canonical_collection_digest_root(
-            "action-event-revisions",
-            tuple(item.revision.semantic_sha256 for item in publications),
+        revision_digest_root=_instrumented_collection_digest_root(
+            collection="action-event-revisions",
+            prepare_ordered_digests=lambda: tuple(
+                item.revision.semantic_sha256 for item in publications
+            ),
+            runtime_observer=runtime_observer,
         ),
         selection_decision_count=len(publications),
-        selection_decision_digest_root=canonical_collection_digest_root(
-            "action-event-selections",
-            tuple(item.selection.semantic_sha256 for item in publications),
+        selection_decision_digest_root=_instrumented_collection_digest_root(
+            collection="action-event-selections",
+            prepare_ordered_digests=lambda: tuple(
+                item.selection.semantic_sha256 for item in publications
+            ),
+            runtime_observer=runtime_observer,
         ),
         current_selection_count=len(publications),
-        current_selection_digest_root=canonical_collection_digest_root(
-            "action-event-current-selections",
-            tuple(
+        current_selection_digest_root=_instrumented_collection_digest_root(
+            collection="action-event-current-selections",
+            prepare_ordered_digests=lambda: tuple(
                 semantic_sha256(
                     {
                         "current": item.current.model_dump(mode="json"),
@@ -820,13 +897,20 @@ def _primary_completion_record_from_detail(
                 )
                 for item in publications
             ),
+            runtime_observer=runtime_observer,
         ),
         successor_outbox_count=len(successor_outbox),
         successor_outbox_digest_root=_model_collection_root(
-            "primary-successor-outbox", successor_outbox
+            "primary-successor-outbox",
+            successor_outbox,
+            runtime_observer=runtime_observer,
         ),
         skipped_work_item_count=0,
-        skipped_work_item_digest_root=canonical_collection_digest_root("skipped-work-items", ()),
+        skipped_work_item_digest_root=_instrumented_collection_digest_root(
+            collection="skipped-work-items",
+            prepare_ordered_digests=lambda: (),
+            runtime_observer=runtime_observer,
+        ),
         detailed_result=detailed_result,
         completed_at=completed_at,
     )
@@ -853,11 +937,54 @@ def _primary_terminal_evidence(
     )
 
 
-def _model_collection_root(collection: str, items: tuple[object, ...]) -> Sha256Digest:
-    return canonical_collection_digest_root(
-        collection,
-        tuple(semantic_sha256(item.model_dump(mode="json")) for item in items),  # type: ignore[attr-defined]
+def _model_collection_root(
+    collection: str,
+    items: tuple[object, ...],
+    *,
+    runtime_observer: RuntimeObserver | None = None,
+) -> Sha256Digest:
+    return _instrumented_collection_digest_root(
+        collection=collection,
+        prepare_ordered_digests=lambda: tuple(
+            semantic_sha256(cast(StrictModel, item).model_dump(mode="json")) for item in items
+        ),
+        runtime_observer=runtime_observer,
     )
+
+
+def _instrumented_collection_digest_root(
+    *,
+    collection: str,
+    prepare_ordered_digests: Callable[[], tuple[str, ...]],
+    runtime_observer: RuntimeObserver | None,
+) -> Sha256Digest:
+    """Observe leaf preparation without changing the v3 ordered-digest input."""
+
+    attributes = {"collection": collection}
+    with runtime_span(
+        runtime_observer,
+        "completion.command.roots.leaf_prepare",
+        attributes,
+    ):
+        ordered_item_digests = prepare_ordered_digests()
+    runtime_increment(
+        runtime_observer,
+        "completion.command.root_collections",
+        attributes=attributes,
+    )
+    if ordered_item_digests:
+        runtime_increment(
+            runtime_observer,
+            "completion.command.root_leaves",
+            len(ordered_item_digests),
+            attributes=attributes,
+        )
+    with runtime_span(
+        runtime_observer,
+        "completion.command.roots.compute",
+        attributes,
+    ):
+        return canonical_collection_digest_root(collection, ordered_item_digests)
 
 
 def _detailed_result_artifact_id(exact_digest: str) -> str:

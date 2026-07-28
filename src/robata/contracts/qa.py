@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from math import isclose
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -92,11 +92,24 @@ class ProductQAScopeKind(StrEnum):
 
 
 class ProductQAConfidenceKind(StrEnum):
-    """Origin of a local score; none of these values claims calibration."""
+    """Origin of an uncalibrated local product-QA score.
+
+    Calibration lineage remains inference-only until a separately registered
+    Product QA shape explicitly carries it.
+    """
 
     DETECTOR_REPORTED = "DETECTOR_REPORTED"
     MODEL_REPORTED = "MODEL_REPORTED"
     POLICY_DERIVED = "POLICY_DERIVED"
+
+
+PRODUCT_QA_UNCALIBRATED_CONFIDENCE_KINDS: Final[frozenset[ProductQAConfidenceKind]] = frozenset(
+    {
+        ProductQAConfidenceKind.DETECTOR_REPORTED,
+        ProductQAConfidenceKind.MODEL_REPORTED,
+        ProductQAConfidenceKind.POLICY_DERIVED,
+    }
+)
 
 
 class QAIssueClaim(StrictModel):
@@ -178,6 +191,8 @@ class ProductQAIssueEvidence(StrictModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> Self:
+        if self.confidence_kind not in PRODUCT_QA_UNCALIBRATED_CONFIDENCE_KINDS:
+            raise ValueError("Product QA evidence cannot carry calibrated confidence")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("evidence_refs must be unique")
         if any(not reference.strip() for reference in self.evidence_refs):
@@ -388,9 +403,27 @@ class QAClassifier:
 
         if isinstance(duration_ns, bool) or duration_ns <= 0:
             raise ValueError("duration_ns must be a positive integer")
+        checked_issues: list[ProductQAIssueEvidence] = []
+        for issue in issues:
+            if not isinstance(issue, ProductQAIssueEvidence):
+                raise TypeError("issues must contain ProductQAIssueEvidence")
+            try:
+                checked_issues.append(
+                    ProductQAIssueEvidence.model_validate(
+                        {
+                            name: getattr(issue, name)
+                            for name in ProductQAIssueEvidence.model_fields
+                        },
+                        strict=True,
+                    )
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "issues must contain valid uncalibrated ProductQAIssueEvidence"
+                ) from exc
         projected_marks: list[ClipMark] = []
         unprojected_issues: list[ProductQAIssueEvidence] = []
-        for issue in issues:
+        for issue in checked_issues:
             if issue.scope.kind is ProductQAScopeKind.CROSS_RECORDING_SEQUENCE:
                 unprojected_issues.append(issue)
                 continue
@@ -412,12 +445,13 @@ class QAClassifier:
         )
         return LocalQARecordingResult(
             assessment=assessment,
-            issue_evidence=issues,
+            issue_evidence=tuple(checked_issues),
             unprojected_issue_evidence=tuple(unprojected_issues),
         )
 
 
 __all__ = [
+    "PRODUCT_QA_UNCALIBRATED_CONFIDENCE_KINDS",
     "CameraQAClaim",
     "ClipMark",
     "LocalQARecordingResult",

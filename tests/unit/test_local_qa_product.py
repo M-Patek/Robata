@@ -16,6 +16,7 @@ from robata.application.canonical.product_qa import (
 from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.qa import (
+    PRODUCT_QA_UNCALIBRATED_CONFIDENCE_KINDS,
     ClipMark,
     ProductQAConfidenceKind,
     ProductQAEvidenceScope,
@@ -97,6 +98,35 @@ def test_product_issue_vocabulary_is_exact_and_internal_taxonomy_is_retained() -
     )
     assert QAIssue.MOTION_BLUR.value == "MOTION_BLUR"
     assert QAIssue.SCENE_CHANGE.value == "SCENE_CHANGE"
+
+
+def test_product_qa_rejects_calibrated_confidence_before_any_local_decision() -> None:
+    """P9 keeps calibration lineage out of the existing Product QA contract."""
+
+    assert (
+        frozenset(
+            {
+                ProductQAConfidenceKind.DETECTOR_REPORTED,
+                ProductQAConfidenceKind.MODEL_REPORTED,
+                ProductQAConfidenceKind.POLICY_DERIVED,
+            }
+        )
+        == PRODUCT_QA_UNCALIBRATED_CONFIDENCE_KINDS
+    )
+
+    valid = _evidence()
+    forged = ProductQAIssueEvidence.model_construct(
+        issue=valid.issue,
+        scope=valid.scope,
+        interval=valid.interval,
+        confidence=0.99,
+        confidence_kind="CALIBRATED",
+        evidence_refs=valid.evidence_refs,
+        note=valid.note,
+    )
+
+    with pytest.raises(ValueError, match="valid uncalibrated ProductQAIssueEvidence"):
+        QAClassifier().assess_evidence("recording-1", 10_000_000_000, (forged,))
 
 
 @pytest.mark.parametrize("note", [None, "   "])
@@ -273,7 +303,6 @@ def test_assessment_flags_cannot_be_promoted_or_changed_to_deletion() -> None:
         QAAssessment(**fields, delete_source=True)
 
 
-
 def test_complete_product_cascade_has_one_deterministic_state_for_every_class() -> None:
     result = ProductQACascadeProjector().project(
         recording_id="recording-1",
@@ -418,6 +447,7 @@ def test_media_quality_context_maps_direct_and_proxy_evidence_at_original_timest
         by_issue[ProductQAIssue.BLURRY_LENS].confidence_kind
         is ProductQAConfidenceKind.POLICY_DERIVED
     )
-    assert "media-quality:" + report.semantic_sha256 in by_issue[
-        ProductQAIssue.BLACK_SCREEN
-    ].evidence_refs[0]
+    assert (
+        "media-quality:" + report.semantic_sha256
+        in by_issue[ProductQAIssue.BLACK_SCREEN].evidence_refs[0]
+    )

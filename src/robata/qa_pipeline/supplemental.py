@@ -247,6 +247,9 @@ class DeterministicSupplementalQaDenseConsumer:
             if item.selected_artifact is None:
                 continue
             artifact = item.selected_artifact.artifact
+            # The JPEG source experiment is not an authorization to change Product
+            # QA_DENSE semantics. A policy/schema decision must explicitly widen this
+            # PNG decoder before supplemental QA accepts another representation.
             if artifact.media_type != "image/png":
                 raise ValueError("supplemental QA_DENSE artifact media type is unsupported")
             contents = artifact_bytes_resolver(artifact)

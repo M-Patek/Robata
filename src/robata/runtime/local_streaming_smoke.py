@@ -50,6 +50,7 @@ from robata.application.canonical.stream_recording_reduction import (
 from robata.application.canonical.stream_scheduler import (
     DurableStreamWindowScheduler,
     EosSealInputs,
+    StreamBackpressureThrottle,
     StreamDrainWorkSnapshot,
     StreamSchedulerSchemaRefs,
 )
@@ -113,6 +114,7 @@ from robata.contracts.stream_window import (
     STREAM_INFERENCE_SCHEMA_ID,
     STREAM_INFERENCE_SCHEMA_VERSION,
 )
+from robata.durability import sync_directory
 from robata.queue.outbox import OutboxRetryPolicy
 from robata.runtime.local_streaming_benchmark import (
     WP6_MINIMUM_SERVICE_CAPACITY,
@@ -877,32 +879,69 @@ def run_local_streaming_smoke(
     def bounded_drain() -> None:
         nonlocal bounded_executed
         nonlocal drain_calls
-        scope = scheduler.bounded_drain_scope(manifest.config.drain_batch_size)
-        if not execute_mock_provider_batches(scope):
-            backlog_after_drain_samples.append(observe_backlog())
-            return
-        bounded_executed += finalizer.drain_ready(
-            max_items=manifest.config.drain_batch_size,
-            scope=scope,
-        )
-        drain_calls += 1
-        observe_terminals()
+        remaining_budget = manifest.config.drain_batch_size
+        while remaining_budget > 0:
+            scope = scheduler.bounded_drain_scope(remaining_budget)
+            if not scope:
+                break
+            if not execute_mock_provider_batches(scope):
+                backlog_after_drain_samples.append(observe_backlog())
+                return
+            executed = finalizer.drain_ready(
+                max_items=remaining_budget,
+                scope=scope,
+            )
+            if executed == 0:
+                break
+            bounded_executed += executed
+            drain_calls += 1
+            remaining_budget -= executed
+            observe_terminals()
         backlog_after_drain_samples.append(observe_backlog())
+
+    def append_windows_with_backpressure(windows: tuple[BoundedWindowPlan, ...]) -> None:
+        """Admit an ordered batch without treating throttle as dropped source work."""
+
+        next_index = 0
+        while next_index < len(windows):
+            candidate_count = len(windows) - next_index
+            while True:
+                candidate = windows[next_index : next_index + candidate_count]
+                try:
+                    scheduler.append_windows(candidate)
+                except StreamBackpressureThrottle:
+                    if candidate_count > 1:
+                        candidate_count = max(1, candidate_count // 2)
+                        continue
+                    backlog_before_retry = observe_backlog()
+                    bounded_drain()
+                    if observe_backlog() >= backlog_before_retry:
+                        raise RuntimeError(
+                            "stream admission remained throttled after a bounded drain"
+                        ) from None
+                    candidate_count = len(windows) - next_index
+                    continue
+
+                admitted_at_ns = perf_counter_ns()
+                for window in candidate:
+                    eligible_at_ns[window.ordinal] = admitted_at_ns
+                next_index += len(candidate)
+                observe_backlog()
+                bounded_drain()
+                break
 
     window_count = _window_count(manifest.config)
     for batch_start in range(0, window_count, manifest.config.window_batch_size):
         batch_end = min(batch_start + manifest.config.window_batch_size, window_count)
-        for ordinal in range(batch_start, batch_end):
-            scheduler.append_window(
-                _window(
-                    manifest,
-                    ordinal,
-                    capture_scope_digest=capture_scope_digest,
-                )
+        windows = tuple(
+            _window(
+                manifest,
+                ordinal,
+                capture_scope_digest=capture_scope_digest,
             )
-            eligible_at_ns[ordinal] = perf_counter_ns()
-        observe_backlog()
-        bounded_drain()
+            for ordinal in range(batch_start, batch_end)
+        )
+        append_windows_with_backpressure(windows)
 
     catchup_cycles = max(
         1,
@@ -1352,13 +1391,7 @@ def _content_addressed_bytes_match(path: Path, payload: bytes) -> bool:
 
 
 def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 def _git_output(root: Path, *arguments: str) -> bytes:

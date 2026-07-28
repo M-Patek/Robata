@@ -34,6 +34,7 @@ from robata.contracts.video_export_v2 import (
     CameraVideoExportManifestV2,
     CameraVideoExportRecordV2,
 )
+from robata.durability import sync_directory
 from robata.ports.frame_materialization import (
     FrameMaterializationError,
     FrameMaterializationErrorCode,
@@ -45,8 +46,16 @@ from robata.tempfiles import make_staging_directory
 _MANIFEST_FILENAME = "camera-video-export-manifest.json"
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8"
+_JPEG_END_OF_IMAGE = b"\xff\xd9"
 _PRODUCER_VERSION = "0.1.0"
 _QUALITY_FLAGS = ("LOCAL_UNVERIFIED_IDENTITY_ALIGNMENT",)
+
+# The MCAP source records these values in its explicit evidence-encoding policy.
+# Keeping them next to the encoder prevents policy values from describing a different
+# implementation than the one that actually emitted the bytes.
+PYAV_FRAME_ENCODER_IMPLEMENTATION = "pyav"
+PYAV_FRAME_ENCODER_VERSION = str(av.__version__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +425,9 @@ def _frame_pts_ns(frame: Any) -> int:
     return exact_ns.numerator
 
 
-def _encode_png(frame: Any, *, max_width: int | None) -> tuple[bytes, int, int]:
+def _normalize_rgb24(frame: Any, *, max_width: int | None) -> Any:
+    """Return the exact RGB24 surface consumed by the canonical PNG encoder."""
+
     try:
         output_width = frame.width if max_width is None else min(frame.width, max_width)
         output_height = max(
@@ -430,6 +441,18 @@ def _encode_png(frame: Any, *, max_width: int | None) -> tuple[bytes, int, int]:
         )
         rgb_frame.pts = 0
         rgb_frame.time_base = Fraction(1, 1)
+    except Exception as error:
+        _fail(
+            FrameMaterializationErrorCode.PNG_ENCODE_FAILED,
+            f"PyAV could not normalize a selected frame as RGB24: {error}",
+        )
+    return rgb_frame
+
+
+def _encode_png_rgb24(rgb_frame: Any) -> bytes:
+    """Encode one already-normalized RGB24 surface with the canonical PNG settings."""
+
+    try:
         encoder = av.CodecContext.create("png", "w")
         encoder.width = rgb_frame.width
         encoder.height = rgb_frame.height
@@ -441,26 +464,208 @@ def _encode_png(frame: Any, *, max_width: int | None) -> tuple[bytes, int, int]:
     except Exception as error:
         _fail(
             FrameMaterializationErrorCode.PNG_ENCODE_FAILED,
-            f"PyAV could not encode a selected frame as PNG: {error}",
+            f"PyAV could not encode a normalized RGB24 frame as PNG: {error}",
         )
     if not png_bytes.startswith(_PNG_SIGNATURE):
         _fail(
             FrameMaterializationErrorCode.PNG_ENCODE_FAILED,
             "PyAV PNG encoder returned invalid output",
         )
+    return png_bytes
+
+
+def _encode_png(frame: Any, *, max_width: int | None) -> tuple[bytes, int, int]:
+    rgb_frame = _normalize_rgb24(frame, max_width=max_width)
+    png_bytes = _encode_png_rgb24(rgb_frame)
     return png_bytes, rgb_frame.width, rgb_frame.height
+
+
+def _encode_jpeg_rgb24(
+    rgb_frame: Any,
+    *,
+    qscale: int,
+    chroma_subsampling: str,
+) -> bytes:
+    """Encode normalized RGB24 bytes with the pinned experimental MJPEG settings."""
+
+    if isinstance(qscale, bool) or not isinstance(qscale, int) or not 1 <= qscale <= 31:
+        _fail(
+            FrameMaterializationErrorCode.JPEG_ENCODE_FAILED,
+            "JPEG qscale must be an integer from 1 through 31",
+        )
+    if chroma_subsampling not in {"yuvj420p", "yuvj444p"}:
+        _fail(
+            FrameMaterializationErrorCode.JPEG_ENCODE_FAILED,
+            f"unsupported JPEG chroma subsampling: {chroma_subsampling!r}",
+        )
+    try:
+        encoder = av.CodecContext.create("mjpeg", "w")
+        encoder.width = rgb_frame.width
+        encoder.height = rgb_frame.height
+        encoder.pix_fmt = chroma_subsampling
+        encoder.time_base = Fraction(1, 1)
+        # This suppresses encoder-version comments and other non-pixel metadata.
+        encoder.flags |= av.codec.context.Flags.bitexact
+        encoder.options = {"qscale": str(qscale)}
+        yuv_frame = rgb_frame.reformat(format=chroma_subsampling)
+        yuv_frame.pts = 0
+        yuv_frame.time_base = Fraction(1, 1)
+        packets = list(encoder.encode(yuv_frame))
+        packets.extend(encoder.encode(None))
+        jpeg_bytes = b"".join(bytes(packet) for packet in packets)
+    except Exception as error:
+        _fail(
+            FrameMaterializationErrorCode.JPEG_ENCODE_FAILED,
+            f"PyAV could not encode a normalized RGB24 frame as JPEG: {error}",
+        )
+    if not jpeg_bytes.startswith(_JPEG_SIGNATURE) or not jpeg_bytes.endswith(_JPEG_END_OF_IMAGE):
+        _fail(
+            FrameMaterializationErrorCode.JPEG_ENCODE_FAILED,
+            "PyAV MJPEG encoder returned invalid output",
+        )
+    return jpeg_bytes
+
+
+def _encode_evidence_rgb24(
+    rgb_frame: Any,
+    *,
+    encoding: str,
+    jpeg_qscale: int = 2,
+    jpeg_chroma_subsampling: str = "yuvj420p",
+) -> bytes:
+    """Encode a normalized surface under an explicitly selected evidence policy."""
+
+    if encoding == "png":
+        return _encode_png_rgb24(rgb_frame)
+    if encoding == "jpeg":
+        return _encode_jpeg_rgb24(
+            rgb_frame,
+            qscale=jpeg_qscale,
+            chroma_subsampling=jpeg_chroma_subsampling,
+        )
+    _fail(
+        FrameMaterializationErrorCode.INVALID_REQUEST,
+        f"unsupported evidence encoding: {encoding!r}",
+    )
+
+
+def _encode_evidence(
+    frame: Any,
+    *,
+    max_width: int | None,
+    encoding: str,
+    jpeg_qscale: int = 2,
+    jpeg_chroma_subsampling: str = "yuvj420p",
+) -> tuple[bytes, int, int]:
+    """Normalize and encode one selected frame without changing the PNG default path."""
+
+    rgb_frame = _normalize_rgb24(frame, max_width=max_width)
+    evidence_bytes = _encode_evidence_rgb24(
+        rgb_frame,
+        encoding=encoding,
+        jpeg_qscale=jpeg_qscale,
+        jpeg_chroma_subsampling=jpeg_chroma_subsampling,
+    )
+    return evidence_bytes, rgb_frame.width, rgb_frame.height
 
 
 def _write_new_file(path: Path, contents: bytes) -> None:
     try:
         with path.open("xb") as stream:
-            stream.write(contents)
+            written = stream.write(contents)
+            if written != len(contents):
+                raise OSError(
+                    f"short write: expected {len(contents)} bytes but wrote {written} bytes"
+                )
             stream.flush()
             os.fsync(stream.fileno())
     except OSError as error:
         _fail(
             FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
             f"cannot write materialized frame {path.name}: {error}",
+        )
+    _verify_staged_file(path, contents)
+
+
+def _verify_staged_file(path: Path, expected_contents: bytes) -> None:
+    expected_sha256 = exact_bytes_sha256(expected_contents)
+    digest = hashlib.sha256()
+    bytes_read = 0
+    try:
+        if path.is_symlink() or not path.is_file():
+            _fail(
+                FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+                f"materialized frame is not a regular file: {path.name}",
+            )
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                bytes_read += len(chunk)
+    except OSError as error:
+        _fail(
+            FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+            f"cannot verify materialized frame {path.name}: {error}",
+        )
+    if bytes_read != len(expected_contents) or digest.hexdigest() != expected_sha256:
+        _fail(
+            FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+            f"materialized frame failed exact-byte verification: {path.name}",
+        )
+
+
+def _sync_directory(path: Path) -> None:
+    sync_directory(path)
+
+
+def _sync_directory_tree(root: Path) -> None:
+    """Persist child directory entries before exposing a staged package."""
+
+    try:
+        if root.is_symlink() or not root.is_dir():
+            _fail(
+                FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+                f"frame-materialization staging directory is invalid: {root.name}",
+            )
+        directories = sorted(
+            (
+                candidate
+                for candidate in root.rglob("*")
+                if candidate.is_dir() and not candidate.is_symlink()
+            ),
+            key=lambda candidate: len(candidate.parts),
+            reverse=True,
+        )
+        for directory in directories:
+            _sync_directory(directory)
+        _sync_directory(root)
+    except OSError as error:
+        _fail(
+            FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+            f"cannot synchronize frame-materialization staging: {error}",
+        )
+
+
+def _publish_staging_directory(staging: Path, target: Path) -> None:
+    """Atomically expose only a fully persisted staged frame package."""
+
+    _sync_directory_tree(staging)
+    try:
+        staging.rename(target)
+    except OSError as error:
+        code = (
+            FrameMaterializationErrorCode.OUTPUT_EXISTS
+            if target.exists() or target.is_symlink()
+            else FrameMaterializationErrorCode.OUTPUT_IO_ERROR
+        )
+        _fail(code, f"cannot publish frame package {target.name}: {error}")
+    try:
+        _sync_directory(target.parent)
+    except OSError as error:
+        # The complete tree is atomically visible at this point, but callers must not
+        # commit authority until its parent-directory durability barrier succeeds.
+        _fail(
+            FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+            f"cannot synchronize published frame package {target.name}: {error}",
         )
 
 
@@ -830,15 +1035,7 @@ class PyAvFrameMaterializer:
                     FrameMaterializationErrorCode.OUTPUT_EXISTS,
                     f"frame package already exists: {package_id}",
                 )
-            try:
-                staging.rename(target)
-            except OSError as error:
-                code = (
-                    FrameMaterializationErrorCode.OUTPUT_EXISTS
-                    if target.exists() or target.is_symlink()
-                    else FrameMaterializationErrorCode.OUTPUT_IO_ERROR
-                )
-                _fail(code, f"cannot publish frame package {package_id}: {error}")
+            _publish_staging_directory(staging, target)
             published = True
             return package
         finally:

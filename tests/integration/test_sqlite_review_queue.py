@@ -200,6 +200,11 @@ def test_priority_claim_submit_and_exact_replay(tmp_path: Path) -> None:
     assert queue.enqueue(low_priority).inserted is True
     assert queue.enqueue(low_priority).inserted is False
     queue.enqueue(high_priority)
+    assert tuple(item.task for item in queue.list_open(limit=1)) == (high_priority,)
+    assert queue.list_open(limit=0) == ()
+    with pytest.raises(ReviewQueueError) as invalid_limit:
+        queue.list_open(limit=-1)
+    assert invalid_limit.value.code is ReviewQueueErrorCode.INVALID_REQUEST
 
     lease = queue.claim_next(worker_id="worker-a", now_ns=1_010, lease_duration_ns=100)
     assert lease is not None

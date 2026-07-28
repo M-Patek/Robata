@@ -13,15 +13,24 @@ from pathlib import Path
 from typing import cast
 
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkFenceError
+from robata.queue.models import TERMINAL_WORK_STATES
 
 _EXTENSION_NAME = "stream-work-ledger"
-_EXTENSION_SCHEMA_VERSION = 2
-_EXTENSION_OBJECT_NAMES = frozenset(
+_EXTENSION_SCHEMA_VERSION = 3
+_TERMINAL_WORK_STATE_VALUES = tuple(sorted(state.value for state in TERMINAL_WORK_STATES))
+_V1_EXTENSION_OBJECT_NAMES = frozenset(
     {
         "stream_plans",
         "expected_windows",
         "stream_work_plans",
         "stream_work_plan_order",
+    }
+)
+_V2_EXTENSION_OBJECT_NAMES = _V1_EXTENSION_OBJECT_NAMES
+_EXTENSION_OBJECT_NAMES = frozenset(
+    {
+        *_V2_EXTENSION_OBJECT_NAMES,
+        "stream_backpressure_controllers",
     }
 )
 _EXTENSION_SCHEMA_STATEMENTS = (
@@ -68,6 +77,17 @@ _EXTENSION_SCHEMA_STATEMENTS = (
     """
     CREATE INDEX stream_work_plan_order
     ON stream_work_plans(plan_key, expected_ordinal, role_order)
+    """,
+    """
+    CREATE TABLE stream_backpressure_controllers (
+        plan_key TEXT NOT NULL REFERENCES stream_plans(plan_key),
+        controller_key TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        owner_fence INTEGER NOT NULL CHECK (owner_fence > 0),
+        state_json BLOB NOT NULL,
+        PRIMARY KEY (plan_key, controller_key)
+    )
     """,
 )
 _ADDITIVE_INDEX_STATEMENTS = (
@@ -127,6 +147,16 @@ _EXTENSION_REQUIRED_COLUMNS["stream_work_plans"] = frozenset(
         "pending_fencing_token",
     }
 )
+_EXTENSION_REQUIRED_COLUMNS["stream_backpressure_controllers"] = frozenset(
+    {
+        "plan_key",
+        "controller_key",
+        "policy_version",
+        "owner_id",
+        "owner_fence",
+        "state_json",
+    }
+)
 _V1_TO_V2_PENDING_COLUMNS = (
     ("pending_terminal_json", "BLOB"),
     ("pending_lease_epoch", "INTEGER"),
@@ -140,6 +170,34 @@ class SQLiteStreamWorkLedgerError(RuntimeError):
 
 class SQLiteStreamWorkLedgerConflict(SQLiteStreamWorkLedgerError):
     """An exact replay differs from already-persisted stream state."""
+
+
+class SQLiteStreamWorkLedgerFairnessThrottle(SQLiteStreamWorkLedgerError):
+    """A recording would exceed its durable active-window share in one partition."""
+
+    def __init__(
+        self,
+        *,
+        plan_key: str,
+        controller_key: str,
+        current_active_window_count: int,
+        least_peer_active_window_count: int,
+        requested_new_window_count: int,
+        allowed_new_window_count: int,
+    ) -> None:
+        self.plan_key = plan_key
+        self.controller_key = controller_key
+        self.current_active_window_count = current_active_window_count
+        self.least_peer_active_window_count = least_peer_active_window_count
+        self.requested_new_window_count = requested_new_window_count
+        self.allowed_new_window_count = allowed_new_window_count
+        super().__init__(
+            "recording admission is throttled by durable active-window fairness "
+            f"for partition {controller_key}: requested={requested_new_window_count}, "
+            f"allowed={allowed_new_window_count}, "
+            f"current_active={current_active_window_count}, "
+            f"least_peer_active={least_peer_active_window_count}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +261,18 @@ class StoredStreamBacklog:
     export_manifest_sha256: str | None
     export_member_count: int | None
     finalization_published: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredStreamBackpressureController:
+    """Owned state of one restart-safe, timing-only controller."""
+
+    plan_key: str
+    controller_key: str
+    policy_version: str
+    owner_id: str
+    owner_fence: int
+    state_json: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,11 +369,147 @@ class SQLiteStreamWorkLedger:
 
         return self._run(write=False, operation_name="plans", operation=operation)
 
+    def claim_backpressure_controller(
+        self,
+        *,
+        plan_key: str,
+        controller_key: str,
+        policy_version: str,
+        owner_id: str,
+        initial_state_json: bytes,
+    ) -> StoredStreamBackpressureController:
+        """Acquire the owner fence for one controller without losing its state."""
+
+        _require_nonempty_text(plan_key, "plan_key")
+        _require_nonempty_text(controller_key, "controller_key")
+        _require_nonempty_text(policy_version, "policy_version")
+        _require_nonempty_text(owner_id, "owner_id")
+        _require_nonempty_bytes(initial_state_json, "initial_state_json")
+
+        def operation(connection: sqlite3.Connection) -> StoredStreamBackpressureController:
+            plan = connection.execute(
+                "SELECT 1 FROM stream_plans WHERE plan_key = ?",
+                (plan_key,),
+            ).fetchone()
+            if plan is None:
+                raise SQLiteStreamWorkLedgerError("expected plan is not registered")
+            row = connection.execute(
+                """
+                SELECT * FROM stream_backpressure_controllers
+                WHERE plan_key = ? AND controller_key = ?
+                """,
+                (plan_key, controller_key),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO stream_backpressure_controllers (
+                        plan_key, controller_key, policy_version, owner_id,
+                        owner_fence, state_json
+                    ) VALUES (?, ?, ?, ?, 1, ?)
+                    """,
+                    (
+                        plan_key,
+                        controller_key,
+                        policy_version,
+                        owner_id,
+                        sqlite3.Binary(initial_state_json),
+                    ),
+                )
+                return StoredStreamBackpressureController(
+                    plan_key=plan_key,
+                    controller_key=controller_key,
+                    policy_version=policy_version,
+                    owner_id=owner_id,
+                    owner_fence=1,
+                    state_json=initial_state_json,
+                )
+            stored = _backpressure_controller_from_row(row)
+            if stored.policy_version != policy_version:
+                raise SQLiteStreamWorkLedgerConflict(
+                    "backpressure controller policy version changed"
+                )
+            if stored.owner_id == owner_id:
+                return stored
+            next_fence = stored.owner_fence + 1
+            cursor = connection.execute(
+                """
+                UPDATE stream_backpressure_controllers
+                SET owner_id = ?, owner_fence = ?
+                WHERE plan_key = ? AND controller_key = ? AND owner_fence = ?
+                """,
+                (owner_id, next_fence, plan_key, controller_key, stored.owner_fence),
+            )
+            if cursor.rowcount != 1:
+                raise WorkFenceError("backpressure controller ownership changed")
+            return StoredStreamBackpressureController(
+                plan_key=stored.plan_key,
+                controller_key=stored.controller_key,
+                policy_version=stored.policy_version,
+                owner_id=owner_id,
+                owner_fence=next_fence,
+                state_json=stored.state_json,
+            )
+
+        return self._run(
+            write=True,
+            operation_name="claim_backpressure_controller",
+            operation=operation,
+        )
+
+    def save_backpressure_controller(
+        self,
+        controller: StoredStreamBackpressureController,
+        *,
+        state_json: bytes,
+    ) -> StoredStreamBackpressureController:
+        """Persist the successor state using the current owner fence."""
+
+        if not isinstance(controller, StoredStreamBackpressureController):
+            raise TypeError("controller must be StoredStreamBackpressureController")
+        _require_nonempty_bytes(state_json, "state_json")
+
+        def operation(connection: sqlite3.Connection) -> StoredStreamBackpressureController:
+            cursor = connection.execute(
+                """
+                UPDATE stream_backpressure_controllers
+                SET state_json = ?
+                WHERE plan_key = ? AND controller_key = ?
+                  AND owner_id = ? AND owner_fence = ? AND policy_version = ?
+                """,
+                (
+                    sqlite3.Binary(state_json),
+                    controller.plan_key,
+                    controller.controller_key,
+                    controller.owner_id,
+                    controller.owner_fence,
+                    controller.policy_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise WorkFenceError("backpressure controller fence is stale")
+            return StoredStreamBackpressureController(
+                plan_key=controller.plan_key,
+                controller_key=controller.controller_key,
+                policy_version=controller.policy_version,
+                owner_id=controller.owner_id,
+                owner_fence=controller.owner_fence,
+                state_json=state_json,
+            )
+
+        return self._run(
+            write=True,
+            operation_name="save_backpressure_controller",
+            operation=operation,
+        )
+
     def append_windows(
         self,
         *,
         plan_key: str,
         windows: Sequence[NewStreamWindow],
+        controller_key: str | None = None,
+        controller_policy_version: str | None = None,
     ) -> tuple[bool, ...]:
         """Atomically append a contiguous batch of windows.
 
@@ -317,6 +523,13 @@ class SQLiteStreamWorkLedger:
         checked = tuple(windows)
         if not checked:
             return ()
+        if (controller_key is None) != (controller_policy_version is None):
+            raise ValueError(
+                "controller_key and controller_policy_version must be supplied together"
+            )
+        if controller_key is not None and controller_policy_version is not None:
+            _require_nonempty_text(controller_key, "controller_key")
+            _require_nonempty_text(controller_policy_version, "controller_policy_version")
         for window in checked:
             if not isinstance(window, NewStreamWindow):
                 raise TypeError("windows must contain NewStreamWindow values")
@@ -348,6 +561,7 @@ class SQLiteStreamWorkLedger:
             ).fetchone()
             if plan is None:
                 raise SQLiteStreamWorkLedgerError("expected plan is not registered")
+
             tail = connection.execute(
                 """
                 SELECT ordinal FROM expected_windows
@@ -359,6 +573,7 @@ class SQLiteStreamWorkLedger:
             ).fetchone()
             next_ordinal = 0 if tail is None else _int(tail, "ordinal") + 1
             inserted: list[bool] = []
+            new_windows: list[NewStreamWindow] = []
             for window in checked:
                 existing = connection.execute(
                     """
@@ -392,6 +607,22 @@ class SQLiteStreamWorkLedger:
                     raise SQLiteStreamWorkLedgerConflict(
                         "expected windows must be appended in contiguous planner order"
                     )
+                new_windows.append(window)
+                next_ordinal += 1
+                inserted.append(True)
+
+            if new_windows and controller_key is not None and controller_policy_version is not None:
+                _enforce_recording_fair_admission(
+                    connection,
+                    plan_key=plan_key,
+                    controller_key=controller_key,
+                    controller_policy_version=controller_policy_version,
+                    requested_new_window_count=len(new_windows),
+                )
+
+            for window, did_insert in zip(checked, inserted, strict=True):
+                if not did_insert:
+                    continue
                 connection.execute(
                     """
                     INSERT INTO expected_windows (
@@ -407,8 +638,6 @@ class SQLiteStreamWorkLedger:
                 )
                 for work in window.work_plans:
                     _insert_work(connection, plan_key, work)
-                next_ordinal += 1
-                inserted.append(True)
             return tuple(inserted)
 
         return self._run(write=True, operation_name="append_windows", operation=operation)
@@ -421,6 +650,8 @@ class SQLiteStreamWorkLedger:
         declaration_json: bytes,
         window_json: bytes,
         work_plans: Sequence[NewStreamWorkPlan],
+        controller_key: str | None = None,
+        controller_policy_version: str | None = None,
     ) -> bool:
         """Atomically append one declaration and its children."""
 
@@ -434,6 +665,8 @@ class SQLiteStreamWorkLedger:
                     work_plans=tuple(work_plans),
                 ),
             ),
+            controller_key=controller_key,
+            controller_policy_version=controller_policy_version,
         )[0]
 
     def windows(self, plan_key: str) -> tuple[StoredExpectedWindow, ...]:
@@ -1386,10 +1619,11 @@ class SQLiteStreamWorkLedger:
                 """,
                 (_EXTENSION_NAME,),
             ).fetchone()
+            placeholders = ", ".join("?" for _ in _EXTENSION_OBJECT_NAMES)
             rows = connection.execute(
-                """
+                f"""
                 SELECT name FROM sqlite_schema
-                WHERE name IN (?, ?, ?, ?)
+                WHERE name IN ({placeholders})
                 """,
                 tuple(sorted(_EXTENSION_OBJECT_NAMES)),
             ).fetchall()
@@ -1411,7 +1645,7 @@ class SQLiteStreamWorkLedger:
             else:
                 version = _int(metadata, "schema_version")
                 if version == 1:
-                    if existing_objects != _EXTENSION_OBJECT_NAMES:
+                    if existing_objects != _V1_EXTENSION_OBJECT_NAMES:
                         raise SQLiteStreamWorkLedgerError(
                             "stream extension v1 schema inventory changed"
                         )
@@ -1419,11 +1653,26 @@ class SQLiteStreamWorkLedger:
                     cursor = connection.execute(
                         "UPDATE stream_extension_metadata SET schema_version = ? "
                         "WHERE extension_name = ? AND schema_version = 1",
+                        (2, _EXTENSION_NAME),
+                    )
+                    if cursor.rowcount != 1:
+                        raise SQLiteStreamWorkLedgerError("stream migration metadata row missing")
+                    version = 2
+                if version == 2:
+                    if existing_objects != _V2_EXTENSION_OBJECT_NAMES:
+                        raise SQLiteStreamWorkLedgerError(
+                            "stream extension v2 schema inventory changed"
+                        )
+                    _migrate_v2_to_v3(connection)
+                    cursor = connection.execute(
+                        "UPDATE stream_extension_metadata SET schema_version = ? "
+                        "WHERE extension_name = ? AND schema_version = 2",
                         (_EXTENSION_SCHEMA_VERSION, _EXTENSION_NAME),
                     )
                     if cursor.rowcount != 1:
                         raise SQLiteStreamWorkLedgerError("stream migration metadata row missing")
                     version = _EXTENSION_SCHEMA_VERSION
+                    existing_objects = _EXTENSION_OBJECT_NAMES
                 if version != _EXTENSION_SCHEMA_VERSION:
                     raise SQLiteStreamWorkLedgerError(
                         "stream extension belongs to another schema version"
@@ -1462,6 +1711,22 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE stream_backpressure_controllers (
+            plan_key TEXT NOT NULL REFERENCES stream_plans(plan_key),
+            controller_key TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_fence INTEGER NOT NULL CHECK (owner_fence > 0),
+            state_json BLOB NOT NULL,
+            PRIMARY KEY (plan_key, controller_key)
+        )
+        """
+    )
+
+
 def _validate_extension_columns(connection: sqlite3.Connection) -> None:
     for table, required in _EXTENSION_REQUIRED_COLUMNS.items():
         missing = required.difference(_table_columns(connection, table))
@@ -1475,6 +1740,93 @@ def _validate_extension_columns(connection: sqlite3.Connection) -> None:
 def _table_columns(connection: sqlite3.Connection, table: str) -> frozenset[str]:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return frozenset(_text(row, "name") for row in rows)
+
+
+def _enforce_recording_fair_admission(
+    connection: sqlite3.Connection,
+    *,
+    plan_key: str,
+    controller_key: str,
+    controller_policy_version: str,
+    requested_new_window_count: int,
+) -> None:
+    """Keep one partition's durable active windows balanced across recordings.
+
+    The fairness source is the authoritative stream/work ledger, rather than
+    process-local requests. A window remains active while any of its fixed DAG
+    work is pending or nonterminal. This includes a durable PENDING projection
+    after a crash, so reopening the database reconstructs the exact share.
+    """
+
+    controller = connection.execute(
+        """
+        SELECT policy_version FROM stream_backpressure_controllers
+        WHERE plan_key = ? AND controller_key = ?
+        """,
+        (plan_key, controller_key),
+    ).fetchone()
+    if controller is None:
+        raise SQLiteStreamWorkLedgerError(
+            "backpressure fairness requires a registered partition controller"
+        )
+    if _text(controller, "policy_version") != controller_policy_version:
+        raise SQLiteStreamWorkLedgerConflict(
+            "backpressure fairness policy does not match this recording controller"
+        )
+
+    policy_rows = connection.execute(
+        """
+        SELECT DISTINCT policy_version FROM stream_backpressure_controllers
+        WHERE controller_key = ? ORDER BY policy_version
+        """,
+        (controller_key,),
+    ).fetchall()
+    if any(_text(row, "policy_version") != controller_policy_version for row in policy_rows):
+        raise SQLiteStreamWorkLedgerConflict(
+            "backpressure partition controller key has conflicting policy versions"
+        )
+
+    terminal_placeholders = ", ".join("?" for _ in _TERMINAL_WORK_STATE_VALUES)
+    rows = connection.execute(
+        f"""
+        SELECT stream.plan_key,
+               COUNT(DISTINCT stream.expected_ordinal) AS active_window_count
+        FROM stream_work_plans AS stream
+        JOIN stream_backpressure_controllers AS controller
+          ON controller.plan_key = stream.plan_key
+        LEFT JOIN work_items AS execution
+          ON execution.work_item_id = stream.work_item_id
+        WHERE controller.controller_key = ?
+          AND stream.expected_ordinal IS NOT NULL
+          AND (
+              stream.publication_state = 'PENDING'
+              OR execution.work_item_id IS NULL
+              OR execution.state NOT IN ({terminal_placeholders})
+          )
+        GROUP BY stream.plan_key
+        ORDER BY stream.plan_key
+        """,
+        (controller_key, *_TERMINAL_WORK_STATE_VALUES),
+    ).fetchall()
+    active_by_plan = {_text(row, "plan_key"): _int(row, "active_window_count") for row in rows}
+    peer_active_counts = tuple(
+        count for candidate, count in active_by_plan.items() if candidate != plan_key
+    )
+    if not peer_active_counts:
+        return
+
+    current_active = active_by_plan.get(plan_key, 0)
+    least_peer_active = min(peer_active_counts)
+    allowed_new = max(0, least_peer_active + 1 - current_active)
+    if requested_new_window_count > allowed_new:
+        raise SQLiteStreamWorkLedgerFairnessThrottle(
+            plan_key=plan_key,
+            controller_key=controller_key,
+            current_active_window_count=current_active,
+            least_peer_active_window_count=least_peer_active,
+            requested_new_window_count=requested_new_window_count,
+            allowed_new_window_count=allowed_new,
+        )
 
 
 def _insert_work(
@@ -1555,6 +1907,19 @@ def _plan_from_row(row: sqlite3.Row) -> StoredStreamPlan:
     )
 
 
+def _backpressure_controller_from_row(
+    row: sqlite3.Row,
+) -> StoredStreamBackpressureController:
+    return StoredStreamBackpressureController(
+        plan_key=_text(row, "plan_key"),
+        controller_key=_text(row, "controller_key"),
+        policy_version=_text(row, "policy_version"),
+        owner_id=_text(row, "owner_id"),
+        owner_fence=_int(row, "owner_fence"),
+        state_json=_bytes(row, "state_json"),
+    )
+
+
 def _window_from_row(row: sqlite3.Row) -> StoredExpectedWindow:
     return StoredExpectedWindow(
         plan_key=_text(row, "plan_key"),
@@ -1588,6 +1953,18 @@ def _work_execution_from_row(row: sqlite3.Row) -> StoredStreamWorkExecution:
         execution_state=_text(row, "execution_state"),
         execution_created_at=_text(row, "execution_created_at"),
     )
+
+
+def _require_nonempty_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be non-empty text")
+    return value
+
+
+def _require_nonempty_bytes(value: object, field: str) -> bytes:
+    if not isinstance(value, bytes) or not value:
+        raise ValueError(f"{field} must be non-empty bytes")
+    return value
 
 
 def _bytes(row: sqlite3.Row, field: str) -> bytes:

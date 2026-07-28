@@ -72,6 +72,7 @@ from robata.inference.runpod import (
     RunPodEndpointConfig,
     RunPodHttpRequest,
     RunPodHttpResponse,
+    RunPodNativeBatchQualification,
     RunPodRetryPolicy,
     RunPodTransport,
     RunPodTransportError,
@@ -83,6 +84,7 @@ NOW = "2026-07-21T12:00:00Z"
 API_KEY = "runpod-test-secret-000000000000"
 RAW_CLAIM = '{"claims":[],"abstained":true}'
 QUALIFICATION_RUN_NAMESPACE = "runpod-adapter-test"
+
 
 def _uuid(value: int) -> str:
     return str(UUID(int=value))
@@ -136,6 +138,7 @@ def _qualified_request(
             }
         }
     )
+
 
 def _provider_schema(registry: SchemaRegistry) -> JsonSchemaRef:
     ref = registry.resolve_version(PROVIDER_CLAIM_SCHEMA_ID, "1.0.0").ref
@@ -361,6 +364,26 @@ def _retry_policy(*, max_attempts: int = 3) -> RunPodRetryPolicy:
         max_attempts=max_attempts,
         base_delay_ms=10,
         max_delay_ms=20,
+    )
+
+
+def _native_batch_qualification(
+    config: RunPodEndpointConfig,
+    capabilities: ModelCapabilities,
+    retry_policy: RunPodRetryPolicy,
+) -> RunPodNativeBatchQualification:
+    return RunPodNativeBatchQualification.create(
+        config=config,
+        capabilities=capabilities,
+        retry_policy=retry_policy,
+        qualification_report_uri="object://qualification/runpod-native-batch-report.json",
+        qualification_report_sha256="a" * 64,
+        handler_contract_evidence_uri="object://qualification/runpod-native-batch-handler.json",
+        handler_contract_evidence_sha256="b" * 64,
+        streaming_wait_deadline_evidence_uri=(
+            "object://qualification/runpod-native-batch-streaming-gate.json"
+        ),
+        streaming_wait_deadline_evidence_sha256="c" * 64,
     )
 
 
@@ -617,13 +640,27 @@ def _adapter(
 ) -> tuple[RunPodVisionAdapter, InMemoryRawProviderBytesStore]:
     raw_store = InMemoryRawProviderBytesStore()
     resolved_sleep = asyncio.sleep if sleep is None else sleep
+    resolved_config = config or _config()
+    resolved_retry_policy = retry_policy or _retry_policy()
+    capabilities = _capabilities()
+    native_batch_qualification = None
+    native_batch_qualification_measurement = False
+    if resolved_config.native_batch_enabled:
+        if qualification_observer is not None and qualification_session is not None:
+            native_batch_qualification_measurement = True
+        else:
+            native_batch_qualification = _native_batch_qualification(
+                resolved_config,
+                capabilities,
+                resolved_retry_policy,
+            )
 
     return (
         RunPodVisionAdapter(
-            config=config or _config(),
+            config=resolved_config,
             credential=RunPodApiKey(API_KEY),
-            capabilities=_capabilities(),
-            retry_policy=retry_policy or _retry_policy(),
+            capabilities=capabilities,
+            retry_policy=resolved_retry_policy,
             raw_store=raw_store,
             parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
             transport=transport,
@@ -631,6 +668,8 @@ def _adapter(
             runtime_observer=runtime_observer,
             qualification_observer=qualification_observer,
             qualification_session=qualification_session,
+            native_batch_qualification=native_batch_qualification,
+            native_batch_qualification_measurement=native_batch_qualification_measurement,
         ),
         raw_store,
     )
@@ -841,6 +880,67 @@ def test_infer_batch_without_native_opt_in_uses_exact_single_request_fallback() 
         assert "requests" not in document["input"]
 
 
+def test_native_batch_requires_bound_representative_endpoint_evidence() -> None:
+    registry = SchemaRegistry()
+    config = _config(native_batch_enabled=True, native_batch_max_size=2)
+    capabilities = _capabilities()
+    retry_policy = _retry_policy()
+
+    with pytest.raises(ValueError, match="requires representative endpoint qualification evidence"):
+        RunPodVisionAdapter(
+            config=config,
+            credential=RunPodApiKey(API_KEY),
+            capabilities=capabilities,
+            retry_policy=retry_policy,
+            raw_store=InMemoryRawProviderBytesStore(),
+            parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
+            transport=_ScriptedTransport(),
+        )
+
+    qualification = _native_batch_qualification(config, capabilities, retry_policy)
+    adapter = RunPodVisionAdapter(
+        config=config,
+        credential=RunPodApiKey(API_KEY),
+        capabilities=capabilities,
+        retry_policy=retry_policy,
+        raw_store=InMemoryRawProviderBytesStore(),
+        parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
+        transport=_ScriptedTransport(),
+        native_batch_qualification=qualification,
+    )
+
+    assert adapter.native_batch_qualification_state == "QUALIFIED_EVIDENCE"
+    with pytest.raises(ValueError, match="does not bind the active endpoint configuration"):
+        RunPodVisionAdapter(
+            config=config.model_copy(
+                update={"endpoint_url": "https://api.runpod.test/v2/other/runsync"}
+            ),
+            credential=RunPodApiKey(API_KEY),
+            capabilities=capabilities,
+            retry_policy=retry_policy,
+            raw_store=InMemoryRawProviderBytesStore(),
+            parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
+            transport=_ScriptedTransport(),
+            native_batch_qualification=qualification,
+        )
+
+
+def test_native_batch_measurement_mode_requires_a_scoped_qualification_run() -> None:
+    registry = SchemaRegistry()
+
+    with pytest.raises(ValueError, match="requires a scoped observer and session"):
+        RunPodVisionAdapter(
+            config=_config(native_batch_enabled=True, native_batch_max_size=2),
+            credential=RunPodApiKey(API_KEY),
+            capabilities=_capabilities(),
+            retry_policy=_retry_policy(),
+            raw_store=InMemoryRawProviderBytesStore(),
+            parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
+            transport=_ScriptedTransport(),
+            native_batch_qualification_measurement=True,
+        )
+
+
 def test_native_batch_splits_concurrently_and_returns_request_order() -> None:
     async def scenario() -> None:
         registry = SchemaRegistry()
@@ -903,9 +1003,7 @@ def test_native_batch_retries_only_timed_out_item_after_partial_completion() -> 
     registry = SchemaRegistry()
     first, second = _requests(_provider_schema(registry), 2)
     session = _qualification_session(first, run_namespace="native-partial-retry")
-    first, second = tuple(
-        _qualified_request(request, session) for request in (first, second)
-    )
+    first, second = tuple(_qualified_request(request, session) for request in (first, second))
     transport = _ScriptedTransport(
         _completed_batch_response(
             (first, second),
@@ -1001,6 +1099,106 @@ def test_native_batch_keeps_a_completed_sibling_when_one_item_permanently_fails(
     assert isinstance(second_result, VisionInferenceSuccess)
     assert len(transport.requests) == 1
     assert len(raw_store.list_records()) == 1
+
+
+@pytest.mark.parametrize("shape", ("duplicate", "missing", "unknown"))
+def test_native_batch_rejects_invalid_item_association_without_sibling_evidence(
+    shape: str,
+) -> None:
+    registry = SchemaRegistry()
+    first, second = _requests(_provider_schema(registry), 2)
+    document = json.loads(_completed_batch_response((first, second)).body)
+    output = document["output"]
+    assert isinstance(output, dict)
+    items = output["items"]
+    assert isinstance(items, list)
+    if shape == "duplicate":
+        output["items"] = [items[0], dict(items[0])]
+    elif shape == "missing":
+        output["items"] = [items[0]]
+    else:
+        unknown = dict(items[1])
+        unknown["request_id"] = _uuid(9_999)
+        output["items"] = [items[0], unknown]
+    transport = _ScriptedTransport(
+        RunPodHttpResponse(status_code=200, body=canonical_json_bytes(document))
+    )
+    adapter, raw_store = _adapter(
+        registry=registry,
+        transport=transport,
+        config=_config(native_batch_enabled=True, native_batch_max_size=2),
+    )
+
+    results = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in results)
+    assert {result.status for result in results} == {InferenceStatus.INVALID_OUTPUT}
+    assert {result.failure.code for result in results if result.failure is not None} == {
+        "RUNPOD_BATCH_RESPONSE_ITEM_SET_MISMATCH"
+    }
+    assert len(raw_store.list_records()) == 0
+
+
+@pytest.mark.parametrize(
+    ("response_body", "expected_code"),
+    (
+        (b"{not-valid-json", "RUNPOD_BATCH_RESPONSE_INVALID_JSON"),
+        (b'{"id":"first","id":"second"}', "RUNPOD_BATCH_RESPONSE_DUPLICATE_JSON_KEY"),
+    ),
+)
+def test_native_batch_rejects_malformed_response_without_raw_evidence(
+    response_body: bytes,
+    expected_code: str,
+) -> None:
+    registry = SchemaRegistry()
+    first, second = _requests(_provider_schema(registry), 2)
+    transport = _ScriptedTransport(RunPodHttpResponse(status_code=200, body=response_body))
+    adapter, raw_store = _adapter(
+        registry=registry,
+        transport=transport,
+        config=_config(native_batch_enabled=True, native_batch_max_size=2),
+    )
+
+    results = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in results)
+    assert {result.status for result in results} == {InferenceStatus.INVALID_OUTPUT}
+    assert {result.failure.code for result in results if result.failure is not None} == {
+        expected_code
+    }
+    assert len(raw_store.list_records()) == 0
+
+
+def test_native_batch_does_not_borrow_successful_sibling_raw_evidence_on_binding_mismatch() -> None:
+    registry = SchemaRegistry()
+    first, second = _requests(_provider_schema(registry), 2)
+    document = json.loads(_completed_batch_response((first, second)).body)
+    output = document["output"]
+    assert isinstance(output, dict)
+    items = output["items"]
+    assert isinstance(items, list)
+    failed_response = items[1]["response"]
+    assert isinstance(failed_response, dict)
+    failed_output = failed_response["output"]
+    assert isinstance(failed_output, dict)
+    failed_output["binding"] = _binding(first)
+    transport = _ScriptedTransport(
+        RunPodHttpResponse(status_code=200, body=canonical_json_bytes(document))
+    )
+    adapter, raw_store = _adapter(
+        registry=registry,
+        transport=transport,
+        config=_config(native_batch_enabled=True, native_batch_max_size=2),
+    )
+
+    first_result, second_result = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert isinstance(first_result, VisionInferenceSuccess)
+    assert isinstance(second_result, VisionInferenceFailure)
+    assert second_result.failure.code == "RUNPOD_RESPONSE_BINDING_MISMATCH"
+    assert second_result.raw_output_artifact_id is None
+    assert len(raw_store.list_records()) == 1
+    assert raw_store.get(first_result.raw_output_artifact_id).data == RAW_CLAIM.encode()
 
 
 def test_adapter_lifetime_dispatch_gate_bounds_mixed_native_and_direct_inference() -> None:
@@ -1165,6 +1363,76 @@ def test_native_batch_metrics_use_actual_per_item_dispatch_mode() -> None:
         )
         == 1
     )
+
+
+def test_recorded_native_batch_replay_binds_exact_body_and_reverse_item_association() -> None:
+    registry = SchemaRegistry()
+    first, second, changed = _requests(_provider_schema(registry), 3)
+    config = _config(native_batch_enabled=True, native_batch_max_size=2)
+    probe_transport = RecordedRunPodTransport(
+        (
+            RecordedRunPodExchange(
+                request_body_sha256=_digest(9_998),
+                response=RunPodTransportError("recorded probe miss"),
+            ),
+        )
+    )
+    probe_adapter, _probe_raw_store = _adapter(
+        registry=registry,
+        transport=probe_transport,
+        config=config,
+        retry_policy=_retry_policy(max_attempts=1),
+    )
+
+    probe_results = asyncio.run(probe_adapter.infer_batch((first, second)))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in probe_results)
+    assert probe_transport.request_count == 1
+    exact_body = probe_transport.requests[0].body
+    exact_document = json.loads(exact_body)
+    assert exact_document["input"]["contract_version"] == RUNPOD_BATCH_REQUEST_CONTRACT_VERSION
+    assert tuple(item["request_id"] for item in exact_document["input"]["requests"]) == (
+        first.request_id,
+        second.request_id,
+    )
+
+    replay_transport = RecordedRunPodTransport(
+        (
+            RecordedRunPodExchange(
+                request_body_sha256=exact_bytes_sha256(exact_body),
+                response=_completed_batch_response((first, second), reverse_items=True),
+            ),
+        )
+    )
+    adapter, raw_store = _adapter(
+        registry=registry,
+        transport=replay_transport,
+        config=config,
+        retry_policy=_retry_policy(max_attempts=1),
+    )
+
+    results = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert all(isinstance(result, VisionInferenceSuccess) for result in results)
+    assert tuple(result.provider_request_id for result in results) == tuple(
+        f"runpod-job-{request.request_id[-8:]}" for request in (first, second)
+    )
+    assert replay_transport.requests[0].body == exact_body
+    assert len(raw_store.list_records()) == 2
+    assert all(
+        raw_store.get(result.raw_output_artifact_id).data == RAW_CLAIM.encode()
+        for result in results
+    )
+
+    mismatch_results = asyncio.run(adapter.infer_batch((first, changed)))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in mismatch_results)
+    assert {result.status for result in mismatch_results} == {InferenceStatus.TIMEOUT}
+    assert {result.failure.code for result in mismatch_results if result.failure is not None} == {
+        "RUNPOD_TRANSPORT_RETRY_EXHAUSTED"
+    }
+    assert replay_transport.request_count == 2
+    assert len(raw_store.list_records()) == 2
 
 
 def test_recorded_response_replays_through_runpod_parser_and_raw_evidence_ledger() -> None:
@@ -1440,6 +1708,7 @@ def test_runpod_rejects_an_unparted_split_input_plan_before_dispatch() -> None:
     assert "explicit call part" in result.failure.detail
     assert transport.requests == []
 
+
 def test_qualification_observer_error_is_exposed_to_the_saturation_runner() -> None:
     class FailingObserver:
         def record_provider_timing(self, **_kwargs: object) -> None:
@@ -1514,9 +1783,9 @@ def test_recorded_response_replays_through_orchestrator_and_sqlite_evidence(
         "input_plan": plan,
         "input_plan_part_ordinal": 0,
     }
+
     def clock() -> datetime:
         return datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
-
 
     # Capture the exact request body emitted by the normal adapter, then turn the
     # captured response shape into a request-bound replay fixture.
@@ -1615,6 +1884,215 @@ def test_recorded_response_replays_through_orchestrator_and_sqlite_evidence(
         assert redelivered == terminal
         assert replay_transport.request_count == 1
         assert len(ledger.list_records()) == 1
+        ledger.verify_integrity()
+    finally:
+        ledger.close()
+
+
+def test_recorded_native_batch_replays_two_logical_invocations_through_sqlite_evidence(
+    tmp_path: Path,
+) -> None:
+    """One native envelope retains two independent durable evidence chains."""
+
+    registry = SchemaRegistry()
+    schema = _provider_schema(registry)
+    request = _request(schema)
+    assert request.input_plan is not None
+    plan = request.input_plan
+    policy = InferencePolicy(
+        policy_version="model-policy-v1",
+        task=request.task,
+        provider="runpod",
+        model_name="runpod-qwen-vision",
+        model_version="1.0",
+        adapter_version="runpod-adapter-v1",
+        prompt_version=plan.prompt_output.prompt_version,
+        prompt_artifact_id=request.prompt_artifact_id,
+        prompt_sha256=plan.prompt_output.prompt_sha256,
+        output_schema=schema,
+        generation_config={"temperature": 0.0},
+        timeout_ms=1_000,
+        selection_policy_version="selection-v1",
+        required_input_mode=InputMode.MULTI_IMAGE,
+        required_media_types=("image/png",),
+        required_data_handling_policy_version="runpod-local-policy-v1",
+    )
+    registered_claim = registry.resolve_version(PROVIDER_CLAIM_SCHEMA_ID, "1.0.0")
+    registered_common = registry.resolve_version("https://schemas.robata.dev/common", "1.0.0")
+    schema_artifacts = {
+        registered_claim.ref.artifact_id: registered_claim.document_bytes,
+        registered_common.ref.artifact_id: registered_common.document_bytes,
+    }
+    first_call_args: dict[str, object] = {
+        "task": request.task,
+        "package_set_id": request.package_set_id,
+        "mcap_id": _uuid(950),
+        "camera_mapping_run_id": _uuid(951),
+        "alignment_id": _uuid(952),
+        "start_ns": 1,
+        "end_ns": 2,
+        "package_inputs": request.package_inputs,
+        "input_plan": plan,
+        "input_plan_part_ordinal": 0,
+    }
+    second_call_args = {
+        **first_call_args,
+        "mcap_id": _uuid(953),
+        "start_ns": 3,
+        "end_ns": 4,
+        "logical_dependency_sha256": _digest(9_996),
+    }
+    config = _config(native_batch_enabled=True, native_batch_max_size=2)
+
+    def clock() -> datetime:
+        return datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
+    async def run_pair(orchestrator: InferenceOrchestrator) -> tuple[object, object]:
+        results = await asyncio.gather(
+            orchestrator.orchestrate(**first_call_args),
+            orchestrator.orchestrate(**second_call_args),
+        )
+        return tuple(results)
+
+    probe_transport = RecordedRunPodTransport(
+        (
+            RecordedRunPodExchange(
+                request_body_sha256=_digest(9_997),
+                response=RunPodTransportError("recorded probe miss"),
+            ),
+        )
+    )
+    probe_adapter, _probe_raw_store = _adapter(
+        registry=registry,
+        transport=probe_transport,
+        config=config,
+        retry_policy=_retry_policy(max_attempts=1),
+    )
+    probe_orchestrator = InferenceOrchestrator(
+        adapters={"runpod": probe_adapter},
+        task_policies={request.task: policy},
+        schema_artifacts=schema_artifacts,
+        ledger=InMemoryInferenceLedger(),
+        max_batch_size=2,
+        max_batch_queue_delay_ms=5,
+        clock=clock,
+    )
+
+    probe_results = asyncio.run(run_pair(probe_orchestrator))
+
+    assert all(result.status is InferenceStatus.TIMEOUT for result in probe_results)
+    assert probe_transport.request_count == 1
+    exact_body = probe_transport.requests[0].body
+    batch_document = json.loads(exact_body)
+    batch_input = batch_document["input"]
+    assert isinstance(batch_input, dict)
+    batch_requests = batch_input["requests"]
+    assert isinstance(batch_requests, list)
+    response_items: list[dict[str, object]] = []
+    for item in reversed(batch_requests):
+        request_document = item["request"]
+        assert isinstance(request_document, dict)
+        binding = request_document["binding"]
+        assert isinstance(binding, dict)
+        request_id = item["request_id"]
+        assert isinstance(request_id, str)
+        response_items.append(
+            {
+                "request_id": request_id,
+                "response": {
+                    "id": f"recorded-native-batch-{request_id[-8:]}",
+                    "status": "COMPLETED",
+                    "output": {
+                        "contract_version": RUNPOD_RESPONSE_CONTRACT_VERSION,
+                        "binding": binding,
+                        "raw_output_json": RAW_CLAIM,
+                        "usage": {
+                            "input_tokens": 123,
+                            "output_tokens": 7,
+                            "cost_usd": 0.125,
+                        },
+                    },
+                },
+            }
+        )
+    recorded_response = RunPodHttpResponse(
+        status_code=200,
+        body=canonical_json_bytes(
+            {
+                "id": "recorded-native-batch-job-1",
+                "status": "COMPLETED",
+                "output": {
+                    "contract_version": RUNPOD_BATCH_RESPONSE_CONTRACT_VERSION,
+                    "items": response_items,
+                },
+            }
+        ),
+    )
+    replay_transport = RecordedRunPodTransport(
+        (
+            RecordedRunPodExchange(
+                request_body_sha256=exact_bytes_sha256(exact_body),
+                response=recorded_response,
+            ),
+        )
+    )
+    ledger = SQLiteInferenceEvidenceLedger(tmp_path / "recorded-native-batch.sqlite", registry)
+    try:
+        replay_adapter = RunPodVisionAdapter(
+            config=config,
+            credential=RunPodApiKey(API_KEY),
+            capabilities=_capabilities(),
+            retry_policy=_retry_policy(max_attempts=1),
+            raw_store=ledger,
+            parser=StrictProviderClaimParser(registry, parser_version="runpod-parser-v1"),
+            transport=replay_transport,
+            native_batch_qualification=_native_batch_qualification(
+                config,
+                _capabilities(),
+                _retry_policy(max_attempts=1),
+            ),
+        )
+        replay_orchestrator = InferenceOrchestrator(
+            adapters={"runpod": replay_adapter},
+            task_policies={request.task: policy},
+            schema_artifacts=schema_artifacts,
+            ledger=ledger,
+            max_batch_size=2,
+            max_batch_queue_delay_ms=5,
+            clock=clock,
+        )
+
+        terminals = asyncio.run(run_pair(replay_orchestrator))
+
+        assert all(terminal.status is InferenceStatus.SUCCEEDED for terminal in terminals)
+        assert replay_transport.request_count == 1
+        terminal_ids = {terminal.inference_id for terminal in terminals}
+        logical_ids = {terminal.logical_invocation_id for terminal in terminals}
+        assert len(terminal_ids) == 2
+        assert len(logical_ids) == 2
+        raw_artifact_ids: set[str] = set()
+        for terminal in terminals:
+            raw_output = terminal.raw_output
+            assert isinstance(raw_output, dict)
+            raw_artifact_id = raw_output["artifact_id"]
+            assert isinstance(raw_artifact_id, str)
+            raw_artifact_ids.add(raw_artifact_id)
+            logical_invocation_id = terminal.logical_invocation_id
+            inference_id = terminal.inference_id
+            selection = ledger.get_selection(logical_invocation_id, "selection-v1")
+            assert selection is not None
+            assert selection.inference_id == inference_id
+        assert len(raw_artifact_ids) == 2
+        assert all(
+            ledger.get(raw_artifact_id).data == RAW_CLAIM.encode()
+            for raw_artifact_id in raw_artifact_ids
+        )
+
+        redelivered = asyncio.run(run_pair(replay_orchestrator))
+
+        assert redelivered == terminals
+        assert replay_transport.request_count == 1
+        assert len(ledger.list_records()) == 2
         ledger.verify_integrity()
     finally:
         ledger.close()

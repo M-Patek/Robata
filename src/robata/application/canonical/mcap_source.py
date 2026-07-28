@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import builtins
+import json
 import os
+import struct
+import zlib
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from fractions import Fraction
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 from uuid import NAMESPACE_URL, uuid5
 
 import av
@@ -21,11 +27,19 @@ from pydantic import ValidationError
 from robata.adapters.local_artifact_registry import LocalArtifactRegistry
 from robata.adapters.mcap_inspector import McapPreflight, OfficialMcapInspector
 from robata.adapters.mcap_single_pass import H264PacketEnvelope, iter_h264_spool
+from robata.adapters.nvdec_backend import (
+    MediaRuntimeBackend,
+    MediaRuntimeProvenance,
+)
 from robata.adapters.pyav_frame_materializer import (
+    PYAV_FRAME_ENCODER_IMPLEMENTATION,
+    PYAV_FRAME_ENCODER_VERSION,
     _CameraLedger,
-    _encode_png,
+    _encode_jpeg_rgb24,
+    _encode_png_rgb24,
     _frame_pts_ns,
     _load_camera_ledger,
+    _normalize_rgb24,
     _validate_publication,
 )
 from robata.adapters.pyav_mp4_exporter import (
@@ -40,7 +54,10 @@ from robata.adapters.pyav_mp4_exporter import (
 from robata.adapters.sqlite_capture_authority import SQLiteLocalCaptureAuthority
 from robata.adapters.sqlite_inference_evidence import MODEL_INFERENCE_SCHEMA_ID
 from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
-from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
+from robata.adapters.sqlite_work_scheduler import (
+    SQLiteWorkScheduler,
+    require_outside_authority_transaction,
+)
 from robata.admission.context import AdmissionContextResolver, AdmittedRecordingContextV2
 from robata.admission.ledger import (
     AlignmentAdmissionOutcome,
@@ -54,9 +71,11 @@ from robata.application.canonical.bounded_media import (
     PlannerFinish,
 )
 from robata.application.canonical.local_stream_finalization import (
+    DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
     LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
     LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
     LocalConformanceStreamFinalizer,
+    LocalStreamExecutorConfig,
     LocalStreamFinalizationSchemaRefs,
 )
 from robata.application.canonical.media_quality import (
@@ -195,8 +214,17 @@ from robata.contracts.stream_window import (
     STREAM_INFERENCE_SCHEMA_VERSION,
 )
 from robata.contracts.video_export import VideoExporterMode
+from robata.durability import sync_directory
+from robata.frame_cache import (
+    LayeredMediaCache,
+    encoded_artifact_cache_key,
+    manifest_cache_key,
+    raw_frame_cache_key,
+)
 from robata.ingestion.mapping import ExactTopicMappingPolicy, TopicMappingProfile
+from robata.ports.artifact_registry import ArtifactRegistryError
 from robata.ports.ingestion import ChannelInspection, McapInspection
+from robata.queue.backpressure import BackpressureRuntimeSignals
 from robata.queue.outbox import OutboxRetryPolicy
 from robata.queue.stream_models import StreamTerminalEvidence
 from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
@@ -211,13 +239,40 @@ from robata.sampling.materializer import (
 )
 from robata.tempfiles import make_temp_file
 
+# Keep the on-disk cache path compact: MCAP state directories already include a
+# recording identifier, and the content-addressed blob names add 64 characters.
+MCAP_LAYERED_MEDIA_CACHE_DIRECTORY: Final = "c"
+MCAP_LAYERED_MEDIA_CACHE_NAMESPACE: Final = "v1"
+MCAP_LAYERED_MEDIA_CACHE_FORMAT: Final = "canonical-mcap-layered-media-v1"
+MCAP_LAYERED_MEDIA_RAW_SURFACE_VERSION: Final = "canonical-mcap-rgb24-surface-v1"
+MCAP_LAYERED_MEDIA_ENCODING_VERSION: Final = "canonical-mcap-evidence-encoding-v2"
+_MCAP_RGB24_CACHE_MAGIC: Final = b"robata-mcap-rgb24-v1\x00"
+_MCAP_RGB24_CACHE_HEADER: Final = struct.Struct(f">{len(_MCAP_RGB24_CACHE_MAGIC)}sII")
+
 MCAP_SOURCE_POLICY_VERSION = "canonical-development-mcap-v1"
 MCAP_SAMPLING_POLICY_VERSION = "canonical-development-sampling-v1"
 MCAP_RECORDING_NAMESPACE = "robata-canonical-development-mcap-v1"
 MCAP_PNG_EXTRACTOR_VERSION = "canonical-mcap-png-320-v1"
+MCAP_JPEG_EXTRACTOR_VERSION = "canonical-mcap-jpeg-mjpeg-qscale-2-320-v1"
 MCAP_PNG_MAX_WIDTH: Final = 320
 MCAP_MEDIA_PROCESSING_POLICY_VERSION: Final = "canonical-mcap-media-processing-v1"
+MCAP_JPEG_MEDIA_PROCESSING_POLICY_VERSION: Final = "canonical-mcap-media-processing-jpeg-v1"
 MCAP_MEDIA_EVIDENCE_ENCODING: Final = "png"
+MCAP_JPEG_EVIDENCE_ENCODING: Final = "jpeg"
+MCAP_EVIDENCE_ENCODER_IMPLEMENTATION: Final = PYAV_FRAME_ENCODER_IMPLEMENTATION
+MCAP_EVIDENCE_ENCODER_VERSION: Final = PYAV_FRAME_ENCODER_VERSION
+MCAP_EVIDENCE_RESIZE_POLICY: Final = "pyav-rgb24-proportional-max-width-half-up-v1"
+MCAP_PNG_EVIDENCE_ENCODER: Final = "png"
+MCAP_PNG_EVIDENCE_QUALITY: Final = "lossless"
+MCAP_PNG_EVIDENCE_CHROMA_SUBSAMPLING: Final = "rgb24"
+MCAP_PNG_EVIDENCE_COLOR_CONVERSION: Final = "pyav-source-to-rgb24-v1"
+MCAP_PNG_EVIDENCE_METADATA_POLICY: Final = "pyav-png-default-metadata-v1"
+MCAP_JPEG_EVIDENCE_ENCODER: Final = "mjpeg"
+MCAP_JPEG_EVIDENCE_QUALITY: Final = "qscale-2"
+MCAP_JPEG_EVIDENCE_QSCALE: Final = 2
+MCAP_JPEG_EVIDENCE_CHROMA_SUBSAMPLING: Final = "yuvj420p"
+MCAP_JPEG_EVIDENCE_COLOR_CONVERSION: Final = "pyav-rgb24-to-yuvj420p-v1"
+MCAP_JPEG_EVIDENCE_METADATA_POLICY: Final = "pyav-mjpeg-bitexact-no-comment-v1"
 MCAP_BASE_SENTINEL_RATE_NUMERATOR: Final = 2
 MCAP_BASE_SENTINEL_RATE_DENOMINATOR: Final = 1
 MCAP_TARGET_SELECTION_TOLERANCE_NS: Final = 300_000_000
@@ -293,6 +348,36 @@ class McapMediaProcessingPolicy:
     evidence_encoding: str = MCAP_MEDIA_EVIDENCE_ENCODING
     evidence_max_width: int = MCAP_PNG_MAX_WIDTH
     evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION
+    evidence_encoder_implementation: str = MCAP_EVIDENCE_ENCODER_IMPLEMENTATION
+    evidence_encoder_version: str = MCAP_EVIDENCE_ENCODER_VERSION
+    evidence_encoder: str = MCAP_PNG_EVIDENCE_ENCODER
+    evidence_quality: str = MCAP_PNG_EVIDENCE_QUALITY
+    evidence_jpeg_qscale: int = MCAP_JPEG_EVIDENCE_QSCALE
+    evidence_chroma_subsampling: str = MCAP_PNG_EVIDENCE_CHROMA_SUBSAMPLING
+    evidence_resize_policy: str = MCAP_EVIDENCE_RESIZE_POLICY
+    evidence_color_conversion: str = MCAP_PNG_EVIDENCE_COLOR_CONVERSION
+    evidence_metadata_policy: str = MCAP_PNG_EVIDENCE_METADATA_POLICY
+
+    @classmethod
+    def jpeg_experiment(cls, **overrides: Any) -> McapMediaProcessingPolicy:
+        """Construct the only supported lossy experiment with complete provenance."""
+
+        values: dict[str, Any] = {
+            "version": MCAP_JPEG_MEDIA_PROCESSING_POLICY_VERSION,
+            "evidence_encoding": MCAP_JPEG_EVIDENCE_ENCODING,
+            "evidence_extractor_version": MCAP_JPEG_EXTRACTOR_VERSION,
+            "evidence_encoder_implementation": MCAP_EVIDENCE_ENCODER_IMPLEMENTATION,
+            "evidence_encoder_version": MCAP_EVIDENCE_ENCODER_VERSION,
+            "evidence_encoder": MCAP_JPEG_EVIDENCE_ENCODER,
+            "evidence_quality": MCAP_JPEG_EVIDENCE_QUALITY,
+            "evidence_jpeg_qscale": MCAP_JPEG_EVIDENCE_QSCALE,
+            "evidence_chroma_subsampling": MCAP_JPEG_EVIDENCE_CHROMA_SUBSAMPLING,
+            "evidence_resize_policy": MCAP_EVIDENCE_RESIZE_POLICY,
+            "evidence_color_conversion": MCAP_JPEG_EVIDENCE_COLOR_CONVERSION,
+            "evidence_metadata_policy": MCAP_JPEG_EVIDENCE_METADATA_POLICY,
+        }
+        values.update(overrides)
+        return cls(**values)
 
     def __post_init__(self) -> None:
         if not isinstance(self.version, str) or not self.version:
@@ -311,13 +396,75 @@ class McapMediaProcessingPolicy:
             for value in positive_fields
         ):
             raise ValueError("media processing policy numeric fields must be positive integers")
-        if self.evidence_encoding != MCAP_MEDIA_EVIDENCE_ENCODING:
+        if self.evidence_encoding not in {
+            MCAP_MEDIA_EVIDENCE_ENCODING,
+            MCAP_JPEG_EVIDENCE_ENCODING,
+        }:
             raise ValueError(f"unsupported media evidence encoding: {self.evidence_encoding!r}")
         if (
             not isinstance(self.evidence_extractor_version, str)
             or not self.evidence_extractor_version
         ):
             raise ValueError("evidence extractor version must be a non-empty string")
+        if (
+            self.evidence_encoder_implementation != MCAP_EVIDENCE_ENCODER_IMPLEMENTATION
+            or self.evidence_encoder_version != MCAP_EVIDENCE_ENCODER_VERSION
+        ):
+            raise ValueError("media evidence policy must match the installed PyAV encoder")
+        text_fields = (
+            self.evidence_encoder,
+            self.evidence_quality,
+            self.evidence_chroma_subsampling,
+            self.evidence_resize_policy,
+            self.evidence_color_conversion,
+            self.evidence_metadata_policy,
+        )
+        if any(not isinstance(value, str) or not value for value in text_fields):
+            raise ValueError("media evidence encoder fields must be non-empty strings")
+        if (
+            isinstance(self.evidence_jpeg_qscale, bool)
+            or not isinstance(self.evidence_jpeg_qscale, int)
+            or not 1 <= self.evidence_jpeg_qscale <= 31
+        ):
+            raise ValueError("media evidence JPEG qscale must be an integer from 1 through 31")
+        expected = _expected_evidence_encoding_configuration(self.evidence_encoding)
+        actual = {
+            "evidence_encoder": self.evidence_encoder,
+            "evidence_quality": self.evidence_quality,
+            "evidence_chroma_subsampling": self.evidence_chroma_subsampling,
+            "evidence_resize_policy": self.evidence_resize_policy,
+            "evidence_color_conversion": self.evidence_color_conversion,
+            "evidence_metadata_policy": self.evidence_metadata_policy,
+        }
+        if actual != expected:
+            raise ValueError("media evidence encoding settings are not a pinned supported policy")
+        if (
+            self.evidence_encoding == MCAP_JPEG_EVIDENCE_ENCODING
+            and self.evidence_jpeg_qscale != MCAP_JPEG_EVIDENCE_QSCALE
+        ):
+            raise ValueError("unsupported media evidence JPEG qscale")
+
+
+def _expected_evidence_encoding_configuration(encoding: str) -> dict[str, str]:
+    if encoding == MCAP_MEDIA_EVIDENCE_ENCODING:
+        return {
+            "evidence_encoder": MCAP_PNG_EVIDENCE_ENCODER,
+            "evidence_quality": MCAP_PNG_EVIDENCE_QUALITY,
+            "evidence_chroma_subsampling": MCAP_PNG_EVIDENCE_CHROMA_SUBSAMPLING,
+            "evidence_resize_policy": MCAP_EVIDENCE_RESIZE_POLICY,
+            "evidence_color_conversion": MCAP_PNG_EVIDENCE_COLOR_CONVERSION,
+            "evidence_metadata_policy": MCAP_PNG_EVIDENCE_METADATA_POLICY,
+        }
+    if encoding == MCAP_JPEG_EVIDENCE_ENCODING:
+        return {
+            "evidence_encoder": MCAP_JPEG_EVIDENCE_ENCODER,
+            "evidence_quality": MCAP_JPEG_EVIDENCE_QUALITY,
+            "evidence_chroma_subsampling": MCAP_JPEG_EVIDENCE_CHROMA_SUBSAMPLING,
+            "evidence_resize_policy": MCAP_EVIDENCE_RESIZE_POLICY,
+            "evidence_color_conversion": MCAP_JPEG_EVIDENCE_COLOR_CONVERSION,
+            "evidence_metadata_policy": MCAP_JPEG_EVIDENCE_METADATA_POLICY,
+        }
+    raise ValueError(f"unsupported media evidence encoding: {encoding!r}")
 
 
 DEFAULT_MCAP_MEDIA_PROCESSING_POLICY: Final = McapMediaProcessingPolicy()
@@ -341,7 +488,77 @@ def mcap_media_processing_policy_projection(
         "evidence_encoding": policy.evidence_encoding,
         "evidence_max_width": policy.evidence_max_width,
         "evidence_extractor_version": policy.evidence_extractor_version,
+        "evidence_encoder_implementation": policy.evidence_encoder_implementation,
+        "evidence_encoder_version": policy.evidence_encoder_version,
+        "evidence_encoder": policy.evidence_encoder,
+        "evidence_quality": policy.evidence_quality,
+        "evidence_jpeg_qscale": policy.evidence_jpeg_qscale,
+        "evidence_chroma_subsampling": policy.evidence_chroma_subsampling,
+        "evidence_resize_policy": policy.evidence_resize_policy,
+        "evidence_color_conversion": policy.evidence_color_conversion,
+        "evidence_metadata_policy": policy.evidence_metadata_policy,
     }
+
+
+def _evidence_encoding_projection(policy: McapMediaProcessingPolicy) -> dict[str, str | int]:
+    """Return every field that can affect encoded evidence bytes or representation."""
+
+    return {
+        "evidence_encoding": policy.evidence_encoding,
+        "evidence_max_width": policy.evidence_max_width,
+        "evidence_extractor_version": policy.evidence_extractor_version,
+        "evidence_encoder_implementation": policy.evidence_encoder_implementation,
+        "evidence_encoder_version": policy.evidence_encoder_version,
+        "evidence_encoder": policy.evidence_encoder,
+        "evidence_quality": policy.evidence_quality,
+        "evidence_jpeg_qscale": policy.evidence_jpeg_qscale,
+        "evidence_chroma_subsampling": policy.evidence_chroma_subsampling,
+        "evidence_resize_policy": policy.evidence_resize_policy,
+        "evidence_color_conversion": policy.evidence_color_conversion,
+        "evidence_metadata_policy": policy.evidence_metadata_policy,
+    }
+
+
+def _evidence_media_type_for_encoding(encoding: str) -> str:
+    if encoding == MCAP_MEDIA_EVIDENCE_ENCODING:
+        return "image/png"
+    if encoding == MCAP_JPEG_EVIDENCE_ENCODING:
+        return "image/jpeg"
+    raise CanonicalMcapSourceError("unsupported media evidence encoding")
+
+
+def _evidence_extension_for_encoding(encoding: str) -> str:
+    if encoding == MCAP_MEDIA_EVIDENCE_ENCODING:
+        return "png"
+    if encoding == MCAP_JPEG_EVIDENCE_ENCODING:
+        return "jpg"
+    raise CanonicalMcapSourceError("unsupported media evidence encoding")
+
+
+def _evidence_media_type(policy: McapMediaProcessingPolicy) -> str:
+    return _evidence_media_type_for_encoding(policy.evidence_encoding)
+
+
+def _evidence_extension(policy: McapMediaProcessingPolicy) -> str:
+    return _evidence_extension_for_encoding(policy.evidence_encoding)
+
+
+def _encode_evidence_rgb24_for_policy(
+    rgb_frame: Any,
+    *,
+    policy: McapMediaProcessingPolicy,
+) -> bytes:
+    # Keep the historic local name for PNG so cache/replay tests can prove reuse
+    # without accidentally allowing a hidden re-encode.
+    if policy.evidence_encoding == MCAP_MEDIA_EVIDENCE_ENCODING:
+        return _encode_png_rgb24(rgb_frame)
+    if policy.evidence_encoding == MCAP_JPEG_EVIDENCE_ENCODING:
+        return _encode_jpeg_rgb24(
+            rgb_frame,
+            qscale=policy.evidence_jpeg_qscale,
+            chroma_subsampling=policy.evidence_chroma_subsampling,
+        )
+    raise CanonicalMcapSourceError("unsupported media evidence encoding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +595,14 @@ class CanonicalMcapSourceBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class _McapLayeredMediaCacheContext:
+    cache: LayeredMediaCache
+    source_content_sha256: str
+    media_processing_policy: McapMediaProcessingPolicy
+    media_runtime_provenance_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedVideoPublication:
     publication: PublishedRegisteredVideoExport
     inspection: McapInspection
@@ -392,6 +617,10 @@ class _RenderedPngFact:
     bytes: int
     width: int
     height: int
+    normalized_rgb24: builtins.bytes | None = None
+    media_type: str = "image/png"
+    encoding: str = MCAP_MEDIA_EVIDENCE_ENCODING
+    extension: str = "png"
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,8 +652,7 @@ class _CameraExportVisualCollector:
     sentinel_source_orders: frozenset[int]
     output_root: Path
     quality_policy: LocalMediaQualityPolicy
-    evidence_max_width: int
-    evidence_extractor_version: str
+    media_processing_policy: McapMediaProcessingPolicy
     analyzer: LocalFrameQualityAnalyzer = field(init=False)
     rendered: dict[int, _RenderedPngFact] = field(default_factory=dict, init=False)
     observations: dict[int, _ExportTimeVisualObservation] = field(
@@ -457,18 +685,31 @@ class _CameraExportVisualCollector:
                 raise CanonicalMcapSourceError(
                     f"{self.camera_id.value} received a duplicate semantic frame callback"
                 )
-            png_bytes, width, height = _encode_png(
+            rgb_frame, normalized_rgb24, width, height = _normalized_rgb24_cache_surface(
                 decoded_frame,
-                max_width=self.evidence_max_width,
+                max_width=self.media_processing_policy.evidence_max_width,
             )
-            digest = exact_bytes_sha256(png_bytes)
-            path = _publish_png(self.output_root, digest, png_bytes)
+            evidence_bytes = _encode_evidence_rgb24_for_policy(
+                rgb_frame,
+                policy=self.media_processing_policy,
+            )
+            digest = exact_bytes_sha256(evidence_bytes)
+            path = _publish_evidence(
+                self.output_root,
+                digest,
+                evidence_bytes,
+                extension=_evidence_extension(self.media_processing_policy),
+            )
             self.rendered[raw_order] = _RenderedPngFact(
                 path=path,
                 sha256=digest,
-                bytes=len(png_bytes),
+                bytes=len(evidence_bytes),
                 width=width,
                 height=height,
+                normalized_rgb24=normalized_rgb24,
+                media_type=_evidence_media_type(self.media_processing_policy),
+                encoding=self.media_processing_policy.evidence_encoding,
+                extension=_evidence_extension(self.media_processing_policy),
             )
         if raw_order in self.sentinel_source_orders:
             if raw_order in self.observations:
@@ -550,6 +791,7 @@ class _VerifiedMcapArtifactResolver:
     evidence_max_width: int
     evidence_extractor_version: str
     runtime_observer: RuntimeObserver | None = None
+    media_cache: _McapLayeredMediaCacheContext | None = None
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _frames_by_id: dict[CameraId, dict[str, IndexedSourceFrame]] = field(
         init=False,
@@ -608,6 +850,7 @@ class _VerifiedMcapArtifactResolver:
                     output_root=self.output_root,
                     evidence_max_width=self.evidence_max_width,
                     evidence_extractor_version=self.evidence_extractor_version,
+                    media_cache=self.media_cache,
                 )
             self.artifacts[key] = artifact
             runtime_increment(
@@ -647,6 +890,8 @@ def load_canonical_mcap_source(
     schema_registry: SchemaRegistry | None = None,
     clock: Callable[[], datetime] | None = None,
     runtime_observer: RuntimeObserver | None = None,
+    media_exporter: Any | None = None,
+    media_runtime_provenance: MediaRuntimeProvenance | None = None,
     execution_scheduler: SQLiteWorkScheduler | None = None,
     stream_run_id: str | None = None,
     stream_artifact_root: Path | None = None,
@@ -654,8 +899,11 @@ def load_canonical_mcap_source(
         Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
     ) = None,
     provider_terminal_required: bool = False,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
 ) -> CanonicalMcapSourceBundle:
     """Inspect, export, admit, index, and materialize one real six-camera MCAP."""
+    require_outside_authority_transaction(activity="MCAP media loading")
 
     try:
         if max_duration_ns is not None:
@@ -669,6 +917,10 @@ def load_canonical_mcap_source(
             raise TypeError("stage_terminal_executor must be callable or None")
         if not isinstance(provider_terminal_required, bool):
             raise TypeError("provider_terminal_required must be bool")
+        if not isinstance(executor_config, LocalStreamExecutorConfig):
+            raise TypeError("executor_config must be LocalStreamExecutorConfig")
+        if backpressure_signal_provider is not None and not callable(backpressure_signal_provider):
+            raise TypeError("backpressure_signal_provider must be callable or None")
         if stage_terminal_executor is not None and execution_scheduler is None:
             raise ValueError(
                 "stage_terminal_executor requires execution_scheduler and stream_run_id"
@@ -680,24 +932,64 @@ def load_canonical_mcap_source(
         )
         if not isinstance(resolved_media_processing_policy, McapMediaProcessingPolicy):
             raise TypeError("media_processing_policy must be a McapMediaProcessingPolicy or None")
-        return _load_canonical_mcap_source(
-            Path(source),
-            authorization=authorization,
-            state_dir=Path(state_dir),
-            expected_source_sha256=expected_source_sha256,
-            max_duration_ns=max_duration_ns,
-            media_processing_policy=resolved_media_processing_policy,
-            schema_registry=schema_registry or SchemaRegistry(),
-            clock=clock or (lambda: datetime.now(tz=UTC)),
-            runtime_observer=runtime_observer,
-            execution_scheduler=execution_scheduler,
-            stream_run_id=stream_run_id,
-            stream_artifact_root=(
-                None if stream_artifact_root is None else Path(stream_artifact_root)
-            ),
-            stage_terminal_executor=stage_terminal_executor,
-            provider_terminal_required=provider_terminal_required,
+        if media_exporter is not None and not callable(
+            getattr(media_exporter, "begin_incremental", None)
+        ):
+            raise TypeError("media_exporter must support incremental H.264 export")
+        if media_runtime_provenance is None:
+            if media_exporter is not None:
+                raise ValueError("media_exporter requires explicit media_runtime_provenance")
+            resolved_media_runtime_provenance = MediaRuntimeProvenance.cpu_reference()
+        elif not isinstance(media_runtime_provenance, MediaRuntimeProvenance):
+            raise TypeError("media_runtime_provenance must be a MediaRuntimeProvenance or None")
+        else:
+            resolved_media_runtime_provenance = media_runtime_provenance
+        resolved_media_exporter = (
+            PyAvH264Mp4Exporter() if media_exporter is None else media_exporter
         )
+        if resolved_media_runtime_provenance.backend is MediaRuntimeBackend.CPU_FALLBACK:
+            raise ValueError(
+                "CPU fallback media provenance is an observed outcome, not an input declaration"
+            )
+        target_selected = getattr(resolved_media_exporter, "using_nvdec", None) is True
+        if (
+            target_selected
+            and resolved_media_runtime_provenance.backend is not MediaRuntimeBackend.NVDEC_TARGET
+        ):
+            raise ValueError("selected NVDEC target exporter requires target media provenance")
+        if (
+            resolved_media_runtime_provenance.backend is MediaRuntimeBackend.NVDEC_TARGET
+            and not target_selected
+        ):
+            raise ValueError("NVDEC target provenance requires a selected target exporter")
+        runtime_observation = _begin_media_runtime_observation(resolved_media_exporter)
+        try:
+            bundle = _load_canonical_mcap_source(
+                Path(source),
+                authorization=authorization,
+                state_dir=Path(state_dir),
+                expected_source_sha256=expected_source_sha256,
+                max_duration_ns=max_duration_ns,
+                media_processing_policy=resolved_media_processing_policy,
+                schema_registry=schema_registry or SchemaRegistry(),
+                clock=clock or (lambda: datetime.now(tz=UTC)),
+                runtime_observer=runtime_observer,
+                media_exporter=resolved_media_exporter,
+                media_runtime_provenance=resolved_media_runtime_provenance,
+                runtime_observation=runtime_observation,
+                execution_scheduler=execution_scheduler,
+                stream_run_id=stream_run_id,
+                stream_artifact_root=(
+                    None if stream_artifact_root is None else Path(stream_artifact_root)
+                ),
+                stage_terminal_executor=stage_terminal_executor,
+                provider_terminal_required=provider_terminal_required,
+                executor_config=executor_config,
+                backpressure_signal_provider=backpressure_signal_provider,
+            )
+        finally:
+            _close_media_runtime_observation(resolved_media_exporter, runtime_observation)
+        return bundle
     except CanonicalMcapSourceError:
         raise
     except (OSError, RuntimeError, TypeError, ValidationError, ValueError) as error:
@@ -715,13 +1007,16 @@ def _load_canonical_mcap_source(
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
     runtime_observer: RuntimeObserver | None,
+    media_exporter: Any,
+    media_runtime_provenance: MediaRuntimeProvenance,
+    runtime_observation: Any | None,
     execution_scheduler: SQLiteWorkScheduler | None,
     stream_run_id: str | None,
     stream_artifact_root: Path | None,
-    stage_terminal_executor: (
-        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
-    ),
+    stage_terminal_executor: (Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None),
     provider_terminal_required: bool,
+    executor_config: LocalStreamExecutorConfig,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None,
 ) -> CanonicalMcapSourceBundle:
     observed_at = _rfc3339(clock())
     stage_attributes = {"camera_count": len(CAMERA_IDS)}
@@ -751,6 +1046,8 @@ def _load_canonical_mcap_source(
             channels=channels,
             max_duration_ns=max_duration_ns,
             media_processing_policy=media_processing_policy,
+            media_exporter=media_exporter,
+            runtime_observation=runtime_observation,
             authorization=authorization,
             schema_registry=schema_registry,
             clock=clock,
@@ -761,12 +1058,32 @@ def _load_canonical_mcap_source(
             stream_artifact_root=stream_artifact_root,
             stage_terminal_executor=stage_terminal_executor,
             provider_terminal_required=provider_terminal_required,
+            executor_config=executor_config,
+            backpressure_signal_provider=backpressure_signal_provider,
         )
         publication = prepared_publication.publication
         inspection = prepared_publication.inspection
         channels = prepared_publication.channels
         export_time_visual_results = prepared_publication.export_time_visual_results
         fresh_media_handoff = not publication.derivation_reused
+    resolved_media_runtime_declaration = (
+        media_runtime_provenance if fresh_media_handoff else MediaRuntimeProvenance.cpu_reference()
+    )
+    completed_media_runtime_provenance = _completed_media_runtime_provenance(
+        media_exporter=media_exporter,
+        declared=resolved_media_runtime_declaration,
+        runtime_observation=runtime_observation,
+    )
+    _validate_target_media_runtime_source(
+        provenance=completed_media_runtime_provenance,
+        channels=channels,
+        publication=publication,
+    )
+    _publish_exact_state_file(
+        state_dir / f"mr-{completed_media_runtime_provenance.provenance_sha256[:12]}.json",
+        canonical_json_bytes(completed_media_runtime_provenance.model_dump(mode="json")),
+        label="media runtime provenance",
+    )
     if inspection.message_count > 0:
         runtime_increment(
             runtime_observer,
@@ -913,6 +1230,15 @@ def _load_canonical_mcap_source(
         DEFAULT_MEDIA_QUALITY_POLICY,
         analysis_width=media_processing_policy.sentinel_analysis_width,
     )
+    media_cache = _McapLayeredMediaCacheContext(
+        cache=LayeredMediaCache(
+            state_dir / MCAP_LAYERED_MEDIA_CACHE_DIRECTORY,
+            namespace=MCAP_LAYERED_MEDIA_CACHE_NAMESPACE,
+        ),
+        source_content_sha256=inspection.source_sha256,
+        media_processing_policy=media_processing_policy,
+        media_runtime_provenance_sha256=completed_media_runtime_provenance.provenance_sha256,
+    )
     materialize_attributes: dict[str, str | int | float | bool] = {
         **stage_attributes,
         "max_duration_limited": window_limited,
@@ -932,28 +1258,34 @@ def _load_canonical_mcap_source(
         "evidence_extractor_version": media_processing_policy.evidence_extractor_version,
     }
     with runtime_span(runtime_observer, "source.materialize", materialize_attributes):
-        if export_time_visual_results is None:
-            artifacts, quality_observations = _materialize_selected_frames(
-                frame_index=frame_index,
-                ledgers=ledgers,
-                quality_timings=quality_timings,
-                requested_interval=requested_interval,
-                output_root=frame_output_root,
-                media_processing_policy=media_processing_policy,
-                quality_policy=quality_policy,
-                stop_after_selected=window_limited,
-            )
-        else:
-            artifacts, quality_observations = _bind_export_time_visual_results(
-                frame_index=frame_index,
-                ledgers=ledgers,
-                quality_timings=quality_timings,
-                requested_interval=requested_interval,
-                output_root=frame_output_root,
-                media_processing_policy=media_processing_policy,
-                quality_policy=quality_policy,
-                visual_results=export_time_visual_results,
-            )
+        binding_attributes = {
+            "mode": "REPLAY_DECODE" if export_time_visual_results is None else "EXPORT_TIME",
+        }
+        with runtime_span(runtime_observer, "source.media.package_binding", binding_attributes):
+            if export_time_visual_results is None:
+                artifacts, quality_observations = _materialize_selected_frames(
+                    frame_index=frame_index,
+                    ledgers=ledgers,
+                    quality_timings=quality_timings,
+                    requested_interval=requested_interval,
+                    output_root=frame_output_root,
+                    media_processing_policy=media_processing_policy,
+                    quality_policy=quality_policy,
+                    stop_after_selected=window_limited,
+                    media_cache=media_cache,
+                )
+            else:
+                artifacts, quality_observations = _bind_export_time_visual_results(
+                    frame_index=frame_index,
+                    ledgers=ledgers,
+                    quality_timings=quality_timings,
+                    requested_interval=requested_interval,
+                    output_root=frame_output_root,
+                    media_processing_policy=media_processing_policy,
+                    quality_policy=quality_policy,
+                    visual_results=export_time_visual_results,
+                    media_cache=media_cache,
+                )
     if artifacts:
         runtime_increment(
             runtime_observer,
@@ -998,6 +1330,7 @@ def _load_canonical_mcap_source(
         evidence_max_width=media_processing_policy.evidence_max_width,
         evidence_extractor_version=media_processing_policy.evidence_extractor_version,
         runtime_observer=runtime_observer,
+        media_cache=media_cache,
     )
     return CanonicalMcapSourceBundle(
         source_content_sha256=inspection.source_sha256,
@@ -1119,10 +1452,25 @@ def _build_export_time_visual_observer(
             sentinel_source_orders=selected_orders(sentinel_rate),
             output_root=output_root,
             quality_policy=quality_policy,
-            evidence_max_width=media_processing_policy.evidence_max_width,
-            evidence_extractor_version=media_processing_policy.evidence_extractor_version,
+            media_processing_policy=media_processing_policy,
         )
     return _ExportTimeVisualObserver(collectors=MappingProxyType(collectors))
+
+
+def _reconcile_artifact_registry_for_startup(
+    registry: LocalArtifactRegistry,
+) -> None:
+    try:
+        registry.reconcile(
+            remove_orphans=True,
+            remove_partials=True,
+            remove_duplicates=True,
+            strict=True,
+        )
+    except ArtifactRegistryError as error:
+        raise CanonicalMcapSourceError(
+            f"artifact registry startup reconciliation failed: {error}"
+        ) from error
 
 
 def _export_registered_videos(
@@ -1133,6 +1481,8 @@ def _export_registered_videos(
     channels: SixCameraMap[ChannelInspection],
     max_duration_ns: int | None,
     media_processing_policy: McapMediaProcessingPolicy,
+    media_exporter: Any,
+    runtime_observation: Any | None,
     authorization: AuthorizedMcapMapping,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
@@ -1141,11 +1491,12 @@ def _export_registered_videos(
     execution_scheduler: SQLiteWorkScheduler | None,
     stream_run_id: str | None,
     stream_artifact_root: Path | None,
-    stage_terminal_executor: (
-        Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
-    ),
+    stage_terminal_executor: (Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None),
     provider_terminal_required: bool,
+    executor_config: LocalStreamExecutorConfig,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None,
 ) -> _PreparedVideoPublication:
+    stage_attributes = {"camera_count": len(CAMERA_IDS)}
     if authorization.profile.approved:
         raise CanonicalMcapSourceError(
             "the local registered exporter requires a development UNAPPROVED profile"
@@ -1158,14 +1509,15 @@ def _export_registered_videos(
         profile_version=EXPORT_PROFILE_VERSION,
         canonical_config_sha256=semantic_sha256(EXPORT_CONFIG),
     )
-    exporter = PyAvH264Mp4Exporter()
+    artifact_registry = LocalArtifactRegistry(
+        state_dir / "artifact-registry",
+        runtime_observer=runtime_observer,
+        hardlink_artifact_types=frozenset({ArtifactType.RAW_MCAP}),
+    )
+    _reconcile_artifact_registry_for_startup(artifact_registry)
     service = RegisteredSixCameraVideoExportService(
-        exporter,
-        LocalArtifactRegistry(
-            state_dir / "artifact-registry",
-            runtime_observer=runtime_observer,
-            hardlink_artifact_types=frozenset({ArtifactType.RAW_MCAP}),
-        ),
+        media_exporter,
+        artifact_registry,
         schema_registry,
         clock=clock,
     )
@@ -1183,6 +1535,7 @@ def _export_registered_videos(
             authorization=authorization,
             schema_registry=schema_registry,
             clock=clock,
+            backpressure_signal_provider=backpressure_signal_provider,
         )
         planner_source_scope_digest = capture_subject.capture_scope_digest
         planning_sink = _IncrementalLocalStreamPlanningSink(
@@ -1258,6 +1611,7 @@ def _export_registered_videos(
                 window_purpose=StreamPurpose.EVENT_PROPOSAL,
                 recover_graph_before_execute=False,
                 stage_terminal_executor=stage_terminal_executor,
+                executor_config=executor_config,
                 clock=clock,
             ),
             runtime_observer=runtime_observer,
@@ -1294,9 +1648,17 @@ def _export_registered_videos(
         planner_policy_factory=planner_policy_factory,
         planner_source_scope_digest=planner_source_scope_digest,
         planning_sink=planning_sink,
-        exporter=exporter,
+        exporter=media_exporter,
+        runtime_observation=runtime_observation,
     )
-    spool_set = producer.prepare()
+    with runtime_span(runtime_observer, "source.media.cache_lookup", stage_attributes):
+        spool_set_present = (state_dir / "h264-spools").is_dir()
+    with runtime_span(
+        runtime_observer,
+        "source.media.decode",
+        {"spool_set_present": spool_set_present},
+    ):
+        spool_set = producer.prepare()
     runtime_increment(
         runtime_observer,
         "media.planning_mode",
@@ -1323,15 +1685,16 @@ def _export_registered_videos(
         DEFAULT_MEDIA_QUALITY_POLICY,
         analysis_width=media_processing_policy.sentinel_analysis_width,
     )
-    export_time_visual_observer = _build_export_time_visual_observer(
-        spool_set=spool_set,
-        final_channels=final_channels,
-        origin_ns=source_origin_ns,
-        requested_interval=export_requested_interval,
-        output_root=state_dir / "frames",
-        media_processing_policy=media_processing_policy,
-        quality_policy=export_quality_policy,
-    )
+    with runtime_span(runtime_observer, "source.media.selection", stage_attributes):
+        export_time_visual_observer = _build_export_time_visual_observer(
+            spool_set=spool_set,
+            final_channels=final_channels,
+            origin_ns=source_origin_ns,
+            requested_interval=export_requested_interval,
+            output_root=state_dir / "frames",
+            media_processing_policy=media_processing_policy,
+            quality_policy=export_quality_policy,
+        )
     producer.set_decoded_frame_observer(export_time_visual_observer.observe)
 
     request = LocalVideoExportRequest(
@@ -1370,7 +1733,8 @@ def _export_registered_videos(
                     final_inspection=final_inspection,
                 )
             )
-        publication = publication_future.result()
+        with runtime_span(runtime_observer, "source.media.encode", stage_attributes):
+            publication = publication_future.result()
         export_time_visual_results = (
             None if publication.derivation_reused else export_time_visual_observer.finish()
         )
@@ -1414,6 +1778,7 @@ def _create_mcap_stream_scheduler(
     authorization: AuthorizedMcapMapping,
     schema_registry: SchemaRegistry,
     clock: Callable[[], datetime],
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None,
 ) -> tuple[PreEosCaptureSubject, DurableStreamWindowScheduler]:
     clock_policy_sha256 = _pre_eos_clock_policy_sha256()
     mapping_authority = AuthorityBinding(
@@ -1528,6 +1893,7 @@ def _create_mcap_stream_scheduler(
         stream_run_id=stream_run_id,
         schema_refs=schema_refs,
         dag_config_semantic_sha256=dag_config_semantic_sha256,
+        backpressure_signal_provider=backpressure_signal_provider,
         clock=clock,
     )
 
@@ -2208,6 +2574,7 @@ def _materialize_selected_frames(
     media_processing_policy: McapMediaProcessingPolicy = DEFAULT_MCAP_MEDIA_PROCESSING_POLICY,
     quality_policy: LocalMediaQualityPolicy = DEFAULT_MEDIA_QUALITY_POLICY,
     stop_after_selected: bool = False,
+    media_cache: _McapLayeredMediaCacheContext | None = None,
 ) -> tuple[
     dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     dict[CameraId, tuple[FrameQualityObservation, ...]],
@@ -2273,6 +2640,7 @@ def _materialize_selected_frames(
                 evidence_max_width=media_processing_policy.evidence_max_width,
                 evidence_extractor_version=media_processing_policy.evidence_extractor_version,
                 stop_after_selected=stop_after_selected,
+                media_cache=media_cache,
             )
             for camera_id in CAMERA_IDS
         }
@@ -2293,6 +2661,7 @@ def _bind_export_time_visual_results(
     media_processing_policy: McapMediaProcessingPolicy,
     quality_policy: LocalMediaQualityPolicy,
     visual_results: _ExportTimeVisualResults,
+    media_cache: _McapLayeredMediaCacheContext | None = None,
 ) -> tuple[
     dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     dict[CameraId, tuple[FrameQualityObservation, ...]],
@@ -2369,11 +2738,20 @@ def _bind_export_time_visual_results(
                 raise CanonicalMcapSourceError(
                     f"{camera_id.value} export rendered frame is absent from its frame index"
                 )
+            if media_cache is not None:
+                rendered = _cache_rendered_export_time_frame(
+                    media_cache=media_cache,
+                    camera_id=camera_id,
+                    ledger=ledgers[camera_id],
+                    source_frame=source_frame,
+                    rendered=rendered,
+                )
             artifacts[(camera_id, source_frame.source_frame_id)] = (
                 _materialized_frame_artifact_from_rendered(
                     source_frame=source_frame,
                     rendered=rendered,
                     evidence_extractor_version=media_processing_policy.evidence_extractor_version,
+                    media_processing_policy=media_processing_policy,
                 )
             )
         if set(result.observations) != expected_sentinel_orders:
@@ -2472,6 +2850,7 @@ def _decode_selected_camera_frames(
     evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
     evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
     stop_after_selected: bool = False,
+    media_cache: _McapLayeredMediaCacheContext | None = None,
 ) -> tuple[
     dict[tuple[CameraId, str], MaterializedFrameArtifactFact],
     tuple[FrameQualityObservation, ...],
@@ -2550,6 +2929,9 @@ def _decode_selected_camera_frames(
                     output_root=output_root,
                     evidence_max_width=evidence_max_width,
                     evidence_extractor_version=evidence_extractor_version,
+                    camera_id=camera_id,
+                    ledger=ledger,
+                    media_cache=media_cache,
                 )
                 rendered_indexes.add(decoded_index)
             if last_required_index is not None and decoded_index >= last_required_index:
@@ -2581,6 +2963,7 @@ def _materialize_verified_source_frame(
     output_root: Path,
     evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
     evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
+    media_cache: _McapLayeredMediaCacheContext | None = None,
 ) -> MaterializedFrameArtifactFact:
     """Seek from verified keyframe evidence and materialize one exact source frame."""
 
@@ -2665,6 +3048,9 @@ def _materialize_verified_source_frame(
                         output_root=output_root,
                         evidence_max_width=evidence_max_width,
                         evidence_extractor_version=evidence_extractor_version,
+                        camera_id=camera_id,
+                        ledger=ledger,
+                        media_cache=media_cache,
                     )
                 if actual_pts_ns > row.relative_pts_ns:
                     break
@@ -2684,12 +3070,31 @@ def _materialized_frame_artifact_from_rendered(
     source_frame: IndexedSourceFrame,
     rendered: _RenderedPngFact,
     evidence_extractor_version: str,
+    media_processing_policy: McapMediaProcessingPolicy | None = None,
 ) -> MaterializedFrameArtifactFact:
+    policy = media_processing_policy or McapMediaProcessingPolicy(
+        evidence_extractor_version=evidence_extractor_version,
+    )
+    if evidence_extractor_version != policy.evidence_extractor_version:
+        raise CanonicalMcapSourceError(
+            "materialized evidence extractor version differs from its policy"
+        )
+    expected_media_type = _evidence_media_type(policy)
+    expected_extension = _evidence_extension(policy)
+    if (
+        rendered.media_type != expected_media_type
+        or rendered.encoding != policy.evidence_encoding
+        or rendered.extension != expected_extension
+    ):
+        raise CanonicalMcapSourceError("rendered evidence representation differs from its policy")
     artifact_identity = semantic_sha256(
         {
             "extractor_version": evidence_extractor_version,
             "source_frame_id": source_frame.source_frame_id,
-            "png_sha256": rendered.sha256,
+            "media_type": rendered.media_type,
+            "encoding": rendered.encoding,
+            "encoding_policy": _evidence_encoding_projection(policy),
+            "artifact_sha256": rendered.sha256,
         }
     )
     return MaterializedFrameArtifactFact(
@@ -2701,7 +3106,7 @@ def _materialized_frame_artifact_from_rendered(
             uri=rendered.path.as_uri(),
             sha256=rendered.sha256,
             bytes=rendered.bytes,
-            media_type="image/png",
+            media_type=rendered.media_type,
         ),
         width=rendered.width,
         height=rendered.height,
@@ -2719,81 +3124,795 @@ def _materialized_frame_artifact(
     output_root: Path,
     evidence_max_width: int = MCAP_PNG_MAX_WIDTH,
     evidence_extractor_version: str = MCAP_PNG_EXTRACTOR_VERSION,
+    camera_id: CameraId | None = None,
+    ledger: _CameraLedger | None = None,
+    media_cache: _McapLayeredMediaCacheContext | None = None,
+    media_processing_policy: McapMediaProcessingPolicy | None = None,
 ) -> MaterializedFrameArtifactFact:
-    png_bytes, width, height = _encode_png(
+    if media_cache is not None:
+        if camera_id is None or ledger is None:
+            raise CanonicalMcapSourceError(
+                "layered media cache materialization requires verified camera evidence"
+            )
+        policy = media_cache.media_processing_policy
+        if media_processing_policy is not None and media_processing_policy != policy:
+            raise CanonicalMcapSourceError(
+                "layered media cache materialization policy differs from its cache context"
+            )
+        if evidence_max_width != policy.evidence_max_width:
+            raise CanonicalMcapSourceError(
+                "layered media cache materialization width differs from its policy"
+            )
+        if evidence_extractor_version != policy.evidence_extractor_version:
+            raise CanonicalMcapSourceError(
+                "layered media cache extractor version differs from its policy"
+            )
+        return _materialized_cached_frame_artifact(
+            camera_id=camera_id,
+            ledger=ledger,
+            source_frame=source_frame,
+            decoded_frame=decoded_frame,
+            output_root=output_root,
+            evidence_extractor_version=evidence_extractor_version,
+            media_cache=media_cache,
+        )
+
+    direct_policy = media_processing_policy or McapMediaProcessingPolicy(
+        evidence_max_width=evidence_max_width,
+        evidence_extractor_version=evidence_extractor_version,
+    )
+    if evidence_max_width != direct_policy.evidence_max_width:
+        raise CanonicalMcapSourceError("direct media materialization width differs from its policy")
+    if evidence_extractor_version != direct_policy.evidence_extractor_version:
+        raise CanonicalMcapSourceError(
+            "direct media materialization extractor version differs from its policy"
+        )
+    rgb_frame = _normalize_rgb24(
         decoded_frame,
-        max_width=evidence_max_width,
+        max_width=direct_policy.evidence_max_width,
     )
-    digest = exact_bytes_sha256(png_bytes)
-    path = _publish_png(output_root, digest, png_bytes)
-    artifact_identity = semantic_sha256(
-        {
-            "extractor_version": evidence_extractor_version,
-            "source_frame_id": source_frame.source_frame_id,
-            "png_sha256": digest,
-        }
-    )
-    return MaterializedFrameArtifactFact(
-        artifact=MaterializedArtifactManifest(
-            artifact_id=_stable_uuid(
-                "canonical-mcap-frame-artifact",
-                artifact_identity,
-            ),
-            uri=path.as_uri(),
-            sha256=digest,
-            bytes=len(png_bytes),
-            media_type="image/png",
+    evidence_bytes = _encode_evidence_rgb24_for_policy(rgb_frame, policy=direct_policy)
+    width = int(rgb_frame.width)
+    height = int(rgb_frame.height)
+    digest = exact_bytes_sha256(evidence_bytes)
+    rendered = _RenderedPngFact(
+        path=_publish_evidence(
+            output_root,
+            digest,
+            evidence_bytes,
+            extension=_evidence_extension(direct_policy),
         ),
+        sha256=digest,
+        bytes=len(evidence_bytes),
         width=width,
         height=height,
-        quality_flags=(
-            "LOCAL_CONFORMANCE",
-            "REAL_MCAP_H264_DECODED",
+        media_type=_evidence_media_type(direct_policy),
+        encoding=direct_policy.evidence_encoding,
+        extension=_evidence_extension(direct_policy),
+    )
+    return _materialized_frame_artifact_from_rendered(
+        source_frame=source_frame,
+        rendered=rendered,
+        evidence_extractor_version=evidence_extractor_version,
+        media_processing_policy=direct_policy,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedMcapPngManifest:
+    sha256: str
+    byte_count: int
+    width: int
+    height: int
+    media_type: str = "image/png"
+    encoding: str = MCAP_MEDIA_EVIDENCE_ENCODING
+    extension: str = "png"
+
+
+def _normalized_rgb24_cache_surface(
+    decoded_frame: Any,
+    *,
+    max_width: int,
+) -> tuple[Any, bytes, int, int]:
+    rgb_frame = _normalize_rgb24(decoded_frame, max_width=max_width)
+    try:
+        width = int(rgb_frame.width)
+        height = int(rgb_frame.height)
+        if width <= 0 or height <= 0:
+            raise ValueError("normalized RGB24 dimensions must be positive")
+        plane = rgb_frame.planes[0]
+        line_size = int(plane.line_size)
+        row_bytes = width * 3
+        if line_size < row_bytes:
+            raise ValueError("normalized RGB24 plane is narrower than its active row")
+        raw = bytes(plane)
+        if len(raw) < line_size * height:
+            raise ValueError("normalized RGB24 plane is shorter than its declared dimensions")
+        packed = b"".join(
+            raw[row * line_size : row * line_size + row_bytes] for row in range(height)
+        )
+    except Exception as error:
+        raise CanonicalMcapSourceError(
+            f"cannot normalize decoded frame as cacheable RGB24: {error}"
+        ) from error
+    return (
+        rgb_frame,
+        _MCAP_RGB24_CACHE_HEADER.pack(_MCAP_RGB24_CACHE_MAGIC, width, height) + packed,
+        width,
+        height,
+    )
+
+
+def _restore_normalized_rgb24_cache_surface(data: bytes) -> tuple[Any, int, int] | None:
+    if not isinstance(data, bytes) or len(data) < _MCAP_RGB24_CACHE_HEADER.size:
+        return None
+    try:
+        magic, width, height = _MCAP_RGB24_CACHE_HEADER.unpack(
+            data[: _MCAP_RGB24_CACHE_HEADER.size]
+        )
+        if magic != _MCAP_RGB24_CACHE_MAGIC or width <= 0 or height <= 0:
+            return None
+        row_bytes = width * 3
+        expected_size = _MCAP_RGB24_CACHE_HEADER.size + row_bytes * height
+        if len(data) != expected_size:
+            return None
+        pixels = data[_MCAP_RGB24_CACHE_HEADER.size :]
+        frame = av.VideoFrame(width=width, height=height, format="rgb24")
+        plane = frame.planes[0]
+        line_size = int(plane.line_size)
+        if line_size < row_bytes:
+            return None
+        buffer = bytearray(plane.buffer_size)
+        for row in range(height):
+            source_start = row * row_bytes
+            target_start = row * line_size
+            buffer[target_start : target_start + row_bytes] = pixels[
+                source_start : source_start + row_bytes
+            ]
+        plane.update(buffer)
+        frame.pts = 0
+        frame.time_base = Fraction(1, 1)
+    except Exception:
+        return None
+    return frame, width, height
+
+
+def _mcap_media_cache_raw_key(
+    *,
+    media_cache: _McapLayeredMediaCacheContext,
+    camera_id: CameraId,
+    ledger: _CameraLedger,
+    source_frame: IndexedSourceFrame,
+) -> str:
+    decode_identity = semantic_sha256(
+        {
+            "cache_format": MCAP_LAYERED_MEDIA_CACHE_FORMAT,
+            "media_processing_policy_version": media_cache.media_processing_policy.version,
+            "raw_surface_version": MCAP_LAYERED_MEDIA_RAW_SURFACE_VERSION,
+            "camera_id": camera_id.value,
+            "video_sha256": ledger.record.video_artifact.sha256,
+            "timestamp_sidecar_sha256": ledger.sidecar_sha256,
+            "evidence_max_width": media_cache.media_processing_policy.evidence_max_width,
+            "media_runtime_provenance_sha256": media_cache.media_runtime_provenance_sha256,
+        }
+    )
+    return raw_frame_cache_key(
+        source_identity=media_cache.source_content_sha256,
+        frame_identity=source_frame.source_frame_id,
+        decode_identity=decode_identity,
+    )
+
+
+def _mcap_media_cache_encoded_key(
+    *,
+    media_cache: _McapLayeredMediaCacheContext,
+    raw_frame_key: str,
+) -> str:
+    encoding_identity = semantic_sha256(
+        {
+            "cache_format": MCAP_LAYERED_MEDIA_CACHE_FORMAT,
+            "media_processing_policy_version": media_cache.media_processing_policy.version,
+            "encoding_version": MCAP_LAYERED_MEDIA_ENCODING_VERSION,
+            **_evidence_encoding_projection(media_cache.media_processing_policy),
+        }
+    )
+    return encoded_artifact_cache_key(
+        raw_frame_key=raw_frame_key,
+        encoding_identity=encoding_identity,
+    )
+
+
+def _mcap_media_cache_manifest_static_projection(
+    *,
+    media_cache: _McapLayeredMediaCacheContext,
+    camera_id: CameraId,
+    ledger: _CameraLedger,
+    source_frame: IndexedSourceFrame,
+    raw_frame_key: str,
+    encoded_artifact_key: str,
+) -> dict[str, str | int]:
+    return {
+        "cache_format": MCAP_LAYERED_MEDIA_CACHE_FORMAT,
+        "media_processing_policy_version": media_cache.media_processing_policy.version,
+        "source_content_sha256": media_cache.source_content_sha256,
+        "media_runtime_provenance_sha256": media_cache.media_runtime_provenance_sha256,
+        "camera_id": camera_id.value,
+        "source_frame_id": source_frame.source_frame_id,
+        "source_order": source_frame.source_order,
+        "source_timestamp_ns": str(source_frame.source_timestamp_ns),
+        "video_sha256": ledger.record.video_artifact.sha256,
+        "timestamp_sidecar_sha256": ledger.sidecar_sha256,
+        **_evidence_encoding_projection(media_cache.media_processing_policy),
+        "raw_frame_key": raw_frame_key,
+        "encoded_artifact_key": encoded_artifact_key,
+    }
+
+
+def _mcap_media_cache_manifest_key(
+    *,
+    static_projection: Mapping[str, str | int],
+    encoded_artifact_key: str,
+) -> str:
+    return manifest_cache_key(
+        ordered_artifact_keys=(encoded_artifact_key,),
+        manifest_identity=semantic_sha256(dict(static_projection)),
+    )
+
+
+def _mcap_media_cache_manifest_bytes(
+    *,
+    static_projection: Mapping[str, str | int],
+    rendered: _RenderedPngFact,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            **static_projection,
+            "artifact_sha256": rendered.sha256,
+            "artifact_bytes": rendered.bytes,
+            "media_type": rendered.media_type,
+            "encoding": rendered.encoding,
+            "extension": rendered.extension,
+            "width": rendered.width,
+            "height": rendered.height,
+        }
+    )
+
+
+def _is_sha256_digest(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _cache_manifest_descriptor(
+    data: bytes,
+    *,
+    static_projection: Mapping[str, str | int],
+) -> _CachedMcapPngManifest | None:
+    try:
+        document = json.loads(data)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    dynamic_fields = {
+        "artifact_sha256",
+        "artifact_bytes",
+        "media_type",
+        "encoding",
+        "extension",
+        "width",
+        "height",
+    }
+    if not isinstance(document, dict) or set(document) != set(static_projection) | dynamic_fields:
+        return None
+    if any(document.get(name) != value for name, value in static_projection.items()):
+        return None
+    encoding = document.get("encoding")
+    if not isinstance(encoding, str) or encoding != static_projection.get("evidence_encoding"):
+        return None
+    try:
+        expected_media_type = _evidence_media_type_for_encoding(encoding)
+        expected_extension = _evidence_extension_for_encoding(encoding)
+    except CanonicalMcapSourceError:
+        return None
+    media_type = document.get("media_type")
+    extension = document.get("extension")
+    if media_type != expected_media_type or extension != expected_extension:
+        return None
+    sha256 = document.get("artifact_sha256")
+    byte_count = document.get("artifact_bytes")
+    width = document.get("width")
+    height = document.get("height")
+    if (
+        not _is_sha256_digest(sha256)
+        or isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+        or isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+    ):
+        return None
+    return _CachedMcapPngManifest(
+        sha256=sha256,
+        byte_count=byte_count,
+        width=width,
+        height=height,
+        media_type=media_type,
+        encoding=encoding,
+        extension=extension,
+    )
+
+
+def _validated_cached_png_dimensions(png_bytes: bytes) -> tuple[int, int] | None:
+    """Validate the canonical RGB24 PNG structure before publishing cached bytes."""
+
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    offset = 8
+    width = height = 0
+    saw_ihdr = False
+    saw_idat = False
+    saw_iend = False
+    idat_closed = False
+    compressed = bytearray()
+    while offset < len(png_bytes):
+        if len(png_bytes) - offset < 12:
+            return None
+        chunk_length = int.from_bytes(png_bytes[offset : offset + 4], "big")
+        chunk_type = png_bytes[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(png_bytes):
+            return None
+        chunk_data = png_bytes[offset + 8 : offset + 8 + chunk_length]
+        expected_crc = int.from_bytes(png_bytes[chunk_end - 4 : chunk_end], "big")
+        if zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF != expected_crc:
+            return None
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                return None
+            width = int.from_bytes(chunk_data[0:4], "big")
+            height = int.from_bytes(chunk_data[4:8], "big")
+            bit_depth, color_type, compression, filtering, interlace = chunk_data[8:13]
+            if (
+                width <= 0
+                or height <= 0
+                or bit_depth != 8
+                or color_type != 2
+                or compression != 0
+                or filtering != 0
+                or interlace != 0
+            ):
+                return None
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return None
+        elif chunk_type == b"IDAT":
+            if idat_closed:
+                return None
+            saw_idat = True
+            compressed.extend(chunk_data)
+        elif chunk_type == b"IEND":
+            if chunk_length != 0 or chunk_end != len(png_bytes):
+                return None
+            saw_iend = True
+        else:
+            if saw_idat:
+                idat_closed = True
+            if chunk_type[0] & 0x20 == 0:
+                return None
+        offset = chunk_end
+    if not saw_ihdr or not saw_idat or not saw_iend:
+        return None
+    row_bytes = width * 3
+    decoded_size = height * (row_bytes + 1)
+    if decoded_size > 256 * 1024 * 1024:
+        return None
+    try:
+        decoder = zlib.decompressobj()
+        decoded = decoder.decompress(bytes(compressed), decoded_size + 1)
+    except zlib.error:
+        return None
+    if (
+        len(decoded) != decoded_size
+        or not decoder.eof
+        or decoder.unconsumed_tail
+        or decoder.unused_data
+    ):
+        return None
+    if any(decoded[offset] > 4 for offset in range(0, decoded_size, row_bytes + 1)):
+        return None
+    return width, height
+
+
+def _validated_cached_jpeg_dimensions(jpeg_bytes: bytes) -> tuple[int, int] | None:
+    """Decode one bounded JPEG before exposing cached bytes as evidence."""
+
+    if (
+        len(jpeg_bytes) > 256 * 1024 * 1024
+        or not jpeg_bytes.startswith(b"\xff\xd8")
+        or not jpeg_bytes.endswith(b"\xff\xd9")
+    ):
+        return None
+    try:
+        with av.open(BytesIO(jpeg_bytes), mode="r", format="mjpeg") as container:
+            streams = tuple(container.streams.video)
+            if len(streams) != 1:
+                return None
+            frames = tuple(container.decode(streams[0]))
+    except Exception:
+        return None
+    if len(frames) != 1 or frames[0].width <= 0 or frames[0].height <= 0:
+        return None
+    return frames[0].width, frames[0].height
+
+
+def _validated_cached_evidence_dimensions(
+    evidence_bytes: bytes,
+    *,
+    encoding: str,
+) -> tuple[int, int] | None:
+    if encoding == MCAP_MEDIA_EVIDENCE_ENCODING:
+        return _validated_cached_png_dimensions(evidence_bytes)
+    if encoding == MCAP_JPEG_EVIDENCE_ENCODING:
+        return _validated_cached_jpeg_dimensions(evidence_bytes)
+    return None
+
+
+def _cached_evidence_matches_manifest(
+    evidence_bytes: bytes | None,
+    *,
+    descriptor: _CachedMcapPngManifest,
+) -> bool:
+    return (
+        evidence_bytes is not None
+        and descriptor.media_type == _evidence_media_type_for_encoding(descriptor.encoding)
+        and descriptor.extension == _evidence_extension_for_encoding(descriptor.encoding)
+        and len(evidence_bytes) == descriptor.byte_count
+        and exact_bytes_sha256(evidence_bytes) == descriptor.sha256
+        and _validated_cached_evidence_dimensions(
+            evidence_bytes,
+            encoding=descriptor.encoding,
+        )
+        == (descriptor.width, descriptor.height)
+    )
+
+
+def _cached_png_matches_manifest(
+    png_bytes: bytes | None,
+    *,
+    descriptor: _CachedMcapPngManifest,
+) -> bool:
+    """Compatibility wrapper retained for existing PNG cache conformance tests."""
+
+    return _cached_evidence_matches_manifest(png_bytes, descriptor=descriptor)
+
+
+def _expected_cache_surface_dimensions(
+    *,
+    ledger: _CameraLedger,
+    evidence_max_width: int,
+) -> tuple[int, int]:
+    width = min(ledger.record.width, evidence_max_width)
+    height = max(
+        1,
+        (ledger.record.height * width + ledger.record.width // 2) // ledger.record.width,
+    )
+    return width, height
+
+
+def _read_rendered_evidence_bytes(rendered: _RenderedPngFact) -> bytes:
+    try:
+        if rendered.path.is_symlink() or not rendered.path.is_file():
+            raise CanonicalMcapSourceError("export-time evidence is not a regular file")
+        evidence_bytes = rendered.path.read_bytes()
+    except OSError as error:
+        raise CanonicalMcapSourceError(f"cannot read export-time evidence: {error}") from error
+    if (
+        rendered.media_type != _evidence_media_type_for_encoding(rendered.encoding)
+        or rendered.extension != _evidence_extension_for_encoding(rendered.encoding)
+        or len(evidence_bytes) != rendered.bytes
+        or exact_bytes_sha256(evidence_bytes) != rendered.sha256
+        or _validated_cached_evidence_dimensions(
+            evidence_bytes,
+            encoding=rendered.encoding,
+        )
+        != (rendered.width, rendered.height)
+    ):
+        raise CanonicalMcapSourceError("export-time evidence differs from its rendered fact")
+    return evidence_bytes
+
+
+def _cache_rendered_export_time_frame(
+    *,
+    media_cache: _McapLayeredMediaCacheContext,
+    camera_id: CameraId,
+    ledger: _CameraLedger,
+    source_frame: IndexedSourceFrame,
+    rendered: _RenderedPngFact,
+) -> _RenderedPngFact:
+    policy = media_cache.media_processing_policy
+    if (
+        rendered.media_type != _evidence_media_type(policy)
+        or rendered.encoding != policy.evidence_encoding
+        or rendered.extension != _evidence_extension(policy)
+    ):
+        raise CanonicalMcapSourceError("export-time evidence representation differs from policy")
+    normalized_rgb24 = rendered.normalized_rgb24
+    if normalized_rgb24 is None:
+        raise CanonicalMcapSourceError("export-time RGB24 cache surface is invalid")
+    restored = _restore_normalized_rgb24_cache_surface(normalized_rgb24)
+    expected_dimensions = _expected_cache_surface_dimensions(
+        ledger=ledger,
+        evidence_max_width=media_cache.media_processing_policy.evidence_max_width,
+    )
+    if restored is None or restored[1:] != expected_dimensions:
+        raise CanonicalMcapSourceError("export-time RGB24 cache surface is invalid")
+    raw_frame_key = _mcap_media_cache_raw_key(
+        media_cache=media_cache,
+        camera_id=camera_id,
+        ledger=ledger,
+        source_frame=source_frame,
+    )
+    encoded_artifact_key = _mcap_media_cache_encoded_key(
+        media_cache=media_cache,
+        raw_frame_key=raw_frame_key,
+    )
+    static_projection = _mcap_media_cache_manifest_static_projection(
+        media_cache=media_cache,
+        camera_id=camera_id,
+        ledger=ledger,
+        source_frame=source_frame,
+        raw_frame_key=raw_frame_key,
+        encoded_artifact_key=encoded_artifact_key,
+    )
+    manifest_key = _mcap_media_cache_manifest_key(
+        static_projection=static_projection,
+        encoded_artifact_key=encoded_artifact_key,
+    )
+    evidence_bytes = _read_rendered_evidence_bytes(rendered)
+    cached_raw = media_cache.cache.get_raw_frame(raw_frame_key)
+    cached_surface = (
+        None if cached_raw is None else _restore_normalized_rgb24_cache_surface(cached_raw)
+    )
+    if cached_raw is not None and (
+        cached_surface is None
+        or cached_surface[1:] != expected_dimensions
+        or cached_raw != normalized_rgb24
+    ):
+        media_cache.cache.invalidate("raw", raw_frame_key)
+
+    manifest_bytes = media_cache.cache.get_manifest(manifest_key)
+    descriptor = (
+        None
+        if manifest_bytes is None
+        else _cache_manifest_descriptor(
+            manifest_bytes,
+            static_projection=static_projection,
+        )
+    )
+    cached_evidence = media_cache.cache.get_encoded_artifact(encoded_artifact_key)
+    manifest_matches_rendered = (
+        descriptor is not None
+        and descriptor.sha256 == rendered.sha256
+        and descriptor.byte_count == rendered.bytes
+        and descriptor.media_type == rendered.media_type
+        and descriptor.encoding == rendered.encoding
+        and descriptor.extension == rendered.extension
+        and descriptor.width == rendered.width
+        and descriptor.height == rendered.height
+    )
+    if manifest_bytes is not None and not manifest_matches_rendered:
+        media_cache.cache.invalidate("manifest", manifest_key)
+    if cached_evidence is not None and cached_evidence != evidence_bytes:
+        media_cache.cache.invalidate("encoded", encoded_artifact_key)
+
+    media_cache.cache.put_raw_frame(raw_frame_key, normalized_rgb24)
+    media_cache.cache.put_encoded_artifact(encoded_artifact_key, evidence_bytes)
+    media_cache.cache.put_manifest(
+        manifest_key,
+        _mcap_media_cache_manifest_bytes(
+            static_projection=static_projection,
+            rendered=rendered,
         ),
     )
+    return rendered
 
 
-def _publish_png(root: Path, digest: str, contents: bytes) -> Path:
-    directory = root / "sha256" / digest[:2]
-    target = directory / f"{digest}.png"
-    directory.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if target.is_symlink() or exact_bytes_sha256(target.read_bytes()) != digest:
-            raise CanonicalMcapSourceError(f"existing frame artifact is corrupt: {target}")
-        return target.resolve()
-
-    descriptor, temporary = make_temp_file(
-        directory,
-        prefix=f".{digest}.",
-        suffix=".tmp",
+def _materialized_cached_frame_artifact(
+    *,
+    camera_id: CameraId,
+    ledger: _CameraLedger,
+    source_frame: IndexedSourceFrame,
+    decoded_frame: Any,
+    output_root: Path,
+    evidence_extractor_version: str,
+    media_cache: _McapLayeredMediaCacheContext,
+) -> MaterializedFrameArtifactFact:
+    policy = media_cache.media_processing_policy
+    if evidence_extractor_version != policy.evidence_extractor_version:
+        raise CanonicalMcapSourceError(
+            "layered media cache extractor version differs from its policy"
+        )
+    raw_frame_key = _mcap_media_cache_raw_key(
+        media_cache=media_cache,
+        camera_id=camera_id,
+        ledger=ledger,
+        source_frame=source_frame,
     )
+    rgb_frame, raw_surface, width, height = _normalized_rgb24_cache_surface(
+        decoded_frame,
+        max_width=media_cache.media_processing_policy.evidence_max_width,
+    )
+    cached_raw = media_cache.cache.get_raw_frame(raw_frame_key)
+    restored = _restore_normalized_rgb24_cache_surface(cached_raw) if cached_raw else None
+    raw_mapping_replaced = cached_raw is not None and (
+        restored is None or restored[1:] != (width, height) or cached_raw != raw_surface
+    )
+    if raw_mapping_replaced:
+        media_cache.cache.invalidate("raw", raw_frame_key)
+    media_cache.cache.put_raw_frame(raw_frame_key, raw_surface)
+
+    encoded_artifact_key = _mcap_media_cache_encoded_key(
+        media_cache=media_cache,
+        raw_frame_key=raw_frame_key,
+    )
+    static_projection = _mcap_media_cache_manifest_static_projection(
+        media_cache=media_cache,
+        camera_id=camera_id,
+        ledger=ledger,
+        source_frame=source_frame,
+        raw_frame_key=raw_frame_key,
+        encoded_artifact_key=encoded_artifact_key,
+    )
+    manifest_key = _mcap_media_cache_manifest_key(
+        static_projection=static_projection,
+        encoded_artifact_key=encoded_artifact_key,
+    )
+    manifest_bytes = media_cache.cache.get_manifest(manifest_key)
+    descriptor = (
+        None
+        if manifest_bytes is None
+        else _cache_manifest_descriptor(
+            manifest_bytes,
+            static_projection=static_projection,
+        )
+    )
+    cached_evidence = media_cache.cache.get_encoded_artifact(encoded_artifact_key)
+    if raw_mapping_replaced:
+        media_cache.cache.invalidate("manifest", manifest_key)
+        media_cache.cache.invalidate("encoded", encoded_artifact_key)
+        manifest_bytes = None
+        descriptor = None
+        cached_evidence = None
+    if (
+        descriptor is not None
+        and descriptor.width == width
+        and descriptor.height == height
+        and _cached_evidence_matches_manifest(cached_evidence, descriptor=descriptor)
+    ):
+        if cached_evidence is None:
+            raise CanonicalMcapSourceError("matched layered evidence cache entry is unavailable")
+        rendered = _RenderedPngFact(
+            path=_publish_evidence(
+                output_root,
+                descriptor.sha256,
+                cached_evidence,
+                extension=descriptor.extension,
+            ),
+            sha256=descriptor.sha256,
+            bytes=descriptor.byte_count,
+            width=descriptor.width,
+            height=descriptor.height,
+            normalized_rgb24=raw_surface,
+            media_type=descriptor.media_type,
+            encoding=descriptor.encoding,
+            extension=descriptor.extension,
+        )
+        return _materialized_frame_artifact_from_rendered(
+            source_frame=source_frame,
+            rendered=rendered,
+            evidence_extractor_version=evidence_extractor_version,
+            media_processing_policy=policy,
+        )
+
+    if manifest_bytes is not None:
+        media_cache.cache.invalidate("manifest", manifest_key)
+    if cached_evidence is not None:
+        media_cache.cache.invalidate("encoded", encoded_artifact_key)
+    evidence_bytes = _encode_evidence_rgb24_for_policy(rgb_frame, policy=policy)
+    if _validated_cached_evidence_dimensions(
+        evidence_bytes,
+        encoding=policy.evidence_encoding,
+    ) != (width, height):
+        raise CanonicalMcapSourceError("canonical evidence encoder returned invalid output")
+    digest = exact_bytes_sha256(evidence_bytes)
+    rendered = _RenderedPngFact(
+        path=_publish_evidence(
+            output_root,
+            digest,
+            evidence_bytes,
+            extension=_evidence_extension(policy),
+        ),
+        sha256=digest,
+        bytes=len(evidence_bytes),
+        width=width,
+        height=height,
+        normalized_rgb24=raw_surface,
+        media_type=_evidence_media_type(policy),
+        encoding=policy.evidence_encoding,
+        extension=_evidence_extension(policy),
+    )
+    media_cache.cache.put_encoded_artifact(encoded_artifact_key, evidence_bytes)
+    media_cache.cache.put_manifest(
+        manifest_key,
+        _mcap_media_cache_manifest_bytes(
+            static_projection=static_projection,
+            rendered=rendered,
+        ),
+    )
+    return _materialized_frame_artifact_from_rendered(
+        source_frame=source_frame,
+        rendered=rendered,
+        evidence_extractor_version=evidence_extractor_version,
+        media_processing_policy=policy,
+    )
+
+
+def _sync_file(path: Path) -> None:
+    # Windows FlushFileBuffers requires a handle opened with write access.
+    with path.open("r+b") as stream:
+        os.fsync(stream.fileno())
+
+
+def _sync_directory(path: Path) -> None:
+    sync_directory(path)
+
+
+def _verify_exact_file(
+    path: Path,
+    contents: bytes,
+    *,
+    label: str,
+    mismatch_message: str,
+) -> None:
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, target)
-        except FileExistsError:
-            if target.is_symlink() or exact_bytes_sha256(target.read_bytes()) != digest:
-                raise CanonicalMcapSourceError(
-                    f"concurrent frame artifact is corrupt: {target}"
-                ) from None
-        return target.resolve()
-    finally:
-        temporary.unlink(missing_ok=True)
+        matches = not path.is_symlink() and path.is_file() and path.read_bytes() == contents
+    except OSError as error:
+        raise CanonicalMcapSourceError(f"cannot verify {label}: {error}") from error
+    if not matches:
+        raise CanonicalMcapSourceError(mismatch_message)
 
 
-def _publish_exact_state_file(
+def _publish_linked_file(
     target: Path,
     contents: bytes,
     *,
     label: str,
+    expected_sha256: str | None = None,
 ) -> Path:
+    if expected_sha256 is not None and exact_bytes_sha256(contents) != expected_sha256:
+        raise CanonicalMcapSourceError(f"{label} digest does not match its bytes")
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if target.is_symlink() or not target.is_file() or target.read_bytes() != contents:
-            raise CanonicalMcapSourceError(f"existing {label} bytes are inconsistent")
+    existing_message = f"existing {label} bytes are inconsistent"
+    if target.exists() or target.is_symlink():
+        _verify_exact_file(
+            target,
+            contents,
+            label=label,
+            mismatch_message=existing_message,
+        )
+        try:
+            _sync_file(target)
+            _sync_directory(target.parent)
+        except OSError as error:
+            raise CanonicalMcapSourceError(
+                f"cannot synchronize existing {label}: {error}"
+            ) from error
         return target.resolve()
 
     descriptor, temporary = make_temp_file(
@@ -2802,20 +3921,167 @@ def _publish_exact_state_file(
         suffix=".tmp",
     )
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                written = stream.write(contents)
+                if written != len(contents):
+                    raise OSError(
+                        f"short write: expected {len(contents)} bytes but wrote {written} bytes"
+                    )
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise CanonicalMcapSourceError(f"cannot write staged {label}: {error}") from error
+        _verify_exact_file(
+            temporary,
+            contents,
+            label=f"staged {label}",
+            mismatch_message=f"staged {label} bytes are inconsistent",
+        )
+        try:
+            _sync_directory(target.parent)
+        except OSError as error:
+            raise CanonicalMcapSourceError(f"cannot synchronize staged {label}: {error}") from error
         try:
             os.link(temporary, target)
         except FileExistsError:
-            if target.is_symlink() or not target.is_file() or target.read_bytes() != contents:
-                raise CanonicalMcapSourceError(
-                    f"concurrent {label} bytes are inconsistent"
-                ) from None
+            _verify_exact_file(
+                target,
+                contents,
+                label=f"concurrent {label}",
+                mismatch_message=f"concurrent {label} bytes are inconsistent",
+            )
+        except OSError as error:
+            raise CanonicalMcapSourceError(f"cannot expose {label}: {error}") from error
+        try:
+            _sync_file(target)
+            _sync_directory(target.parent)
+        except OSError as error:
+            raise CanonicalMcapSourceError(
+                f"cannot synchronize published {label}: {error}"
+            ) from error
         return target.resolve()
     finally:
-        temporary.unlink(missing_ok=True)
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
+def _publish_evidence(
+    root: Path,
+    digest: str,
+    contents: bytes,
+    *,
+    extension: str,
+) -> Path:
+    if extension not in {"png", "jpg"}:
+        raise CanonicalMcapSourceError("unsupported evidence artifact extension")
+    target = root / "sha256" / digest[:2] / f"{digest}.{extension}"
+    return _publish_linked_file(
+        target,
+        contents,
+        label="frame artifact",
+        expected_sha256=digest,
+    )
+
+
+def _publish_png(root: Path, digest: str, contents: bytes) -> Path:
+    return _publish_evidence(root, digest, contents, extension="png")
+
+
+def _publish_exact_state_file(
+    target: Path,
+    contents: bytes,
+    *,
+    label: str,
+) -> Path:
+    return _publish_linked_file(target, contents, label=label)
+
+
+def _begin_media_runtime_observation(media_exporter: Any) -> Any | None:
+    """Start one exporter-owned observation without retaining cross-run fallback state."""
+
+    starter = getattr(media_exporter, "begin_runtime_observation", None)
+    closer = getattr(media_exporter, "close_runtime_observation", None)
+    if starter is None:
+        if closer is not None:
+            raise CanonicalMcapSourceError(
+                "media exporter close_runtime_observation requires begin_runtime_observation"
+            )
+        return None
+    if not callable(starter):
+        raise CanonicalMcapSourceError(
+            "media exporter begin_runtime_observation must be callable when present"
+        )
+    if not callable(closer):
+        raise CanonicalMcapSourceError(
+            "media exporter begin_runtime_observation requires callable close_runtime_observation"
+        )
+    observation = starter()
+    if observation is None:
+        raise CanonicalMcapSourceError("media exporter begin_runtime_observation returned None")
+    return observation
+
+
+def _close_media_runtime_observation(media_exporter: Any, observation: Any | None) -> None:
+    if observation is None:
+        return
+    closer = getattr(media_exporter, "close_runtime_observation", None)
+    if not callable(closer):
+        raise CanonicalMcapSourceError(
+            "media exporter close_runtime_observation must be callable when observation exists"
+        )
+    closer(observation)
+
+
+def _completed_media_runtime_provenance(
+    *,
+    media_exporter: Any,
+    declared: MediaRuntimeProvenance,
+    runtime_observation: Any | None,
+) -> MediaRuntimeProvenance:
+    """Resolve an optional exporter runtime result into the persisted observation."""
+
+    resolver = getattr(media_exporter, "completed_runtime_provenance", None)
+    if resolver is None:
+        return declared
+    if not callable(resolver):
+        raise CanonicalMcapSourceError(
+            "media exporter completed_runtime_provenance must be callable when present"
+        )
+    if runtime_observation is None:
+        completed = resolver(declared)
+    else:
+        completed = resolver(declared, runtime_observation=runtime_observation)
+    if not isinstance(completed, MediaRuntimeProvenance):
+        raise CanonicalMcapSourceError(
+            "media exporter completed_runtime_provenance returned an invalid provenance"
+        )
+    return completed
+
+
+def _validate_target_media_runtime_source(
+    *,
+    provenance: MediaRuntimeProvenance,
+    channels: SixCameraMap[ChannelInspection],
+    publication: PublishedRegisteredVideoExport,
+) -> None:
+    """Reject a target claim that does not match the canonical source observations."""
+
+    if provenance.backend is not MediaRuntimeBackend.NVDEC_TARGET:
+        return
+    selected_input = provenance.selected_input
+    if selected_input is None:
+        raise CanonicalMcapSourceError("target media runtime has no selected input")
+    observed_codecs = {channel.codec for channel in channels.values()}
+    if observed_codecs != {selected_input.codec}:
+        raise CanonicalMcapSourceError(
+            "target media runtime codec does not match the canonical mapped channels"
+        )
+    observed_dimensions = {(record.width, record.height) for record in publication.manifest.cameras}
+    if observed_dimensions != {(selected_input.width, selected_input.height)}:
+        raise CanonicalMcapSourceError(
+            "target media runtime dimensions do not match the registered video view"
+        )
 
 
 def _sampling_plan() -> SamplingPlan:

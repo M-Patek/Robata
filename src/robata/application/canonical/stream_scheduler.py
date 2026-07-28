@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, Self
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -19,7 +19,9 @@ from robata.adapters.sqlite_stream_work_ledger import (
     NewStreamWindow,
     NewStreamWorkPlan,
     SQLiteStreamWorkLedger,
+    SQLiteStreamWorkLedgerFairnessThrottle,
     StoredExpectedWindow,
+    StoredStreamBackpressureController,
     StoredStreamWorkPlan,
 )
 from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkFenceError
@@ -60,6 +62,9 @@ from robata.queue.backpressure import (
     AdmissionDecision,
     BackpressureConfig,
     BackpressureController,
+    BackpressureControllerState,
+    BackpressureRuntimeSignals,
+    PressureClass,
     QueueMetrics,
 )
 from robata.queue.models import (
@@ -107,6 +112,7 @@ _WINDOW_DAG_TOPOLOGY: Final = (
     ),
 )
 _WINDOW_DAG_STAGES: Final = tuple(stage for stage, _dependencies in _WINDOW_DAG_TOPOLOGY)
+_BACKPRESSURE_CONTROLLER_KEY: Final = "stream-window-admission"
 
 # Local-conformance scheduling budgets. They are operational fields rather than
 # logical-identity inputs and remain explicitly unqualified for production SLOs.
@@ -196,7 +202,7 @@ class _StoredSchedulerConfig(BaseModel):
     stream_run_id: str
     dag_config_semantic_sha256: str
     terminal_policy_version: str
-    backpressure_config: BackpressureConfig
+    backpressure_config: dict[str, object]
     schema_refs: _StoredSchedulerSchemaRefs
 
 
@@ -292,6 +298,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         schema_refs: StreamSchedulerSchemaRefs,
         dag_config_semantic_sha256: str,
         terminal_policy_version: str = "stream-terminal-policy-v1",
+        backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
         backpressure_config: BackpressureConfig = DEFAULT_STREAM_BACKPRESSURE_CONFIG,
         clock: Callable[[], datetime] | None = None,
         boundary_observer: Callable[[str], None] | None = None,
@@ -325,12 +332,21 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             BackpressureConfig,
             "backpressure_config",
         )
+        if backpressure_signal_provider is not None and not callable(backpressure_signal_provider):
+            raise TypeError("backpressure_signal_provider must be callable or None")
+        self._backpressure_signal_provider = backpressure_signal_provider
         self._backpressure = BackpressureController(self._backpressure_config)
+        self._backpressure_controller_owner_id = f"stream-backpressure:{uuid4()}"
+        self._backpressure_controller: StoredStreamBackpressureController
+        self._backpressure_state: BackpressureControllerState
         self._clock = clock or (lambda: datetime.now(UTC))
         self._boundary_observer = boundary_observer
         if self._expected_plan.capture_scope_digest != self._source_subject.capture_scope_digest:
             raise ValueError("expected plan and source subject must share capture_scope_digest")
         self._register_plan()
+        self._backpressure_controller, self._backpressure_state = (
+            self._claim_backpressure_controller()
+        )
         self._verify_storage()
         self.recover()
 
@@ -340,6 +356,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         *,
         execution_scheduler: SQLiteWorkScheduler,
         stream_run_id: str,
+        backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
         clock: Callable[[], datetime] | None = None,
         boundary_observer: Callable[[str], None] | None = None,
     ) -> tuple[Self, ...]:
@@ -376,9 +393,10 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                     ),
                     stream_run_id=checked_run_id,
                     schema_refs=_schema_refs_from_stored(config.schema_refs),
+                    backpressure_signal_provider=backpressure_signal_provider,
                     dag_config_semantic_sha256=config.dag_config_semantic_sha256,
                     terminal_policy_version=config.terminal_policy_version,
-                    backpressure_config=config.backpressure_config,
+                    backpressure_config=_stored_backpressure_config(config.backpressure_config),
                     clock=clock,
                     boundary_observer=boundary_observer,
                 )
@@ -390,6 +408,24 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         return self._ledger.database_path
 
     @property
+    def execution_scheduler(self) -> SQLiteWorkScheduler:
+        """Return the shared authority used for every stream-ledger operation."""
+
+        return self._execution_scheduler
+
+    @property
+    def backpressure_controller_key(self) -> str:
+        """Return the declared provider/partition controller key."""
+
+        return self._backpressure_config.controller_key
+
+    @property
+    def backpressure_controller_limit(self) -> int:
+        """Return the last durable controller limit without creating an observation."""
+
+        return self._backpressure_state.current_limit
+
+    @property
     def plan_key(self) -> str:
         return self._expected_plan.plan_key
 
@@ -399,6 +435,11 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         if not isinstance(emission, PlannerEmission):
             raise TypeError("emission must be PlannerEmission")
         self._append_window_batch(emission.windows)
+
+    def append_windows(self, windows: Sequence[BoundedWindowPlan]) -> None:
+        """Commit one explicit bounded, ordered planner window batch."""
+
+        self._append_window_batch(windows)
 
     def _append_window_batch(self, windows: Sequence[BoundedWindowPlan]) -> None:
         """Commit a bounded sequence of windows as one durable batch."""
@@ -543,10 +584,16 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
             if existing is not None:
                 existing_checks.append((existing, plans[-1].work_item_id))
 
-        inserted = self._ledger.append_windows(
-            plan_key=self.plan_key,
-            windows=tuple(append_batch),
-        )
+        try:
+            inserted = self._ledger.append_windows(
+                plan_key=self.plan_key,
+                windows=tuple(append_batch),
+                controller_key=self._backpressure_config.controller_key,
+                controller_policy_version=self._backpressure_config.version,
+            )
+        except SQLiteStreamWorkLedgerFairnessThrottle as error:
+            self._observe("window_admission_throttled")
+            raise StreamBackpressureThrottle(self._recording_fairness_decision(error)) from error
         for did_insert in inserted:
             if did_insert:
                 self._observe("expected_declaration_durable")
@@ -569,16 +616,25 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
 
         pressure = self.backpressure_snapshot()
         metrics = pressure.metrics
-        for _index in range(new_window_count):
-            decision = self._backpressure.should_admit(
-                _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
-                metrics,
-            )
+        state = self._backpressure_state
+        observed_at_ms = state.last_observed_at_ms
+        if observed_at_ms is None:
+            raise StreamSchedulerCompositionError("backpressure observation was not persisted")
+
+        for index in range(new_window_count):
+            if index:
+                decision, state = self._backpressure.evaluate(
+                    _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
+                    metrics,
+                    state,
+                    observed_at_ms=observed_at_ms,
+                )
+            else:
+                decision = pressure.decision
             if not decision.admitted:
                 self._observe("window_admission_throttled")
                 raise StreamBackpressureThrottle(decision)
             projected_depth = metrics.depth + len(_WINDOW_DAG_STAGES)
-            depth_limit = self._backpressure_config.queue_depth_threshold
             metrics = QueueMetrics(
                 depth=projected_depth,
                 oldest_age_ms=metrics.oldest_age_ms,
@@ -586,9 +642,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 service_rate=metrics.service_rate,
                 backlog_slope=metrics.backlog_slope,
                 provider_quota=metrics.provider_quota,
-                worker_utilization=(
-                    0.0 if depth_limit == 0 else projected_depth / depth_limit
-                ),
+                worker_utilization=metrics.worker_utilization,
             )
 
     def append_window(self, window: BoundedWindowPlan) -> ExpectedWindowDeclaration:
@@ -681,13 +735,19 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 self._window_work_plans(wire_window, created_at=created_at)
             )
         )
-        inserted = self._ledger.append_window(
-            plan_key=self.plan_key,
-            ordinal=window.ordinal,
-            declaration_json=canonical_json_bytes(declaration),
-            window_json=canonical_json_bytes(wire_window),
-            work_plans=new_work,
-        )
+        try:
+            inserted = self._ledger.append_window(
+                plan_key=self.plan_key,
+                ordinal=window.ordinal,
+                declaration_json=canonical_json_bytes(declaration),
+                window_json=canonical_json_bytes(wire_window),
+                work_plans=new_work,
+                controller_key=self._backpressure_config.controller_key,
+                controller_policy_version=self._backpressure_config.version,
+            )
+        except SQLiteStreamWorkLedgerFairnessThrottle as error:
+            self._observe("window_admission_throttled")
+            raise StreamBackpressureThrottle(self._recording_fairness_decision(error)) from error
         if inserted:
             self._observe("expected_declaration_durable")
         self._publish_work_rows(new_work if inserted else companion_rows)
@@ -1034,6 +1094,45 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         )
         return _stream_lease(renewed)
 
+    def fail_retryable(
+        self,
+        lease: StreamWorkLease,
+        *,
+        error_code: str,
+        error_detail: str | None = None,
+        now: datetime | None = None,
+    ) -> StreamWorkItem:
+        """Record a fenced execution failure without inventing terminal evidence.
+
+        A worker can fail before it has prepared a typed stream terminal. Keep that
+        distinction durable by returning the execution item to the scheduler's
+        retry path instead of synthesizing a stream terminal fact.
+        """
+
+        checked = _strict_model(lease, StreamWorkLease, "lease")
+        stored = self._stored_work_row(
+            checked.work_item_id,
+            require_published=True,
+        )
+        plan = _parse_exact(stored.plan_json, StreamWorkItemPlan, "stream work plan")
+        active_execution = self._execution_scheduler.get(checked.work_item_id)
+        if active_execution.attempt >= active_execution.max_attempts:
+            raise StreamSchedulerCompositionError(
+                "pre-terminal execution cannot exhaust attempts without typed stream evidence"
+            )
+        execution = self._execution_scheduler.fail(
+            _execution_lease(checked),
+            error_code=error_code,
+            error_detail=error_detail,
+            retryable=True,
+            now=self._checked_now(now),
+        )
+        return self._stream_item_from(
+            plan,
+            execution,
+            evidence=self._accepted_evidence(stored),
+        )
+
     def complete(
         self,
         lease: StreamWorkLease,
@@ -1332,36 +1431,191 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         now: datetime | None = None,
         metrics: QueueMetrics | None = None,
     ) -> StreamBackpressureSnapshot:
-        """Classify current pressure without mutating work or execution state."""
+        """Persist one timing-only controller observation over durable backlog."""
 
+        checked_now = self._checked_now(now)
+        observed_at_ms = int(checked_now.timestamp() * 1_000)
+        backlog = self.backlog(now=checked_now)
+        durable_metrics, sample_counts = self._durable_backpressure_metrics(
+            backlog,
+            observed_at_ms=observed_at_ms,
+        )
         if metrics is None:
-            backlog = self.backlog(now=now)
-            oldest_age_ms = (
-                0
-                if backlog.oldest_active_age_seconds is None
-                else max(0, int(backlog.oldest_active_age_seconds * 1_000))
-            )
-            depth_limit = self._backpressure_config.queue_depth_threshold
-            metrics = QueueMetrics(
-                depth=backlog.active_backlog,
-                oldest_age_ms=oldest_age_ms,
-                arrival_rate=0.0,
-                service_rate=0.0,
-                backlog_slope=0.0,
-                provider_quota=0,
-                worker_utilization=(
-                    0.0 if depth_limit == 0 else backlog.active_backlog / depth_limit
-                ),
+            runtime_signals = self._runtime_backpressure_signals()
+            metrics = durable_metrics.model_copy(
+                update={
+                    "provider_quota": runtime_signals.provider_quota,
+                    "worker_utilization": runtime_signals.worker_utilization,
+                }
             )
         else:
             metrics = _strict_model(metrics, QueueMetrics, "metrics")
+        decision, next_state = self._backpressure.evaluate(
+            _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
+            metrics,
+            self._backpressure_state,
+            observed_at_ms=observed_at_ms,
+        )
+        total_work_count, terminal_work_count, backlog_depth = sample_counts
+        next_state = next_state.model_copy(
+            update={
+                "last_arrival_count": total_work_count,
+                "last_service_count": terminal_work_count,
+                "last_backlog_depth": backlog_depth,
+            }
+        )
+        try:
+            controller = self._ledger.save_backpressure_controller(
+                self._backpressure_controller,
+                state_json=canonical_json_bytes(next_state),
+            )
+        except WorkFenceError as error:
+            raise StreamSchedulerCompositionError(
+                "backpressure controller ownership changed"
+            ) from error
+        self._backpressure_controller = controller
+        self._backpressure_state = next_state
         return StreamBackpressureSnapshot(
             metrics=metrics,
-            decision=self._backpressure.should_admit(
-                _STAGE_EXECUTION_PROJECTION[StreamStage.WINDOW],
-                metrics,
-            ),
+            decision=decision,
         )
+
+    def _runtime_backpressure_signals(self) -> BackpressureRuntimeSignals:
+        """Read non-durable provider/executor signals without inventing unavailable values."""
+
+        provider = self._backpressure_signal_provider
+        if provider is None:
+            return BackpressureRuntimeSignals()
+        try:
+            observed = provider()
+        except Exception as error:
+            raise StreamSchedulerCompositionError(
+                "backpressure runtime signal provider failed"
+            ) from error
+        if observed is None:
+            return BackpressureRuntimeSignals()
+        try:
+            return _strict_model(
+                observed,
+                BackpressureRuntimeSignals,
+                "backpressure runtime signals",
+            )
+        except (TypeError, ValueError) as error:
+            raise StreamSchedulerCompositionError(
+                "backpressure runtime signal provider returned invalid signals"
+            ) from error
+
+    def _recording_fairness_decision(
+        self,
+        error: SQLiteStreamWorkLedgerFairnessThrottle,
+    ) -> AdmissionDecision:
+        """Map a durable partition-share rejection onto the timing-only controller surface."""
+
+        return AdmissionDecision(
+            admitted=False,
+            policy_version=self._backpressure_config.version,
+            pressure_class=PressureClass.THROTTLED,
+            signals=("RECORDING_FAIRNESS",),
+            shedding_actions=("THROTTLE_LEDGER",),
+            reason=(
+                "stream window admission is throttled by RECORDING_FAIRNESS "
+                f"for partition {error.controller_key}"
+            ),
+            suggested_delay_ms=1_000,
+            controller_limit=self._backpressure_state.current_limit,
+            controller_mode=self._backpressure_config.controller_mode,
+        )
+
+    def _durable_backpressure_metrics(
+        self,
+        backlog: StreamBacklogSnapshot,
+        *,
+        observed_at_ms: int,
+    ) -> tuple[QueueMetrics, tuple[int, int, int]]:
+        """Derive rate observations from monotonically durable work transitions."""
+
+        total_work_count = sum(count for _state, count in backlog.state_counts)
+        terminal_work_count = max(0, total_work_count - backlog.active_backlog)
+        oldest_age_ms = (
+            0
+            if backlog.oldest_active_age_seconds is None
+            else max(0, int(backlog.oldest_active_age_seconds * 1_000))
+        )
+        arrival_rate: float | None = None
+        service_rate: float | None = None
+        backlog_slope: float | None = None
+        state = self._backpressure_state
+        if (
+            state.last_observed_at_ms is not None
+            and state.last_arrival_count is not None
+            and state.last_service_count is not None
+            and state.last_backlog_depth is not None
+        ):
+            elapsed_ms = observed_at_ms - state.last_observed_at_ms
+            if elapsed_ms >= self._backpressure_config.minimum_rate_observation_interval_ms:
+                elapsed_seconds = elapsed_ms / 1_000
+                arrival_rate = max(
+                    0.0,
+                    (total_work_count - state.last_arrival_count) / elapsed_seconds,
+                )
+                service_rate = max(
+                    0.0,
+                    (terminal_work_count - state.last_service_count) / elapsed_seconds,
+                )
+                backlog_slope = (
+                    backlog.active_backlog - state.last_backlog_depth
+                ) / elapsed_seconds
+
+        return (
+            QueueMetrics(
+                depth=backlog.active_backlog,
+                oldest_age_ms=oldest_age_ms,
+                arrival_rate=arrival_rate,
+                service_rate=service_rate,
+                backlog_slope=backlog_slope,
+            ),
+            (total_work_count, terminal_work_count, backlog.active_backlog),
+        )
+
+    def _claim_backpressure_controller(
+        self,
+    ) -> tuple[StoredStreamBackpressureController, BackpressureControllerState]:
+        """Fence one local owner while preserving the last canonical controller state."""
+
+        controller_key = self._backpressure_config.controller_key
+        initial_state = self._backpressure.initial_state(controller_key)
+        controller = self._ledger.claim_backpressure_controller(
+            plan_key=self.plan_key,
+            controller_key=controller_key,
+            policy_version=self._backpressure_config.version,
+            owner_id=self._backpressure_controller_owner_id,
+            initial_state_json=canonical_json_bytes(initial_state),
+        )
+        state = _parse_exact(
+            controller.state_json,
+            BackpressureControllerState,
+            "backpressure controller state",
+        )
+        if (
+            controller.plan_key != self.plan_key
+            or controller.controller_key != controller_key
+            or controller.policy_version != self._backpressure_config.version
+            or state.controller_key != controller_key
+            or state.policy_version != self._backpressure_config.version
+            or state.controller_version != self._backpressure_config.controller_version
+        ):
+            raise StreamSchedulerCompositionError(
+                "persisted backpressure controller does not match composition policy"
+            )
+        if not (
+            self._backpressure_config.minimum_limit
+            <= state.current_limit
+            <= self._backpressure_config.maximum_limit
+        ):
+            raise StreamSchedulerCompositionError(
+                "persisted backpressure controller limit is outside policy bounds"
+            )
+        return controller, state
 
     def _window_work_plans(
         self,
@@ -1858,7 +2112,9 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
                 "stream_run_id": self._stream_run_id,
                 "dag_config_semantic_sha256": self._dag_config_semantic_sha256,
                 "terminal_policy_version": self._terminal_policy_version,
-                "backpressure_config": self._backpressure_config,
+                "backpressure_config": _backpressure_config_storage_payload(
+                    self._backpressure_config,
+                ),
                 "schema_refs": {
                     "incremental_window": self._schema_refs.incremental_window,
                     "expected_declaration": self._schema_refs.expected_declaration,
@@ -2261,6 +2517,46 @@ def _strict_model[T: BaseModel](value: object, model_type: type[T], label: str) 
         return model_type.model_validate(value.model_dump(mode="python"), strict=True)
     except (AttributeError, ValidationError) as error:
         raise ValueError(f"{label} failed strict validation") from error
+
+
+def _backpressure_config_storage_payload(config: BackpressureConfig) -> dict[str, object]:
+    """Keep a default fixed policy byte-compatible with pre-controller plans."""
+
+    legacy_fields = (
+        "version",
+        "queue_depth_threshold",
+        "oldest_age_threshold_ms",
+        "backlog_slope_threshold",
+    )
+    legacy_payload = {field: getattr(config, field) for field in legacy_fields}
+    default = BackpressureConfig(**legacy_payload)
+    controller_fields = (
+        "controller_version",
+        "controller_key",
+        "worker_utilization_threshold",
+        "controller_mode",
+        "minimum_limit",
+        "maximum_limit",
+        "additive_increase",
+        "minimum_rate_observation_interval_ms",
+        "multiplicative_decrease",
+        "cooldown_ms",
+    )
+    if all(getattr(config, field) == getattr(default, field) for field in controller_fields):
+        return legacy_payload
+    return config.model_dump(mode="json")
+
+
+def _stored_backpressure_config(value: Mapping[str, object]) -> BackpressureConfig:
+    """Strictly restore either the legacy fixed shape or an explicit controller shape."""
+
+    try:
+        return BackpressureConfig.model_validate_json(
+            canonical_json_bytes(dict(value)),
+            strict=True,
+        )
+    except (TypeError, ValidationError, ValueError) as error:
+        raise StreamSchedulerCompositionError("persisted backpressure config is invalid") from error
 
 
 def _parse_exact[T: BaseModel](payload: bytes, model_type: type[T], label: str) -> T:

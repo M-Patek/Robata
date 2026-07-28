@@ -8,6 +8,9 @@ from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from robata.adapters.sqlite_review_queue import SQLiteReviewQueue
+from robata.application.canonical.active_learning_selection import (
+    dispatch_local_active_learning_selection,
+)
 from robata.application.canonical.media_quality_binding import LocalMediaQualityBinding
 from robata.application.canonical.primary_completion import CommittedPrimaryCompletion
 from robata.contracts.common import StrictModel
@@ -24,7 +27,7 @@ from robata.review.routing import (
     NonBlockingReviewRouter,
     ReviewRoutingDisposition,
 )
-from robata.runtime.observability import RuntimeObserver
+from robata.runtime.observability import RuntimeObserver, runtime_increment
 
 LOCAL_CANONICAL_REVIEW_POLICY_VERSION = "canonical-local-nonblocking-review-v2"
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -132,6 +135,21 @@ def route_local_review_after_completion(
         runtime_observer=runtime_observer,
     )
     receipt = NonBlockingReviewRouter(policy=policy, queue=active_queue).route(request)
+    if receipt.review_task_id is not None:
+        try:
+            dispatch_local_active_learning_selection(
+                queue=active_queue,
+                state_root=state_root,
+                routed_task_id=receipt.review_task_id,
+                runtime_observer=runtime_observer,
+            )
+        except Exception as error:
+            # Keep a defensive containment boundary around every optional review sidecar.
+            runtime_increment(
+                runtime_observer,
+                "review.active_learning_selection_outcomes",
+                attributes={"disposition": "FAILED", "error_type": type(error).__name__},
+            )
     return LocalReviewRoutingSummary(
         disposition=receipt.disposition,
         review_task_id=receipt.review_task_id,

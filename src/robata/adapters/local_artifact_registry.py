@@ -22,6 +22,7 @@ from robata.contracts.artifacts import (
     ArtifactType,
 )
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
+from robata.durability import sync_directory
 from robata.ports.artifact_registry import (
     ArtifactBlobSource,
     ArtifactRegistryError,
@@ -2017,13 +2018,7 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 __all__ = [

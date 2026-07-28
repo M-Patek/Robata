@@ -72,6 +72,7 @@ from robata.inference.models import (
     inference_attempt_selection_logical_key,
 )
 from robata.inference.orchestrator import (
+    CapabilityValidationError,
     InferenceOrchestrator,
     InferencePolicy,
     InMemoryInferenceLedger,
@@ -97,6 +98,8 @@ def _package(
     row_offset: int = 0,
     semantic_content_sha256: str | None = None,
     manifest_bytes_sha256: str | None = None,
+    media_type: str = "image/png",
+    encoding: str = "png",
 ) -> CatalogPackage:
     cameras = tuple(
         CatalogCamera(
@@ -111,8 +114,8 @@ def _package(
                     source_artifact_uri=f"object://source/{row_offset}/{ordinal}",
                     source_artifact_sha256=_digest(200 + ordinal),
                     source_artifact_bytes=100,
-                    media_type="image/png",
-                    encoding="png",
+                    media_type=media_type,
+                    encoding=encoding,
                     width=640,
                     height=480,
                 ),
@@ -169,12 +172,16 @@ def _fixture(
     manifest_bytes_sha256: str | None = None,
     max_images: int | None = 4,
     prompt_output: PromptOutputContract | None = None,
+    media_type: str = "image/png",
+    encoding: str = "png",
 ):
     planner = InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION)
     package = _package(
         row_offset=row_offset,
         semantic_content_sha256=semantic_content_sha256,
         manifest_bytes_sha256=manifest_bytes_sha256,
+        media_type=media_type,
+        encoding=encoding,
     )
     catalog = planner.build_request_catalog(
         request_catalog_id=_uuid(900 + row_offset),
@@ -768,6 +775,42 @@ def _execution_fixture() -> tuple[
 
 def test_input_plan_is_bound_into_orchestrator_identity_and_request() -> None:
     _execution_fixture()
+
+
+def test_rendered_media_type_must_be_accepted_before_adapter_dispatch() -> None:
+    first_plan, adapter, orchestrator, request_args, _, _ = _execution_fixture()
+    jpeg_plan = _fixture(
+        media_type="image/jpeg",
+        encoding="jpeg",
+        prompt_output=first_plan.prompt_output,
+    )[3].model_copy(update={"input_plan_id": _uuid(9_400)})
+    dispatched_before_rejection = len(adapter.requests)
+
+    with pytest.raises(CapabilityValidationError, match="rendered input-plan media types"):
+        asyncio.run(
+            orchestrator.orchestrate(
+                **request_args,
+                input_plan=jpeg_plan,
+                input_plan_part_ordinal=0,
+            )
+        )
+
+    assert len(adapter.requests) == dispatched_before_rejection
+
+    adapter._capabilities = adapter._capabilities.model_copy(
+        update={"accepted_media_types": ("image/png", "image/jpeg")}
+    )
+    accepted = asyncio.run(
+        orchestrator.orchestrate(
+            **request_args,
+            input_plan=jpeg_plan,
+            input_plan_part_ordinal=0,
+        )
+    )
+
+    assert accepted.status is InferenceStatus.SUCCEEDED
+    assert len(adapter.requests) == dispatched_before_rejection + 1
+    assert adapter.requests[-1].input_plan == jpeg_plan
 
 
 def _relocated_input_plan(plan: InferenceInputPlan) -> InferenceInputPlan:

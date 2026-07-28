@@ -23,9 +23,12 @@ from robata.runtime.canonical_profile import (
     CanonicalProfilePolicyFacts,
     CanonicalProfileReport,
     CanonicalProfileRunError,
+    CompletionProfileMeasurements,
     ProfileFileFact,
     ProfileGitFacts,
+    ProfileMetricAvailability,
     ProfileRuntimeFacts,
+    SQLiteOperationMeasurements,
     StateFileClass,
     build_canonical_profile_manifest,
     build_canonical_profile_measurements,
@@ -746,6 +749,319 @@ def test_profile_measurements_expose_provider_multipliers_sqlite_scope_and_stage
     assert report.capacity.dense_provider_image_fraction == pytest.approx(0.2)
     assert report.capacity.provider_images_per_unique_image == pytest.approx(20 / 12)
     assert report.capacity.production_eligible is False
+
+
+def test_profile_comparison_keeps_scheduler_costs_by_stable_operation() -> None:
+    report = _v3_report(replayed=False)
+    assert report.measurements is not None
+
+    baseline_operation = SQLiteOperationMeasurements(
+        operation="plan_many",
+        connection_count=1,
+        connection_setup_duration_ns=25,
+        transaction_count=1,
+        begin_lock_wait_duration_ns=10,
+        transaction_duration_ns=100,
+        operation_duration_ns=60,
+        commit_duration_ns=30,
+        rollback_duration_ns=0,
+        rows_committed=12,
+        rows_rolled_back=0,
+        retry_count=0,
+        rollback_count=0,
+        busy_or_locked_failure_count=0,
+        fsync_count_status=ProfileMetricAvailability.NOT_AVAILABLE,
+        fsync_count=None,
+    )
+    candidate_operation = baseline_operation.model_copy(
+        update={
+            "connection_setup_duration_ns": 15,
+            "transaction_duration_ns": 50,
+            "operation_duration_ns": 25,
+            "commit_duration_ns": 10,
+        }
+    )
+    baseline_measurements = report.measurements.model_copy(
+        update={
+            "sqlite": report.measurements.sqlite.model_copy(
+                update={"operations": (baseline_operation,)}
+            )
+        }
+    )
+    candidate_measurements = report.measurements.model_copy(
+        update={
+            "sqlite": report.measurements.sqlite.model_copy(
+                update={"operations": (candidate_operation,)}
+            )
+        }
+    )
+    baseline = report.model_copy(update={"measurements": baseline_measurements})
+    candidate = report.model_copy(update={"measurements": candidate_measurements})
+
+    comparison = compare_canonical_profile_reports(baseline, candidate)
+    transaction = next(
+        item
+        for item in comparison.resources
+        if item.metric == "sqlite.operation.plan_many.transaction_duration_ns"
+    )
+    fsync = next(
+        item
+        for item in comparison.resources
+        if item.metric == "sqlite.operation.plan_many.fsync_count"
+    )
+
+    assert transaction.baseline_value == 100
+    assert transaction.candidate_value == 50
+    assert transaction.candidate_to_baseline_ratio == pytest.approx(0.5)
+    assert fsync.baseline_availability is ProfileMetricAvailability.NOT_AVAILABLE
+    assert fsync.candidate_availability is ProfileMetricAvailability.NOT_AVAILABLE
+    assert fsync.candidate_to_baseline_ratio is None
+
+
+def test_profile_measurements_aggregate_scheduler_operation_facts() -> None:
+    attributes = (
+        RuntimeAttribute(name="operation", value="plan_many"),
+        RuntimeAttribute(name="synchronous", value="FULL"),
+        RuntimeAttribute(name="write", value=True),
+    )
+    observer = RuntimeProfileSnapshot(
+        elapsed_ns=100,
+        process_cpu_ns=50,
+        resources=RuntimeResourceSnapshot(
+            rss_bytes=_unsupported_resource(),
+            read_bytes_delta=_unsupported_resource(),
+            write_bytes_delta=_unsupported_resource(),
+        ),
+        spans=(
+            RuntimeSpanSnapshot(
+                sequence=1,
+                name="sqlite.work_scheduler.connection_setup",
+                attributes=attributes,
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=0,
+                ended_offset_ns=10,
+                elapsed_ns=10,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=2,
+                name="sqlite.work_scheduler.transaction",
+                attributes=attributes,
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=10,
+                ended_offset_ns=100,
+                elapsed_ns=90,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=3,
+                name="sqlite.work_scheduler.begin",
+                attributes=attributes,
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=10,
+                ended_offset_ns=20,
+                elapsed_ns=10,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=4,
+                name="sqlite.work_scheduler.operation",
+                attributes=attributes,
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=20,
+                ended_offset_ns=80,
+                elapsed_ns=60,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=5,
+                name="sqlite.work_scheduler.commit",
+                attributes=attributes,
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=80,
+                ended_offset_ns=100,
+                elapsed_ns=20,
+            ),
+        ),
+        counters=(
+            RuntimeCounterSnapshot(
+                name="sqlite.work_scheduler.connections",
+                attributes=attributes,
+                value=1,
+            ),
+            RuntimeCounterSnapshot(
+                name="sqlite.work_scheduler.rows_committed",
+                attributes=attributes,
+                value=12,
+            ),
+            RuntimeCounterSnapshot(
+                name="sqlite.work_scheduler.transactions",
+                attributes=attributes,
+                value=1,
+            ),
+            RuntimeCounterSnapshot(
+                name="sqlite.work_scheduler.work_retries",
+                attributes=attributes,
+                value=1,
+            ),
+        ),
+    )
+    state = _empty_state()
+    measurements = build_canonical_profile_measurements(
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        manifest=_manifest(),
+        receipt=_receipt(),
+    )
+
+    operation = measurements.sqlite.operations
+    assert len(operation) == 1
+    assert operation[0].operation == "plan_many"
+    assert operation[0].connection_count == 1
+    assert operation[0].begin_lock_wait_duration_ns == 10
+    assert operation[0].transaction_duration_ns == 90
+    assert operation[0].operation_duration_ns == 60
+    assert operation[0].commit_duration_ns == 20
+    assert operation[0].rows_committed == 12
+    assert operation[0].retry_count == 1
+    assert operation[0].fsync_count_status is ProfileMetricAvailability.NOT_AVAILABLE
+    assert operation[0].fsync_count is None
+
+
+def test_profile_measurements_aggregate_completion_payload_and_root_facts() -> None:
+    observer = RuntimeProfileSnapshot(
+        elapsed_ns=100,
+        process_cpu_ns=50,
+        resources=RuntimeResourceSnapshot(
+            rss_bytes=_unsupported_resource(),
+            read_bytes_delta=_unsupported_resource(),
+            write_bytes_delta=_unsupported_resource(),
+        ),
+        spans=(
+            RuntimeSpanSnapshot(
+                sequence=1,
+                name="completion.command.roots.leaf_prepare",
+                attributes=(RuntimeAttribute(name="collection", value="run-memberships"),),
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=0,
+                ended_offset_ns=10,
+                elapsed_ns=10,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=2,
+                name="completion.command.roots.compute",
+                attributes=(RuntimeAttribute(name="collection", value="run-memberships"),),
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=10,
+                ended_offset_ns=30,
+                elapsed_ns=20,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=3,
+                name="completion.command.detail.model_validate",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=30,
+                ended_offset_ns=55,
+                elapsed_ns=25,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=4,
+                name="completion.commit.detail_artifact.insert",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=55,
+                ended_offset_ns=75,
+                elapsed_ns=20,
+            ),
+            RuntimeSpanSnapshot(
+                sequence=5,
+                name="completion.commit.database_commit",
+                status=RuntimeSpanStatus.OK,
+                started_offset_ns=75,
+                ended_offset_ns=100,
+                elapsed_ns=25,
+            ),
+        ),
+        counters=(
+            RuntimeCounterSnapshot(
+                name="completion.command.command_bytes",
+                value=300,
+            ),
+            RuntimeCounterSnapshot(
+                name="completion.command.detail_bytes",
+                value=200,
+            ),
+            RuntimeCounterSnapshot(
+                name="completion.command.processing_run_bytes",
+                value=100,
+            ),
+            RuntimeCounterSnapshot(
+                name="completion.command.root_collections",
+                value=11,
+            ),
+            RuntimeCounterSnapshot(
+                name="completion.command.root_leaves",
+                value=7,
+            ),
+        ),
+    )
+    state = _empty_state()
+    measurements = build_canonical_profile_measurements(
+        observer=observer,
+        state_before=state,
+        state_after=state,
+        manifest=_manifest(),
+        receipt=_receipt(),
+    )
+
+    completion = measurements.completion
+    assert completion is not None
+    assert completion.detail_bytes == 200
+    assert completion.command_bytes == 300
+    assert completion.processing_run_bytes == 100
+    assert completion.ordered_root_collection_count == 11
+    assert completion.ordered_root_leaf_count == 7
+    assert completion.ordered_root_leaf_count_status is ProfileMetricAvailability.AVAILABLE
+    stages = {stage.stage: stage for stage in measurements.stages}
+    assert stages["completion.command.roots.leaf_prepare"].inclusive_wall_time_ns == 10
+    assert stages["completion.command.roots.compute"].inclusive_wall_time_ns == 20
+    assert stages["completion.command.detail.model_validate"].inclusive_wall_time_ns == 25
+    assert stages["completion.commit.detail_artifact.insert"].inclusive_wall_time_ns == 20
+    assert stages["completion.commit.database_commit"].inclusive_wall_time_ns == 25
+
+    report = _v3_report(replayed=False)
+    assert report.measurements is not None
+    baseline_completion = CompletionProfileMeasurements(
+        detail_bytes_status=ProfileMetricAvailability.AVAILABLE,
+        detail_bytes=200,
+        command_bytes_status=ProfileMetricAvailability.AVAILABLE,
+        command_bytes=300,
+        processing_run_bytes_status=ProfileMetricAvailability.AVAILABLE,
+        processing_run_bytes=100,
+        ordered_root_collection_count_status=ProfileMetricAvailability.AVAILABLE,
+        ordered_root_collection_count=11,
+        ordered_root_leaf_count_status=ProfileMetricAvailability.AVAILABLE,
+        ordered_root_leaf_count=7,
+    )
+    candidate_completion = baseline_completion.model_copy(update={"command_bytes": 150})
+    baseline = report.model_copy(
+        update={
+            "measurements": report.measurements.model_copy(
+                update={"completion": baseline_completion}
+            )
+        }
+    )
+    candidate = report.model_copy(
+        update={
+            "measurements": report.measurements.model_copy(
+                update={"completion": candidate_completion}
+            )
+        }
+    )
+
+    comparison = compare_canonical_profile_reports(baseline, candidate)
+    command_bytes = next(
+        item for item in comparison.resources if item.metric == "completion.command_bytes"
+    )
+    assert command_bytes.baseline_value == 300
+    assert command_bytes.candidate_value == 150
+    assert command_bytes.candidate_to_baseline_ratio == pytest.approx(0.5)
 
 
 def test_profile_capacity_preserves_known_zero_output_tokens() -> None:

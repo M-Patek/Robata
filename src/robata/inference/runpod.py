@@ -178,6 +178,112 @@ class RunPodRetryPolicy(StrictModel):
         return int(min(self.max_delay_ms, self.base_delay_ms * (2 ** (attempt - 1))))
 
 
+class RunPodNativeBatchQualification(StrictModel):
+    """Representative endpoint evidence authorizing one native-batch configuration.
+
+    This record is deliberately non-promotional. It binds a completed P6
+    qualification artifact to the exact transport, capability, and retry
+    configuration that opens native batch dispatch. P15 remains responsible for
+    any production-eligibility decision.
+    """
+
+    qualification_version: Literal["runpod-native-batch-qualification-v1"] = (
+        "runpod-native-batch-qualification-v1"
+    )
+    evidence_class: Literal["PRODUCTION_QUALIFICATION"] = "PRODUCTION_QUALIFICATION"
+    qualification_status: Literal["REPRESENTATIVE_ENDPOINT_PASSED"] = (
+        "REPRESENTATIVE_ENDPOINT_PASSED"
+    )
+    production_eligible: Literal[False] = False
+    qualification_report_uri: NonEmptyString
+    qualification_report_sha256: Sha256Digest
+    handler_contract_evidence_uri: NonEmptyString
+    handler_contract_evidence_sha256: Sha256Digest
+    streaming_wait_deadline_evidence_uri: NonEmptyString
+    streaming_wait_deadline_evidence_sha256: Sha256Digest
+    adapter_binding_sha256: Sha256Digest
+    handler_declares_exact_native_batch_contract: Literal[True] = True
+    streaming_wait_deadline_gate_passed: Literal[True] = True
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        config: RunPodEndpointConfig,
+        capabilities: ModelCapabilities,
+        retry_policy: RunPodRetryPolicy,
+        qualification_report_uri: str,
+        qualification_report_sha256: str,
+        handler_contract_evidence_uri: str,
+        handler_contract_evidence_sha256: str,
+        streaming_wait_deadline_evidence_uri: str,
+        streaming_wait_deadline_evidence_sha256: str,
+    ) -> Self:
+        """Bind passed external P6 evidence to one active adapter projection."""
+
+        if not isinstance(config, RunPodEndpointConfig):
+            raise TypeError("config must be a RunPodEndpointConfig")
+        if not isinstance(capabilities, ModelCapabilities):
+            raise TypeError("capabilities must be ModelCapabilities")
+        if not isinstance(retry_policy, RunPodRetryPolicy):
+            raise TypeError("retry_policy must be a RunPodRetryPolicy")
+        if not config.native_batch_enabled:
+            raise ValueError("native batch qualification requires native batch to be enabled")
+        return cls(
+            qualification_report_uri=qualification_report_uri,
+            qualification_report_sha256=qualification_report_sha256,
+            handler_contract_evidence_uri=handler_contract_evidence_uri,
+            handler_contract_evidence_sha256=handler_contract_evidence_sha256,
+            streaming_wait_deadline_evidence_uri=streaming_wait_deadline_evidence_uri,
+            streaming_wait_deadline_evidence_sha256=(streaming_wait_deadline_evidence_sha256),
+            adapter_binding_sha256=_native_batch_adapter_binding_sha256(
+                config=config,
+                capabilities=capabilities,
+                retry_policy=retry_policy,
+            ),
+        )
+
+    def validate_adapter_binding(
+        self,
+        *,
+        config: RunPodEndpointConfig,
+        capabilities: ModelCapabilities,
+        retry_policy: RunPodRetryPolicy,
+    ) -> None:
+        """Reject evidence copied from a different endpoint or dispatch contract."""
+
+        if not config.native_batch_enabled:
+            raise ValueError("native batch qualification cannot authorize a disabled configuration")
+        expected = _native_batch_adapter_binding_sha256(
+            config=config,
+            capabilities=capabilities,
+            retry_policy=retry_policy,
+        )
+        if self.adapter_binding_sha256 != expected:
+            raise ValueError(
+                "native batch qualification does not bind the active endpoint configuration"
+            )
+
+
+def _native_batch_adapter_binding_sha256(
+    *,
+    config: RunPodEndpointConfig,
+    capabilities: ModelCapabilities,
+    retry_policy: RunPodRetryPolicy,
+) -> Sha256Digest:
+    """Return the exact P6 adapter projection protected by a qualification record."""
+
+    return exact_bytes_sha256(
+        canonical_json_bytes(
+            {
+                "endpoint_config": config.model_dump(mode="json"),
+                "capabilities": capabilities.model_dump(mode="json"),
+                "retry_policy": retry_policy.model_dump(mode="json"),
+            }
+        )
+    )
+
+
 class RunPodApiKey:
     """Opaque credential value whose string representations are always redacted."""
 
@@ -540,6 +646,8 @@ class RunPodVisionAdapter:
         runtime_observer: RuntimeObserver | None = None,
         qualification_observer: ProviderQualificationObserver | None = None,
         qualification_session: ProviderQualificationSession | None = None,
+        native_batch_qualification: RunPodNativeBatchQualification | None = None,
+        native_batch_qualification_measurement: bool = False,
     ) -> None:
         if not isinstance(config, RunPodEndpointConfig):
             raise TypeError("config must be RunPodEndpointConfig")
@@ -573,6 +681,43 @@ class RunPodVisionAdapter:
             ProviderQualificationSession,
         ):
             raise TypeError("qualification_session must be a ProviderQualificationSession")
+        if native_batch_qualification is not None and not isinstance(
+            native_batch_qualification,
+            RunPodNativeBatchQualification,
+        ):
+            raise TypeError("native_batch_qualification must be a RunPodNativeBatchQualification")
+        if type(native_batch_qualification_measurement) is not bool:
+            raise TypeError("native_batch_qualification_measurement must be a bool")
+        if config.native_batch_enabled:
+            if native_batch_qualification is not None:
+                if native_batch_qualification_measurement:
+                    raise ValueError(
+                        "native batch cannot use passed evidence and qualification "
+                        "measurement mode together"
+                    )
+                native_batch_qualification.validate_adapter_binding(
+                    config=config,
+                    capabilities=capabilities,
+                    retry_policy=retry_policy,
+                )
+                native_batch_qualification_state = "QUALIFIED_EVIDENCE"
+            elif native_batch_qualification_measurement:
+                if qualification_observer is None or qualification_session is None:
+                    raise ValueError(
+                        "native batch qualification measurement requires a scoped "
+                        "observer and session"
+                    )
+                native_batch_qualification_state = "QUALIFICATION_MEASUREMENT"
+            else:
+                raise ValueError(
+                    "native batch dispatch requires representative endpoint qualification evidence"
+                )
+        elif native_batch_qualification is not None or native_batch_qualification_measurement:
+            raise ValueError(
+                "native batch qualification inputs require native_batch_enabled to be true"
+            )
+        else:
+            native_batch_qualification_state = "DISABLED"
         deployment = config.deployment_configuration
         if deployment is not None and (
             deployment.model_identifier != capabilities.model_name
@@ -604,6 +749,7 @@ class RunPodVisionAdapter:
         self._qualification_observed_request_ids: set[str] = set()
         self._qualification_observed_http_request_count = 0
         self._qualification_observed_transport_retry_count = 0
+        self._native_batch_qualification_state = native_batch_qualification_state
         # This is intentionally adapter-scoped rather than invocation-scoped: a
         # direct ``infer`` and every chunk/retry started by any concurrent
         # ``infer_batch`` call share the same endpoint capacity budget.
@@ -634,6 +780,14 @@ class RunPodVisionAdapter:
     @property
     def qualification_session(self) -> ProviderQualificationSession | None:
         return self._qualification_session
+
+    @property
+    def native_batch_qualification_state(
+        self,
+    ) -> Literal["DISABLED", "QUALIFIED_EVIDENCE", "QUALIFICATION_MEASUREMENT"]:
+        """State used to distinguish ordinary dispatch from fresh P6 measurement."""
+
+        return self._native_batch_qualification_state
 
     @property
     def qualification_observation_error(self) -> str | None:
@@ -1886,14 +2040,13 @@ def _qualification_request_measurement(
         raise ValueError("qualification request lacks an immutable input plan")
     part_ordinal = request.input_plan_part_ordinal or 0
     items = _selected_items(request)
-    provider_image_count = sum(
-        item.artifact.media_type.startswith("image/") for item in items
-    )
+    provider_image_count = sum(item.artifact.media_type.startswith("image/") for item in items)
     return (
         request.logical_invocation_id,
         part_ordinal,
         provider_image_count,
     )
+
 
 def _native_batch_compatibility_key(request: VisionInferenceRequest) -> tuple[object, ...]:
     """Keep direct adapter callers from mixing task, shape, or deadline groups."""
@@ -2096,6 +2249,7 @@ __all__ = [
     "RunPodEndpointConfig",
     "RunPodHttpRequest",
     "RunPodHttpResponse",
+    "RunPodNativeBatchQualification",
     "RunPodRetryPolicy",
     "RunPodTransport",
     "RunPodTransportError",

@@ -398,6 +398,7 @@ def test_cancelling_inflight_member_records_settled_batch_outcome_then_reraises(
 
     asyncio.run(scenario())
 
+
 def test_cancelling_inflight_member_records_settled_batch_failure_then_reraises() -> None:
     async def scenario() -> None:
         policies = _policies(VisionTask.ACTION_EVIDENCE)

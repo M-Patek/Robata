@@ -17,16 +17,21 @@ from pydantic import Field, StringConstraints, model_validator
 from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.logical_nodes import Rfc3339Timestamp
+from robata.contracts.phase_contract_decisions import (
+    PhaseContractDecisionRegister,
+    default_phase_contract_decision_register,
+)
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=512)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 
-SCOPE_FINGERPRINT_VERSION: Final[Literal['scope-fingerprint-v1']] = 'scope-fingerprint-v1'
-SCOPE_EVIDENCE_REGISTER_VERSION: Final[Literal['scope-evidence-register-v1']] = (
-    'scope-evidence-register-v1'
+SCOPE_FINGERPRINT_VERSION: Final[Literal["scope-fingerprint-v1"]] = "scope-fingerprint-v1"
+SCOPE_EVIDENCE_REGISTER_VERSION: Final[Literal["scope-evidence-register-v1"]] = (
+    "scope-evidence-register-v1"
 )
-IDENTITY_FORMULA_VERSION: Final[Literal['recording-identity-v1']] = 'recording-identity-v1'
+IDENTITY_FORMULA_VERSION: Final[Literal["recording-identity-v1"]] = "recording-identity-v1"
+
 
 class EvidenceClass(StrEnum):
     """Evidence boundary used by every profile or qualification artifact."""
@@ -196,6 +201,7 @@ class ScopeEvidenceRegister(StrictModel):
     axes: MeasurementAxes
     observed_at: Rfc3339Timestamp
     measurement_status: MeasurementStatus
+    phase_contract_decisions: PhaseContractDecisionRegister
     production_eligible: Literal[False] = False
     historical_snapshot: Literal[True] = True
     profile_manifest_digest: Sha256Digest | None = None
@@ -213,11 +219,15 @@ class ScopeEvidenceRegister(StrictModel):
         axes: MeasurementAxes,
         observed_at: str | None = None,
         measurement_status: MeasurementStatus = MeasurementStatus.NOT_MEASURED,
+        phase_contract_decisions: PhaseContractDecisionRegister | None = None,
         profile_manifest_digest: Sha256Digest | None = None,
         profile_report_digest: Sha256Digest | None = None,
     ) -> Self:
-        observed_at_value = (
-            _default_observed_at() if observed_at is None else observed_at
+        observed_at_value = _default_observed_at() if observed_at is None else observed_at
+        decisions = (
+            default_phase_contract_decision_register()
+            if phase_contract_decisions is None
+            else phase_contract_decisions
         )
         values: dict[str, object] = {
             "schema_version": "1.0",
@@ -231,15 +241,16 @@ class ScopeEvidenceRegister(StrictModel):
             "axes": axes,
             "observed_at": observed_at_value,
             "measurement_status": measurement_status,
+            "phase_contract_decisions": decisions,
             "production_eligible": False,
             "historical_snapshot": True,
             "profile_manifest_digest": profile_manifest_digest,
             "profile_report_digest": profile_report_digest,
         }
         draft = cls.model_construct(
-            schema_version='1.0',
+            schema_version="1.0",
             register_version=SCOPE_EVIDENCE_REGISTER_VERSION,
-            register_digest='0' * 64,
+            register_digest="0" * 64,
             scope=scope,
             evidence_class=evidence_class,
             execution_mode=execution_mode,
@@ -248,6 +259,7 @@ class ScopeEvidenceRegister(StrictModel):
             axes=axes,
             observed_at=observed_at_value,
             measurement_status=measurement_status,
+            phase_contract_decisions=decisions,
             production_eligible=False,
             historical_snapshot=True,
             profile_manifest_digest=profile_manifest_digest,
@@ -262,14 +274,17 @@ class ScopeEvidenceRegister(StrictModel):
         if self.register_digest != expected:
             raise ValueError("register_digest does not match the evidence register")
         if self.production_eligible:
-            raise ValueError('scope evidence cannot grant production eligibility')
+            raise ValueError("scope evidence cannot grant production eligibility")
         if self.scope.inputs.workload_digest != self.workload.workload_fingerprint:
-            raise ValueError('scope workload digest must match workload fingerprint')
+            raise ValueError("scope workload digest must match workload fingerprint")
         if (
             self.evidence_class is EvidenceClass.LOCAL_CONFORMANCE
             and self.measurement_status is not MeasurementStatus.NOT_MEASURED
         ):
             raise ValueError("local conformance evidence must remain NOT_MEASURED")
+        for phase in self.phase_contract_decisions.decisions:
+            if not phase.dispatchable:
+                raise ValueError(f"{phase.phase.value} has an unresolved contract decision")
         return self
 
 

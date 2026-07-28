@@ -13,12 +13,13 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, Self
 
-from pydantic import Field, StringConstraints, ValidationError
+from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from robata.benchmark.models import StratificationDimension
-from robata.contracts.common import StrictModel
+from robata.contracts.common import Sha256Digest, StrictModel
+from robata.contracts.hashing import semantic_sha256
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1)]
 SplitName = Literal["development", "validation", "frozen_test"]
@@ -26,6 +27,7 @@ _SPLIT_NAMES: tuple[SplitName, ...] = ("development", "validation", "frozen_test
 _ROUNDING_METHOD: Final[Literal["LARGEST_REMAINDER_MCAP_TARGET_THEN_GROUP_GREEDY"]] = (
     "LARGEST_REMAINDER_MCAP_TARGET_THEN_GROUP_GREEDY"
 )
+CalibrationSplitName = Literal["development", "calibration", "frozen_test"]
 
 
 class SplitMetadataError(ValueError):
@@ -70,6 +72,162 @@ class DataSplitResult(StrictModel):
     leakage_group_ids: dict[NonEmptyString, NonEmptyString] = Field(default_factory=dict)
     rounding_method: Literal["LARGEST_REMAINDER_MCAP_TARGET_THEN_GROUP_GREEDY"] = _ROUNDING_METHOD
     notes: tuple[NonEmptyString, ...] = ()
+
+    @property
+    def calibration(self) -> tuple[NonEmptyString, ...]:
+        """Return the validation partition in its explicit calibration role.
+
+        The stored field remains named ``validation`` for backwards compatibility.
+        Calibration work must use this partition rather than development or frozen
+        test records.
+        """
+
+        return self.validation
+
+
+CalibrationSplitProtocolIdentity = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        pattern=r"^calibration-split-protocol:[0-9a-f]{64}$",
+    ),
+]
+
+
+def calibration_split_protocol_projection(
+    *,
+    split_config_version: str,
+    development_mcap_ids: tuple[str, ...],
+    calibration_mcap_ids: tuple[str, ...],
+    frozen_test_mcap_ids: tuple[str, ...],
+    leakage_group_ids: Mapping[str, str],
+) -> dict[str, object]:
+    """Return the content-addressed split binding for calibration evaluation."""
+
+    return {
+        "domain": "robata.calibration-split-protocol",
+        "schema_version": "1.0",
+        "split_config_version": split_config_version,
+        "development_mcap_ids": development_mcap_ids,
+        "calibration_mcap_ids": calibration_mcap_ids,
+        "frozen_test_mcap_ids": frozen_test_mcap_ids,
+        "leakage_group_ids": dict(sorted(leakage_group_ids.items())),
+    }
+
+
+class CalibrationSplitProtocol(StrictModel):
+    """Leakage-safe role assignment for calibration fitting and evaluation.
+
+    Development and calibration records may be used to fit or select an internal
+    calibration artifact. Frozen-test records are retained solely for evaluation.
+    This is an internal evidence binding, not a published data contract.
+    """
+
+    schema_version: Literal["1.0"]
+    protocol_identity: CalibrationSplitProtocolIdentity
+    protocol_digest: Sha256Digest
+    split_config_version: NonEmptyString
+    development_mcap_ids: tuple[NonEmptyString, ...] = Field(min_length=1)
+    calibration_mcap_ids: tuple[NonEmptyString, ...] = Field(min_length=1)
+    frozen_test_mcap_ids: tuple[NonEmptyString, ...] = Field(min_length=1)
+    leakage_group_ids: dict[NonEmptyString, NonEmptyString]
+    grouping_metadata_complete: Literal[True] = True
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        split_config_version: NonEmptyString,
+        development_mcap_ids: tuple[NonEmptyString, ...],
+        calibration_mcap_ids: tuple[NonEmptyString, ...],
+        frozen_test_mcap_ids: tuple[NonEmptyString, ...],
+        leakage_group_ids: Mapping[NonEmptyString, NonEmptyString],
+    ) -> Self:
+        """Build a canonical, content-addressed calibration split protocol."""
+
+        normalized = {
+            "development": tuple(sorted(development_mcap_ids)),
+            "calibration": tuple(sorted(calibration_mcap_ids)),
+            "frozen_test": tuple(sorted(frozen_test_mcap_ids)),
+        }
+        normalized_group_ids = dict(sorted(leakage_group_ids.items()))
+        digest = semantic_sha256(
+            calibration_split_protocol_projection(
+                split_config_version=split_config_version,
+                development_mcap_ids=normalized["development"],
+                calibration_mcap_ids=normalized["calibration"],
+                frozen_test_mcap_ids=normalized["frozen_test"],
+                leakage_group_ids=normalized_group_ids,
+            )
+        )
+        return cls(
+            schema_version="1.0",
+            protocol_identity=f"calibration-split-protocol:{digest}",
+            protocol_digest=digest,
+            split_config_version=split_config_version,
+            development_mcap_ids=normalized["development"],
+            calibration_mcap_ids=normalized["calibration"],
+            frozen_test_mcap_ids=normalized["frozen_test"],
+            leakage_group_ids=normalized_group_ids,
+        )
+
+    @model_validator(mode="after")
+    def validate_protocol(self) -> Self:
+        partitions = (
+            self.development_mcap_ids,
+            self.calibration_mcap_ids,
+            self.frozen_test_mcap_ids,
+        )
+        if any(tuple(sorted(ids)) != ids or len(set(ids)) != len(ids) for ids in partitions):
+            raise ValueError("calibration split MCAP IDs must be unique and sorted")
+        all_ids = tuple(mcap_id for ids in partitions for mcap_id in ids)
+        if len(all_ids) != len(set(all_ids)):
+            raise ValueError("calibration split partitions must be disjoint")
+        if set(self.leakage_group_ids) != set(all_ids):
+            raise ValueError("calibration split must bind every assigned MCAP to a leakage group")
+        partition_by_mcap_id = {
+            mcap_id: split_name
+            for split_name, mcap_ids in (
+                ("development", self.development_mcap_ids),
+                ("calibration", self.calibration_mcap_ids),
+                ("frozen_test", self.frozen_test_mcap_ids),
+            )
+            for mcap_id in mcap_ids
+        }
+        group_partitions: dict[str, set[str]] = {}
+        for mcap_id, group_id in self.leakage_group_ids.items():
+            group_partitions.setdefault(group_id, set()).add(partition_by_mcap_id[mcap_id])
+        if any(len(assigned) != 1 for assigned in group_partitions.values()):
+            raise ValueError("calibration split may not separate a leakage group")
+        digest = semantic_sha256(
+            calibration_split_protocol_projection(
+                split_config_version=self.split_config_version,
+                development_mcap_ids=self.development_mcap_ids,
+                calibration_mcap_ids=self.calibration_mcap_ids,
+                frozen_test_mcap_ids=self.frozen_test_mcap_ids,
+                leakage_group_ids=self.leakage_group_ids,
+            )
+        )
+        if self.protocol_digest != digest:
+            raise ValueError("protocol_digest does not match calibration split protocol")
+        if self.protocol_identity != f"calibration-split-protocol:{digest}":
+            raise ValueError("protocol_identity does not match protocol_digest")
+        return self
+
+    @property
+    def fitting_mcap_ids(self) -> tuple[NonEmptyString, ...]:
+        """Return the only records eligible for fitting or calibration selection."""
+
+        return tuple(sorted(self.development_mcap_ids + self.calibration_mcap_ids))
+
+    def mcap_ids_for(self, split_name: CalibrationSplitName) -> tuple[NonEmptyString, ...]:
+        """Return the immutable membership of one calibration protocol role."""
+
+        return {
+            "development": self.development_mcap_ids,
+            "calibration": self.calibration_mcap_ids,
+            "frozen_test": self.frozen_test_mcap_ids,
+        }[split_name]
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +400,40 @@ class DataSplitter:
                 group_splits.setdefault(group_id, set()).add(memberships[mcap_id])
             return all(len(split_names) == 1 for split_names in group_splits.values())
         return True
+
+    def calibration_protocol(
+        self,
+        splits: DataSplitResult,
+        *,
+        records: Sequence[SplitRecord | Mapping[str, Any]]
+        | Mapping[str, Mapping[str, Any]]
+        | None = None,
+        metadata: Sequence[SplitRecord | Mapping[str, Any]]
+        | Mapping[str, Mapping[str, Any]]
+        | None = None,
+    ) -> CalibrationSplitProtocol:
+        """Bind a grouped split to the development/calibration/test roles.
+
+        Legacy local splits without complete grouping metadata cannot create a
+        calibration protocol. If source metadata is supplied it is revalidated
+        before the immutable protocol is issued.
+        """
+
+        if not splits.grouping_metadata_complete:
+            raise SplitMetadataError("calibration requires complete grouping metadata")
+        if not self.validate_no_leakage(splits, records=records, metadata=metadata):
+            raise SplitMetadataError("calibration split has leakage or invalid metadata")
+        if not all((splits.development, splits.calibration, splits.frozen_test)):
+            raise SplitMetadataError(
+                "calibration requires nonempty development, calibration, and frozen-test partitions"
+            )
+        return CalibrationSplitProtocol.create(
+            split_config_version=self._config.version,
+            development_mcap_ids=splits.development,
+            calibration_mcap_ids=splits.calibration,
+            frozen_test_mcap_ids=splits.frozen_test,
+            leakage_group_ids=splits.leakage_group_ids,
+        )
 
     def _ratios(self) -> dict[SplitName, float]:
         return {
@@ -510,10 +702,14 @@ def _seeded_rank(seed: int, value: str) -> int:
 
 
 __all__ = [
+    "CalibrationSplitName",
+    "CalibrationSplitProtocol",
+    "CalibrationSplitProtocolIdentity",
     "DataSplitResult",
     "DataSplitter",
     "SplitConfig",
     "SplitMetadataError",
     "SplitRecord",
     "StratificationDimension",
+    "calibration_split_protocol_projection",
 ]

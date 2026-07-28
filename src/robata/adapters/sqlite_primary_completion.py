@@ -664,13 +664,17 @@ class SQLitePrimaryCompletionRepository:
                     if prepared is not None
                     else exact_bytes_sha256(detail_bytes)
                 )
-                with runtime_span(self._runtime_observer, "completion.commit.detail"):
+                with (
+                    runtime_span(self._runtime_observer, "completion.commit.detail"),
+                    runtime_span(self._runtime_observer, "completion.commit.detail_artifact"),
+                ):
                     self._insert_or_verify_detail(
                         connection,
                         checked,
                         detail_bytes,
                         payload_exact_bytes_sha256=detail_exact_bytes_sha256,
                     )
+                self._after_detail_artifact_staged(connection, checked)
                 self._after_staged_facts(connection, checked)
                 outbox = identity_result.outbox if identity_result is not None else ()
                 with runtime_span(self._runtime_observer, "completion.commit.serialize"):
@@ -695,25 +699,39 @@ class SQLitePrimaryCompletionRepository:
                         if prepared is not None
                         else exact_bytes_sha256(command_bytes)
                     )
-                    committed_bytes = canonical_json_bytes(committed)
-                connection.execute(
-                    """
-                    INSERT INTO primary_completions (
-                        run_id, command_sha256, command_json, command_json_sha256,
-                        committed_json, committed_json_sha256,
-                        detailed_result_artifact_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        checked.detail.run_id,
-                        checked.command_sha256,
-                        sqlite3.Binary(command_bytes),
-                        command_exact_bytes_sha256,
-                        sqlite3.Binary(committed_bytes),
-                        exact_bytes_sha256(committed_bytes),
-                        checked.completion.detailed_result.artifact_id,
-                    ),
+                    with runtime_span(
+                        self._runtime_observer,
+                        "completion.commit.committed.serialize",
+                    ):
+                        committed_bytes = canonical_json_bytes(committed)
+                runtime_increment(
+                    self._runtime_observer,
+                    "completion.commit.committed_bytes",
+                    len(committed_bytes),
                 )
+                with runtime_span(
+                    self._runtime_observer,
+                    "completion.commit.primary_record_persist",
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO primary_completions (
+                            run_id, command_sha256, command_json, command_json_sha256,
+                            committed_json, committed_json_sha256,
+                            detailed_result_artifact_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            checked.detail.run_id,
+                            checked.command_sha256,
+                            sqlite3.Binary(command_bytes),
+                            command_exact_bytes_sha256,
+                            sqlite3.Binary(committed_bytes),
+                            exact_bytes_sha256(committed_bytes),
+                            checked.completion.detailed_result.artifact_id,
+                        ),
+                    )
+                runtime_increment(self._runtime_observer, "completion.commit.primary_records")
                 with runtime_span(self._runtime_observer, "completion.commit.outbox"):
                     for ordinal, item in enumerate(outbox):
                         self._insert_outbox(
@@ -758,12 +776,16 @@ class SQLitePrimaryCompletionRepository:
                         )
 
                 commit_attempted = True
-                with runtime_span(self._runtime_observer, "completion.commit.authoritative"):
+                with (
+                    runtime_span(self._runtime_observer, "completion.commit.authoritative"),
+                    runtime_span(self._runtime_observer, "completion.commit.database_commit"),
+                ):
                     self._commit_observed(
                         connection,
                         attributes,
                         use_commit_hook=True,
                     )
+                runtime_increment(self._runtime_observer, "completion.commit.authoritative_commits")
                 return PrimaryCompletionCommitResult(committed=committed, replayed=False)
         except PrimaryCompletionError:
             raise
@@ -1115,59 +1137,84 @@ class SQLitePrimaryCompletionRepository:
         *,
         payload_exact_bytes_sha256: str | None = None,
     ) -> None:
-        reference = command.completion.detailed_result
-        payload_digest = (
-            exact_bytes_sha256(payload)
-            if payload_exact_bytes_sha256 is None
-            else payload_exact_bytes_sha256
-        )
-        if payload_digest != reference.exact_bytes_sha256 or len(payload) != reference.byte_count:
-            raise PrimaryCompletionError(
-                PrimaryCompletionErrorCode.INVALID_COMMAND,
-                "detailed result bytes do not match their exact reference",
+        with runtime_span(
+            self._runtime_observer,
+            "completion.commit.detail_artifact.verify",
+        ):
+            reference = command.completion.detailed_result
+            payload_digest = (
+                exact_bytes_sha256(payload)
+                if payload_exact_bytes_sha256 is None
+                else payload_exact_bytes_sha256
             )
-        row = connection.execute(
-            """
-            SELECT * FROM detailed_results
-            WHERE artifact_id = ? OR exact_bytes_sha256 = ?
-            """,
-            (reference.artifact_id, reference.exact_bytes_sha256),
-        ).fetchone()
-        if row is not None:
             if (
-                str(row["artifact_id"]) != reference.artifact_id
-                or str(row["exact_bytes_sha256"]) != reference.exact_bytes_sha256
-                or int(row["byte_count"]) != reference.byte_count
-                or str(row["schema_id"]) != reference.schema_ref.schema_id
-                or str(row["schema_version"]) != reference.schema_ref.version
-                or str(row["schema_artifact_id"]) != reference.schema_ref.artifact_id
-                or str(row["schema_sha256"]) != reference.schema_ref.sha256
-                or bytes(row["payload_json"]) != payload
-                or exact_bytes_sha256(bytes(row["payload_json"])) != str(row["exact_bytes_sha256"])
+                payload_digest != reference.exact_bytes_sha256
+                or len(payload) != reference.byte_count
             ):
                 raise PrimaryCompletionError(
-                    PrimaryCompletionErrorCode.INTEGRITY_ERROR,
-                    "content-addressed detailed result conflicts with stored bytes",
+                    PrimaryCompletionErrorCode.INVALID_COMMAND,
+                    "detailed result bytes do not match their exact reference",
                 )
-            return
+            row = connection.execute(
+                """
+                SELECT * FROM detailed_results
+                WHERE artifact_id = ? OR exact_bytes_sha256 = ?
+                """,
+                (reference.artifact_id, reference.exact_bytes_sha256),
+            ).fetchone()
+            if row is not None:
+                if (
+                    str(row["artifact_id"]) != reference.artifact_id
+                    or str(row["exact_bytes_sha256"]) != reference.exact_bytes_sha256
+                    or int(row["byte_count"]) != reference.byte_count
+                    or str(row["schema_id"]) != reference.schema_ref.schema_id
+                    or str(row["schema_version"]) != reference.schema_ref.version
+                    or str(row["schema_artifact_id"]) != reference.schema_ref.artifact_id
+                    or str(row["schema_sha256"]) != reference.schema_ref.sha256
+                    or bytes(row["payload_json"]) != payload
+                    or exact_bytes_sha256(bytes(row["payload_json"]))
+                    != str(row["exact_bytes_sha256"])
+                ):
+                    raise PrimaryCompletionError(
+                        PrimaryCompletionErrorCode.INTEGRITY_ERROR,
+                        "content-addressed detailed result conflicts with stored bytes",
+                    )
+                runtime_increment(
+                    self._runtime_observer,
+                    "completion.commit.detail_artifact_reuses",
+                )
+                return
         schema_ref = reference.schema_ref
-        connection.execute(
-            """
-            INSERT INTO detailed_results (
-                artifact_id, exact_bytes_sha256, byte_count, schema_id,
-                schema_version, schema_artifact_id, schema_sha256, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                reference.artifact_id,
-                reference.exact_bytes_sha256,
-                reference.byte_count,
-                schema_ref.schema_id,
-                schema_ref.version,
-                schema_ref.artifact_id,
-                schema_ref.sha256,
-                sqlite3.Binary(payload),
-            ),
+        with runtime_span(
+            self._runtime_observer,
+            "completion.commit.detail_artifact.insert",
+        ):
+            connection.execute(
+                """
+                INSERT INTO detailed_results (
+                    artifact_id, exact_bytes_sha256, byte_count, schema_id,
+                    schema_version, schema_artifact_id, schema_sha256, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reference.artifact_id,
+                    reference.exact_bytes_sha256,
+                    reference.byte_count,
+                    schema_ref.schema_id,
+                    schema_ref.version,
+                    schema_ref.artifact_id,
+                    schema_ref.sha256,
+                    sqlite3.Binary(payload),
+                ),
+            )
+        runtime_increment(
+            self._runtime_observer,
+            "completion.commit.detail_artifact_insertions",
+        )
+        runtime_increment(
+            self._runtime_observer,
+            "completion.commit.detail_artifact_bytes",
+            len(payload),
         )
 
     def _insert_outbox(
@@ -1822,6 +1869,15 @@ class SQLitePrimaryCompletionRepository:
         """Narrow test hook for commit-outcome uncertainty."""
 
         connection.commit()
+
+    def _after_detail_artifact_staged(
+        self,
+        connection: sqlite3.Connection,
+        command: PrimaryCompletionCommand,
+    ) -> None:
+        """Narrow test hook for rollback after detailed artifact staging."""
+
+        del connection, command
 
     def _after_staged_facts(
         self,

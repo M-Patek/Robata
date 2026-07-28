@@ -986,6 +986,7 @@ class InferenceOrchestrator:
         capabilities: ModelCapabilities,
         package_inputs: Sequence[PackageInput],
         input_config: Mapping[str, object],
+        input_plan: InferenceInputPlan | None = None,
     ) -> None:
         expected_identity = (policy.provider, policy.model_name, policy.model_version)
         actual_identity = (
@@ -1008,6 +1009,15 @@ class InferenceOrchestrator:
             raise CapabilityValidationError(
                 f"model does not accept required media types: {sorted(unsupported_media)}"
             )
+        if input_plan is not None:
+            unsupported_rendered_media = {
+                item.artifact.media_type for item in input_plan.rendered_items
+            } - set(capabilities.accepted_media_types)
+            if unsupported_rendered_media:
+                raise CapabilityValidationError(
+                    "model does not accept rendered input-plan media types: "
+                    f"{sorted(unsupported_rendered_media)}"
+                )
         if not capabilities.supports_json_schema:
             raise CapabilityValidationError("model does not support JSON Schema output")
         required_policy = policy.required_data_handling_policy_version
@@ -1974,6 +1984,7 @@ class InferenceOrchestrator:
             policy=policy,
             capabilities=capabilities,
             package_inputs=inputs,
+            input_plan=input_plan,
             input_config=inputs_config,
         )
         capability_snapshot = CapabilitySnapshot(

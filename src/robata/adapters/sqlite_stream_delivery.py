@@ -233,6 +233,12 @@ class SQLiteStreamDeliveryAuthority:
     def database_path(self) -> Path:
         return self._authority.database_path
 
+    @property
+    def authority(self) -> SQLiteWorkScheduler:
+        """Return the scheduler that owns this delivery extension's transactions."""
+
+        return self._authority
+
     def commit_window_reduction(
         self,
         *,

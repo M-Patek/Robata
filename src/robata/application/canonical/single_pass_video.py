@@ -50,6 +50,7 @@ from robata.contracts import (
     canonical_json_bytes,
     exact_bytes_sha256,
 )
+from robata.durability import sync_directory
 from robata.ports import ChannelInspection, ExportedCameraVideoFacts, McapInspection
 from robata.tempfiles import make_staging_directory
 
@@ -113,7 +114,8 @@ class DurableSinglePassVideoProducer:
         planner_policy_factory: Callable[[int], BoundedMediaPolicy] | None = None,
         planner_source_scope_digest: str | None = None,
         tee: McapSinglePassH264Tee | None = None,
-        exporter: PyAvH264Mp4Exporter | None = None,
+        exporter: Any | None = None,
+        runtime_observation: Any | None = None,
     ) -> None:
         if isinstance(max_parallel_exports, bool) or not isinstance(max_parallel_exports, int):
             raise TypeError("max_parallel_exports must be an integer")
@@ -167,6 +169,7 @@ class DurableSinglePassVideoProducer:
         self._planner_source_scope_digest = resolved_planner_scope
         self._tee = tee or McapSinglePassH264Tee()
         self._exporter = exporter or PyAvH264Mp4Exporter()
+        self._runtime_observation = runtime_observation
         self._decoded_frame_observer: DecodedFrameObserver | None = None
         self._last_facts: SinglePassVideoProductionFacts | None = None
         self._prepared: (
@@ -725,7 +728,7 @@ class DurableSinglePassVideoProducer:
             packet = envelope.packet
             if last_traversal_index is not None and packet.traversal_index <= last_traversal_index:
                 raise SinglePassVideoProductionError(
-                    'sealed spool traversal indexes are not strictly increasing'
+                    "sealed spool traversal indexes are not strictly increasing"
                 )
             last_traversal_index = packet.traversal_index
             if packet.camera_id is not camera_id or packet.source_order != observed[camera_id]:
@@ -796,13 +799,18 @@ class DurableSinglePassVideoProducer:
         spool: H264SpoolFacts,
         staging_directory: Path,
     ) -> ExportedCameraVideoFacts:
+        begin_kwargs: dict[str, Any] = {
+            "decoded_frame_observer": self._decoded_frame_observer,
+            "validate_output": self._decoded_frame_observer is None,
+        }
+        if self._runtime_observation is not None:
+            begin_kwargs["runtime_observation"] = self._runtime_observation
         session = self._exporter.begin_incremental(
             camera_id,
             self._channels[camera_id],
             staging_directory / f"{camera_id.value}.mp4",
             staging_directory / f"{camera_id.value}.timestamps.jsonl",
-            decoded_frame_observer=self._decoded_frame_observer,
-            validate_output=self._decoded_frame_observer is None,
+            **begin_kwargs,
         )
         observed = 0
         try:
@@ -1235,13 +1243,7 @@ def _sync_file(path: Path) -> None:
 
 
 def _sync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 __all__ = [

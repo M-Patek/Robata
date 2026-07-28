@@ -536,17 +536,26 @@ class SQLiteReviewQueue(ReviewQueue):
 
         return self._transaction(write=False, operation_name="get_task", operation=read)
 
-    def list_open(self) -> tuple[ReviewTaskSnapshot, ...]:
-        """List pending and leased work in deterministic scheduling order."""
+    def list_open(self, *, limit: int | None = None) -> tuple[ReviewTaskSnapshot, ...]:
+        """List pending and leased work in deterministic scheduling order.
+
+        A bounded caller receives at most ``limit`` verified snapshots directly
+        from SQLite instead of materializing the entire open queue.
+        """
+
+        bounded_limit = _open_task_limit(limit)
 
         def read(connection: sqlite3.Connection) -> tuple[ReviewTaskSnapshot, ...]:
-            rows = connection.execute(
-                """
+            statement = """
                 SELECT * FROM review_tasks
                 WHERE status != 'COMPLETED'
                 ORDER BY priority, due_at_ns, requested_at_ns, review_task_id
-                """
-            ).fetchall()
+            """
+            parameters: tuple[int, ...] = ()
+            if bounded_limit is not None:
+                statement += " LIMIT ?"
+                parameters = (bounded_limit,)
+            rows = connection.execute(statement, parameters).fetchall()
             return tuple(self._snapshot_from_row(row) for row in rows)
 
         return self._transaction(write=False, operation_name="list_open", operation=read)
@@ -1011,6 +1020,17 @@ def _nonempty_string(value: object, label: str) -> str:
         raise ReviewQueueError(
             ReviewQueueErrorCode.INVALID_REQUEST,
             f"{label} must be a nonempty string",
+        )
+    return value
+
+
+def _open_task_limit(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= INT64_MAX:
+        raise ReviewQueueError(
+            ReviewQueueErrorCode.INVALID_REQUEST,
+            "limit must be a nonnegative signed int64 integer or None",
         )
     return value
 

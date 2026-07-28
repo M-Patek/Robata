@@ -26,6 +26,7 @@ from robata.contracts.artifacts import (
 )
 from robata.contracts.hashing import CanonicalizationError, canonical_json_bytes
 from robata.contracts.video_export_v2 import CameraVideoExportManifestV2
+from robata.durability import sync_directory
 from robata.ports.artifact_registry import (
     ArtifactRegistry,
     ArtifactRegistryError,
@@ -412,13 +413,7 @@ def _materialize_registry_blob(
 
 
 def _sync_directory(directory: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(directory)
 
 
 def _rename_no_replace(source: Path, target: Path) -> None:

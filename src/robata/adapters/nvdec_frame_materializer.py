@@ -1,9 +1,11 @@
-"""Optional NVDEC frame-materialization adapter with a verified PyAV fallback."""
+"""Optional NVDEC frame materialization with guarded PyAV fallback."""
 
 from __future__ import annotations
 
 from robata.adapters.nvdec_backend import (
     NvdecBackendUnavailableError,
+    media_output_snapshot,
+    nvdec_fallback_allowed,
     record_nvdec_fallback,
 )
 from robata.contracts.pipeline import TemporalVisualPackage
@@ -17,13 +19,7 @@ from robata.runtime.observability import RuntimeObserver
 
 
 class NvdecFrameMaterializer:
-    """Use an injected target-SKU materializer, falling back before output is written.
-
-    The injected backend has the same ``FrameMaterializer`` contract as PyAV. This
-    keeps sampling, package identity, timestamps, and artifact publication outside the
-    acceleration choice. Backends must raise ``NvdecBackendUnavailableError`` before
-    publishing any package when a CPU retry is required.
-    """
+    """Use a target materializer only while fallback remains pre-publication safe."""
 
     def __init__(
         self,
@@ -58,9 +54,21 @@ class NvdecFrameMaterializer:
     def materialize(self, request: FrameMaterializationRequest) -> TemporalVisualPackage:
         if self._backend is None:
             return self._fallback.materialize(request)
+        output_paths = (
+            (request.output_directory / "frames",)
+            if isinstance(request, FrameMaterializationRequest)
+            else ()
+        )
+        before = media_output_snapshot(output_paths)
         try:
             return self._backend.materialize(request)
         except NvdecBackendUnavailableError as error:
+            output_changed = before != media_output_snapshot(output_paths)
+            if not nvdec_fallback_allowed(error, output_changed=output_changed):
+                raise FrameMaterializationError(
+                    FrameMaterializationErrorCode.OUTPUT_IO_ERROR,
+                    "NVDEC became unavailable after frame output changed; CPU fallback is unsafe",
+                ) from error
             record_nvdec_fallback(
                 self._runtime_observer,
                 operation="frame_materialization",

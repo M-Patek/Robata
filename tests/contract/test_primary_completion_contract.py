@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from robata.application.canonical.primary_completion import canonical_collection_digest_root
 from robata.contracts.hashing import semantic_sha256
 from robata.contracts.primary_completion import (
     PRIMARY_COMPLETION_RECORD_SCHEMA_ID,
@@ -59,6 +60,27 @@ def _digest(label: str) -> str:
 
 def _uuid(value: int) -> str:
     return f"00000000-0000-5000-8000-{value:012x}"
+
+
+@pytest.mark.parametrize(
+    ("ordered_item_digests", "expected"),
+    (
+        ((), "556f107d94e7f09418244480eb3baeee36f76bc16058e35636500c212043adf0"),
+        (("a" * 64,), "80399f944b13884d75d0d11eb29d95be69bd9fab3318c291d9ec8d95b28235c6"),
+        (("a" * 64, "a" * 64), "5e3988ba9542c225a09a20e62c68a76e61ad81527764fc4be724206e03550a35"),
+        (("a" * 64, "b" * 64), "4bdb9ec007051dc74a470d4e21fefeee9a97ccc17704f466bddc8b89ec38244b"),
+        (("b" * 64, "a" * 64), "f69491e3233b6f2d9ff90042a4653ec434e8d6e59caf706757c6d94eb991fa66"),
+        (
+            tuple(f"{index:064x}" for index in range(128)),
+            "a177f14194db24fbacc5f6013cdcf787eefa48d403c161d69f0744131042531d",
+        ),
+    ),
+)
+def test_v3_collection_root_regression_vectors(
+    ordered_item_digests: tuple[str, ...],
+    expected: str,
+) -> None:
+    assert canonical_collection_digest_root("x", ordered_item_digests) == expected
 
 
 def _record(**updates: Any) -> PrimaryCompletionRecord:

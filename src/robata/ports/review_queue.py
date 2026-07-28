@@ -103,8 +103,11 @@ class ReviewQueue(Protocol):
     def get_task(self, review_task_id: str) -> ReviewTaskSnapshot | None:
         """Return independently visible queue state."""
 
-    def list_open(self) -> tuple[ReviewTaskSnapshot, ...]:
-        """List pending and leased tasks in deterministic scheduling order."""
+    def list_open(self, *, limit: int | None = None) -> tuple[ReviewTaskSnapshot, ...]:
+        """List pending and leased tasks in deterministic scheduling order.
+
+        ``limit`` bounds the storage read when callers only need a queue head.
+        """
 
     def list_overdue(self, *, now_ns: int) -> tuple[ReviewTaskSnapshot, ...]:
         """List incomplete tasks strictly beyond their SLA deadline."""

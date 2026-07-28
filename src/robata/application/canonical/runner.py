@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
 
+from robata.adapters.sqlite_work_scheduler import require_outside_authority_transaction
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.boundary_windows import (
     CanonicalBoundaryRefinementWindow,
@@ -145,6 +146,7 @@ from robata.inference.adapter import (
     VisionInferenceSuccess,
     VisionModelAdapter,
 )
+from robata.inference.calibration import AcceptedInferenceCalibrationBridge
 from robata.inference.call_barrier import (
     InferenceCallBarrierCoordinator,
     InferenceCallBarrierError,
@@ -408,12 +410,14 @@ class _CountingVisionModelAdapter:
         model_name: str,
         model_version: str,
     ) -> ModelCapabilities:
+        require_outside_authority_transaction(activity="provider capability lookup")
         return await self._delegate.capabilities(model_name, model_version)
 
     async def infer(
         self,
         request: VisionInferenceRequest,
     ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        require_outside_authority_transaction(activity="provider inference dispatch")
         self._infer_calls += 1
         attributes: dict[str, str | int | float | bool] = {
             "provider": self.provider,
@@ -538,6 +542,7 @@ class CanonicalOfflinePipeline:
         execution_policy: CanonicalOfflineExecutionPolicy,
         inference_ledger: InferenceLedger | None = None,
         evidence_store: InferenceEvidenceStore | None = None,
+        calibration_bridge: AcceptedInferenceCalibrationBridge | None = None,
         barrier_storage: BarrierStorage | None = None,
         call_barrier_storage: InferenceCallBarrierStorage | None = None,
         max_concurrent_call_parts: int = 1,
@@ -582,6 +587,10 @@ class CanonicalOfflinePipeline:
             raise TypeError("logical_node_registry must implement attach_run_node")
         if not isinstance(execution_policy, CanonicalOfflineExecutionPolicy):
             raise TypeError("execution_policy must be a CanonicalOfflineExecutionPolicy")
+        if calibration_bridge is not None and not isinstance(
+            calibration_bridge, AcceptedInferenceCalibrationBridge
+        ):
+            raise TypeError("calibration_bridge must be an AcceptedInferenceCalibrationBridge")
         if (inference_ledger is None) != (evidence_store is None):
             raise CanonicalOfflineConfigurationError(
                 "durable inference evidence requires both ledger and evidence store"
@@ -663,6 +672,18 @@ class CanonicalOfflinePipeline:
         self._evidence_store = (
             evidence_store if evidence_store is not None else InMemoryInferenceEvidenceStore()
         )
+        bridge_store_identity: object = (
+            None if calibration_bridge is None else calibration_bridge.store
+        )
+        configured_ledger_identity: object = self._ledger
+        if (
+            calibration_bridge is not None
+            and bridge_store_identity is not configured_ledger_identity
+        ):
+            raise CanonicalOfflineConfigurationError(
+                "calibration bridge must use the same append-only inference ledger"
+            )
+        self._calibration_bridge = calibration_bridge
         schema_registry.resolve_exact(_schema_ref(coarse_qa_policy.output_schema))
         schema_registry.resolve_exact(_schema_ref(dense_qa_policy.output_schema))
         schema_registry.resolve_exact(_schema_ref(event_proposal_policy.output_schema))
@@ -762,14 +783,10 @@ class CanonicalOfflinePipeline:
         """
 
         if not isinstance(invocation, CanonicalPreEosInferenceInvocation):
-            raise TypeError(
-                "invocation must be a CanonicalPreEosInferenceInvocation"
-            )
+            raise TypeError("invocation must be a CanonicalPreEosInferenceInvocation")
         if invocation.task not in _PRE_EOS_INFERENCE_TASKS:
             allowed = ", ".join(task.value for task in sorted(_PRE_EOS_INFERENCE_TASKS))
-            raise CanonicalOfflineConfigurationError(
-                "pre-EOS inference only supports " + allowed
-            )
+            raise CanonicalOfflineConfigurationError("pre-EOS inference only supports " + allowed)
         if not isinstance(invocation.package_inputs, tuple):
             raise TypeError("invocation.package_inputs must be a tuple")
         if not isinstance(invocation.input_config, Mapping):
@@ -959,7 +976,8 @@ class CanonicalOfflinePipeline:
                     ),
                     boundary_results=tuple(item.result for item in boundary_executions),
                     context=checked_product_qa_context,
-                    pipeline_incomplete=status not in {
+                    pipeline_incomplete=status
+                    not in {
                         CanonicalOfflineRunStatus.SUCCEEDED,
                         CanonicalOfflineRunStatus.NO_EVENTS,
                         CanonicalOfflineRunStatus.ABSTAINED,
@@ -2095,6 +2113,25 @@ class CanonicalOfflinePipeline:
             parsed_claims = persisted_parsed
             selected_output = persisted_selected
             enriched_output = persisted_enriched
+            if self._calibration_bridge is not None:
+                try:
+                    self._calibration_bridge.record_accepted(
+                        task=task,
+                        inference=selected_terminal,
+                        selection=selection,
+                        selected_output=selected_output,
+                        enriched_output=enriched_output,
+                    )
+                except Exception as exc:
+                    # Detached calibration evidence cannot invalidate canonical lineage.
+                    runtime_increment(
+                        self._runtime_observer,
+                        "inference.calibration_association_failures",
+                        attributes={
+                            "error_type": type(exc).__name__,
+                            "task": task.value,
+                        },
+                    )
         except (InferenceEvidenceStoreError, InferenceLedgerError) as exc:
             return (
                 parsed_claims.raw_response,

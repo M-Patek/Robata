@@ -11,6 +11,7 @@ from robata.benchmark import (
     BenchmarkEvidenceContext,
     BenchmarkMetricPolicy,
     BenchmarkResults,
+    CalibrationSplitProtocol,
     GateCategory,
     MetricsCalculator,
     PromotionEvaluator,
@@ -77,6 +78,88 @@ def _calculator(
     context: BenchmarkEvidenceContext | None = None,
 ) -> MetricsCalculator:
     return MetricsCalculator(_metric_policy(context))
+
+
+def _calibration_protocol() -> CalibrationSplitProtocol:
+    return CalibrationSplitProtocol.create(
+        split_config_version="split-v1",
+        development_mcap_ids=("development-1",),
+        calibration_mcap_ids=("calibration-1",),
+        frozen_test_mcap_ids=("frozen-1", "frozen-2"),
+        leakage_group_ids={
+            "development-1": "development-group",
+            "calibration-1": "calibration-group",
+            "frozen-1": "frozen-group-1",
+            "frozen-2": "frozen-group-2",
+        },
+    )
+
+
+def _calibration_evidence(
+    *,
+    frozen_mcap_id: str = "frozen-1",
+    calibrated: bool = True,
+) -> dict[str, object]:
+    score_field = "calibrated_probability" if calibrated else "confidence"
+
+    def prediction(
+        mcap_id: str,
+        class_id: str,
+        score: float | None,
+        *,
+        scene: str,
+        day: str,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "mcap_id": mcap_id,
+            "class_id": class_id,
+            "scene": scene,
+            "collection_day": day,
+        }
+        if score is None:
+            payload["status"] = "ABSTAINED"
+        else:
+            payload[score_field] = score
+        return payload
+
+    def target(
+        mcap_id: str,
+        class_id: str,
+        outcome: bool,
+        *,
+        scene: str,
+        day: str,
+    ) -> dict[str, object]:
+        return {
+            "mcap_id": mcap_id,
+            "class_id": class_id,
+            "outcome": outcome,
+            "scene": scene,
+            "collection_day": day,
+        }
+
+    return {
+        "development_predictions": (
+            prediction("development-1", "quality", 0.2, scene="lab-a", day="2026-01-01"),
+        ),
+        "development_ground_truth": (
+            target("development-1", "quality", False, scene="lab-a", day="2026-01-01"),
+        ),
+        "calibration_predictions": (
+            prediction("calibration-1", "quality", 0.75, scene="lab-a", day="2026-01-02"),
+        ),
+        "calibration_ground_truth": (
+            target("calibration-1", "quality", True, scene="lab-a", day="2026-01-02"),
+        ),
+        "frozen_test_predictions": (
+            prediction(frozen_mcap_id, "quality", 0.9, scene="lab-b", day="2026-01-03"),
+            prediction("frozen-2", "safety", None, scene="lab-b", day="2026-01-03"),
+        ),
+        "frozen_test_ground_truth": (
+            target(frozen_mcap_id, "quality", False, scene="lab-b", day="2026-01-03"),
+            target("frozen-2", "safety", True, scene="lab-b", day="2026-01-03"),
+        ),
+    }
 
 
 def _gate(
@@ -204,6 +287,136 @@ def test_offline_metrics_calculate_perfect_fixture() -> None:
     assert boundaries.start_mae == 0.0
     assert calibration.ece == 0.0
     assert calibration.brier_score == 0.0
+
+
+def test_calibration_qualification_reports_grouped_cohorts_and_local_diagnostics() -> None:
+    evidence = _calibration_evidence()
+    report = _calculator().calculate_calibration_qualification(
+        split_protocol=_calibration_protocol(),
+        score_kind="CALIBRATED",
+        score_family="P(task_output_correct)",
+        calibration_artifact_sha256=_digest("calibration-artifact"),
+        subgroup_fields=("scene",),
+        temporal_fields=("collection_day",),
+        **evidence,
+    )
+
+    assert report.measurement_status == "NOT_MEASURED"
+    assert report.evidence_class == "INTERNAL_CALIBRATION_EVALUATION"
+    assert report.production_eligible is False
+    assert report.qualification_status == "NOT_PRODUCTION_QUALIFIED"
+    assert report.development.expected_mcap_ids == ("development-1",)
+    assert report.calibration.expected_mcap_ids == ("calibration-1",)
+    assert report.frozen_test.expected_mcap_ids == ("frozen-1", "frozen-2")
+    assert report.frozen_test.per_class["quality"].brier_score == pytest.approx(0.81)
+    assert report.frozen_test.per_class["safety"].ece is None
+    assert report.frozen_test.per_class["safety"].abstention_count == 1
+    assert report.frozen_test.subgroup_metrics["scene"]["lab-b"].sample_count == 2
+    assert report.frozen_test.temporal_metrics["collection_day"]["2026-01-03"].sample_count == 2
+    assert report.drift.status == "REPORTED"
+    assert report.drift.aggregate is not None
+    assert report.drift.aggregate.mean_confidence_delta == pytest.approx(0.15)
+    assert report.report_identity == f"calibration-qualification-report:{report.report_digest}"
+
+    repeated = _calculator().calculate_calibration_qualification(
+        split_protocol=_calibration_protocol(),
+        score_kind="CALIBRATED",
+        score_family="P(task_output_correct)",
+        calibration_artifact_sha256=_digest("calibration-artifact"),
+        subgroup_fields=("scene",),
+        temporal_fields=("collection_day",),
+        **evidence,
+    )
+    assert repeated.report_digest == report.report_digest
+
+    tampered = report.model_dump(mode="python")
+    tampered["score_family"] = "different-score-family"
+    with pytest.raises(ValidationError, match="report_digest"):
+        type(report).model_validate(tampered)
+
+
+def test_calibration_qualification_requires_artifact_and_rejects_cross_split_samples() -> None:
+    evidence = _calibration_evidence()
+    calculator = _calculator()
+    protocol = _calibration_protocol()
+
+    with pytest.raises(ValueError, match="calibration_artifact_sha256"):
+        calculator.calculate_calibration_qualification(
+            split_protocol=protocol,
+            score_kind="CALIBRATED",
+            score_family="P(task_output_correct)",
+            **evidence,
+        )
+
+    with pytest.raises(ValueError, match="outside its assigned split"):
+        calculator.calculate_calibration_qualification(
+            split_protocol=protocol,
+            score_kind="CALIBRATED",
+            score_family="P(task_output_correct)",
+            calibration_artifact_sha256=_digest("calibration-artifact"),
+            **_calibration_evidence(frozen_mcap_id="development-1"),
+        )
+
+
+def test_calibration_qualification_measured_binding_remains_non_production() -> None:
+    context = _context()
+    report = _calculator(context).calculate_calibration_qualification(
+        split_protocol=_calibration_protocol(),
+        score_kind="CALIBRATED",
+        score_family="P(task_output_correct)",
+        calibration_artifact_sha256=_digest("calibration-artifact"),
+        **_calibration_evidence(),
+        evidence_context=context,
+    )
+
+    assert report.measurement_status == "MEASURED"
+    assert report.evidence_context_digest == context.context_digest
+    assert report.production_eligible is False
+    assert report.qualification_status == "NOT_PRODUCTION_QUALIFIED"
+
+
+def test_calibration_qualification_keeps_raw_and_calibrated_score_paths_distinct() -> None:
+    calculator = _calculator()
+    raw_evidence = _calibration_evidence(calibrated=False)
+    raw_report = calculator.calculate_calibration_qualification(
+        split_protocol=_calibration_protocol(),
+        score_kind="MODEL_REPORTED",
+        score_family="provider_self_report",
+        **raw_evidence,
+    )
+    calibrated_report = calculator.calculate_calibration_qualification(
+        split_protocol=_calibration_protocol(),
+        score_kind="CALIBRATED",
+        score_family="P(task_output_correct)",
+        calibration_artifact_sha256=_digest("calibration-artifact"),
+        **raw_evidence,
+    )
+
+    assert raw_report.calibration_artifact_sha256 is None
+    assert raw_report.frozen_test.overall.scored_count == 1
+    assert calibrated_report.frozen_test.overall.scored_count == 0
+    assert calibrated_report.frozen_test.overall.abstention_count == 2
+    assert calibrated_report.drift.status == "INSUFFICIENT_SCORED_SAMPLES"
+
+
+def test_calibration_qualification_rejects_ambiguous_repeated_samples() -> None:
+    evidence = _calibration_evidence()
+    duplicate_predictions = evidence["development_predictions"] * 2
+    duplicate_truth = evidence["development_ground_truth"] * 2
+
+    with pytest.raises(ValueError, match="explicit sample identity"):
+        _calculator().calculate_calibration_qualification(
+            split_protocol=_calibration_protocol(),
+            score_kind="CALIBRATED",
+            score_family="P(task_output_correct)",
+            calibration_artifact_sha256=_digest("calibration-artifact"),
+            development_predictions=duplicate_predictions,
+            development_ground_truth=duplicate_truth,
+            calibration_predictions=evidence["calibration_predictions"],
+            calibration_ground_truth=evidence["calibration_ground_truth"],
+            frozen_test_predictions=evidence["frozen_test_predictions"],
+            frozen_test_ground_truth=evidence["frozen_test_ground_truth"],
+        )
 
 
 def test_metric_policy_is_content_addressed_and_controls_metric_definitions() -> None:

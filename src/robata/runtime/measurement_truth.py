@@ -44,12 +44,14 @@ _CODE_ROOTS: Final[tuple[str, ...]] = (
     "conformance/",
 )
 _ROOT_FILES: Final[frozenset[str]] = frozenset({"pyproject.toml", "uv.lock"})
-_IGNORED_CODE_DIRS: Final[frozenset[str]] = frozenset({
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-})
+_IGNORED_CODE_DIRS: Final[frozenset[str]] = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
 _IGNORED_CODE_SUFFIXES: Final[frozenset[str]] = frozenset({".pyc", ".pyo"})
 
 
@@ -57,6 +59,17 @@ def _git_paths(repository_root: Path) -> tuple[str, ...]:
     """Return tracked and non-ignored paths without embedding local filesystem paths."""
 
     try:
+        git_root = (
+            subprocess.run(
+                ["git", "-C", str(repository_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+            )
+            .stdout.decode("utf-8")
+            .strip()
+        )
+        if Path(git_root).resolve() != repository_root.resolve():
+            return ()
         tracked = subprocess.run(
             ["git", "-C", str(repository_root), "ls-files", "-z"],
             check=True,
@@ -82,25 +95,35 @@ def _git_paths(repository_root: Path) -> tuple[str, ...]:
         return ()
     # The pathspec keeps local recordings and historical snapshots outside the scan while
     # still including new implementation files under the bounded source roots.
-    paths = {
-        item
-        for item in (*tracked.split("\0"), *untracked.split("\0"))
-        if item
-    }
+    paths = {item for item in (*tracked.split("\0"), *untracked.split("\0")) if item}
     return tuple(sorted(path for path in paths if _is_code_path(path)))
 
 
 def _git_worktree_root(repository_root: Path) -> Path:
-    # Normalize a Git subdirectory input to the worktree root when available.
+    """Normalize only the worktree root and its declared source roots."""
+
+    resolved_root = repository_root.resolve()
     try:
-        output = subprocess.run(
-            ['git', '-C', str(repository_root), 'rev-parse', '--show-toplevel'],
-            check=True,
-            capture_output=True,
-        ).stdout.decode('utf-8').strip()
+        output = (
+            subprocess.run(
+                ["git", "-C", str(repository_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+            )
+            .stdout.decode("utf-8")
+            .strip()
+        )
     except (OSError, UnicodeError, subprocess.CalledProcessError):
-        return repository_root
-    return Path(output).resolve() if output else repository_root
+        return resolved_root
+    worktree_root = Path(output).resolve()
+    try:
+        relative_to_worktree = resolved_root.relative_to(worktree_root)
+    except ValueError:
+        return resolved_root
+    code_roots = {root.rstrip("/") for root in _CODE_ROOTS}
+    if relative_to_worktree != Path(".") and relative_to_worktree.as_posix() not in code_roots:
+        return resolved_root
+    return worktree_root
 
 
 def _is_code_path(relative_path: str) -> bool:
@@ -124,9 +147,7 @@ def _fallback_paths(repository_root: Path) -> tuple[str, ...]:
                 and path.suffix.lower() not in _IGNORED_CODE_SUFFIXES
             )
         )
-    candidates.extend(
-        name for name in _ROOT_FILES if (repository_root / name).is_file()
-    )
+    candidates.extend(name for name in _ROOT_FILES if (repository_root / name).is_file())
     return tuple(sorted(set(candidates)))
 
 
@@ -181,9 +202,7 @@ def build_profile_scope_fingerprint(
     if not isinstance(manifest, CanonicalProfileManifest):
         raise TypeError("manifest must be a CanonicalProfileManifest")
     code_root = (
-        repository_root
-        if repository_root is not None
-        else Path(__file__).resolve().parents[3]
+        repository_root if repository_root is not None else Path(__file__).resolve().parents[3]
     )
     code_digest = repository_code_digest(code_root)
     workload_digest = canonical_profile_workload_fingerprint(manifest)
@@ -296,13 +315,13 @@ def build_profile_evidence_register(
         hardware=(
             hardware
             if hardware is not None
-            else f'{report.manifest.runtime.platform}/{report.manifest.runtime.machine}'
+            else f"{report.manifest.runtime.platform}/{report.manifest.runtime.machine}"
         ),
         accelerator=None,
     )
     execution_mode = MeasurementExecutionMode(report.execution_mode)
     if evidence_class is EvidenceClass.PRODUCTION_QUALIFIED:
-        raise ValueError('PRODUCTION_QUALIFIED requires the external qualification gate')
+        raise ValueError("PRODUCTION_QUALIFIED requires the external qualification gate")
     measurement_status = (
         MeasurementStatus.MEASURED
         if (

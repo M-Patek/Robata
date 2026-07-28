@@ -17,6 +17,7 @@ from uuid import NAMESPACE_URL, uuid5
 from pydantic import ValidationError
 
 from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
+from robata.adapters.nvdec_backend import MediaRuntimeProvenance
 from robata.adapters.sqlite_barrier import (
     SQLiteBarrierStorage,
     SQLiteBarrierStorageError,
@@ -30,11 +31,24 @@ from robata.adapters.sqlite_outbox import SQLiteIdempotentOutboxSink
 from robata.adapters.sqlite_primary_completion import SQLitePrimaryCompletionRepository
 from robata.adapters.sqlite_stream_delivery import SQLiteStreamDeliveryAuthority
 from robata.adapters.sqlite_stream_work_ledger import SQLiteStreamWorkLedgerError
-from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkSchedulerError
+from robata.adapters.sqlite_work_scheduler import (
+    SQLiteWorkScheduler,
+    WorkSchedulerError,
+    require_outside_authority_transaction,
+)
 from robata.admission.context import AdmittedRecordingContextV2
 from robata.application.canonical.action_event_revision import (
     CanonicalActionEventRevisionError,
     prepare_initial_action_event_publications,
+)
+from robata.application.canonical.adaptive_sampling import (
+    AdaptiveSamplingExecutionStore,
+    CanonicalAdaptiveSamplingBridge,
+)
+from robata.application.canonical.boundary_qualification import (
+    BoundaryQualificationSidecarStore,
+    CanonicalBoundaryQualificationBridge,
+    CanonicalBoundaryQualificationWorker,
 )
 from robata.application.canonical.durable_work import (
     CanonicalActionPublishWorkCoordinator,
@@ -51,12 +65,14 @@ from robata.application.canonical.local_review_routing import (
     route_local_review_after_completion,
 )
 from robata.application.canonical.local_stream_finalization import (
+    DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
     LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION,
     LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION,
     LOCAL_STREAM_WORK_RECEIPT_SCHEMA_ID,
     LOCAL_STREAM_WORK_RECEIPT_SCHEMA_VERSION,
     FinalRecordingFacts,
     LocalConformanceStreamFinalizer,
+    LocalStreamExecutorConfig,
     LocalStreamFinalizationError,
     LocalStreamFinalizationOutcome,
     LocalStreamFinalizationSchemaRefs,
@@ -107,7 +123,14 @@ from robata.application.canonical.primary_completion import (
 from robata.application.canonical.product_qa import (
     product_qa_context_from_media_quality_report,
 )
-from robata.application.canonical.result_validation import CanonicalOfflineRunResult
+from robata.application.canonical.recording_association_dispatch import (
+    RecordingAssociationJobStore,
+    enqueue_recording_association_after_completion,
+)
+from robata.application.canonical.result_validation import (
+    CanonicalBoundaryRefinementExecution,
+    CanonicalOfflineRunResult,
+)
 from robata.application.canonical.runner import CanonicalOfflinePipeline
 from robata.application.canonical.source_fixture import (
     CanonicalSourceBundle,
@@ -168,6 +191,7 @@ from robata.contracts.stream_window import (
     STREAM_INFERENCE_SCHEMA_ID,
     STREAM_INFERENCE_SCHEMA_VERSION,
 )
+from robata.event_pipeline.boundary_qualification import BoundaryQualificationPolicy
 from robata.event_pipeline.identity_registry import (
     EventIdAllocator,
     EventIdentityPolicyRef,
@@ -187,6 +211,11 @@ from robata.inference.adapter import (
     VisionInferenceRequest,
     VisionInferenceSuccess,
     VisionModelAdapter,
+)
+from robata.inference.calibration import (
+    AcceptedInferenceCalibrationBridge,
+    CalibrationBinding,
+    CalibrationScoreSource,
 )
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
@@ -218,8 +247,11 @@ from robata.inference.orchestrator import InferencePolicy
 from robata.inference.preparation import InputPlanPreparer, ProviderRenderingPolicy
 from robata.ports.logical_node_registry import LogicalNodeRegistryError
 from robata.qa_pipeline.coarse import LOCAL_COARSE_QA_POLICY_VERSION
-from robata.qa_pipeline.completion import LOCAL_QA_COMPLETION_POLICY_VERSION
-from robata.qa_pipeline.dense import DenseQAPlanningPolicy
+from robata.qa_pipeline.completion import (
+    LOCAL_QA_COMPLETION_POLICY_VERSION,
+    QACompletionStatus,
+)
+from robata.qa_pipeline.dense import DenseQAOutcome, DenseQAPlanningPolicy
 from robata.qa_pipeline.supplemental import (
     LOCAL_SUPPLEMENTAL_QA_DENSE_POLICY_VERSION,
     SUPPLEMENTAL_QA_DENSE_INPUT_PROJECTION_VERSION,
@@ -231,6 +263,7 @@ from robata.qa_pipeline.supplemental_wire import (
     LOCAL_SUPPLEMENTAL_QA_EVIDENCE_SCHEMA_VERSION,
     LocalSupplementalQaEvidence,
 )
+from robata.queue.backpressure import BackpressureRuntimeSignals
 from robata.queue.outbox import OutboxRelay, OutboxRetryPolicy
 from robata.queue.stream_models import StreamTerminalEvidence
 from robata.runtime.observability import (
@@ -238,6 +271,18 @@ from robata.runtime.observability import (
     runtime_increment,
     runtime_span,
 )
+from robata.sampling.adaptive import AdaptiveCoveragePolicy
+from robata.sampling.adaptive_decision import (
+    AcceptedAdaptiveEvidenceBinding,
+    AdaptiveDecisionBaseBinding,
+    AdaptiveDecisionSourceBinding,
+    AdaptiveNoAdditionalWorkProof,
+    AdaptiveNoAdditionalWorkProofKind,
+    AdaptiveSamplingDecision,
+    AdaptiveSamplingDecisionOutcome,
+    build_adaptive_sampling_decision,
+)
+from robata.sampling.adaptive_decision_store import SQLiteAdaptiveDecisionStore
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     IndexedSourceFrame,
@@ -266,6 +311,11 @@ LOCAL_CANONICAL_PARSER_VERSION = "strict-provider-claim-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY = "ordered-claims-v1"
 LOCAL_CANONICAL_REDUCTION_POLICY_VERSION = "1.0"
 LOCAL_CANONICAL_EVENT_ALLOCATOR_VERSION = "canonical-local-event-uuid5-v1"
+LOCAL_CALIBRATION_SCORE_FAMILY: Final = "local-conformance-provider-claim-score.v1"
+LOCAL_CALIBRATION_RUNTIME_REVISION: Final = "local-conformance-fixture-runtime-v1"
+LOCAL_CALIBRATION_PREPROCESS_REVISION: Final = "local-conformance-preprocess-v1"
+LOCAL_ADAPTIVE_SAMPLING_POLICY_VERSION: Final = "local-adaptive-no-extra-work-v1"
+LOCAL_BOUNDARY_QUALIFICATION_POLICY_VERSION: Final = "local-boundary-qualification-sidecar-v1"
 # Runtime-only dispatch bounds. They deliberately stay outside the canonical
 # execution policy: compatible batch grouping must not change identity/evidence.
 LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS: Final = 6
@@ -469,6 +519,7 @@ class _DispatchingVisionModelAdapter:
         return self._delegate.provider
 
     async def capabilities(self, model_name: str, model_version: str) -> ModelCapabilities:
+        require_outside_authority_transaction(activity="provider capability dispatch")
         outcome = await self._dispatcher.dispatch(
             lambda: self._delegate.capabilities(model_name, model_version)
         )
@@ -480,6 +531,7 @@ class _DispatchingVisionModelAdapter:
         self,
         request: VisionInferenceRequest,
     ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        require_outside_authority_transaction(activity="provider inference dispatch")
         outcome = await self._dispatcher.dispatch(lambda: self._delegate.infer(request))
         if not isinstance(outcome, (VisionInferenceSuccess, VisionInferenceFailure)):
             raise TypeError("provider dispatcher returned an invalid inference result")
@@ -493,6 +545,7 @@ class _DispatchingBatchVisionModelAdapter(_DispatchingVisionModelAdapter):
         self,
         requests: tuple[VisionInferenceRequest, ...],
     ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        require_outside_authority_transaction(activity="provider batch inference dispatch")
         infer_batch = getattr(self._delegate, "infer_batch", None)
         if not callable(infer_batch):
             raise TypeError("delegate does not implement infer_batch")
@@ -552,6 +605,7 @@ def run_local_canonical_fixture(
     *,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a JSON source fixture."""
 
@@ -559,6 +613,11 @@ def run_local_canonical_fixture(
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
     _require_provider_dispatcher(provider_dispatcher)
+    if not isinstance(executor_config, LocalStreamExecutorConfig):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "executor_config must be LocalStreamExecutorConfig",
+        )
     with runtime_span(runtime_observer, "source.fixture.read_validate"):
         source_sha256, _, clock_value = _source_run_binding(source)
     source_binding_sha256 = semantic_sha256(
@@ -589,6 +648,7 @@ def run_local_canonical_fixture(
         source_loader=load_source,
         runtime_observer=runtime_observer,
         provider_dispatcher=provider_dispatcher,
+        executor_config=executor_config,
     )
 
 
@@ -601,10 +661,14 @@ def run_local_canonical_mcap(
     allow_unapproved_profile: bool = False,
     max_duration_ns: int | None = None,
     media_processing_policy: McapMediaProcessingPolicy | None = None,
+    media_exporter: object | None = None,
+    media_runtime_provenance: MediaRuntimeProvenance | None = None,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run or recover the complete local canonical path from a real MCAP.
 
@@ -613,6 +677,11 @@ def run_local_canonical_mcap(
     returns the one hook used for both incremental pre-EOS work and any work
     still pending at EOS. ``stage_terminal_executor`` remains available for
     direct injection, but the two options are mutually exclusive.
+
+    ``media_exporter`` and ``media_runtime_provenance`` provide the optional
+    P4 target-media injection point. They are forwarded to the MCAP source
+    bridge as runtime facts only; canonical source binding and wire identities
+    remain unchanged.
     """
 
     from robata.application.canonical.mcap_source import (
@@ -630,6 +699,7 @@ def run_local_canonical_mcap(
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
     _require_provider_dispatcher(provider_dispatcher)
+    _require_media_runtime_injection(media_exporter, media_runtime_provenance)
     if stage_terminal_executor is not None and not callable(stage_terminal_executor):
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
@@ -644,6 +714,16 @@ def run_local_canonical_mcap(
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "stage_terminal_executor and pre_eos_executor_factory are mutually exclusive",
+        )
+    if not isinstance(executor_config, LocalStreamExecutorConfig):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "executor_config must be LocalStreamExecutorConfig",
+        )
+    if backpressure_signal_provider is not None and not callable(backpressure_signal_provider):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "backpressure_signal_provider must be callable or None",
         )
     if not isinstance(allow_unapproved_profile, bool):
         raise CanonicalLocalCompositionError(
@@ -763,10 +843,14 @@ def run_local_canonical_mcap(
                 max_duration_ns=max_duration_ns,
                 media_processing_policy=resolved_media_processing_policy,
                 runtime_observer=runtime_observer,
+                media_exporter=media_exporter,
+                media_runtime_provenance=media_runtime_provenance,
                 execution_scheduler=execution_scheduler,
                 stream_run_id=stream_run_id,
                 stream_artifact_root=state_root / "stream-artifacts",
                 stage_terminal_executor=resolved_stage_terminal_executor,
+                executor_config=executor_config,
+                backpressure_signal_provider=backpressure_signal_provider,
                 # A factory-installed provider-neutral executor owns every
                 # eligible QA/event item in the P5 path. A typed terminal is
                 # therefore required; direct conformance callers retain their
@@ -850,6 +934,8 @@ def run_local_canonical_mcap(
         provider_dispatcher=provider_dispatcher,
         stage_terminal_executor=stage_terminal_executor,
         pre_eos_executor_factory=pre_eos_executor_factory,
+        executor_config=executor_config,
+        backpressure_signal_provider=backpressure_signal_provider,
     )
 
 
@@ -867,6 +953,8 @@ def _run_local_canonical(
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
 ) -> CanonicalLocalRunReceipt:
     with runtime_span(runtime_observer, "canonical.composition"):
         return _run_local_canonical_inner(
@@ -882,6 +970,8 @@ def _run_local_canonical(
             provider_dispatcher=provider_dispatcher,
             stage_terminal_executor=stage_terminal_executor,
             pre_eos_executor_factory=pre_eos_executor_factory,
+            executor_config=executor_config,
+            backpressure_signal_provider=backpressure_signal_provider,
         )
 
 
@@ -899,6 +989,8 @@ def _run_local_canonical_inner(
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+    backpressure_signal_provider: Callable[[], BackpressureRuntimeSignals | None] | None = None,
 ) -> CanonicalLocalRunReceipt:
     """Run the shared canonical flow after source authorization and binding."""
 
@@ -921,6 +1013,16 @@ def _run_local_canonical_inner(
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "stage_terminal_executor and pre_eos_executor_factory are mutually exclusive",
+        )
+    if not isinstance(executor_config, LocalStreamExecutorConfig):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "executor_config must be LocalStreamExecutorConfig",
+        )
+    if backpressure_signal_provider is not None and not callable(backpressure_signal_provider):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "backpressure_signal_provider must be callable or None",
         )
     started_at = LOCAL_CANONICAL_EXECUTION_TIME
     clock_value = _LOCAL_CANONICAL_EXECUTION_DATETIME
@@ -991,6 +1093,7 @@ def _run_local_canonical_inner(
                 execution_scheduler=work_scheduler,
                 stream_run_id=run_id,
                 clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+                backpressure_signal_provider=backpressure_signal_provider,
             )
             runtime_increment(
                 runtime_observer,
@@ -1070,6 +1173,21 @@ def _run_local_canonical_inner(
                     CanonicalLocalCompositionErrorCode.LOCAL_STATE_FAILED,
                     "persisted local evidence differs from authoritative completion references",
                 )
+            _enqueue_local_recording_association_dispatch(
+                recovered,
+                state_root=state_root,
+                runtime_observer=runtime_observer,
+            )
+            _execute_local_adaptive_sampling_after_completion(
+                recovered,
+                state_root=state_root,
+                runtime_observer=runtime_observer,
+            )
+            _enqueue_and_drain_local_boundary_qualification(
+                recovered.detail.boundary_refinement_executions,
+                state_root=state_root,
+                runtime_observer=runtime_observer,
+            )
             return _receipt(
                 recovered,
                 replayed=True,
@@ -1128,6 +1246,7 @@ def _run_local_canonical_inner(
             execution_scheduler=work_scheduler,
             stream_run_id=run_id,
             clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
+            backpressure_signal_provider=backpressure_signal_provider,
         )
         runtime_increment(
             runtime_observer,
@@ -1203,6 +1322,8 @@ def _run_local_canonical_inner(
                 canonical_result=result,
                 stage_terminal_executor=resolved_stage_terminal_executor,
                 provider_terminal_required=pre_eos_executor_factory is not None,
+                executor_config=executor_config,
+                runtime_observer=runtime_observer,
             )
         runtime_increment(
             runtime_observer,
@@ -1276,6 +1397,7 @@ def _run_local_canonical_inner(
                 action_event_publications=publications,
                 evidence_references=evidence_references,
                 registry=registry,
+                runtime_observer=runtime_observer,
             )
         with runtime_span(runtime_observer, "completion.commit"):
             commit_result = publish_work.commit_prepared(prepared_command)
@@ -1287,6 +1409,21 @@ def _run_local_canonical_inner(
                 "stage": "ACTION_PUBLISH",
                 "state": "SUCCEEDED",
             },
+        )
+        _enqueue_local_recording_association_dispatch(
+            commit_result.committed,
+            state_root=state_root,
+            runtime_observer=runtime_observer,
+        )
+        _execute_local_adaptive_sampling_after_completion(
+            commit_result.committed,
+            state_root=state_root,
+            runtime_observer=runtime_observer,
+        )
+        _enqueue_and_drain_local_boundary_qualification(
+            commit_result.committed.detail.boundary_refinement_executions,
+            state_root=state_root,
+            runtime_observer=runtime_observer,
         )
         return _receipt(
             commit_result.committed,
@@ -1378,6 +1515,22 @@ def _build_runtime(
             registry,
             parser_version=LOCAL_CANONICAL_PARSER_VERSION,
         )
+        # The fixture keeps only raw declared provider scores. No calibration
+        # artifact is configured, so every usable score records a detached
+        # raw fallback and cannot alter Product QA or production eligibility.
+        calibration_bridge = AcceptedInferenceCalibrationBridge(
+            store=inference_evidence,
+            bindings=(
+                CalibrationBinding(
+                    task=event_proposal_policy.task,
+                    score_family=LOCAL_CALIBRATION_SCORE_FAMILY,
+                    runtime_revision=LOCAL_CALIBRATION_RUNTIME_REVISION,
+                    preprocess_revision=LOCAL_CALIBRATION_PREPROCESS_REVISION,
+                    score_source=CalibrationScoreSource.ENRICHED_CLAIM_REPORTED_CONFIDENCE,
+                    source_claim_ordinal=0,
+                ),
+            ),
+        )
         adapter: VisionModelAdapter = OfflineFixtureVisionAdapter(
             capabilities=_capabilities(observed_at),
             raw_store=inference_evidence,
@@ -1438,6 +1591,7 @@ def _build_runtime(
             max_inference_batch_queue_delay_ms=(LOCAL_CANONICAL_MAX_INFERENCE_BATCH_QUEUE_DELAY_MS),
             inference_ledger=inference_evidence,
             evidence_store=inference_evidence,
+            calibration_bridge=calibration_bridge,
             barrier_storage=barrier_storage,
             call_barrier_storage=barrier_storage,
             clock=lambda: clock_value,
@@ -2109,6 +2263,8 @@ def _finalize_local_stream_graphs(
     bundle: _CanonicalSourceInputs,
     canonical_result: CanonicalOfflineRunResult,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
+    executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+    runtime_observer: RuntimeObserver | None = None,
     provider_terminal_required: bool = False,
 ) -> tuple[LocalStreamFinalizationOutcome, ...]:
     if not schedulers:
@@ -2197,6 +2353,8 @@ def _finalize_local_stream_graphs(
             terminal_policy_version=LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION,
             recover_graph_before_execute=False,
             stage_terminal_executor=stage_terminal_executor,
+            executor_config=executor_config,
+            runtime_observer=runtime_observer,
             clock=lambda: _LOCAL_CANONICAL_EXECUTION_DATETIME,
         ).execute()
         for scheduler in schedulers
@@ -2216,7 +2374,7 @@ def _local_stream_delivery_authority(
             "one canonical run cannot span multiple stream authority databases"
         )
     return SQLiteStreamDeliveryAuthority(
-        SQLiteWorkScheduler(database_path),
+        schedulers[0].execution_scheduler,
         retry_policy=OutboxRetryPolicy(
             version="local-stream-delivery-retry-v1",
             max_attempts=3,
@@ -2271,6 +2429,273 @@ def _reconcile_local_outbox(
     except Exception as error:
         # Completion is already authoritative; delivery remains observable recovery work.
         return failed_local_outbox_delivery(committed.outbox, error)
+
+
+def _enqueue_local_recording_association_dispatch(
+    committed: CommittedPrimaryCompletion,
+    *,
+    state_root: Path,
+    runtime_observer: RuntimeObserver | None = None,
+) -> None:
+    """Queue P11-derived work without making primary completion depend on it."""
+
+    try:
+        with runtime_span(runtime_observer, "recording_association.dispatch.enqueue"):
+            dispatch = enqueue_recording_association_after_completion(
+                committed=committed,
+                jobs=RecordingAssociationJobStore(state_root / "recording-association"),
+            )
+    except Exception as error:
+        runtime_increment(
+            runtime_observer,
+            "recording_association.dispatches",
+            attributes={"status": "FAILED", "error_type": type(error).__name__},
+        )
+        return
+    runtime_increment(
+        runtime_observer,
+        "recording_association.dispatches",
+        attributes={"status": dispatch.status.value, "replayed": dispatch.replayed},
+    )
+
+
+def _execute_local_adaptive_sampling_after_completion(
+    committed: CommittedPrimaryCompletion,
+    *,
+    state_root: Path,
+    runtime_observer: RuntimeObserver | None = None,
+) -> None:
+    """Persist only the retained coarse-complete no-work adaptive decision."""
+
+    try:
+        result = _canonical_result_from_committed_completion(committed)
+        decision = _local_adaptive_sampling_no_work_decision(result)
+        if decision is None:
+            runtime_increment(
+                runtime_observer,
+                "adaptive_sampling.dispatches",
+                attributes={"status": "NOT_PROVEN"},
+            )
+            return
+        with runtime_span(runtime_observer, "adaptive_sampling.dispatch.execute"):
+            execution = CanonicalAdaptiveSamplingBridge(
+                SQLiteAdaptiveDecisionStore(state_root / "adaptive-sampling-decisions.sqlite3"),
+                AdaptiveSamplingExecutionStore(state_root / "adaptive-sampling-executions"),
+            ).execute_for_canonical_result(decision, result=result)
+    except Exception as error:
+        # This sidecar can never replace an already-authoritative completion.
+        runtime_increment(
+            runtime_observer,
+            "adaptive_sampling.dispatches",
+            attributes={"status": "FAILED", "error_type": type(error).__name__},
+        )
+        return
+    runtime_increment(
+        runtime_observer,
+        "adaptive_sampling.dispatches",
+        attributes={
+            "status": execution.status.value,
+            "decision_replayed": execution.decision_replayed,
+            "terminal_replayed": execution.terminal_replayed,
+        },
+    )
+
+
+def _local_adaptive_sampling_no_work_decision(
+    result: CanonicalOfflineRunResult,
+) -> AdaptiveSamplingDecision | None:
+    """Build the sole local adaptive outcome proven by retained QA evidence."""
+
+    qa_completion = result.qa_completion_result
+    coarse = result.coarse_qa_result
+    package_set = result.package_set
+    window = result.window
+    if (
+        result.status
+        not in {CanonicalOfflineRunStatus.SUCCEEDED, CanonicalOfflineRunStatus.NO_EVENTS}
+        or qa_completion is None
+        or qa_completion.status is not QACompletionStatus.QA_COMPLETE
+        or qa_completion.dense_work_manifest.outcome is not DenseQAOutcome.SKIPPED_NOT_NEEDED
+        or coarse is None
+        or not coarse.complete
+        or package_set is None
+        or window is None
+    ):
+        return None
+
+    part = next(
+        (
+            item
+            for item in result.part_results
+            if (
+                item.selection is not None
+                and item.selected_output is not None
+                and item.enriched_output is not None
+            )
+        ),
+        None,
+    )
+    if part is None:
+        return None
+    selection = part.selection
+    selected_output = part.selected_output
+    enriched_output = part.enriched_output
+    if selection is None or selected_output is None or enriched_output is None:
+        return None
+
+    return build_adaptive_sampling_decision(
+        base=AdaptiveDecisionBaseBinding(
+            sampling_plan_sha256=package_set.lineage.sampling_plan_sha256,
+            package_set_id=package_set.package_set_id,
+            package_set_member_manifest_sha256=package_set.member_manifest_sha256,
+            package_set_split_plan_sha256=package_set.split_plan_digest,
+        ),
+        accepted_evidence=AcceptedAdaptiveEvidenceBinding(
+            selection_id=selection.selection_id,
+            selection_decision_logical_key=selection.selection_decision_logical_key,
+            selected_output_sha256=selected_output.output_sha256,
+            enriched_output_artifact_id=enriched_output.artifact_id,
+            enriched_output_semantic_sha256=enriched_output.semantic_sha256,
+        ),
+        source=AdaptiveDecisionSourceBinding(
+            source_content_sha256=window.source_content_sha256,
+            camera_mapping_semantic_sha256=window.camera_mapping_semantic_sha256,
+            alignment_semantic_sha256=window.alignment_semantic_sha256,
+        ),
+        effective_interval=window.interval,
+        policy=AdaptiveCoveragePolicy(
+            version=LOCAL_ADAPTIVE_SAMPLING_POLICY_VERSION,
+            base_rate_num=1,
+            base_target_budget_per_camera=1,
+            context_offsets_ns=(-100_000_000, 100_000_000),
+            max_targets_per_camera=4,
+            max_targets_total=24,
+        ),
+        no_trigger_outcome=AdaptiveSamplingDecisionOutcome.DENSE_QA_ALREADY_COMPLETE,
+        outcome_detail=(
+            "retained coarse-complete QA result proves no additional dense sampling work"
+        ),
+        no_additional_work_proof=AdaptiveNoAdditionalWorkProof(
+            proof_kind=AdaptiveNoAdditionalWorkProofKind.DENSE_QA_COARSE_COMPLETE,
+            evidence_artifact_id=qa_completion.completion_id,
+            evidence_sha256=qa_completion.semantic_sha256,
+            policy_version=qa_completion.policy_version,
+        ),
+    )
+
+
+def _canonical_result_from_committed_completion(
+    committed: CommittedPrimaryCompletion,
+) -> CanonicalOfflineRunResult:
+    """Recover the exact local result closure needed by detached sidecars."""
+
+    detail = committed.detail
+    compatibility: tuple[object | None, ...]
+    if len(detail.part_results) == 1:
+        part = detail.part_results[0]
+        compatibility = (
+            part.terminal,
+            part.selection,
+            part.raw_response,
+            part.parsed_claims,
+            part.selected_output,
+            part.enriched_output,
+        )
+    else:
+        compatibility = (None, None, None, None, None, None)
+    return CanonicalOfflineRunResult.model_validate(
+        CanonicalOfflineRunResult.model_construct(
+            schema_version="1.0",
+            run_id=detail.run_id,
+            processing_run=detail.processing_run,
+            run_memberships=detail.run_memberships,
+            recording_identity=detail.recording_identity,
+            mcap_id=detail.mcap_id,
+            execution_policy_sha256=detail.execution_policy_sha256,
+            status=CanonicalOfflineRunStatus(detail.status),
+            window=detail.window,
+            materialized_package_ids=tuple(item.package_id for item in detail.package_set.members),
+            package_set=detail.package_set,
+            coarse_qa_result=detail.coarse_qa_result,
+            dense_qa_executions=detail.dense_qa_executions,
+            qa_completion_result=detail.qa_completion_result,
+            event_proposal_result=detail.event_proposal_result,
+            candidate_reduction_result=detail.candidate_reduction_result,
+            action_evidence_executions=detail.action_evidence_executions,
+            provisional_fusion_result=detail.provisional_fusion_result,
+            boundary_refinement_executions=detail.boundary_refinement_executions,
+            final_fusion_context=detail.final_fusion_context,
+            input_plan=detail.input_plan,
+            reference_catalog=detail.reference_catalog,
+            part_results=detail.part_results,
+            barrier_reduction=detail.barrier_reduction,
+            fusion_reduction=detail.fusion_reduction,
+            terminal=compatibility[0],
+            selection=compatibility[1],
+            raw_response=compatibility[2],
+            parsed_claims=compatibility[3],
+            selected_output=compatibility[4],
+            enriched_output=compatibility[5],
+            output_decision=detail.output_decision,
+            hypotheses=detail.hypotheses,
+            identity_result=None,
+            attempt_count=sum(item.orchestration_attempt_count for item in detail.part_results),
+            adapter_infer_calls=0,
+            error=None,
+        ).model_dump(mode="python"),
+        strict=True,
+        context={"allow_missing_product_qa": True},
+    )
+
+
+def _enqueue_and_drain_local_boundary_qualification(
+    executions: tuple[CanonicalBoundaryRefinementExecution, ...],
+    *,
+    state_root: Path,
+    runtime_observer: RuntimeObserver | None = None,
+) -> None:
+    """Publish detached candidate reports only from retained boundary executions."""
+
+    if not executions:
+        runtime_increment(
+            runtime_observer,
+            "boundary_qualification.dispatches",
+            attributes={"status": "NO_BOUNDARY_EXECUTIONS"},
+        )
+        return
+    try:
+        store = BoundaryQualificationSidecarStore(state_root / "boundary-qualification")
+        policy = BoundaryQualificationPolicy.create(
+            version=LOCAL_BOUNDARY_QUALIFICATION_POLICY_VERSION,
+        )
+        with runtime_span(runtime_observer, "boundary_qualification.dispatch.enqueue"):
+            dispatches = tuple(
+                CanonicalBoundaryQualificationBridge(store).enqueue(
+                    execution=execution,
+                    policy=policy,
+                )
+                for execution in executions
+            )
+        with runtime_span(runtime_observer, "boundary_qualification.dispatch.drain"):
+            publications = CanonicalBoundaryQualificationWorker(store).drain()
+    except Exception as error:
+        # Qualification is candidate-only and cannot alter primary completion truth.
+        runtime_increment(
+            runtime_observer,
+            "boundary_qualification.dispatches",
+            attributes={"status": "FAILED", "error_type": type(error).__name__},
+        )
+        return
+    runtime_increment(
+        runtime_observer,
+        "boundary_qualification.dispatches",
+        attributes={
+            "status": "DRAINED",
+            "dispatch_count": len(dispatches),
+            "publication_count": len(publications),
+            "replayed": all(item.replayed for item in publications),
+        },
+    )
 
 
 def _receipt(
@@ -2428,6 +2853,32 @@ def _require_provider_dispatcher(
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
             "provider_dispatcher must implement async dispatch",
+        )
+
+
+def _require_media_runtime_injection(
+    media_exporter: object | None,
+    media_runtime_provenance: MediaRuntimeProvenance | None,
+) -> None:
+    if media_exporter is not None and not callable(
+        getattr(media_exporter, "begin_incremental", None)
+    ):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "media_exporter must support incremental H.264 export",
+        )
+    if media_runtime_provenance is not None and not isinstance(
+        media_runtime_provenance,
+        MediaRuntimeProvenance,
+    ):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "media_runtime_provenance must be a MediaRuntimeProvenance or None",
+        )
+    if media_exporter is not None and media_runtime_provenance is None:
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "media_exporter requires explicit media_runtime_provenance",
         )
 
 

@@ -724,6 +724,36 @@ def test_two_h100_report_binds_sessions_and_renders_measured_facts() -> None:
     assert report.production_eligible is False
 
 
+def test_two_h100_report_emits_bound_native_batch_authorization() -> None:
+    report = _report(_configuration())
+    qualification = report.native_batch_qualification(
+        qualification_report_uri="object://qualification/p6-provider-report.json",
+        handler_contract_evidence_uri="object://qualification/p6-native-handler.json",
+        handler_contract_evidence_sha256="1" * 64,
+        streaming_wait_deadline_evidence_uri="object://qualification/p6-streaming-gate.json",
+        streaming_wait_deadline_evidence_sha256="2" * 64,
+    )
+
+    assert qualification.qualification_report_sha256 == exact_bytes_sha256(
+        canonical_json_bytes(report.model_dump(mode="json"))
+    )
+    qualification.validate_adapter_binding(
+        config=report.endpoint_config,
+        capabilities=report.capabilities,
+        retry_policy=report.retry_policy,
+    )
+    with pytest.raises(ValueError, match="production-qualification evidence"):
+        report.model_copy(
+            update={"evidence_class": CapacityEvidenceClass.LOCAL_CONFORMANCE}
+        ).native_batch_qualification(
+            qualification_report_uri="object://qualification/p6-provider-report.json",
+            handler_contract_evidence_uri="object://qualification/p6-native-handler.json",
+            handler_contract_evidence_sha256="1" * 64,
+            streaming_wait_deadline_evidence_uri="object://qualification/p6-streaming-gate.json",
+            streaming_wait_deadline_evidence_sha256="2" * 64,
+        )
+
+
 def test_saturation_point_rejects_unbound_workload_and_gpu_session() -> None:
     configuration = _configuration()
     session = _session(configuration, 20)
@@ -1171,6 +1201,7 @@ def test_run_provider_saturation_point_binds_actual_runpod_adapter() -> None:
             transport=transport,
             qualification_observer=collector,
             qualification_session=received_context.qualification_session,
+            native_batch_qualification_measurement=True,
         )
 
     async def workload(
@@ -1292,6 +1323,7 @@ def test_run_provider_saturation_point_rejects_manual_collector_injection() -> N
             ),
             qualification_observer=collector,
             qualification_session=received_context.qualification_session,
+            native_batch_qualification_measurement=True,
         )
 
     async def workload(

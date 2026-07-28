@@ -1,4 +1,4 @@
-"""Target-media qualification artifacts for the P8 boundary.
+"""Target-media qualification artifacts for the P4 boundary.
 
 The media adapters intentionally remain provider ports: a target deployment may
 inject an NVDEC/DeepStream implementation, while the local checkout normally has
@@ -54,7 +54,7 @@ class MediaExecutionMode(StrEnum):
 
 
 class MediaParityStatus(StrEnum):
-    """Parity state for the timestamp and artifact contracts."""
+    """Parity state for each target-media contract vector component."""
 
     MATCH = "MATCH"
     MISMATCH = "MISMATCH"
@@ -155,8 +155,24 @@ class MediaQualificationMeasurement(StrictModel):
     artifact_parity: MediaParityStatus = MediaParityStatus.NOT_MEASURED
     timestamp_contract_digest: Sha256Digest | None = None
     artifact_contract_digest: Sha256Digest | None = None
+    selected_frame_parity: MediaParityStatus = MediaParityStatus.NOT_MEASURED
+    dimension_parity: MediaParityStatus = MediaParityStatus.NOT_MEASURED
+    exact_byte_parity: MediaParityStatus = MediaParityStatus.NOT_MEASURED
+    semantic_parity: MediaParityStatus = MediaParityStatus.NOT_MEASURED
+    selected_frame_contract_digest: Sha256Digest | None = None
+    dimension_contract_digest: Sha256Digest | None = None
+    exact_byte_contract_digest: Sha256Digest | None = None
+    semantic_contract_digest: Sha256Digest | None = None
+    media_runtime_provenance_digest: Sha256Digest | None = None
     nvdec_fallback_count: NonNegativeInt = 0
     raw_rgb_persisted: Literal[False] = False
+    fsync_count: NonNegativeInt | None = None
+    write_duration_ns: NonNegativeInt | None = None
+    fsync_duration_ns: NonNegativeInt | None = None
+    rename_duration_ns: NonNegativeInt | None = None
+    directory_sync_duration_ns: NonNegativeInt | None = None
+    publication_duration_ns: NonNegativeInt | None = None
+    end_to_end_duration_ns: NonNegativeInt | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -175,6 +191,22 @@ class MediaQualificationMeasurement(StrictModel):
             "fallback_count": "nvdec_fallback_count",
             "timestamp_status": "timestamp_parity",
             "artifact_status": "artifact_parity",
+            "selected_frame_status": "selected_frame_parity",
+            "dimensions_status": "dimension_parity",
+            "exact_byte_status": "exact_byte_parity",
+            "semantic_status": "semantic_parity",
+            "selected_frame_digest": "selected_frame_contract_digest",
+            "dimensions_digest": "dimension_contract_digest",
+            "exact_bytes_digest": "exact_byte_contract_digest",
+            "semantic_digest": "semantic_contract_digest",
+            "runtime_provenance_digest": "media_runtime_provenance_digest",
+            "fsyncs": "fsync_count",
+            "write_ns": "write_duration_ns",
+            "fsync_ns": "fsync_duration_ns",
+            "rename_ns": "rename_duration_ns",
+            "directory_sync_ns": "directory_sync_duration_ns",
+            "publication_ns": "publication_duration_ns",
+            "e2e_duration_ns": "end_to_end_duration_ns",
         }
         for alias, canonical in aliases.items():
             if alias not in normalized:
@@ -202,6 +234,14 @@ class MediaQualificationMeasurement(StrictModel):
             and self.artifact_contract_digest is None
         ):
             raise ValueError("artifact parity MATCH requires a contract digest")
+        for label, status, digest in (
+            ("selected-frame", self.selected_frame_parity, self.selected_frame_contract_digest),
+            ("dimension", self.dimension_parity, self.dimension_contract_digest),
+            ("exact-byte", self.exact_byte_parity, self.exact_byte_contract_digest),
+            ("semantic", self.semantic_parity, self.semantic_contract_digest),
+        ):
+            if status is MediaParityStatus.MATCH and digest is None:
+                raise ValueError(f"{label} parity MATCH requires a contract digest")
         if self.backend is MediaBackend.CPU and self.nvdec_fallback_count:
             raise ValueError("CPU measurements cannot report NVDEC fallbacks")
         if (
@@ -232,13 +272,50 @@ class MediaQualificationMeasurement(StrictModel):
         return self.camera_seconds_per_second
 
     @property
+    def parity_contract_digests(self) -> tuple[str | None, ...]:
+        """Return the complete target-media parity vector in a fixed order."""
+
+        return (
+            self.timestamp_contract_digest,
+            self.artifact_contract_digest,
+            self.selected_frame_contract_digest,
+            self.dimension_contract_digest,
+            self.exact_byte_contract_digest,
+            self.semantic_contract_digest,
+        )
+
+    @property
     def parity_matches(self) -> bool:
         return (
             self.timestamp_parity is MediaParityStatus.MATCH
             and self.artifact_parity is MediaParityStatus.MATCH
-            and self.timestamp_contract_digest is not None
-            and self.artifact_contract_digest is not None
+            and self.selected_frame_parity is MediaParityStatus.MATCH
+            and self.dimension_parity is MediaParityStatus.MATCH
+            and self.exact_byte_parity is MediaParityStatus.MATCH
+            and self.semantic_parity is MediaParityStatus.MATCH
+            and all(self.parity_contract_digests)
+            and (
+                self.backend is not MediaBackend.NVDEC
+                or self.media_runtime_provenance_digest is not None
+            )
             and self.nvdec_fallback_count == 0
+        )
+
+    @property
+    def durability_measured(self) -> bool:
+        """Whether the observation carries a direct publication durability fact."""
+
+        return any(
+            value is not None
+            for value in (
+                self.fsync_count,
+                self.write_duration_ns,
+                self.fsync_duration_ns,
+                self.rename_duration_ns,
+                self.directory_sync_duration_ns,
+                self.publication_duration_ns,
+                self.end_to_end_duration_ns,
+            )
         )
 
 
@@ -249,10 +326,10 @@ def _media_matrix_facts(
     """Derive complete-matrix, parity, and fresh-run facts from media rows.
 
     A parity flag is only meaningful when CPU and NVDEC observed the same frozen
-    source profile and emitted the same timestamp/artifact contract identities. The
-    helper deliberately reports a failed fact instead of silently accepting a
-    backend/profile mismatch; the enclosing report then records the blocker in its
-    safe-envelope reasons.
+    source profile, complete media-contract vector, and a target runtime provenance
+    observation. The helper deliberately reports a failed fact instead of silently
+    accepting a backend/profile mismatch; the enclosing report then records the
+    blocker in its safe-envelope reasons.
     """
 
     by_profile: dict[str, dict[MediaBackend, list[MediaQualificationMeasurement]]] = {}
@@ -280,10 +357,7 @@ def _media_matrix_facts(
                 parity_complete = parity_complete and (
                     cpu.parity_matches
                     and nvdec.parity_matches
-                    and cpu.timestamp_contract_digest is not None
-                    and cpu.timestamp_contract_digest == nvdec.timestamp_contract_digest
-                    and cpu.artifact_contract_digest is not None
-                    and cpu.artifact_contract_digest == nvdec.artifact_contract_digest
+                    and cpu.parity_contract_digests == nvdec.parity_contract_digests
                 )
         else:
             parity_complete = parity_complete and all(
@@ -643,6 +717,15 @@ def measure_media_callable(
     artifact_parity = observed.get("artifact_parity", MediaParityStatus.NOT_MEASURED)
     timestamp_contract_digest = observed.get("timestamp_contract_digest")
     artifact_contract_digest = observed.get("artifact_contract_digest")
+    selected_frame_parity = observed.get("selected_frame_parity", MediaParityStatus.NOT_MEASURED)
+    dimension_parity = observed.get("dimension_parity", MediaParityStatus.NOT_MEASURED)
+    exact_byte_parity = observed.get("exact_byte_parity", MediaParityStatus.NOT_MEASURED)
+    semantic_parity = observed.get("semantic_parity", MediaParityStatus.NOT_MEASURED)
+    selected_frame_contract_digest = observed.get("selected_frame_contract_digest")
+    dimension_contract_digest = observed.get("dimension_contract_digest")
+    exact_byte_contract_digest = observed.get("exact_byte_contract_digest")
+    semantic_contract_digest = observed.get("semantic_contract_digest")
+    media_runtime_provenance_digest = observed.get("media_runtime_provenance_digest")
 
     return MediaQualificationMeasurement(
         workload_manifest_digest=workload_manifest_digest,
@@ -663,7 +746,29 @@ def measure_media_callable(
         artifact_parity=MediaParityStatus(cast(str, artifact_parity)),
         timestamp_contract_digest=cast(str | None, timestamp_contract_digest),
         artifact_contract_digest=cast(str | None, artifact_contract_digest),
+        selected_frame_parity=MediaParityStatus(cast(str, selected_frame_parity)),
+        dimension_parity=MediaParityStatus(cast(str, dimension_parity)),
+        exact_byte_parity=MediaParityStatus(cast(str, exact_byte_parity)),
+        semantic_parity=MediaParityStatus(cast(str, semantic_parity)),
+        selected_frame_contract_digest=cast(str | None, selected_frame_contract_digest),
+        dimension_contract_digest=cast(str | None, dimension_contract_digest),
+        exact_byte_contract_digest=cast(str | None, exact_byte_contract_digest),
+        semantic_contract_digest=cast(str | None, semantic_contract_digest),
+        media_runtime_provenance_digest=cast(str | None, media_runtime_provenance_digest),
         nvdec_fallback_count=counter("nvdec_fallback_count", "fallback_count"),
+        fsync_count=optional_counter("fsync_count", "fsyncs"),
+        write_duration_ns=optional_counter("write_duration_ns", "write_ns"),
+        fsync_duration_ns=optional_counter("fsync_duration_ns", "fsync_ns"),
+        rename_duration_ns=optional_counter("rename_duration_ns", "rename_ns"),
+        directory_sync_duration_ns=optional_counter(
+            "directory_sync_duration_ns",
+            "directory_sync_ns",
+        ),
+        publication_duration_ns=optional_counter("publication_duration_ns", "publication_ns"),
+        end_to_end_duration_ns=optional_counter(
+            "end_to_end_duration_ns",
+            "e2e_duration_ns",
+        ),
     )
 
 

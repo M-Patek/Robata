@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from multiprocessing import get_context
 from pathlib import Path
-from sqlite3 import Row, connect
+from sqlite3 import Connection, Row, connect
 from threading import Barrier as ThreadBarrier
+from typing import Any
 
 import pytest
 
@@ -13,6 +15,9 @@ from robata.adapters.sqlite_work_scheduler import (
     WorkConflictError,
     WorkFenceError,
     WorkNotFoundError,
+    WorkStateError,
+    active_authority_transaction_operation,
+    require_outside_authority_transaction,
 )
 from robata.queue.models import (
     WorkAttemptOutcome,
@@ -23,7 +28,11 @@ from robata.queue.models import (
     WorkItemSubjectType,
 )
 from robata.queue.stage import DependencyCriticality, Stage
-from robata.runtime.observability import RuntimeProfileRecorder
+from robata.runtime.observability import (
+    RuntimeCounterSnapshot,
+    RuntimeProfileRecorder,
+    RuntimeSpanSnapshot,
+)
 
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 _RUN_ID = "00000000-0000-4000-8000-000000000001"
@@ -70,6 +79,31 @@ def _scheduler(tmp_path: Path) -> SQLiteWorkScheduler:
     return SQLiteWorkScheduler(tmp_path / "work.sqlite3")
 
 
+def _claim_in_separate_process(
+    database_path: str,
+    work_item_id: str,
+    worker_id: str,
+    start_event: Any,
+    result_queue: Any,
+) -> None:
+    try:
+        if not start_event.wait(timeout=10):
+            result_queue.put(("timeout", worker_id))
+            return
+
+        scheduler = SQLiteWorkScheduler(Path(database_path))
+        claim = scheduler.claim(
+            worker_id,
+            30,
+            work_item_id=work_item_id,
+            now=_BASE,
+        )
+    except Exception as error:
+        result_queue.put(("error", worker_id, type(error).__name__, str(error)))
+    else:
+        result_queue.put(("claimed" if claim is not None else "empty", worker_id))
+
+
 def test_observes_exact_transaction_boundaries_and_actual_rollback(
     tmp_path: Path,
 ) -> None:
@@ -110,6 +144,123 @@ def test_observes_exact_transaction_boundaries_and_actual_rollback(
     assert rollbacks == 1
     assert writes == {False, True}
     assert sum(span.name == "sqlite.work_scheduler.transaction" for span in snapshot.spans) == 2
+
+
+def test_attributes_cost_by_operation_and_rejects_nested_authority_work(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    scheduler = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+    scheduler.plan_many(((_plan(80), ()), (_plan(81), ())))
+
+    def verify_scope(_connection: object) -> None:
+        assert active_authority_transaction_operation() == "authority.test.scope"
+        with pytest.raises(WorkStateError, match="cannot run inside SQLite authority transaction"):
+            require_outside_authority_transaction(activity="provider dispatch")
+        with pytest.raises(WorkStateError, match="nested SQLite authority transaction"):
+            scheduler.get(_uuid(80))
+
+    scheduler.run_authority_transaction(
+        write=False,
+        operation_name="test.scope",
+        operation=verify_scope,
+    )
+
+    def abort(connection: object) -> None:
+        assert active_authority_transaction_operation() == "authority.test.rollback"
+        assert hasattr(connection, "execute")
+        raise RuntimeError("abort authority work")
+
+    with pytest.raises(RuntimeError, match="abort authority work"):
+        scheduler.run_authority_transaction(
+            write=True,
+            operation_name="test.rollback",
+            operation=abort,
+        )
+
+    snapshot = recorder.snapshot()
+
+    def operation_name(record: RuntimeCounterSnapshot | RuntimeSpanSnapshot) -> str | None:
+        attributes = record.attributes
+        return next(
+            (
+                attribute.value
+                for attribute in attributes
+                if attribute.name == "operation" and isinstance(attribute.value, str)
+            ),
+            None,
+        )
+
+    plan_many_spans = {span.name for span in snapshot.spans if operation_name(span) == "plan_many"}
+    assert {
+        "sqlite.work_scheduler.connection_setup",
+        "sqlite.work_scheduler.begin",
+        "sqlite.work_scheduler.operation",
+        "sqlite.work_scheduler.commit",
+        "sqlite.work_scheduler.transaction",
+    }.issubset(plan_many_spans)
+    assert any(
+        counter.name == "sqlite.work_scheduler.rows_committed"
+        and operation_name(counter) == "plan_many"
+        and counter.value > 0
+        for counter in snapshot.counters
+    )
+    assert any(
+        counter.name == "sqlite.work_scheduler.connections"
+        and operation_name(counter) == "plan_many"
+        and counter.value == 1
+        for counter in snapshot.counters
+    )
+    assert any(
+        span.name == "sqlite.work_scheduler.rollback"
+        and operation_name(span) == "authority.test.rollback"
+        for span in snapshot.spans
+    )
+    assert active_authority_transaction_operation() is None
+
+
+def test_observes_only_committed_durable_retries(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    scheduler = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+    item = scheduler.plan(_plan(82))
+    claim = scheduler.claim_and_start(
+        "retry-worker",
+        30,
+        work_item_id=item.work_item_id,
+        now=_BASE,
+    )
+    assert claim is not None
+
+    failed = scheduler.fail(
+        claim.lease,
+        error_code="TRANSIENT",
+        retryable=True,
+        retry_delay_seconds=10,
+        now=_BASE + timedelta(seconds=1),
+    )
+
+    assert failed.state is WorkItemState.RETRY_WAIT
+    snapshot = recorder.snapshot()
+    assert (
+        sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.work_retries"
+            and any(
+                attribute.name == "operation" and attribute.value == "fail"
+                for attribute in counter.attributes
+            )
+        )
+        == 1
+    )
 
 
 def test_dependency_stays_planned_until_required_upstream_succeeds(
@@ -202,6 +353,64 @@ def test_plan_many_is_exact_replay_safe_and_uses_targeted_readiness(
     assert transactions_for("plan_many") == 2
     assert transactions_for("claim_and_start") == 1
     assert transactions_for("start") == 0
+
+
+@pytest.mark.parametrize(
+    "crash_after_commit",
+    (False, True),
+    ids=("before-commit", "after-commit"),
+)
+def test_plan_many_commit_crash_reopens_and_exactly_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    crash_after_commit: bool,
+) -> None:
+    scheduler = _scheduler(tmp_path)
+    upstream = _plan(74)
+    downstream = _plan(75)
+    dependency = WorkDependency(
+        dependency_id=_uuid(372),
+        downstream_work_item_id=downstream.work_item_id,
+        upstream_work_item_id=upstream.work_item_id,
+        criticality=DependencyCriticality.REQUIRED,
+    )
+    batch = ((upstream, ()), (downstream, (dependency,)))
+    original_commit = scheduler._commit
+    crashed = False
+
+    def crash_at_plan_many_commit(connection: Connection) -> None:
+        nonlocal crashed
+        if not crashed and active_authority_transaction_operation() == "plan_many":
+            crashed = True
+            if crash_after_commit:
+                original_commit(connection)
+            raise SystemExit("injected plan_many commit crash")
+        original_commit(connection)
+
+    monkeypatch.setattr(scheduler, "_commit", crash_at_plan_many_commit)
+
+    with pytest.raises(SystemExit, match="plan_many commit crash"):
+        scheduler.plan_many(batch)
+
+    assert crashed
+    reopened = SQLiteWorkScheduler(scheduler.database_path)
+    replayed = reopened.plan_many(batch)
+
+    assert tuple(item.work_item_id for item in replayed) == (
+        upstream.work_item_id,
+        downstream.work_item_id,
+    )
+    assert tuple(item.state for item in replayed) == (
+        WorkItemState.READY,
+        WorkItemState.PLANNED,
+    )
+    with connect(reopened.database_path) as connection:
+        counts = (
+            connection.execute("SELECT COUNT(*) FROM work_items").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM work_dependencies").fetchone()[0],
+        )
+    assert counts == (2, 1)
 
 
 def test_plan_many_rolls_back_all_members_after_late_dependency_conflict(
@@ -668,6 +877,50 @@ def test_atomic_claim_has_one_winner(tmp_path: Path) -> None:
         results = tuple(executor.map(claim, ("worker-a", "worker-b")))
 
     assert sum(value is not None for value in results) == 1
+
+
+def test_atomic_claim_has_one_winner_across_processes(tmp_path: Path) -> None:
+    scheduler = _scheduler(tmp_path)
+    plan = _plan(12)
+    scheduler.plan(plan)
+
+    context = get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=_claim_in_separate_process,
+            args=(
+                str(scheduler.database_path),
+                plan.work_item_id,
+                worker_id,
+                start_event,
+                result_queue,
+            ),
+        )
+        for worker_id in ("process-worker-a", "process-worker-b")
+    )
+
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        results = tuple(result_queue.get(timeout=20) for _ in processes)
+    finally:
+        start_event.set()
+        for process in processes:
+            if process.pid is not None:
+                process.join(timeout=20)
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(result[0] for result in results) == ["claimed", "empty"]
+    assert scheduler.get(plan.work_item_id).state is WorkItemState.LEASED
 
 
 def test_exact_claim_does_not_take_another_ready_item(tmp_path: Path) -> None:

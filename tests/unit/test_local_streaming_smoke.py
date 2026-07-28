@@ -347,6 +347,36 @@ def test_seeded_failures_leave_work_for_eos_recovery_without_losing_windows(
     assert artifacts.report.no_growing_backlog_met is False
 
 
+def test_smoke_splits_an_admission_batch_and_drains_when_backpressure_throttles(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        LocalStreamingSmokeConfig(
+            source_duration_ms=300_000,
+            window_duration_ms=1_000,
+            window_hop_ms=1_000,
+            window_batch_size=8,
+            drain_batch_size=32,
+            mock_fixed_latency_ms=1,
+            mock_failure_probability_ppm=0,
+            mock_retry_limit=1,
+        )
+    )
+
+    artifacts = run_local_streaming_smoke(
+        manifest=manifest,
+        output_root=tmp_path,
+        sleep=lambda _seconds: None,
+    )
+
+    metrics = artifacts.report.metrics
+    assert metrics.declared_window_count == 300
+    assert metrics.terminal_window_count == 300
+    assert metrics.active_backlog_end == 0
+    assert metrics.active_backlog_high_water >= 256
+    assert metrics.bounded_drain_call_count > 5
+
+
 def test_provider_batches_enforce_manifest_size_and_request_timeout(
     tmp_path: Path,
 ) -> None:

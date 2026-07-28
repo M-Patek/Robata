@@ -6,7 +6,8 @@ and calibration metrics.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from math import isfinite, isnan
 from statistics import mean, median
 from typing import Annotated, Any, Literal, Self
@@ -14,6 +15,7 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import Field, StringConstraints, model_validator
 
 from robata.benchmark.evidence import BenchmarkEvidenceContext, EvidenceContextIdentity
+from robata.benchmark.splits import CalibrationSplitProtocol
 from robata.contracts.common import INT64_MAX, SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 
@@ -30,6 +32,15 @@ MetricPolicyIdentity = Annotated[
 ]
 NonNegativeNanoseconds = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
+NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+FiniteFloat = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+CalibrationReportIdentity = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        pattern=r"^calibration-qualification-report:[0-9a-f]{64}$",
+    ),
+]
 
 
 def benchmark_metric_policy_projection(
@@ -284,6 +295,207 @@ class CalibrationMetrics(EvidenceBoundMetrics):
     abstention_rate: float
     unknown_rate: float
     sample_count: int = Field(default=0, ge=0, strict=True)
+
+
+class CalibrationReliabilityBin(StrictModel):
+    """Observed reliability statistics for one nonempty score bin."""
+
+    lower_bound: UnitInterval
+    upper_bound: UnitInterval
+    sample_count: PositiveInt
+    mean_confidence: UnitInterval
+    observed_positive_rate: UnitInterval
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if self.upper_bound < self.lower_bound:
+            raise ValueError("reliability bin upper_bound must not precede lower_bound")
+        return self
+
+
+class CalibrationSliceMetrics(StrictModel):
+    """Reliability and outcome metrics for one explicit cohort slice.
+
+    ``None`` is intentionally used for ECE/Brier when no score was emitted;
+    a missing score cannot become synthetic zero evidence.
+    """
+
+    sample_count: PositiveInt
+    scored_count: NonNegativeInt
+    abstention_count: NonNegativeInt
+    unknown_count: NonNegativeInt
+    ece: UnitInterval | None
+    brier_score: UnitInterval | None
+    mean_confidence: UnitInterval | None
+    observed_positive_rate: UnitInterval | None
+    reliability_bins: tuple[CalibrationReliabilityBin, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_slice(self) -> Self:
+        if self.scored_count + self.abstention_count != self.sample_count:
+            raise ValueError("scored_count and abstention_count must cover every sample")
+        if self.unknown_count > self.sample_count:
+            raise ValueError("unknown_count cannot exceed sample_count")
+        has_scores = self.scored_count > 0
+        metric_values = (
+            self.ece,
+            self.brier_score,
+            self.mean_confidence,
+            self.observed_positive_rate,
+        )
+        if has_scores and any(value is None for value in metric_values):
+            raise ValueError("scored calibration slices require reliability metrics")
+        if not has_scores and (
+            any(value is not None for value in metric_values) or self.reliability_bins
+        ):
+            raise ValueError("unscored calibration slices cannot invent reliability metrics")
+        if has_scores:
+            if not self.reliability_bins:
+                raise ValueError("scored calibration slices require reliability bins")
+            if sum(bin_.sample_count for bin_ in self.reliability_bins) != self.scored_count:
+                raise ValueError("reliability bin counts must equal scored_count")
+        return self
+
+
+CalibrationCohortName = Literal["development", "calibration", "frozen_test"]
+CalibrationScoreKind = Literal["MODEL_REPORTED", "CALIBRATED"]
+
+
+class CalibrationCohortMetrics(StrictModel):
+    """Calibration evidence for one leakage-safe split role."""
+
+    cohort: CalibrationCohortName
+    expected_mcap_ids: tuple[NonEmptyString, ...] = Field(min_length=1)
+    observed_mcap_ids: tuple[NonEmptyString, ...]
+    unrepresented_mcap_ids: tuple[NonEmptyString, ...]
+    sample_count: PositiveInt
+    overall: CalibrationSliceMetrics
+    per_class: dict[NonEmptyString, CalibrationSliceMetrics] = Field(min_length=1)
+    subgroup_metrics: dict[NonEmptyString, dict[NonEmptyString, CalibrationSliceMetrics]] = Field(
+        default_factory=dict
+    )
+    temporal_metrics: dict[NonEmptyString, dict[NonEmptyString, CalibrationSliceMetrics]] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def validate_cohort(self) -> Self:
+        expected = self.expected_mcap_ids
+        observed = self.observed_mcap_ids
+        if tuple(sorted(expected)) != expected or len(set(expected)) != len(expected):
+            raise ValueError("expected_mcap_ids must be unique and sorted")
+        if tuple(sorted(observed)) != observed or len(set(observed)) != len(observed):
+            raise ValueError("observed_mcap_ids must be unique and sorted")
+        if not set(observed) <= set(expected):
+            raise ValueError("observed_mcap_ids must belong to the assigned cohort")
+        expected_missing = tuple(mcap_id for mcap_id in expected if mcap_id not in set(observed))
+        if self.unrepresented_mcap_ids != expected_missing:
+            raise ValueError("unrepresented_mcap_ids must match assigned cohort coverage")
+        if self.sample_count != self.overall.sample_count:
+            raise ValueError("cohort sample_count must equal overall sample_count")
+        if sum(metric.sample_count for metric in self.per_class.values()) != self.sample_count:
+            raise ValueError("per_class calibration counts must cover the cohort exactly")
+        return self
+
+
+class CalibrationDriftMetrics(StrictModel):
+    """Distribution and outcome drift from a pre-freeze cohort to frozen test.
+
+    Deltas are always ``frozen_test - reference``. They describe a diagnostic
+    comparison only and do not set a threshold or alter a policy decision.
+    """
+
+    reference_split: Literal["development", "calibration"]
+    comparison_split: Literal["frozen_test"] = "frozen_test"
+    reference_scored_count: PositiveInt
+    comparison_scored_count: PositiveInt
+    mean_confidence_delta: FiniteFloat
+    observed_positive_rate_delta: FiniteFloat
+    brier_score_delta: FiniteFloat
+    score_distribution_total_variation: UnitInterval
+
+
+class CalibrationDriftReport(StrictModel):
+    """Aggregate and per-class drift availability without synthetic fallbacks."""
+
+    status: Literal["REPORTED", "INSUFFICIENT_SCORED_SAMPLES"]
+    aggregate: CalibrationDriftMetrics | None = None
+    per_class: dict[NonEmptyString, CalibrationDriftMetrics] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_drift(self) -> Self:
+        if self.status == "REPORTED" and self.aggregate is None:
+            raise ValueError("reported calibration drift requires aggregate metrics")
+        if self.status == "INSUFFICIENT_SCORED_SAMPLES" and (
+            self.aggregate is not None or self.per_class
+        ):
+            raise ValueError("insufficient calibration drift cannot contain metrics")
+        return self
+
+
+class CalibrationQualificationReport(EvidenceBoundMetrics):
+    """Content-addressed internal evidence for a calibrated-score evaluation.
+
+    This report is intentionally separate from Product QA values and from policy
+    thresholds. It binds only an internal score family, calibration artifact
+    digest, grouped split protocol, and observed reliability diagnostics.
+    """
+
+    schema_version: Literal["1.0"]
+    report_identity: CalibrationReportIdentity
+    report_digest: Sha256Digest
+    split_protocol_digest: Sha256Digest
+    score_kind: CalibrationScoreKind
+    score_family: NonEmptyString
+    calibration_artifact_sha256: Sha256Digest | None = None
+    fit_split_policy: Literal["development_and_calibration_only"] = (
+        "development_and_calibration_only"
+    )
+    development: CalibrationCohortMetrics
+    calibration: CalibrationCohortMetrics
+    frozen_test: CalibrationCohortMetrics
+    drift: CalibrationDriftReport
+    evidence_class: Literal["INTERNAL_CALIBRATION_EVALUATION"] = "INTERNAL_CALIBRATION_EVALUATION"
+    production_eligible: Literal[False] = False
+    qualification_status: Literal["NOT_PRODUCTION_QUALIFIED"] = "NOT_PRODUCTION_QUALIFIED"
+
+    @model_validator(mode="after")
+    def validate_qualification_report(self) -> Self:
+        if self.score_kind == "CALIBRATED" and self.calibration_artifact_sha256 is None:
+            raise ValueError("calibrated score reports require calibration_artifact_sha256")
+        if self.score_kind == "MODEL_REPORTED" and self.calibration_artifact_sha256 is not None:
+            raise ValueError("model-reported score reports cannot claim a calibration artifact")
+        if (
+            self.development.cohort != "development"
+            or self.calibration.cohort != "calibration"
+            or self.frozen_test.cohort != "frozen_test"
+        ):
+            raise ValueError("calibration report cohorts must retain their assigned roles")
+        expected_digest = semantic_sha256(calibration_qualification_report_projection(self))
+        if self.report_digest != expected_digest:
+            raise ValueError("report_digest does not match calibration qualification report")
+        if self.report_identity != f"calibration-qualification-report:{expected_digest}":
+            raise ValueError("report_identity does not match report_digest")
+        return self
+
+
+def calibration_qualification_report_projection(
+    report: CalibrationQualificationReport,
+) -> dict[str, object]:
+    """Return the canonical projection for an internal calibration report."""
+
+    return report.model_dump(mode="json", exclude={"report_identity", "report_digest"})
+
+
+@dataclass(frozen=True, slots=True)
+class _CalibrationObservation:
+    mcap_id: str
+    class_id: str
+    confidence: float | None
+    target: int
+    unknown: bool
+    subgroup_values: dict[str, str]
+    temporal_values: dict[str, str]
 
 
 def _records(value: Any, name: str) -> list[Any]:
@@ -867,15 +1079,583 @@ class MetricsCalculator:
             metric_policy_version=self._policy.policy_version,
         )
 
+    def calculate_calibration_qualification(
+        self,
+        *,
+        split_protocol: CalibrationSplitProtocol,
+        development_predictions: Any,
+        development_ground_truth: Any,
+        calibration_predictions: Any,
+        calibration_ground_truth: Any,
+        frozen_test_predictions: Any,
+        frozen_test_ground_truth: Any,
+        score_kind: CalibrationScoreKind,
+        score_family: NonEmptyString,
+        calibration_artifact_sha256: Sha256Digest | None = None,
+        subgroup_fields: Sequence[str] = (),
+        temporal_fields: Sequence[str] = ("temporal_bucket", "collection_day"),
+        evidence_context: BenchmarkEvidenceContext | None = None,
+    ) -> CalibrationQualificationReport:
+        """Evaluate a fitted score path without leaking frozen-test records.
+
+        The supplied protocol assigns every observed MCAP to exactly one role.
+        Development and calibration cohorts are reportable fitting evidence;
+        frozen-test records are evaluated separately and never accepted as fitting
+        input. The result is an internal, non-production qualification artifact.
+        """
+
+        if not isinstance(split_protocol, CalibrationSplitProtocol):
+            raise TypeError("split_protocol must be a CalibrationSplitProtocol")
+        if score_kind not in {"MODEL_REPORTED", "CALIBRATED"}:
+            raise ValueError("score_kind must be MODEL_REPORTED or CALIBRATED")
+        if score_kind == "CALIBRATED" and calibration_artifact_sha256 is None:
+            raise ValueError("calibrated score reports require calibration_artifact_sha256")
+        if score_kind == "MODEL_REPORTED" and calibration_artifact_sha256 is not None:
+            raise ValueError("model-reported score reports cannot claim a calibration artifact")
+        normalized_subgroup_fields = _calibration_metadata_fields(
+            subgroup_fields,
+            name="subgroup_fields",
+        )
+        normalized_temporal_fields = _calibration_metadata_fields(
+            temporal_fields,
+            name="temporal_fields",
+        )
+        development_observations = _calibration_observations(
+            development_predictions,
+            development_ground_truth,
+            split_protocol=split_protocol,
+            cohort="development",
+            score_kind=score_kind,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        calibration_observations = _calibration_observations(
+            calibration_predictions,
+            calibration_ground_truth,
+            split_protocol=split_protocol,
+            cohort="calibration",
+            score_kind=score_kind,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        frozen_test_observations = _calibration_observations(
+            frozen_test_predictions,
+            frozen_test_ground_truth,
+            split_protocol=split_protocol,
+            cohort="frozen_test",
+            score_kind=score_kind,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        development = _calibration_cohort_metrics(
+            cohort="development",
+            expected_mcap_ids=split_protocol.development_mcap_ids,
+            observations=development_observations,
+            bin_count=self._policy.calibration_bin_count,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        calibration = _calibration_cohort_metrics(
+            cohort="calibration",
+            expected_mcap_ids=split_protocol.calibration_mcap_ids,
+            observations=calibration_observations,
+            bin_count=self._policy.calibration_bin_count,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        frozen_test = _calibration_cohort_metrics(
+            cohort="frozen_test",
+            expected_mcap_ids=split_protocol.frozen_test_mcap_ids,
+            observations=frozen_test_observations,
+            bin_count=self._policy.calibration_bin_count,
+            subgroup_fields=normalized_subgroup_fields,
+            temporal_fields=normalized_temporal_fields,
+        )
+        measurement_status, context_digest, context_identity = _measurement_binding(
+            evidence_context,
+            self._policy,
+        )
+        draft = CalibrationQualificationReport.model_construct(
+            schema_version="1.0",
+            report_identity=f"calibration-qualification-report:{'0' * 64}",
+            report_digest="0" * 64,
+            split_protocol_digest=split_protocol.protocol_digest,
+            score_kind=score_kind,
+            score_family=score_family,
+            calibration_artifact_sha256=calibration_artifact_sha256,
+            development=development,
+            calibration=calibration,
+            frozen_test=frozen_test,
+            drift=_calibration_drift_report(
+                calibration_observations,
+                frozen_test_observations,
+                bin_count=self._policy.calibration_bin_count,
+            ),
+            measurement_status=measurement_status,
+            evidence_context_digest=context_digest,
+            evidence_context_identity=context_identity,
+            metric_policy_identity=self._policy.policy_identity,
+            metric_policy_digest=self._policy.policy_digest,
+            metric_policy_version=self._policy.policy_version,
+        )
+        digest = semantic_sha256(calibration_qualification_report_projection(draft))
+        return CalibrationQualificationReport.model_validate(
+            {
+                **draft.model_dump(mode="python"),
+                "report_identity": f"calibration-qualification-report:{digest}",
+                "report_digest": digest,
+            }
+        )
+
+
+def _calibration_metadata_fields(fields: Sequence[str], *, name: str) -> tuple[str, ...]:
+    if isinstance(fields, (str, bytes, bytearray)):
+        raise TypeError(f"{name} must be a sequence of field names")
+    normalized = tuple(fields)
+    if any(not isinstance(field, str) or not field for field in normalized):
+        raise ValueError(f"{name} must contain nonempty strings")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{name} must not contain duplicates")
+    return normalized
+
+
+def _calibration_observations(
+    predictions: Any,
+    ground_truth: Any,
+    *,
+    split_protocol: CalibrationSplitProtocol,
+    cohort: CalibrationCohortName,
+    score_kind: CalibrationScoreKind,
+    subgroup_fields: tuple[str, ...],
+    temporal_fields: tuple[str, ...],
+) -> tuple[_CalibrationObservation, ...]:
+    predicted = _records(predictions, f"{cohort}_predictions")
+    truth = _records(ground_truth, f"{cohort}_ground_truth")
+    if len(predicted) != len(truth):
+        raise ValueError(f"{cohort} predictions and ground_truth must have the same length")
+    expected_mcap_ids = set(split_protocol.mcap_ids_for(cohort))
+    observations: list[_CalibrationObservation] = []
+    unidentified_pair_keys: set[tuple[str, str]] = set()
+    identified_pair_keys: set[tuple[str, str, str]] = set()
+    for prediction, target in zip(predicted, truth, strict=True):
+        prediction_mcap_id = _calibration_mcap_id(prediction)
+        target_mcap_id = _calibration_mcap_id(target)
+        if prediction_mcap_id != target_mcap_id:
+            raise ValueError(f"{cohort} prediction and ground truth MCAP IDs must match")
+        if prediction_mcap_id not in expected_mcap_ids:
+            raise ValueError(f"{cohort} sample belongs outside its assigned split")
+        class_id = _calibration_class_id(prediction, target)
+        sample_identity = _calibration_sample_identity(prediction, target)
+        if sample_identity is None:
+            pair_key = (prediction_mcap_id, class_id)
+            if pair_key in unidentified_pair_keys:
+                raise ValueError(
+                    "repeated calibration MCAP/class samples require an explicit sample identity"
+                )
+            unidentified_pair_keys.add(pair_key)
+        else:
+            pair_key_with_identity = (prediction_mcap_id, class_id, sample_identity)
+            if pair_key_with_identity in identified_pair_keys:
+                raise ValueError("calibration sample identities must be unique within a cohort")
+            identified_pair_keys.add(pair_key_with_identity)
+        observations.append(
+            _CalibrationObservation(
+                mcap_id=prediction_mcap_id,
+                class_id=class_id,
+                confidence=_calibration_confidence(prediction, score_kind),
+                target=_calibration_target(target),
+                unknown=_calibration_unknown(prediction),
+                subgroup_values=_calibration_metadata_values(
+                    prediction,
+                    target,
+                    subgroup_fields,
+                ),
+                temporal_values=_calibration_metadata_values(
+                    prediction,
+                    target,
+                    temporal_fields,
+                ),
+            )
+        )
+    if not observations:
+        raise ValueError(f"{cohort} calibration evidence must contain at least one sample")
+    return tuple(observations)
+
+
+def _calibration_mcap_id(record: Any) -> str:
+    for field_name in ("mcap_id", "recording_id"):
+        value = _field(record, field_name)
+        if value is not None:
+            if not isinstance(value, str) or not value:
+                raise ValueError("calibration samples require a nonempty MCAP identifier")
+            return value
+    raise ValueError("calibration samples require mcap_id or recording_id")
+
+
+def _calibration_class_id(prediction: Any, target: Any) -> str:
+    def value_for(record: Any) -> str | None:
+        for field_name in ("class_id", "class", "issue_code", "code", "label"):
+            value = _field(record, field_name)
+            if value is not None:
+                if field_name == "label" and not isinstance(value, str):
+                    continue
+                if not isinstance(value, str) or not value:
+                    raise ValueError("calibration class identifiers must be nonempty strings")
+                return value
+        return None
+
+    prediction_class = value_for(prediction)
+    target_class = value_for(target)
+    if (
+        prediction_class is not None
+        and target_class is not None
+        and prediction_class != target_class
+    ):
+        raise ValueError("calibration prediction and ground truth classes must match")
+    resolved = prediction_class or target_class
+    if resolved is None:
+        raise ValueError("calibration samples require a class_id or equivalent class field")
+    return resolved
+
+
+def _calibration_sample_identity(prediction: Any, target: Any) -> str | None:
+    def value_for(record: Any) -> str | None:
+        for field_name in ("sample_id", "clip_id", "window_id", "temporal_package_id", "id"):
+            value = _field(record, field_name)
+            if value is not None:
+                if not isinstance(value, str) or not value:
+                    raise ValueError("calibration sample identities must be nonempty strings")
+                return value
+        return None
+
+    prediction_identity = value_for(prediction)
+    target_identity = value_for(target)
+    if prediction_identity != target_identity:
+        raise ValueError("calibration prediction and ground truth sample identities must match")
+    return prediction_identity
+
+
+def _calibration_target(target: Any) -> int:
+    for field_name in ("outcome", "is_correct", "correct", "value", "label"):
+        value = _field(target, field_name)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and value in {0, 1}:
+            return value
+        if isinstance(value, float) and isfinite(value) and value in {0.0, 1.0}:
+            return int(value)
+        raise ValueError("calibration targets must be binary booleans or 0/1 values")
+    raise ValueError("calibration samples require a binary outcome label")
+
+
+def _calibration_confidence(prediction: Any, score_kind: CalibrationScoreKind) -> float | None:
+    fields = (
+        ("calibrated_probability", "calibrated_confidence", "calibrated_score")
+        if score_kind == "CALIBRATED"
+        else ("reported_confidence", "confidence", "score")
+    )
+    for field_name in fields:
+        value = _calibration_field_if_present(prediction, field_name)
+        if value is _MISSING:
+            continue
+        if value is None:
+            return None
+        nested = _field(value, "value", value)
+        if isinstance(nested, bool) or not isinstance(nested, (int, float)):
+            raise ValueError("calibration confidence values must be numeric")
+        confidence = float(nested)
+        if not isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("calibration confidence values must lie in [0, 1]")
+        return confidence
+    return None
+
+
+_MISSING = object()
+
+
+def _calibration_field_if_present(record: Any, field_name: str) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(field_name, _MISSING)
+    return getattr(record, field_name, _MISSING)
+
+
+def _calibration_unknown(prediction: Any) -> bool:
+    status = _field(prediction, "status")
+    return isinstance(status, str) and status.upper() in {"UNKNOWN", "ABSTAIN", "ABSTAINED"}
+
+
+def _calibration_metadata_values(
+    prediction: Any,
+    target: Any,
+    fields: tuple[str, ...],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field_name in fields:
+        prediction_value = _calibration_field_if_present(prediction, field_name)
+        target_value = _calibration_field_if_present(target, field_name)
+        if prediction_value is _MISSING and target_value is _MISSING:
+            continue
+        if (
+            prediction_value is not _MISSING
+            and target_value is not _MISSING
+            and prediction_value != target_value
+        ):
+            raise ValueError(
+                f"calibration {field_name} metadata must match between prediction and truth"
+            )
+        value = target_value if target_value is not _MISSING else prediction_value
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"calibration {field_name} metadata must be a nonempty string")
+        values[field_name] = value
+    return values
+
+
+def _calibration_slice_metrics(
+    observations: Sequence[_CalibrationObservation],
+    *,
+    bin_count: int,
+) -> CalibrationSliceMetrics:
+    if not observations:
+        raise ValueError("calibration metric slices must contain at least one observation")
+    pairs = tuple(
+        (observation.confidence, observation.target)
+        for observation in observations
+        if observation.confidence is not None
+    )
+    unknown_count = sum(observation.unknown for observation in observations)
+    if not pairs:
+        return CalibrationSliceMetrics(
+            sample_count=len(observations),
+            scored_count=0,
+            abstention_count=len(observations),
+            unknown_count=unknown_count,
+            ece=None,
+            brier_score=None,
+            mean_confidence=None,
+            observed_positive_rate=None,
+        )
+    bins: list[list[tuple[float, int]]] = [[] for _ in range(bin_count)]
+    for confidence, target in pairs:
+        assert confidence is not None
+        bins[min(bin_count - 1, int(confidence * bin_count))].append((confidence, target))
+    reliability_bins = tuple(
+        CalibrationReliabilityBin(
+            lower_bound=index / bin_count,
+            upper_bound=(index + 1) / bin_count,
+            sample_count=len(bucket),
+            mean_confidence=mean(confidence for confidence, _ in bucket),
+            observed_positive_rate=mean(target for _, target in bucket),
+        )
+        for index, bucket in enumerate(bins)
+        if bucket
+    )
+    ece = sum(
+        len(bucket)
+        / len(pairs)
+        * abs(mean(confidence for confidence, _ in bucket) - mean(target for _, target in bucket))
+        for bucket in bins
+        if bucket
+    )
+    return CalibrationSliceMetrics(
+        sample_count=len(observations),
+        scored_count=len(pairs),
+        abstention_count=len(observations) - len(pairs),
+        unknown_count=unknown_count,
+        ece=ece,
+        brier_score=mean((confidence - target) ** 2 for confidence, target in pairs),
+        mean_confidence=mean(confidence for confidence, _ in pairs),
+        observed_positive_rate=mean(target for _, target in pairs),
+        reliability_bins=reliability_bins,
+    )
+
+
+def _calibration_cohort_metrics(
+    *,
+    cohort: CalibrationCohortName,
+    expected_mcap_ids: tuple[str, ...],
+    observations: tuple[_CalibrationObservation, ...],
+    bin_count: int,
+    subgroup_fields: tuple[str, ...],
+    temporal_fields: tuple[str, ...],
+) -> CalibrationCohortMetrics:
+    per_class = {
+        class_id: _calibration_slice_metrics(
+            tuple(observation for observation in observations if observation.class_id == class_id),
+            bin_count=bin_count,
+        )
+        for class_id in sorted({observation.class_id for observation in observations})
+    }
+    subgroup_metrics = _calibration_metadata_slices(
+        observations,
+        fields=subgroup_fields,
+        value_selector=lambda observation: observation.subgroup_values,
+        bin_count=bin_count,
+    )
+    temporal_metrics = _calibration_metadata_slices(
+        observations,
+        fields=temporal_fields,
+        value_selector=lambda observation: observation.temporal_values,
+        bin_count=bin_count,
+    )
+    observed_mcap_ids = tuple(sorted({observation.mcap_id for observation in observations}))
+    return CalibrationCohortMetrics(
+        cohort=cohort,
+        expected_mcap_ids=expected_mcap_ids,
+        observed_mcap_ids=observed_mcap_ids,
+        unrepresented_mcap_ids=tuple(
+            mcap_id for mcap_id in expected_mcap_ids if mcap_id not in set(observed_mcap_ids)
+        ),
+        sample_count=len(observations),
+        overall=_calibration_slice_metrics(observations, bin_count=bin_count),
+        per_class=per_class,
+        subgroup_metrics=subgroup_metrics,
+        temporal_metrics=temporal_metrics,
+    )
+
+
+def _calibration_metadata_slices(
+    observations: tuple[_CalibrationObservation, ...],
+    *,
+    fields: tuple[str, ...],
+    value_selector: Callable[[_CalibrationObservation], Mapping[str, str]],
+    bin_count: int,
+) -> dict[str, dict[str, CalibrationSliceMetrics]]:
+    result: dict[str, dict[str, CalibrationSliceMetrics]] = {}
+    for field_name in fields:
+        observed_values = sorted(
+            {
+                value_selector(observation)[field_name]
+                for observation in observations
+                if field_name in value_selector(observation)
+            }
+        )
+        if not observed_values:
+            continue
+        result[field_name] = {
+            value: _calibration_slice_metrics(
+                tuple(
+                    observation
+                    for observation in observations
+                    if value_selector(observation).get(field_name) == value
+                ),
+                bin_count=bin_count,
+            )
+            for value in observed_values
+        }
+    return result
+
+
+def _calibration_drift_report(
+    reference: tuple[_CalibrationObservation, ...],
+    comparison: tuple[_CalibrationObservation, ...],
+    *,
+    bin_count: int,
+) -> CalibrationDriftReport:
+    aggregate = _calibration_drift_metrics(reference, comparison, bin_count=bin_count)
+    if aggregate is None:
+        return CalibrationDriftReport(status="INSUFFICIENT_SCORED_SAMPLES")
+    classes = sorted(
+        {observation.class_id for observation in reference}
+        & {observation.class_id for observation in comparison}
+    )
+    per_class = {
+        class_id: metrics
+        for class_id in classes
+        if (
+            metrics := _calibration_drift_metrics(
+                tuple(observation for observation in reference if observation.class_id == class_id),
+                tuple(
+                    observation for observation in comparison if observation.class_id == class_id
+                ),
+                bin_count=bin_count,
+            )
+        )
+        is not None
+    }
+    return CalibrationDriftReport(
+        status="REPORTED",
+        aggregate=aggregate,
+        per_class=per_class,
+    )
+
+
+def _calibration_drift_metrics(
+    reference: Sequence[_CalibrationObservation],
+    comparison: Sequence[_CalibrationObservation],
+    *,
+    bin_count: int,
+) -> CalibrationDriftMetrics | None:
+    reference_pairs = tuple(
+        (observation.confidence, observation.target)
+        for observation in reference
+        if observation.confidence is not None
+    )
+    comparison_pairs = tuple(
+        (observation.confidence, observation.target)
+        for observation in comparison
+        if observation.confidence is not None
+    )
+    if not reference_pairs or not comparison_pairs:
+        return None
+    reference_histogram = _calibration_histogram(reference_pairs, bin_count=bin_count)
+    comparison_histogram = _calibration_histogram(comparison_pairs, bin_count=bin_count)
+    return CalibrationDriftMetrics(
+        reference_split="calibration",
+        reference_scored_count=len(reference_pairs),
+        comparison_scored_count=len(comparison_pairs),
+        mean_confidence_delta=(
+            mean(confidence for confidence, _ in comparison_pairs)
+            - mean(confidence for confidence, _ in reference_pairs)
+        ),
+        observed_positive_rate_delta=(
+            mean(target for _, target in comparison_pairs)
+            - mean(target for _, target in reference_pairs)
+        ),
+        brier_score_delta=(
+            mean((confidence - target) ** 2 for confidence, target in comparison_pairs)
+            - mean((confidence - target) ** 2 for confidence, target in reference_pairs)
+        ),
+        score_distribution_total_variation=sum(
+            abs(reference_count / len(reference_pairs) - comparison_count / len(comparison_pairs))
+            for reference_count, comparison_count in zip(
+                reference_histogram,
+                comparison_histogram,
+                strict=True,
+            )
+        )
+        / 2.0,
+    )
+
+
+def _calibration_histogram(
+    pairs: Sequence[tuple[float, int]],
+    *,
+    bin_count: int,
+) -> tuple[int, ...]:
+    bins = [0] * bin_count
+    for confidence, _ in pairs:
+        bins[min(bin_count - 1, int(confidence * bin_count))] += 1
+    return tuple(bins)
+
 
 __all__ = [
     "BenchmarkMetricPolicy",
     "BoundaryMetrics",
+    "CalibrationCohortMetrics",
+    "CalibrationDriftMetrics",
+    "CalibrationDriftReport",
     "CalibrationMetrics",
+    "CalibrationQualificationReport",
+    "CalibrationReliabilityBin",
+    "CalibrationScoreKind",
+    "CalibrationSliceMetrics",
     "EventMetrics",
     "EvidenceBoundMetrics",
     "MeasurementStatus",
     "MetricsCalculator",
     "QAMetrics",
     "benchmark_metric_policy_projection",
+    "calibration_qualification_report_projection",
 ]

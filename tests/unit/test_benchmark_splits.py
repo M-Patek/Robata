@@ -154,6 +154,59 @@ def test_metadata_mapping_alias_is_supported_and_id_conflicts_fail_closed() -> N
         _splitter().split(ids, records=records, metadata=metadata)
 
 
+def test_calibration_protocol_binds_grouped_roles_and_excludes_frozen_test_from_fit() -> None:
+    splitter = _splitter()
+    records = [
+        SplitRecord(
+            mcap_id=f"mcap-{index}",
+            session_id=f"session-{index}",
+            actor=None,
+            scene=None,
+            collection_day=None,
+            rig=None,
+        )
+        for index in range(4)
+    ]
+    result = DataSplitResult(
+        development=("mcap-0",),
+        validation=("mcap-1",),
+        frozen_test=("mcap-2", "mcap-3"),
+        stratification_report={},
+        grouping_metadata_complete=True,
+        leakage_group_ids={
+            record.mcap_id: f"group-{index}" for index, record in enumerate(records)
+        },
+    )
+
+    protocol = splitter.calibration_protocol(result, records=records)
+
+    assert result.calibration == result.validation
+    assert protocol.development_mcap_ids == result.development
+    assert protocol.calibration_mcap_ids == result.validation
+    assert protocol.frozen_test_mcap_ids == result.frozen_test
+    assert set(protocol.fitting_mcap_ids) == set(result.development) | set(result.validation)
+    assert not set(protocol.fitting_mcap_ids) & set(protocol.frozen_test_mcap_ids)
+    assert protocol.protocol_identity == f"calibration-split-protocol:{protocol.protocol_digest}"
+
+
+def test_calibration_protocol_rejects_legacy_or_leaking_splits() -> None:
+    splitter = _splitter()
+    records = _records()
+    legacy = splitter.split([record.mcap_id for record in records])
+    with pytest.raises(SplitMetadataError, match="complete grouping metadata"):
+        splitter.calibration_protocol(legacy)
+
+    leaking = DataSplitResult(
+        development=("mcap-0",),
+        validation=("mcap-1",),
+        frozen_test=tuple(record.mcap_id for record in records[2:]),
+        stratification_report={},
+        grouping_metadata_complete=True,
+    )
+    with pytest.raises(SplitMetadataError, match="leakage"):
+        splitter.calibration_protocol(leaking, records=records)
+
+
 def test_validate_no_leakage_checks_group_metadata_when_supplied() -> None:
     records = _records()
     bad = DataSplitResult(

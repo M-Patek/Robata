@@ -4,6 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from robata.adapters.nvdec_backend import (
+    MediaRuntimeBackend,
+    MediaRuntimeProvenance,
+    NvdecInputProfile,
+    NvdecSupportedInput,
+)
 from robata.application.canonical.local_composition import (
     CanonicalLocalCompositionError,
     CanonicalLocalCompositionErrorCode,
@@ -69,9 +75,25 @@ def test_mcap_api_rejects_invalid_media_processing_policy(value: object) -> None
         )
 
     assert caught.value.code is CanonicalLocalCompositionErrorCode.INVALID_REQUEST
-    assert "media_processing_policy must be McapMediaProcessingPolicy or None" in str(
-        caught.value
-    )
+    assert "media_processing_policy must be McapMediaProcessingPolicy or None" in str(caught.value)
+
+
+def test_mcap_api_rejects_unpaired_media_exporter() -> None:
+    class _IncrementalExporter:
+        def begin_incremental(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("validation must run before source preparation")
+
+    with pytest.raises(CanonicalLocalCompositionError) as caught:
+        run_local_canonical_mcap(
+            Path("recording.mcap"),
+            Path("mapping.json"),
+            Path("state"),
+            allow_unapproved_profile=True,
+            media_exporter=_IncrementalExporter(),
+        )
+
+    assert caught.value.code is CanonicalLocalCompositionErrorCode.INVALID_REQUEST
+    assert "media_exporter requires explicit media_runtime_provenance" in str(caught.value)
 
 
 class _AuthorizedMapping:
@@ -142,3 +164,86 @@ def test_mcap_media_policy_changes_binding_and_reaches_source_loader(
         DEFAULT_MCAP_MEDIA_PROCESSING_POLICY,
         custom_policy,
     ]
+
+
+def test_mcap_media_runtime_injection_reaches_source_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from robata.application.canonical import local_composition as local_composition_module
+    from robata.application.canonical import mcap_source as mcap_source_module
+
+    class _IncrementalExporter:
+        def begin_incremental(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("source loader capture must not invoke the exporter")
+
+    declared = MediaRuntimeProvenance.create(
+        backend=MediaRuntimeBackend.NVDEC_TARGET,
+        implementation="test-target-exporter",
+        implementation_version="1.0.0",
+        selected_input=NvdecInputProfile(
+            codec="h264",
+            profile="baseline",
+            width=64,
+            height=48,
+        ),
+        supported_inputs=(
+            NvdecSupportedInput(
+                codec="h264",
+                profiles=("baseline",),
+                max_width=1920,
+                max_height=1080,
+            ),
+        ),
+    )
+    exporter = _IncrementalExporter()
+    captured_runs: list[dict[str, object]] = []
+    source_loader_calls: list[dict[str, object]] = []
+
+    def capture_run(**kwargs: object) -> object:
+        captured_runs.append(kwargs)
+        return object()
+
+    def capture_source_loader(*args: object, **kwargs: object) -> object:
+        source_loader_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        mcap_source_module,
+        "authorize_mcap_mapping",
+        lambda *args, **kwargs: _AuthorizedMapping(),
+    )
+    monkeypatch.setattr(
+        mcap_source_module,
+        "load_canonical_mcap_source",
+        capture_source_loader,
+    )
+    monkeypatch.setattr(
+        local_composition_module,
+        "_hash_source_file",
+        lambda *args, **kwargs: "test-source-sha256",
+    )
+    monkeypatch.setattr(local_composition_module, "_run_local_canonical", capture_run)
+
+    run_local_canonical_mcap(
+        Path("recording.mcap"),
+        Path("mapping.json"),
+        Path("state"),
+        allow_unapproved_profile=True,
+    )
+
+    run_local_canonical_mcap(
+        Path("recording.mcap"),
+        Path("mapping.json"),
+        Path("state"),
+        allow_unapproved_profile=True,
+        media_exporter=exporter,
+        media_runtime_provenance=declared,
+    )
+
+    assert len(captured_runs) == 2
+    assert captured_runs[0]["source_binding_sha256"] == captured_runs[1]["source_binding_sha256"]
+    source_loader = captured_runs[1]["source_loader"]
+    assert callable(source_loader)
+    source_loader(object(), object(), "stream-run")
+    assert source_loader_calls[0]["media_exporter"] is exporter
+    assert source_loader_calls[0]["media_runtime_provenance"] is declared

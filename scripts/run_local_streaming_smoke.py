@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from robata.contracts.hashing import canonical_json_bytes
-from robata.runtime.local_streaming_smoke import (
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
+from robata.contracts.hashing import canonical_json_bytes  # noqa: E402
+from robata.runtime.local_streaming_smoke import (  # noqa: E402
     DEFAULT_SOURCE_DURATION_MS,
     LocalStreamingSmokeConfig,
     create_manifest_from_repository,
@@ -40,7 +44,6 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = _arguments()
-    repository_root = Path(__file__).resolve().parents[1]
     config = LocalStreamingSmokeConfig(
         source_duration_ms=arguments.source_duration_ms,
         chunk_duration_ms=arguments.chunk_duration_ms,
@@ -62,7 +65,7 @@ def main() -> int:
         sqlite_synchronous=arguments.sqlite_synchronous,
     )
     manifest = create_manifest_from_repository(
-        repository_root=repository_root,
+        repository_root=REPOSITORY_ROOT,
         config=config,
     )
     artifacts = run_local_streaming_smoke(

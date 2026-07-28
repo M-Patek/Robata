@@ -42,6 +42,7 @@ from robata.contracts.video_export import (
     VideoExporterMode,
     VideoExportExecutionMode,
 )
+from robata.durability import sync_directory
 from robata.ingestion.mapping import TopicMappingProfile
 from robata.ports import COMPRESSED_IMAGE_SCHEMA, ChannelInspection, McapInspection
 from robata.ports.video_export import CameraVideoExporter, ExportedCameraVideoFacts
@@ -779,13 +780,7 @@ def _sync_file(path: Path) -> None:
 
 
 def _sync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 __all__ = [

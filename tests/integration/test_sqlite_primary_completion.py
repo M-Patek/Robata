@@ -11,6 +11,7 @@ from robata.adapters import SQLitePrimaryCompletionRepository
 from robata.application.canonical.models import CanonicalOfflineRunStatus
 from robata.application.canonical.primary_completion import (
     CanonicalPrimaryCompletionDetail,
+    canonical_collection_digest_root,
     primary_completion_command_projection,
 )
 from robata.application.canonical.result_validation import CanonicalOfflineRunResult
@@ -35,7 +36,11 @@ from robata.event_pipeline.identity_registry import (
 )
 from robata.inference.adapter import VisionInferenceRequest
 from robata.inference.enrichment import OrchestratorEnrichedOutput, ProviderObservation
-from robata.runtime.observability import RuntimeProfileRecorder, RuntimeProfileSnapshot
+from robata.runtime.observability import (
+    RuntimeObserver,
+    RuntimeProfileRecorder,
+    RuntimeProfileSnapshot,
+)
 from tests.integration.test_canonical_offline import (
     _action_evidence_claim_bytes,
     _claim_bytes,
@@ -75,6 +80,7 @@ def _prepare_command(
     repository: SQLitePrimaryCompletionRepository,
     harness: _Harness,
     result: CanonicalOfflineRunResult,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> PrimaryCompletionCommand:
     prepared = None
     if result.status is CanonicalOfflineRunStatus.SUCCEEDED:
@@ -113,6 +119,7 @@ def _prepare_command(
         result=result,
         prepared_identities=prepared,
         action_event_publications=publications,
+        runtime_observer=runtime_observer,
     )
 
 
@@ -159,6 +166,106 @@ def test_runtime_observer_counts_exact_primary_transaction_transitions(
     assert _operation_counter_value(snapshot, f"{domain}.commits", "begin_run") == 1
     assert _operation_counter_value(snapshot, f"{domain}.rollbacks", "begin_run") == 1
     assert sum(span.name == f"{domain}.transaction" for span in snapshot.spans) == 3
+
+
+def test_completion_spans_preserve_exact_command_bytes_and_all_root_inputs(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
+    repository = SQLitePrimaryCompletionRepository(
+        tmp_path / "completion.sqlite3",
+        runtime_observer=recorder,
+    )
+    processing_run = _processing_run(harness, run_id=_uuid(80_018))
+    repository.begin_run(processing_run)
+    result = _run(harness, processing_run=processing_run)
+
+    baseline = _prepare_command(
+        repository=repository,
+        harness=harness,
+        result=result,
+    )
+    observed = _prepare_command(
+        repository=repository,
+        harness=harness,
+        result=result,
+        runtime_observer=recorder,
+    )
+
+    assert canonical_json_bytes(observed) == canonical_json_bytes(baseline)
+    assert canonical_json_bytes(observed.completion) == canonical_json_bytes(baseline.completion)
+    committed = repository.commit(observed)
+    assert committed.replayed is False
+
+    snapshot = recorder.snapshot()
+    span_names = {span.name for span in snapshot.spans}
+    assert {
+        "completion.command.detail.hypothesis_binding_sort",
+        "completion.command.detail.model_validate",
+        "completion.command.detail.registry_validate",
+        "completion.command.roots.leaf_prepare",
+        "completion.command.roots.compute",
+        "completion.command.completion.registry_validate",
+        "completion.command.command.model_validate",
+        "completion.commit.detail_artifact.verify",
+        "completion.commit.detail_artifact.insert",
+        "completion.commit.committed.serialize",
+        "completion.commit.primary_record_persist",
+        "completion.commit.database_commit",
+    } <= span_names
+
+    expected_collections = {
+        "run-memberships",
+        "barrier-members",
+        "event-hypotheses",
+        "identity-assignments",
+        "new-identities",
+        "identity-relations",
+        "action-event-revisions",
+        "action-event-selections",
+        "action-event-current-selections",
+        "primary-successor-outbox",
+        "skipped-work-items",
+    }
+    for span_name in (
+        "completion.command.roots.leaf_prepare",
+        "completion.command.roots.compute",
+    ):
+        collections = {
+            str(attribute.value)
+            for span in snapshot.spans
+            if span.name == span_name
+            for attribute in span.attributes
+            if attribute.name == "collection"
+        }
+        assert collections == expected_collections
+        assert sum(span.name == span_name for span in snapshot.spans) == 11
+
+    def counter_total(name: str) -> int:
+        return sum(counter.value for counter in snapshot.counters if counter.name == name)
+
+    expected_root_leaves = sum(
+        getattr(observed.completion, field_name)
+        for field_name in (
+            "run_membership_count",
+            "barrier_member_count",
+            "hypothesis_count",
+            "identity_assignment_count",
+            "new_identity_count",
+            "identity_relation_count",
+            "revision_count",
+            "selection_decision_count",
+            "current_selection_count",
+            "successor_outbox_count",
+            "skipped_work_item_count",
+        )
+    )
+    assert counter_total("completion.command.root_collections") == 11
+    assert counter_total("completion.command.root_leaves") == expected_root_leaves
+    assert counter_total("completion.commit.detail_artifact_insertions") == 1
+    assert counter_total("completion.commit.primary_records") == 1
+    assert counter_total("completion.commit.authoritative_commits") == 1
 
 
 def test_atomic_completion_survives_reopen_and_exact_replay(tmp_path: Path) -> None:
@@ -745,6 +852,114 @@ def test_failure_after_staging_rolls_back_every_aggregate_fact(tmp_path: Path) -
             connection.execute("SELECT count(*) FROM action_event_publications").fetchone()[0] == 0
         )
         assert connection.execute("SELECT count(*) FROM primary_completions").fetchone()[0] == 0
+
+
+def test_generated_command_preserves_all_eleven_ordered_collection_roots(
+    tmp_path: Path,
+) -> None:
+    _harness_value, _repository, command = _run_case(tmp_path, run_value=80_016)
+    detail = command.detail
+    prepared = detail.prepared_identities
+    mutation = prepared.mutation if prepared is not None else None
+    assignments = prepared.assignments if prepared is not None else ()
+    new_identities = mutation.identities if mutation is not None else ()
+    relations = mutation.relations if mutation is not None else ()
+    successor_outbox = mutation.outbox if mutation is not None else ()
+    publications = detail.action_event_publications.publications
+
+    def model_digests(items: tuple[object, ...]) -> tuple[str, ...]:
+        return tuple(semantic_sha256(item.model_dump(mode="json")) for item in items)  # type: ignore[attr-defined]
+
+    expected_roots = {
+        "run_membership_digest_root": canonical_collection_digest_root(
+            "run-memberships", model_digests(detail.run_memberships)
+        ),
+        "barrier_member_digest_root": canonical_collection_digest_root(
+            "barrier-members",
+            tuple(item.completion.completion_semantic_sha256 for item in detail.part_results),
+        ),
+        "hypothesis_digest_root": canonical_collection_digest_root(
+            "event-hypotheses", tuple(item.semantic_sha256 for item in detail.hypotheses)
+        ),
+        "identity_assignment_digest_root": canonical_collection_digest_root(
+            "identity-assignments",
+            tuple(item.assignment_semantic_sha256 for item in assignments),
+        ),
+        "new_identity_digest_root": canonical_collection_digest_root(
+            "new-identities", model_digests(new_identities)
+        ),
+        "identity_relation_digest_root": canonical_collection_digest_root(
+            "identity-relations", model_digests(relations)
+        ),
+        "revision_digest_root": canonical_collection_digest_root(
+            "action-event-revisions",
+            tuple(item.revision.semantic_sha256 for item in publications),
+        ),
+        "selection_decision_digest_root": canonical_collection_digest_root(
+            "action-event-selections",
+            tuple(item.selection.semantic_sha256 for item in publications),
+        ),
+        "current_selection_digest_root": canonical_collection_digest_root(
+            "action-event-current-selections",
+            tuple(
+                semantic_sha256(
+                    {
+                        "current": item.current.model_dump(mode="json"),
+                        "event_current_revision": item.current_revision.model_dump(mode="json"),
+                    }
+                )
+                for item in publications
+            ),
+        ),
+        "successor_outbox_digest_root": canonical_collection_digest_root(
+            "primary-successor-outbox", model_digests(successor_outbox)
+        ),
+        "skipped_work_item_digest_root": canonical_collection_digest_root("skipped-work-items", ()),
+    }
+
+    assert len(expected_roots) == 11
+    for field_name, expected_root in expected_roots.items():
+        assert getattr(command.completion, field_name) == expected_root
+
+
+def test_failure_after_detail_artifact_staging_rolls_back_and_retries_once(
+    tmp_path: Path,
+) -> None:
+    class _FailAfterDetailArtifactRepository(SQLitePrimaryCompletionRepository):
+        def _after_detail_artifact_staged(
+            self,
+            connection: sqlite3.Connection,
+            command: PrimaryCompletionCommand,
+        ) -> None:
+            del connection, command
+            raise sqlite3.OperationalError("simulated failure after detail artifact staging")
+
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path / "logical")
+    repository = _FailAfterDetailArtifactRepository(tmp_path / "completion.sqlite3")
+    processing_run = _processing_run(harness, run_id=_uuid(80_017))
+    repository.begin_run(processing_run)
+    result = _run(harness, processing_run=processing_run)
+    command = _prepare_command(repository=repository, harness=harness, result=result)
+
+    with pytest.raises(PrimaryCompletionError) as caught:
+        repository.commit(command)
+
+    assert caught.value.code is PrimaryCompletionErrorCode.TRANSACTION_FAILED
+    reopened = SQLitePrimaryCompletionRepository(repository.path)
+    assert reopened.get(processing_run.run_id) is None
+    assert reopened.list_outbox(harness.context.recording_identity) == ()
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("SELECT count(*) FROM detailed_results").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM primary_completions").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM primary_outbox").fetchone()[0] == 0
+
+    first_retry = reopened.commit(command)
+    exact_replay = reopened.commit(command)
+
+    assert first_retry.replayed is False
+    assert exact_replay.replayed is True
+    assert exact_replay.committed == first_retry.committed
+    assert len(reopened.list_outbox(harness.context.recording_identity)) == 1
 
 
 def test_new_run_reuses_identity_and_publication_without_duplicate_outbox(

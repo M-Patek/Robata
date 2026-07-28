@@ -30,6 +30,14 @@ from robata.application.canonical.parallel_service import (
     CanonicalLocalRecordingService,
 )
 from robata.application.canonical.primary_completion import PreparedPrimaryCompletionCommand
+from robata.application.canonical.recording_association import (
+    RecordingAssociationPublicationStatus,
+    RecordingAssociationReportStore,
+)
+from robata.application.canonical.recording_association_dispatch import (
+    CanonicalRecordingAssociationWorker,
+    RecordingAssociationJobStore,
+)
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
 from robata.queue.models import WorkAttemptOutcome, WorkItemState
 from robata.review.routing import ReviewRoutingDisposition
@@ -45,6 +53,42 @@ def _assert_local_conformance(receipt: CanonicalLocalRunReceipt) -> None:
     assert receipt.network_call_count == 0
     assert receipt.evidence_class == "LOCAL_CONFORMANCE"
     assert receipt.production_eligible is False
+
+
+def _primary_completion_bytes(state_dir: Path) -> tuple[bytes, str, bytes, str]:
+    with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
+        detail = connection.execute(
+            "SELECT payload_json, exact_bytes_sha256 FROM detailed_results"
+        ).fetchone()
+        completion = connection.execute(
+            "SELECT command_json, command_json_sha256 FROM primary_completions"
+        ).fetchone()
+    assert detail is not None
+    assert completion is not None
+    return detail[0], detail[1], completion[0], completion[1]
+
+
+def _sidecar_json_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*.json"))
+    }
+
+
+def _counter_has_status(
+    recorder: RuntimeProfileRecorder,
+    *,
+    name: str,
+    status: str,
+) -> bool:
+    return any(
+        counter.name == name
+        and dict((attribute.name, attribute.value) for attribute in counter.attributes).get(
+            "status"
+        )
+        == status
+        for counter in recorder.snapshot().counters
+    )
 
 
 def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> None:
@@ -115,6 +159,319 @@ def test_local_command_commits_then_exactly_replays_one_run(tmp_path: Path) -> N
     assert "cannot reconcile delivered rows" in unreconciled.outbox_delivery.last_error
 
 
+def test_local_completion_queues_then_worker_publishes_detached_association_report(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    receipt = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="recording-association-detached",
+    )
+
+    _assert_local_conformance(receipt)
+    job_root = state_dir / "recording-association"
+    jobs = RecordingAssociationJobStore(job_root)
+    queued = jobs.list_jobs()
+    assert len(queued) == 1
+    job = queued[0]
+    assert job.inputs
+    assert not (job_root / "reports").exists()
+
+    repository = SQLitePrimaryCompletionRepository(state_dir / "primary-completion.sqlite3")
+    primary_before = repository.get(receipt.run_id)
+    assert primary_before is not None
+    assert job.recording.completed_run_id == receipt.run_id
+    assert (
+        job.recording.completed_recording_semantic_sha256 == primary_before.detail.semantic_sha256
+    )
+    assert (
+        job.recording.completed_recording_exact_sha256
+        == primary_before.completion.detailed_result.exact_bytes_sha256
+    )
+
+    reports = RecordingAssociationReportStore(job_root)
+    worker = CanonicalRecordingAssociationWorker(jobs=jobs, reports=reports)
+    first_execution = worker.drain()
+    assert len(first_execution) == 1
+    publication = first_execution[0].publication
+    assert publication.status is RecordingAssociationPublicationStatus.PUBLISHED
+    assert publication.replayed is False
+    assert publication.report is not None
+    assert publication.report.recording == job.recording
+    assert publication.report.inputs == job.inputs
+    assert repository.get(receipt.run_id) == primary_before
+
+    replay = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="recording-association-detached",
+    )
+    _assert_local_conformance(replay)
+    assert replay.replayed is True
+    assert replay.event_ids == receipt.event_ids
+    assert replay.revision_ids == receipt.revision_ids
+    assert replay.outbox_ids == receipt.outbox_ids
+    assert jobs.list_jobs() == queued
+
+    replay_execution = worker.drain()
+    assert len(replay_execution) == 1
+    assert replay_execution[0].publication.status is RecordingAssociationPublicationStatus.REPLAYED
+    assert replay_execution[0].publication.replayed is True
+    assert replay_execution[0].publication.report == publication.report
+    assert repository.get(receipt.run_id) == primary_before
+
+
+def test_disabling_recording_association_preserves_v3_v4_primary_completion_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled_state_dir = tmp_path / "association-enabled"
+    enabled = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=enabled_state_dir,
+        run_key="recording-association-disabled-bytes",
+    )
+    _assert_local_conformance(enabled)
+    enabled_primary = SQLitePrimaryCompletionRepository(
+        enabled_state_dir / "primary-completion.sqlite3"
+    ).get(enabled.run_id)
+    assert enabled_primary is not None
+    assert enabled_primary.completion.schema_version == "3.0"
+    assert enabled_primary.detail.schema_version == "4.0"
+    assert RecordingAssociationJobStore(enabled_state_dir / "recording-association").list_jobs()
+
+    # P11 is detached from primary authority. Turning off its composition hook
+    # may suppress the derived job only; it cannot alter released V3/V4 bytes.
+    def disable_association(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        local_composition_module,
+        "_enqueue_local_recording_association_dispatch",
+        disable_association,
+    )
+    disabled_state_dir = tmp_path / "association-disabled"
+    disabled = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=disabled_state_dir,
+        run_key="recording-association-disabled-bytes",
+    )
+    _assert_local_conformance(disabled)
+    disabled_primary = SQLitePrimaryCompletionRepository(
+        disabled_state_dir / "primary-completion.sqlite3"
+    ).get(disabled.run_id)
+    assert disabled_primary is not None
+    assert not (disabled_state_dir / "recording-association").exists()
+
+    assert disabled.run_id == enabled.run_id
+    assert canonical_json_bytes(disabled_primary.completion) == canonical_json_bytes(
+        enabled_primary.completion
+    )
+    assert canonical_json_bytes(disabled_primary.detail) == canonical_json_bytes(
+        enabled_primary.detail
+    )
+
+
+def test_local_completion_survives_recording_association_enqueue_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    recorder = RuntimeProfileRecorder()
+
+    def fail_dispatch(**_kwargs: object) -> None:
+        raise OSError("association dispatch storage unavailable")
+
+    monkeypatch.setattr(
+        local_composition_module,
+        "enqueue_recording_association_after_completion",
+        fail_dispatch,
+    )
+    receipt = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="recording-association-enqueue-failure",
+        runtime_observer=recorder,
+    )
+
+    _assert_local_conformance(receipt)
+    assert (
+        SQLitePrimaryCompletionRepository(state_dir / "primary-completion.sqlite3").get(
+            receipt.run_id
+        )
+        is not None
+    )
+    assert any(
+        counter.name == "recording_association.dispatches"
+        and dict((attribute.name, attribute.value) for attribute in counter.attributes).get(
+            "status"
+        )
+        == "FAILED"
+        for counter in recorder.snapshot().counters
+    )
+
+
+def test_local_completion_persists_calibration_adaptive_and_boundary_sidecars(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    fresh = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="p9-p10-p12-sidecars",
+    )
+
+    _assert_local_conformance(fresh)
+    primary_before = _primary_completion_bytes(state_dir)
+    repository = SQLitePrimaryCompletionRepository(state_dir / "primary-completion.sqlite3")
+    committed = repository.get(fresh.run_id)
+    assert committed is not None
+
+    with sqlite3.connect(state_dir / "inference-evidence.sqlite3") as connection:
+        artifact_count = connection.execute(
+            "SELECT COUNT(*) FROM calibration_artifacts"
+        ).fetchone()[0]
+        calibration_rows = connection.execute(
+            """
+            SELECT outcome, raw_score, calibrated_probability, calibration_artifact_id
+            FROM inference_calibration_associations
+            """
+        ).fetchall()
+    assert artifact_count == 0
+    assert calibration_rows
+    assert all(row[2] is None and row[3] is None for row in calibration_rows)
+    assert any(
+        row[0] == "RAW_FALLBACK_MISSING_ARTIFACT" and row[1] == pytest.approx(0.8)
+        for row in calibration_rows
+    )
+
+    decision_database = state_dir / "adaptive-sampling-decisions.sqlite3"
+    with sqlite3.connect(decision_database) as connection:
+        decision_rows = connection.execute(
+            "SELECT payload_json FROM adaptive_sampling_decisions"
+        ).fetchall()
+    assert len(decision_rows) == 1
+    decision_bytes = decision_rows[0][0]
+    decision = json.loads(decision_bytes)
+    assert decision["outcome"] == "DENSE_QA_ALREADY_COMPLETE"
+    assert decision["incremental_targets"] == []
+    assert decision["no_additional_work_proof"]["proof_kind"] == "DENSE_QA_COARSE_COMPLETE"
+    assert b"NO_EVENTS" not in decision_bytes
+
+    adaptive_root = state_dir / "adaptive-sampling-executions"
+    terminal_bytes = _sidecar_json_bytes(adaptive_root)
+    assert len(terminal_bytes) == 2
+    terminal_payload = next(
+        json.loads(payload)
+        for path, payload in terminal_bytes.items()
+        if path.startswith("terminals/")
+    )
+    assert terminal_payload["terminal_kind"] == "NO_ADDITIONAL_WORK"
+    assert terminal_payload["no_additional_work_outcome"] == "DENSE_QA_ALREADY_COMPLETE"
+    assert b"NO_EVENTS" not in canonical_json_bytes(terminal_payload)
+
+    boundary_root = state_dir / "boundary-qualification"
+    boundary_bytes = _sidecar_json_bytes(boundary_root)
+    boundary_jobs = [path for path in boundary_bytes if path.startswith("jobs/")]
+    boundary_reports = [path for path in boundary_bytes if path.startswith("reports/")]
+    assert len(boundary_jobs) == len(committed.detail.boundary_refinement_executions)
+    assert len(boundary_reports) == len(boundary_jobs)
+    assert all(
+        json.loads(boundary_bytes[path])["production_eligible"] is False
+        and b"NO_EVENTS" not in boundary_bytes[path]
+        for path in boundary_reports
+    )
+
+    replay = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="p9-p10-p12-sidecars",
+    )
+
+    _assert_local_conformance(replay)
+    assert replay.replayed is True
+    assert replay.fixture_inference_calls == 0
+    assert _primary_completion_bytes(state_dir) == primary_before
+    with sqlite3.connect(decision_database) as connection:
+        replayed_decision = connection.execute(
+            "SELECT payload_json FROM adaptive_sampling_decisions"
+        ).fetchall()
+    assert replayed_decision == [(decision_bytes,)]
+    assert _sidecar_json_bytes(adaptive_root) == terminal_bytes
+    assert _sidecar_json_bytes(boundary_root) == boundary_bytes
+
+
+def test_local_sidecar_failures_do_not_replace_or_mutate_primary_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "canonical-state"
+    recorder = RuntimeProfileRecorder()
+    original_adaptive_execute = (
+        local_composition_module.CanonicalAdaptiveSamplingBridge.execute_for_canonical_result
+    )
+    original_boundary_drain = local_composition_module.CanonicalBoundaryQualificationWorker.drain
+
+    def fail_adaptive_execute(*_args: object, **_kwargs: object) -> None:
+        raise OSError("adaptive sidecar unavailable")
+
+    def fail_boundary_drain(*_args: object, **_kwargs: object) -> None:
+        raise OSError("boundary sidecar unavailable")
+
+    monkeypatch.setattr(
+        local_composition_module.CanonicalAdaptiveSamplingBridge,
+        "execute_for_canonical_result",
+        fail_adaptive_execute,
+    )
+    monkeypatch.setattr(
+        local_composition_module.CanonicalBoundaryQualificationWorker,
+        "drain",
+        fail_boundary_drain,
+    )
+    fresh = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="p10-p12-failure-isolation",
+        runtime_observer=recorder,
+    )
+
+    _assert_local_conformance(fresh)
+    primary_before = _primary_completion_bytes(state_dir)
+    assert _counter_has_status(
+        recorder,
+        name="adaptive_sampling.dispatches",
+        status="FAILED",
+    )
+    assert _counter_has_status(
+        recorder,
+        name="boundary_qualification.dispatches",
+        status="FAILED",
+    )
+
+    monkeypatch.setattr(
+        local_composition_module.CanonicalAdaptiveSamplingBridge,
+        "execute_for_canonical_result",
+        original_adaptive_execute,
+    )
+    monkeypatch.setattr(
+        local_composition_module.CanonicalBoundaryQualificationWorker,
+        "drain",
+        original_boundary_drain,
+    )
+    replay = run_local_canonical_fixture(
+        source_path=SOURCE_FIXTURE,
+        state_dir=state_dir,
+        run_key="p10-p12-failure-isolation",
+    )
+
+    _assert_local_conformance(replay)
+    assert replay.replayed is True
+    assert _primary_completion_bytes(state_dir) == primary_before
+    assert (state_dir / "adaptive-sampling-executions" / "terminals").is_dir()
+    assert list((state_dir / "boundary-qualification" / "reports").glob("*.json"))
+
+
 def test_runtime_observation_preserves_canonical_identity_and_replay(
     tmp_path: Path,
 ) -> None:
@@ -168,14 +525,36 @@ def test_runtime_observation_preserves_canonical_identity_and_replay(
         "sqlite.review_queue.transaction",
         "completion.evidence.audit",
         "completion.command.serialize_validate",
+        "completion.command.detail.semantic_hash",
+        "completion.command.detail.schema_validate",
+        "completion.command.detail.model_validate",
+        "completion.command.detail.registry_validate",
+        "completion.command.detail.hypothesis_binding_sort",
+        "completion.command.detail.serialize",
+        "completion.command.ordered_roots",
+        "completion.command.roots.leaf_prepare",
+        "completion.command.roots.compute",
+        "completion.command.completion.schema_validate",
+        "completion.command.completion.registry_validate",
+        "completion.command.command.semantic_hash",
+        "completion.command.command.schema_validate",
+        "completion.command.command.model_validate",
+        "completion.command.command.serialize",
+        "completion.command.processing_run.serialize",
         "completion.commit",
         "completion.commit.validate",
         "completion.commit.identity",
         "completion.commit.detail",
+        "completion.commit.detail_artifact",
+        "completion.commit.detail_artifact.verify",
+        "completion.commit.detail_artifact.insert",
         "completion.commit.serialize",
+        "completion.commit.committed.serialize",
+        "completion.commit.primary_record_persist",
         "completion.commit.outbox",
         "completion.commit.run_close",
         "completion.commit.authoritative",
+        "completion.commit.database_commit",
         "delivery.outbox.reconcile",
         "review.route",
     } <= span_names
@@ -185,6 +564,25 @@ def test_runtime_observation_preserves_canonical_identity_and_replay(
         if counter.name == "sqlite.inference_evidence.transactions"
     )
     assert transaction_count > observed.fixture_inference_calls
+    completion_counter_names = {
+        "completion.command.detail_bytes",
+        "completion.command.command_bytes",
+        "completion.command.processing_run_bytes",
+        "completion.command.root_collections",
+        "completion.command.root_leaves",
+    }
+    assert all(
+        any(counter.name == name and counter.value > 0 for counter in profile.counters)
+        for name in completion_counter_names
+    )
+    assert (
+        sum(
+            counter.value
+            for counter in profile.counters
+            if counter.name == "completion.command.root_collections"
+        )
+        == 11
+    )
     provider_dispatch_count = sum(
         counter.value
         for counter in profile.counters
@@ -568,9 +966,7 @@ def test_local_command_seals_inference_evidence_before_primary_completion(
     command = prepared.command
     assert prepared.detail_bytes == canonical_json_bytes(command.detail)
     assert prepared.command_bytes == canonical_json_bytes(command)
-    assert prepared.processing_run_bytes == canonical_json_bytes(
-        command.detail.processing_run
-    )
+    assert prepared.processing_run_bytes == canonical_json_bytes(command.detail.processing_run)
     with sqlite3.connect(state_dir / "primary-completion.sqlite3") as connection:
         detail_row = connection.execute(
             "SELECT payload_json, exact_bytes_sha256 FROM detailed_results"
@@ -595,8 +991,6 @@ def test_local_command_seals_inference_evidence_before_primary_completion(
         prepared.processing_run_exact_bytes_sha256,
     )
 
-
-
     tampered_detail = prepared.detail_bytes + b" "
     with pytest.raises(ValueError, match="detail bytes"):
         replace(
@@ -620,6 +1014,8 @@ def test_local_command_seals_inference_evidence_before_primary_completion(
             processing_run_bytes=tampered_processing_run,
             processing_run_exact_bytes_sha256=exact_bytes_sha256(tampered_processing_run),
         )
+
+
 def test_failed_precommit_evidence_seal_publishes_no_primary_fact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -690,7 +1086,6 @@ def test_external_inference_evidence_data_version_change_fails_seal_before_prima
         assert connection.execute("SELECT COUNT(*) FROM primary_outbox").fetchone()[0] == 0
 
 
-
 def test_parallel_local_commands_share_bounded_provider_and_replay_independently(
     tmp_path: Path,
 ) -> None:
@@ -730,9 +1125,7 @@ def test_parallel_local_commands_share_bounded_provider_and_replay_independently
     assert all(receipt.ok and receipt.replayed for receipt in replay)
     assert len({receipt.recording_identity for receipt in fresh}) == 4
     assert len({receipt.run_id for receipt in fresh}) == 4
-    assert tuple(receipt.run_id for receipt in replay) == tuple(
-        receipt.run_id for receipt in fresh
-    )
+    assert tuple(receipt.run_id for receipt in replay) == tuple(receipt.run_id for receipt in fresh)
     assert tuple(receipt.recording_identity for receipt in replay) == tuple(
         receipt.recording_identity for receipt in fresh
     )

@@ -12,11 +12,13 @@ from robata.application.canonical.local_composition import (
     LocalPreEosExecutorContext,
     run_local_canonical_mcap,
 )
+from robata.application.canonical.local_stream_finalization import LocalStreamExecutorConfig
 from robata.contracts.cameras import CAMERA_IDS
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
 from robata.contracts.stream_common import ArtifactEvidenceRef, StreamStage, TerminalOutcome
 from robata.contracts.stream_planning import StreamWorkItemPlan
 from robata.inference.models import VisionTask
+from robata.queue.backpressure import BackpressureRuntimeSignals
 from robata.queue.stream_models import StreamTerminalEvidence
 from tests.integration.test_canonical_mcap_source import _pre_eos_fixture_model
 from tests.support.six_camera_mcap import SIX_CAMERA_TOPICS, write_six_camera_mcap
@@ -61,6 +63,10 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
     hooks: list[object] = []
     pre_eos_stages: list[StreamStage] = []
     eos_hooks: list[object] = []
+    executor_config = LocalStreamExecutorConfig(max_concurrency=2, max_scope_items=8)
+
+    def backpressure_signal_provider() -> BackpressureRuntimeSignals:
+        return BackpressureRuntimeSignals(provider_quota=12, worker_utilization=0.5)
 
     task_by_stage = {
         StreamStage.QA_COARSE: VisionTask.QA_COARSE,
@@ -109,6 +115,8 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
         sequence.append("source")
         assert contexts
         assert kwargs["stage_terminal_executor"] is hooks[-1]
+        assert kwargs["executor_config"] is executor_config
+        assert kwargs["backpressure_signal_provider"] is backpressure_signal_provider
         assert kwargs["provider_terminal_required"] is True
         return original_source_loader(*args, **kwargs)
 
@@ -118,6 +126,11 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
         sequence.append("eos")
         eos_hooks.append(kwargs["stage_terminal_executor"])
         assert kwargs["provider_terminal_required"] is True
+        assert kwargs["executor_config"] is executor_config
+        assert all(
+            scheduler._backpressure_signal_provider is backpressure_signal_provider
+            for scheduler in kwargs["schedulers"]
+        )
         return original_finalizer(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -138,6 +151,8 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
         run_key="pre-eos-factory-wiring",
         allow_unapproved_profile=True,
         pre_eos_executor_factory=factory,
+        executor_config=executor_config,
+        backpressure_signal_provider=backpressure_signal_provider,
     )
 
     assert first.replayed is False
@@ -164,6 +179,8 @@ def test_pre_eos_factory_builds_runtime_before_source_and_reuses_hook_at_eos(
         run_key="pre-eos-factory-wiring",
         allow_unapproved_profile=True,
         pre_eos_executor_factory=factory,
+        executor_config=executor_config,
+        backpressure_signal_provider=backpressure_signal_provider,
     )
 
     assert replay.replayed is True

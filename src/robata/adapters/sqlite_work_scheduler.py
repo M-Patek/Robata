@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -38,6 +39,10 @@ from robata.runtime.observability import (
 _APPLICATION_ID = 0x5242574B
 _SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 5_000
+_ACTIVE_AUTHORITY_TRANSACTION: ContextVar[str | None] = ContextVar(
+    "active_sqlite_authority_transaction",
+    default=None,
+)
 
 _SCHEMA_STATEMENTS = (
     """
@@ -197,6 +202,29 @@ class WorkStateError(WorkSchedulerError):
     """The requested transition is illegal for the current state."""
 
 
+def active_authority_transaction_operation() -> str | None:
+    """Return the current authority operation, if execution is inside its transaction.
+
+    This is operational context only. It is deliberately separate from durable state so
+    callers can fail fast when a provider or media operation is accidentally placed in a
+    SQLite critical section.
+    """
+
+    return _ACTIVE_AUTHORITY_TRANSACTION.get()
+
+
+def require_outside_authority_transaction(*, activity: str) -> None:
+    """Reject provider/media activity while an authority transaction is active."""
+
+    if not isinstance(activity, str) or not activity.strip():
+        raise ValueError("activity must be a nonempty string")
+    operation_name = active_authority_transaction_operation()
+    if operation_name is not None:
+        raise WorkStateError(
+            f"{activity} cannot run inside SQLite authority transaction {operation_name}"
+        )
+
+
 class SQLiteWorkScheduler:
     """Local durable scheduler with atomic SQLite claim and fenced mutation."""
 
@@ -284,8 +312,7 @@ class SQLiteWorkScheduler:
             (
                 _require_model(plan, WorkItemPlan, "plan"),
                 tuple(
-                    _require_model(value, WorkDependency, "dependency")
-                    for value in dependencies
+                    _require_model(value, WorkDependency, "dependency") for value in dependencies
                 ),
             )
             for plan, dependencies in plans
@@ -940,10 +967,21 @@ class SQLiteWorkScheduler:
             return self._load_item(connection, item.work_item_id)
 
         try:
-            return self._transaction(write=True, operation_name="fail", operation=operation)
+            result = self._transaction(write=True, operation_name="fail", operation=operation)
         except WorkFenceError:
             self._reconcile_exact_due_state(checked_lease.work_item_id, checked_now)
             raise
+        if result.state is WorkItemState.RETRY_WAIT:
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.work_scheduler.work_retries",
+                attributes={
+                    "operation": "fail",
+                    "write": True,
+                    "synchronous": self._synchronous,
+                },
+            )
+        return result
 
     def cancel(
         self,
@@ -1027,12 +1065,8 @@ class SQLiteWorkScheduler:
         checked_now = _checked_now(now)
 
         def operation(connection: sqlite3.Connection) -> WorkItem:
-            self._expire_hard_deadlines(
-                connection, checked_now, work_item_id=work_item_id
-            )
-            self._recover_expired_leases(
-                connection, checked_now, work_item_id=work_item_id
-            )
+            self._expire_hard_deadlines(connection, checked_now, work_item_id=work_item_id)
+            self._recover_expired_leases(connection, checked_now, work_item_id=work_item_id)
             item = self._load_item(connection, work_item_id)
             if item.state is state:
                 return item
@@ -1186,9 +1220,7 @@ class SQLiteWorkScheduler:
                 reason_code="EXECUTION_EXPIRED",
                 reason_detail=None,
             )
-            self._refresh_downstream_for_upstreams(
-                connection, now, (item.work_item_id,)
-            )
+            self._refresh_downstream_for_upstreams(connection, now, (item.work_item_id,))
             changed += 1
         return changed
 
@@ -1272,9 +1304,7 @@ class SQLiteWorkScheduler:
                     reason_code="LEASE_ATTEMPTS_EXHAUSTED",
                     reason_detail=None,
                 )
-                self._refresh_downstream_for_upstreams(
-                    connection, now, (item.work_item_id,)
-                )
+                self._refresh_downstream_for_upstreams(connection, now, (item.work_item_id,))
             changed += 1
         return changed
 
@@ -1387,8 +1417,7 @@ class SQLiteWorkScheduler:
         ):
             return None
         required_failure = any(
-            DependencyCriticality(_row_text(value, "criticality"))
-            is DependencyCriticality.REQUIRED
+            DependencyCriticality(_row_text(value, "criticality")) is DependencyCriticality.REQUIRED
             and WorkItemState(_row_text(value, "state")) not in SUCCESSFUL_DEPENDENCY_STATES
             for value in dependency_rows
         )
@@ -1436,8 +1465,7 @@ class SQLiteWorkScheduler:
             # it to the persisted row as well as checking the authority clock; a
             # caller must not be able to forge a different expiry around the same
             # epoch/token pair.
-            or _parse_timestamp(item.lease_expires_at)
-            != _parse_timestamp(lease.lease_expires_at)
+            or _parse_timestamp(item.lease_expires_at) != _parse_timestamp(lease.lease_expires_at)
             or _parse_timestamp(item.lease_expires_at) <= now
             or (
                 item.execution_expiry_at is not None
@@ -1608,7 +1636,10 @@ class SQLiteWorkScheduler:
     def _initialize_database(self) -> None:
         connection: sqlite3.Connection | None = None
         try:
-            connection = self._open(check_header=False)
+            connection = self._open(
+                check_header=False,
+                operation_name="initialize_schema",
+            )
             journal = connection.execute("PRAGMA journal_mode = WAL").fetchone()
             if journal is None or str(journal[0]).lower() != "wal":
                 raise WorkStorageError("SQLite WAL mode could not be enabled")
@@ -1654,20 +1685,39 @@ class SQLiteWorkScheduler:
             if connection is not None:
                 connection.close()
 
-    def _open(self, *, check_header: bool = True) -> sqlite3.Connection:
+    def _open(
+        self,
+        *,
+        check_header: bool = True,
+        operation_name: str,
+    ) -> sqlite3.Connection:
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "synchronous": self._synchronous,
+        }
         connection: sqlite3.Connection | None = None
         try:
-            connection = sqlite3.connect(
-                self._database_path,
-                timeout=_BUSY_TIMEOUT_MS / 1000,
-                isolation_level=None,
+            with runtime_span(
+                self._runtime_observer,
+                "sqlite.work_scheduler.connection_setup",
+                attributes,
+            ):
+                connection = sqlite3.connect(
+                    self._database_path,
+                    timeout=_BUSY_TIMEOUT_MS / 1000,
+                    isolation_level=None,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(f"PRAGMA synchronous = {self._synchronous}")
+                connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+                if check_header:
+                    self._verify_header(connection)
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.work_scheduler.connections",
+                attributes=attributes,
             )
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA synchronous = {self._synchronous}")
-            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            if check_header:
-                self._verify_header(connection)
             return connection
         except (sqlite3.Error, WorkStorageError) as error:
             if connection is not None:
@@ -1691,8 +1741,20 @@ class SQLiteWorkScheduler:
         operation_name: str,
         operation: Callable[[sqlite3.Connection], T],
     ) -> T:
-        connection = self._open()
+        active_operation = active_authority_transaction_operation()
+        if active_operation is not None:
+            raise WorkStateError(
+                "nested SQLite authority transaction is forbidden: "
+                f"{operation_name} inside {active_operation}"
+            )
+        attributes: dict[str, RuntimeAttributeValue] = {
+            "operation": operation_name,
+            "write": write,
+            "synchronous": self._synchronous,
+        }
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self._open(operation_name=operation_name)
             with self._observed_transaction_scope(
                 connection,
                 write=write,
@@ -1705,9 +1767,16 @@ class SQLiteWorkScheduler:
         except sqlite3.IntegrityError as error:
             raise WorkConflictError(f"SQLite rejected durable work: {error}") from error
         except sqlite3.Error as error:
+            if _is_busy_or_locked(error):
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.busy_or_locked_failures",
+                    attributes=attributes,
+                )
             raise WorkStorageError(f"work scheduler transaction failed: {error}") from error
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     @contextmanager
     def _observed_transaction_scope(
@@ -1720,88 +1789,113 @@ class SQLiteWorkScheduler:
         attributes: dict[str, RuntimeAttributeValue] = {
             "operation": operation_name,
             "write": write,
+            "synchronous": self._synchronous,
         }
+        row_changes_before = connection.total_changes
+
+        def rollback() -> None:
+            if not connection.in_transaction:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.transaction_outcomes_unknown",
+                    attributes=attributes,
+                )
+                return
+            try:
+                with runtime_span(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.rollback",
+                    attributes,
+                ):
+                    connection.rollback()
+            except sqlite3.Error:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.rollback_failures",
+                    attributes=attributes,
+                )
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.transaction_outcomes_unknown",
+                    attributes=attributes,
+                )
+                return
+            runtime_increment(
+                self._runtime_observer,
+                "sqlite.work_scheduler.rollbacks",
+                attributes=attributes,
+            )
+            rolled_back_changes = connection.total_changes - row_changes_before
+            if rolled_back_changes > 0:
+                runtime_increment(
+                    self._runtime_observer,
+                    "sqlite.work_scheduler.rows_rolled_back",
+                    rolled_back_changes,
+                    attributes,
+                )
+
         with runtime_span(
             self._runtime_observer,
             "sqlite.work_scheduler.transaction",
             attributes,
         ):
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            with runtime_span(
+                self._runtime_observer,
+                "sqlite.work_scheduler.begin",
+                attributes,
+            ):
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             runtime_increment(
                 self._runtime_observer,
                 "sqlite.work_scheduler.transactions",
                 attributes=attributes,
             )
+            active_token = _ACTIVE_AUTHORITY_TRANSACTION.set(operation_name)
             try:
-                yield
-            except BaseException:
-                if connection.in_transaction:
-                    try:
-                        connection.rollback()
-                    except sqlite3.Error:
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.rollback_failures",
-                            attributes=attributes,
-                        )
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.transaction_outcomes_unknown",
-                            attributes=attributes,
-                        )
-                    else:
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.rollbacks",
-                            attributes=attributes,
-                        )
-                else:
+                try:
+                    with runtime_span(
+                        self._runtime_observer,
+                        "sqlite.work_scheduler.operation",
+                        attributes,
+                    ):
+                        yield
+                except BaseException:
+                    rollback()
+                    raise
+                try:
+                    with runtime_span(
+                        self._runtime_observer,
+                        "sqlite.work_scheduler.commit",
+                        attributes,
+                    ):
+                        self._commit(connection)
+                except BaseException:
                     runtime_increment(
                         self._runtime_observer,
-                        "sqlite.work_scheduler.transaction_outcomes_unknown",
+                        "sqlite.work_scheduler.commit_failures",
                         attributes=attributes,
                     )
-                raise
-            try:
-                connection.commit()
-            except BaseException:
+                    rollback()
+                    raise
                 runtime_increment(
                     self._runtime_observer,
-                    "sqlite.work_scheduler.commit_failures",
+                    "sqlite.work_scheduler.commits",
                     attributes=attributes,
                 )
-                if connection.in_transaction:
-                    try:
-                        connection.rollback()
-                    except sqlite3.Error:
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.rollback_failures",
-                            attributes=attributes,
-                        )
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.transaction_outcomes_unknown",
-                            attributes=attributes,
-                        )
-                    else:
-                        runtime_increment(
-                            self._runtime_observer,
-                            "sqlite.work_scheduler.rollbacks",
-                            attributes=attributes,
-                        )
-                else:
+                committed_changes = connection.total_changes - row_changes_before
+                if committed_changes > 0:
                     runtime_increment(
                         self._runtime_observer,
-                        "sqlite.work_scheduler.transaction_outcomes_unknown",
-                        attributes=attributes,
+                        "sqlite.work_scheduler.rows_committed",
+                        committed_changes,
+                        attributes,
                     )
-                raise
-            runtime_increment(
-                self._runtime_observer,
-                "sqlite.work_scheduler.commits",
-                attributes=attributes,
-            )
+            finally:
+                _ACTIVE_AUTHORITY_TRANSACTION.reset(active_token)
+
+    def _commit(self, connection: sqlite3.Connection) -> None:
+        """Keep the commit boundary injectable for crash-recovery tests."""
+        connection.commit()
 
 
 def _require_model[T](value: object, model_type: type[T], label: str) -> T:
@@ -1933,6 +2027,11 @@ def _pragma_int(connection: sqlite3.Connection, name: str) -> int:
     return value
 
 
+def _is_busy_or_locked(error: sqlite3.Error) -> bool:
+    message = str(error).lower()
+    return "busy" in message or "locked" in message
+
+
 def _rollback_quietly(connection: sqlite3.Connection) -> None:
     with suppress(sqlite3.Error):
         connection.rollback()
@@ -1946,4 +2045,6 @@ __all__ = [
     "WorkSchedulerError",
     "WorkStateError",
     "WorkStorageError",
+    "active_authority_transaction_operation",
+    "require_outside_authority_transaction",
 ]

@@ -9,10 +9,13 @@ never claims governed provider or production-qualified evidence.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import RLock
+from time import monotonic, sleep
 from typing import Final, Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -22,6 +25,7 @@ from robata.adapters.sqlite_stream_delivery import (
     PreparedWindowReductionEvidence,
     SQLiteStreamDeliveryAuthority,
 )
+from robata.adapters.sqlite_work_scheduler import require_outside_authority_transaction
 from robata.application.canonical.pre_eos_execution import _stream_terminal_outcome
 from robata.application.canonical.result_validation import CanonicalOfflineRunResult
 from robata.application.canonical.stream_recording_reduction import (
@@ -47,6 +51,7 @@ from robata.application.canonical.stream_recording_reduction import (
 from robata.application.canonical.stream_scheduler import (
     DurableStreamWindowScheduler,
     StreamDrainWorkSnapshot,
+    StreamSchedulerCompositionError,
 )
 from robata.contracts.common import (
     NanosecondInterval,
@@ -109,12 +114,15 @@ from robata.inference.models import (
 from robata.inference.models import (
     VisionTask as ProviderVisionTask,
 )
+from robata.queue.models import WorkItemState
 from robata.queue.stream_models import (
     TERMINAL_STREAM_WORK_STATES,
     StreamTerminalEvidence,
     StreamWorkItem,
     StreamWorkItemState,
+    StreamWorkLease,
 )
+from robata.runtime.observability import RuntimeObserver, RuntimeSpanStatus, runtime_increment
 
 LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION: Final = (
     "local-conformance-provider-neutral-stream-executor-v1"
@@ -141,6 +149,11 @@ _PRE_EOS_PROVIDER_TASK_BY_STAGE: Final[dict[StreamStage, ProviderVisionTask]] = 
     StreamStage.EVENT_PROPOSAL: ProviderVisionTask.EVENT_PROPOSAL,
 }
 _ARTIFACT_NAMESPACE: Final = uuid5(NAMESPACE_URL, "robata:local-conformance-stream-artifact-v1")
+_COMPETING_EXECUTOR_WAIT_SECONDS: Final = 1.0
+_COMPETING_EXECUTOR_WAIT_POLL_SECONDS: Final = 0.01
+_PENDING_TERMINAL_PROJECTION_ERROR: Final = (
+    "terminal execution projection lacks exact stream terminal evidence"
+)
 
 
 class LocalStreamFinalizationError(RuntimeError):
@@ -206,10 +219,87 @@ class LocalStreamFinalizationOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalStreamStageExecutorConfig:
+    """Runtime-only concurrency limit for one canonical stream stage."""
+
+    stage: StreamStage
+    max_concurrency: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, StreamStage):
+            raise TypeError("stage must be StreamStage")
+        if isinstance(self.max_concurrency, bool) or not isinstance(self.max_concurrency, int):
+            raise TypeError("max_concurrency must be an integer")
+        if self.max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalStreamExecutorConfig:
+    """Bounded runtime executor settings, intentionally outside stream identities."""
+
+    max_concurrency: int = 1
+    max_scope_items: int = 32
+    stage_concurrency: tuple[LocalStreamStageExecutorConfig, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_concurrency, bool) or not isinstance(self.max_concurrency, int):
+            raise TypeError("max_concurrency must be an integer")
+        if self.max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
+        if isinstance(self.max_scope_items, bool) or not isinstance(self.max_scope_items, int):
+            raise TypeError("max_scope_items must be an integer")
+        if self.max_scope_items < self.max_concurrency:
+            raise ValueError("max_scope_items must be at least max_concurrency")
+        if not isinstance(self.stage_concurrency, tuple):
+            raise TypeError("stage_concurrency must be a tuple")
+        seen_stages: set[StreamStage] = set()
+        for setting in self.stage_concurrency:
+            if not isinstance(setting, LocalStreamStageExecutorConfig):
+                raise TypeError("stage_concurrency entries must be LocalStreamStageExecutorConfig")
+            if setting.stage in seen_stages:
+                raise ValueError("stage_concurrency must not contain duplicate stages")
+            if setting.max_concurrency > self.max_concurrency:
+                raise ValueError("stage concurrency cannot exceed the global max_concurrency")
+            seen_stages.add(setting.stage)
+
+    def concurrency_for(self, stage: StreamStage) -> int:
+        """Return the runtime-only limit for one stage."""
+
+        for setting in self.stage_concurrency:
+            if setting.stage is stage:
+                return setting.max_concurrency
+        return self.max_concurrency
+
+
+DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG: Final = LocalStreamExecutorConfig()
+
+
+@dataclass(frozen=True, slots=True)
+class LocalStreamExecutorSnapshot:
+    """Observed bounded-executor state; never part of canonical output."""
+
+    max_concurrency: int
+    in_flight: int
+    maximum_in_flight: int
+    maximum_durable_backlog: int
+    claimed_work_count: int
+    accepted_work_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedStreamWorkCompletion:
     terminal_evidence: StreamTerminalEvidence
     window_result: StreamWindowResult | None = None
     causal_evidence: PreparedWindowReductionEvidence | None = None
+
+
+@dataclass(slots=True)
+class _InFlightStreamPreparation:
+    """Coordinator-owned lease and immutable worker input."""
+
+    plan: StreamWorkItemPlan
+    lease: StreamWorkLease
 
 
 class LocalStreamWorkReceipt(StrictModel):
@@ -371,6 +461,8 @@ class LocalConformanceStreamFinalizer:
         stage_terminal_executor: (
             Callable[[StreamWorkItemPlan], StreamTerminalEvidence | None] | None
         ) = None,
+        executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
+        runtime_observer: RuntimeObserver | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(scheduler, DurableStreamWindowScheduler):
@@ -410,6 +502,8 @@ class LocalConformanceStreamFinalizer:
             raise TypeError("recover_graph_before_execute must be bool")
         if stage_terminal_executor is not None and not callable(stage_terminal_executor):
             raise TypeError("stage_terminal_executor must be callable or None")
+        if not isinstance(executor_config, LocalStreamExecutorConfig):
+            raise TypeError("executor_config must be LocalStreamExecutorConfig")
         self._scheduler = scheduler
         self._delivery = delivery_authority
         self._artifacts = _ExactLocalArtifactStore(Path(artifact_root))
@@ -428,7 +522,30 @@ class LocalConformanceStreamFinalizer:
         self._lease_seconds = lease_duration_seconds
         self._recover_graph_before_execute = recover_graph_before_execute
         self._stage_terminal_executor = stage_terminal_executor
+        self._executor_config = executor_config
+        self._runtime_observer = runtime_observer
+        self._executor_lock = RLock()
+        self._observer_lock = RLock()
+        self._executor_in_flight = 0
+        self._executor_maximum_in_flight = 0
+        self._executor_maximum_durable_backlog = 0
+        self._executor_claimed_work_count = 0
+        self._executor_accepted_work_count = 0
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    @property
+    def executor_snapshot(self) -> LocalStreamExecutorSnapshot:
+        """Return bounded executor observations without changing durable state."""
+
+        with self._executor_lock:
+            return LocalStreamExecutorSnapshot(
+                max_concurrency=self._executor_config.max_concurrency,
+                in_flight=self._executor_in_flight,
+                maximum_in_flight=self._executor_maximum_in_flight,
+                maximum_durable_backlog=self._executor_maximum_durable_backlog,
+                claimed_work_count=self._executor_claimed_work_count,
+                accepted_work_count=self._executor_accepted_work_count,
+            )
 
     def execute(self) -> LocalStreamFinalizationOutcome:
         """Complete every window DAG, close EOS gates, and complete finalization."""
@@ -445,20 +562,60 @@ class LocalConformanceStreamFinalizer:
             )
         all_plans = self._scheduler.work_plans()
         nonfinal = tuple(plan for plan in all_plans if plan.stage is not StreamStage.FINALIZATION)
-        executed = self.drain_ready(max_items=max(1, len(nonfinal)))
-        items_by_id = {
-            item.work_item_id: item for item in self._scheduler.work_items(recover_graph=False)
-        }
-        unresolved = tuple(
-            plan.work_item_id
-            for plan in nonfinal
-            if items_by_id[plan.work_item_id].state not in TERMINAL_STREAM_WORK_STATES
-        )
-        if unresolved:
-            raise LocalStreamFinalizationError(
-                f"stream DAG made no progress; unresolved work: {unresolved}"
+        executed = 0
+        competing_progress_deadline: float | None = None
+        while True:
+            items_by_id = {item.work_item_id: item for item in self._durable_stream_work_items()}
+            unresolved = tuple(
+                plan.work_item_id
+                for plan in nonfinal
+                if items_by_id[plan.work_item_id].state not in TERMINAL_STREAM_WORK_STATES
             )
+            if not unresolved:
+                break
+            progressed = self.drain_ready(
+                max_items=min(len(unresolved), self._executor_config.max_scope_items)
+            )
+            executed += progressed
+            if progressed:
+                competing_progress_deadline = None
+                continue
 
+            # A second stage-affine executor may have atomically claimed the
+            # only currently-ready work. Re-read durable authority and wait
+            # briefly for its fenced terminal instead of treating that normal
+            # competition as a corrupted DAG. We never steal its lease.
+            if self._recover_graph_before_execute:
+                self._scheduler.recover()
+            refreshed_items_by_id = {
+                item.work_item_id: item for item in self._durable_stream_work_items()
+            }
+            refreshed_unresolved = tuple(
+                plan.work_item_id
+                for plan in nonfinal
+                if refreshed_items_by_id[plan.work_item_id].state not in TERMINAL_STREAM_WORK_STATES
+            )
+            if not refreshed_unresolved:
+                items_by_id = refreshed_items_by_id
+                break
+            active_competitors = tuple(
+                refreshed_items_by_id[work_item_id]
+                for work_item_id in refreshed_unresolved
+                if refreshed_items_by_id[work_item_id].state
+                in {StreamWorkItemState.LEASED, StreamWorkItemState.RUNNING}
+            )
+            if active_competitors:
+                competing_progress_deadline = self._wait_for_competing_executor(
+                    active_competitors,
+                    deadline=competing_progress_deadline,
+                    activity="non-final stream work",
+                )
+                continue
+            competing_progress_deadline = self._wait_for_durable_progress(
+                deadline=competing_progress_deadline,
+                activity="non-final stream work",
+                unresolved_work_item_ids=refreshed_unresolved,
+            )
         window_results = self._load_window_results(nonfinal, items_by_id)
         closure = self._scheduler.terminal_closure()
         if closure is None:
@@ -536,8 +693,9 @@ class LocalConformanceStreamFinalizer:
             created_at=self._now(),
         )
 
-        final_item = self._scheduler.get(final_plan.work_item_id)
-        if final_item.state not in TERMINAL_STREAM_WORK_STATES:
+        final_item = self._durable_stream_item(final_plan.work_item_id)
+        finalization_wait_deadline: float | None = None
+        while final_item.state not in TERMINAL_STREAM_WORK_STATES:
             claim = self._scheduler.claim_and_start(
                 self._worker_id,
                 self._lease_seconds,
@@ -558,9 +716,22 @@ class LocalConformanceStreamFinalizer:
                     now=self._now(),
                 )
             if claim is None:
-                raise LocalStreamFinalizationError(
-                    "finalization gate is closed but finalization work is not claimable"
+                final_item = self._durable_stream_item(final_plan.work_item_id)
+                if final_item.state in TERMINAL_STREAM_WORK_STATES:
+                    break
+                if final_item.state not in {
+                    StreamWorkItemState.LEASED,
+                    StreamWorkItemState.RUNNING,
+                }:
+                    raise LocalStreamFinalizationError(
+                        "finalization gate is closed but finalization work is not claimable"
+                    )
+                finalization_wait_deadline = self._wait_for_competing_executor(
+                    (final_item,),
+                    deadline=finalization_wait_deadline,
+                    activity="recording finalization",
                 )
+                continue
             final_item = self._scheduler.complete(
                 claim.lease,
                 StreamTerminalEvidence(
@@ -572,7 +743,7 @@ class LocalConformanceStreamFinalizer:
                 now=self._now(),
             )
             executed += 1
-        else:
+        if final_item.state in TERMINAL_STREAM_WORK_STATES:
             existing = final_item.terminal_evidence_ref
             if existing is None:
                 raise LocalStreamFinalizationError(
@@ -594,7 +765,131 @@ class LocalConformanceStreamFinalizer:
             canonical_truth=canonical_truth,
         )
 
+    def _wait_for_competing_executor(
+        self,
+        active_items: tuple[StreamWorkItem, ...],
+        *,
+        deadline: float | None,
+        activity: str,
+    ) -> float:
+        """Wait briefly for another worker's durable lease without taking it."""
+
+        if not active_items:
+            raise ValueError("active_items must not be empty")
+        if deadline is None:
+            deadline = monotonic() + _COMPETING_EXECUTOR_WAIT_SECONDS
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            owners = tuple(f"{item.work_item_id}:{item.leased_by}" for item in active_items)
+            raise LocalStreamFinalizationError(
+                f"{activity} is still held by competing executor leases: {owners}"
+            )
+        sleep(min(_COMPETING_EXECUTOR_WAIT_POLL_SECONDS, remaining))
+        return deadline
+
+    def _wait_for_durable_progress(
+        self,
+        *,
+        deadline: float | None,
+        activity: str,
+        unresolved_work_item_ids: tuple[str, ...],
+    ) -> float:
+        """Bound a retry when a recently committed terminal changes readiness."""
+
+        if deadline is None:
+            deadline = monotonic() + _COMPETING_EXECUTOR_WAIT_SECONDS
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise LocalStreamFinalizationError(
+                f"{activity} made no durable progress; unresolved work: {unresolved_work_item_ids}"
+            )
+        sleep(min(_COMPETING_EXECUTOR_WAIT_POLL_SECONDS, remaining))
+        return deadline
+
+    def _durable_stream_work_items(self) -> tuple[StreamWorkItem, ...]:
+        """Read a graph snapshot after resolving a competing pending terminal."""
+
+        deadline = monotonic() + _COMPETING_EXECUTOR_WAIT_SECONDS
+        while True:
+            try:
+                return self._scheduler.work_items(recover_graph=False)
+            except StreamSchedulerCompositionError as error:
+                if str(error) != _PENDING_TERMINAL_PROJECTION_ERROR:
+                    raise
+                # ``complete`` durably writes a pending terminal before its work
+                # projection succeeds. A competing reader can observe that narrow
+                # interval; recovery promotes the already-fenced terminal fact.
+                self._scheduler.recover()
+                if monotonic() >= deadline:
+                    raise LocalStreamFinalizationError(
+                        "pending stream terminal was not accepted before the read deadline"
+                    ) from error
+                sleep(_COMPETING_EXECUTOR_WAIT_POLL_SECONDS)
+
+    def _durable_stream_item(self, work_item_id: str) -> StreamWorkItem:
+        """Return one exact graph item using the pending-terminal-safe snapshot."""
+
+        for item in self._durable_stream_work_items():
+            if item.work_item_id == work_item_id:
+                return item
+        raise LocalStreamFinalizationError(
+            f"stream graph does not contain work item {work_item_id}"
+        )
+
+    def _durable_bounded_drain_scope(
+        self,
+        max_items: int,
+    ) -> tuple[StreamDrainWorkSnapshot, ...]:
+        """Read drain work only after pending terminal facts reach accepted state."""
+
+        deadline = monotonic() + _COMPETING_EXECUTOR_WAIT_SECONDS
+        while True:
+            scope = self._scheduler.bounded_drain_scope(max_items)
+            pending_projection_ids = tuple(
+                item.plan.work_item_id
+                for item in scope
+                if item.execution_state is WorkItemState.SUCCEEDED
+                and item.terminal_evidence is None
+            )
+            if not pending_projection_ids:
+                return scope
+
+            # A competing executor has already fenced and persisted the terminal
+            # intent. Promote that durable fact before another worker decides
+            # whether its downstream work has the exact evidence it consumes.
+            self._scheduler.recover()
+            if monotonic() >= deadline:
+                raise LocalStreamFinalizationError(
+                    "pending stream terminal was not accepted before bounded drain "
+                    f"read deadline: {pending_projection_ids}"
+                )
+            sleep(_COMPETING_EXECUTOR_WAIT_POLL_SECONDS)
+
     def drain_ready(
+        self,
+        max_items: int,
+        *,
+        scope: tuple[StreamDrainWorkSnapshot, ...] | None = None,
+    ) -> int:
+        """Complete bounded ready work using only durable claims as executor inputs."""
+
+        if isinstance(max_items, bool) or not isinstance(max_items, int):
+            raise TypeError("max_items must be an integer")
+        if max_items <= 0:
+            raise ValueError("max_items must be positive")
+        if self._recover_graph_before_execute:
+            self._scheduler.recover()
+
+        effective_max_items = min(max_items, self._executor_config.max_scope_items)
+        controller_limit = self._execution_controller_limit()
+        if scope is not None:
+            return self._drain_ready_sequential(effective_max_items, scope=scope)
+        return self._drain_ready_concurrently(
+            effective_max_items,
+            controller_limit=controller_limit,
+        )
+
+    def _drain_ready_sequential(
         self,
         max_items: int,
         *,
@@ -609,7 +904,7 @@ class LocalConformanceStreamFinalizer:
         if self._recover_graph_before_execute:
             self._scheduler.recover()
 
-        bounded_scope = self._scheduler.bounded_drain_scope(max_items) if scope is None else scope
+        bounded_scope = self._durable_bounded_drain_scope(max_items) if scope is None else scope
         plans_by_key = {item.plan.work_logical_key: item.plan for item in bounded_scope}
         terminal_refs_by_key = {
             item.plan.work_logical_key: item.terminal_evidence.evidence_ref
@@ -639,30 +934,11 @@ class LocalConformanceStreamFinalizer:
             for plan in tuple(pending.values()):
                 if executed >= max_items:
                     break
-                claim = self._scheduler.claim_and_start(
-                    self._worker_id,
-                    self._lease_seconds,
-                    work_item_id=plan.work_item_id,
-                    now=self._now(),
-                    recover_graph=False,
+                lease = self._claim_ready_lease(
+                    plan,
+                    terminal_refs_by_key=terminal_refs_by_key,
                 )
-                if (
-                    claim is None
-                    and self._stage_terminal_executor is not None
-                    and plan.stage in _PRE_EOS_PROVIDER_TASK_BY_STAGE
-                ):
-                    # A provider terminal may already be durably persisted while a
-                    # process dies before the stream scheduler accepts it.  Do not
-                    # reclaim or re-dispatch the work: resume only the exact live
-                    # fence still owned by this local worker, then let the canonical
-                    # provider ledger replay its evidence through the same hook.
-                    claim = self._scheduler.resume_owned_active(
-                        self._worker_id,
-                        self._lease_seconds,
-                        work_item_id=plan.work_item_id,
-                        now=self._now(),
-                    )
-                if claim is None:
+                if lease is None:
                     continue
                 prepared = self._prepare_work_completion(
                     plan,
@@ -680,11 +956,11 @@ class LocalConformanceStreamFinalizer:
                             "window reduction did not prepare its causal result closure"
                         )
                     member = self._scheduler.prepare_window_terminal_member(
-                        claim.lease,
+                        lease,
                         evidence,
                     )
                     self._delivery.commit_window_reduction(
-                        lease=claim.lease,
+                        lease=lease,
                         terminal_evidence=evidence,
                         terminal_member=member,
                         result=result,
@@ -694,7 +970,7 @@ class LocalConformanceStreamFinalizer:
                         now=self._now(),
                     )
                 else:
-                    self._scheduler.complete(claim.lease, evidence, now=self._now())
+                    self._scheduler.complete(lease, evidence, now=self._now())
                 terminal_refs_by_key[plan.work_logical_key] = evidence.evidence_ref
                 terminal_outcomes_by_key[plan.work_logical_key] = evidence.outcome
                 executed += 1
@@ -703,6 +979,548 @@ class LocalConformanceStreamFinalizer:
             if not progress:
                 break
         return executed
+
+    def _execution_controller_limit(self) -> int:
+        """Persist one controller observation and return its runtime-only limit."""
+
+        snapshot = self._scheduler.backpressure_snapshot(now=self._now())
+        limit = snapshot.decision.controller_limit
+        if limit is None:
+            raise LocalStreamFinalizationError("backpressure controller omitted its limit")
+        return limit
+
+    def _drain_ready_concurrently(
+        self,
+        max_items: int,
+        *,
+        controller_limit: int,
+    ) -> int:
+        """Prepare bounded claimed work concurrently and accept it on this coordinator."""
+
+        executed = 0
+        in_flight: dict[Future[_PreparedStreamWorkCompletion], _InFlightStreamPreparation] = {}
+        executors: dict[StreamStage, ThreadPoolExecutor] = {}
+        next_heartbeat_at = monotonic() + self._heartbeat_interval_seconds()
+        try:
+            while executed < max_items:
+                remaining_capacity = min(
+                    self._executor_config.max_concurrency - len(in_flight),
+                    controller_limit - len(in_flight),
+                    max_items - executed - len(in_flight),
+                )
+                dispatched = False
+                if remaining_capacity > 0:
+                    bounded_scope = self._durable_bounded_drain_scope(
+                        self._executor_config.max_scope_items
+                    )
+                    (
+                        plans_by_key,
+                        terminal_refs_by_key,
+                        terminal_outcomes_by_key,
+                        pending,
+                        declarations_by_window,
+                    ) = self._execution_context(bounded_scope)
+                    in_flight_work_item_ids = {
+                        entry.plan.work_item_id for entry in in_flight.values()
+                    }
+                    stage_counts = {
+                        stage: sum(entry.plan.stage is stage for entry in in_flight.values())
+                        for stage in StreamStage
+                    }
+                    for plan in pending:
+                        if remaining_capacity <= 0:
+                            break
+                        if plan.work_item_id in in_flight_work_item_ids:
+                            continue
+                        stage_limit = min(
+                            self._executor_config.concurrency_for(plan.stage),
+                            controller_limit,
+                        )
+                        if stage_counts[plan.stage] >= stage_limit:
+                            continue
+                        executor = executors.get(plan.stage)
+                        if executor is None:
+                            executor = ThreadPoolExecutor(
+                                max_workers=stage_limit,
+                                thread_name_prefix=f"robata-stream-{plan.stage.value}",
+                            )
+                            executors[plan.stage] = executor
+                        lease = self._claim_ready_lease(
+                            plan,
+                            terminal_refs_by_key=terminal_refs_by_key,
+                        )
+                        if lease is None:
+                            continue
+                        durable_backlog = self._durable_backlog()
+                        attributes = self._executor_attributes(plan, durable_backlog)
+                        queue_wait_span = self._begin_executor_span(
+                            f"stream.executor.{plan.stage.value}.queue_wait",
+                            attributes,
+                        )
+                        self._record_executor_claim(plan, durable_backlog)
+                        try:
+                            future = executor.submit(
+                                self._prepare_claimed_work,
+                                plan,
+                                dict(plans_by_key),
+                                dict(terminal_refs_by_key),
+                                dict(terminal_outcomes_by_key),
+                                dict(declarations_by_window),
+                                queue_wait_span,
+                                attributes,
+                            )
+                        except BaseException as error:
+                            self._end_executor_span(
+                                queue_wait_span,
+                                status=RuntimeSpanStatus.ERROR,
+                                error_type=type(error).__name__,
+                            )
+                            if isinstance(error, Exception):
+                                self._fail_claimed_work_retryably(
+                                    plan,
+                                    lease,
+                                    error,
+                                    error_code="LOCAL_EXECUTOR_SUBMIT_FAILED",
+                                )
+                            self._record_executor_finished()
+                            raise
+                        in_flight[future] = _InFlightStreamPreparation(
+                            plan=plan,
+                            lease=lease,
+                        )
+                        stage_counts[plan.stage] += 1
+                        remaining_capacity -= 1
+                        dispatched = True
+
+                if not in_flight:
+                    if not dispatched:
+                        break
+                    continue
+
+                done, _pending = wait(
+                    tuple(in_flight),
+                    timeout=max(0.0, next_heartbeat_at - monotonic()),
+                    return_when=FIRST_COMPLETED,
+                )
+                if monotonic() >= next_heartbeat_at:
+                    self._heartbeat_in_flight(in_flight.values())
+                    next_heartbeat_at = monotonic() + self._heartbeat_interval_seconds()
+                if not done:
+                    continue
+
+                completed_futures = tuple(future for future in in_flight if future in done)
+                for future in completed_futures:
+                    if monotonic() >= next_heartbeat_at:
+                        self._heartbeat_in_flight(in_flight.values())
+                        next_heartbeat_at = monotonic() + self._heartbeat_interval_seconds()
+                    entry = in_flight.pop(future)
+                    try:
+                        try:
+                            prepared = future.result()
+                        except Exception as error:
+                            self._fail_claimed_work_retryably(
+                                entry.plan,
+                                entry.lease,
+                                error,
+                                error_code="LOCAL_EXECUTOR_PREPARATION_FAILED",
+                            )
+                            raise
+                        try:
+                            self._accept_prepared_work(entry.plan, entry.lease, prepared)
+                        except Exception as error:
+                            self._fail_claimed_work_retryably(
+                                entry.plan,
+                                entry.lease,
+                                error,
+                                error_code="LOCAL_EXECUTOR_ACCEPT_FAILED",
+                            )
+                            raise
+                    finally:
+                        self._record_executor_finished()
+                    self._record_executor_accept(entry.plan)
+                    executed += 1
+        finally:
+            self._shutdown_executors(executors.values(), in_flight)
+        return executed
+
+    def _execution_context(
+        self,
+        bounded_scope: tuple[StreamDrainWorkSnapshot, ...],
+    ) -> tuple[
+        dict[str, StreamWorkItemPlan],
+        dict[str, ArtifactEvidenceRef],
+        dict[str, TerminalOutcome],
+        tuple[StreamWorkItemPlan, ...],
+        dict[str, ExpectedWindowDeclaration],
+    ]:
+        plans_by_key = {item.plan.work_logical_key: item.plan for item in bounded_scope}
+        terminal_refs_by_key = {
+            item.plan.work_logical_key: item.terminal_evidence.evidence_ref
+            for item in bounded_scope
+            if item.terminal_evidence is not None
+        }
+        terminal_outcomes_by_key = {
+            item.plan.work_logical_key: item.terminal_evidence.outcome
+            for item in bounded_scope
+            if item.terminal_evidence is not None
+        }
+        pending = tuple(
+            item.plan
+            for item in bounded_scope
+            if item.plan.stage is not StreamStage.FINALIZATION and not item.is_terminal
+        )
+        declarations_by_window = (
+            {declaration.window_key: declaration for declaration in self._scheduler.declarations()}
+            if any(plan.stage is StreamStage.WINDOW_REDUCTION for plan in pending)
+            else {}
+        )
+        return (
+            plans_by_key,
+            terminal_refs_by_key,
+            terminal_outcomes_by_key,
+            pending,
+            declarations_by_window,
+        )
+
+    def _claim_ready_lease(
+        self,
+        plan: StreamWorkItemPlan,
+        *,
+        terminal_refs_by_key: dict[str, ArtifactEvidenceRef],
+    ) -> StreamWorkLease | None:
+        # The execution scheduler can expose a direct downstream item between
+        # its terminal projection commit and stream-terminal acceptance. Only
+        # claim it after this bounded scope has the immutable upstream facts
+        # required to construct its receipt or causal reduction.
+        if any(
+            dependency.upstream_work_logical_key not in terminal_refs_by_key
+            for dependency in plan.ordered_dependencies
+        ):
+            return None
+        claim = self._scheduler.claim_and_start(
+            self._worker_id,
+            self._lease_seconds,
+            work_item_id=plan.work_item_id,
+            now=self._now(),
+            recover_graph=False,
+        )
+        if (
+            claim is None
+            and self._stage_terminal_executor is not None
+            and plan.stage in _PRE_EOS_PROVIDER_TASK_BY_STAGE
+        ):
+            claim = self._scheduler.resume_owned_active(
+                self._worker_id,
+                self._lease_seconds,
+                work_item_id=plan.work_item_id,
+                now=self._now(),
+            )
+        return None if claim is None else claim.lease
+
+    def _prepare_claimed_work(
+        self,
+        plan: StreamWorkItemPlan,
+        plans_by_key: dict[str, StreamWorkItemPlan],
+        terminal_refs_by_key: dict[str, ArtifactEvidenceRef],
+        terminal_outcomes_by_key: dict[str, TerminalOutcome],
+        declarations_by_window: dict[str, ExpectedWindowDeclaration],
+        queue_wait_span: object | None,
+        attributes: dict[str, str | int],
+    ) -> _PreparedStreamWorkCompletion:
+        self._end_executor_span(queue_wait_span)
+        execution_span = self._begin_executor_span(
+            f"stream.executor.{plan.stage.value}.execution",
+            attributes,
+        )
+        try:
+            return self._prepare_work_completion(
+                plan,
+                plans_by_key,
+                terminal_refs_by_key,
+                terminal_outcomes_by_key,
+                declarations_by_window,
+            )
+        except BaseException as error:
+            self._end_executor_span(
+                execution_span,
+                status=RuntimeSpanStatus.ERROR,
+                error_type=type(error).__name__,
+            )
+            raise
+        else:
+            self._end_executor_span(execution_span)
+
+    def _accept_prepared_work(
+        self,
+        plan: StreamWorkItemPlan,
+        lease: StreamWorkLease,
+        prepared: _PreparedStreamWorkCompletion,
+    ) -> None:
+        acceptance_span = self._begin_executor_span(
+            f"stream.executor.{plan.stage.value}.accept",
+            self._executor_attributes(plan, self._durable_backlog()),
+        )
+        try:
+            evidence = prepared.terminal_evidence
+            if plan.stage is StreamStage.WINDOW_REDUCTION:
+                result = prepared.window_result
+                causal_evidence = prepared.causal_evidence
+                if result is None or causal_evidence is None:
+                    raise LocalStreamFinalizationError(
+                        "window reduction did not prepare its causal result closure"
+                    )
+                member = self._scheduler.prepare_window_terminal_member(lease, evidence)
+                self._delivery.commit_window_reduction(
+                    lease=lease,
+                    terminal_evidence=evidence,
+                    terminal_member=member,
+                    result=result,
+                    causal_evidence=causal_evidence,
+                    topic="robata.stream.window-results.v1",
+                    message_key=result.window_result_key,
+                    now=self._now(),
+                )
+            else:
+                self._scheduler.complete(lease, evidence, now=self._now())
+        except BaseException as error:
+            self._end_executor_span(
+                acceptance_span,
+                status=RuntimeSpanStatus.ERROR,
+                error_type=type(error).__name__,
+            )
+            raise
+        else:
+            self._end_executor_span(acceptance_span)
+
+    def _heartbeat_in_flight(
+        self,
+        entries: Iterable[_InFlightStreamPreparation],
+    ) -> None:
+        for entry in entries:
+            entry.lease = self._scheduler.heartbeat(
+                entry.lease,
+                self._lease_seconds,
+                now=self._now(),
+            )
+            self._increment_executor_counter(
+                "stream.executor.heartbeat",
+                attributes=self._executor_counter_attributes(entry.plan),
+            )
+
+    def _fail_claimed_work_retryably(
+        self,
+        plan: StreamWorkItemPlan,
+        lease: StreamWorkLease,
+        error: Exception,
+        *,
+        error_code: str,
+    ) -> None:
+        """Return pre-terminal worker failures to durable retry without masking them."""
+
+        try:
+            self._scheduler.fail_retryable(
+                lease,
+                error_code=error_code,
+                error_detail=type(error).__name__,
+                now=self._now(),
+            )
+        except Exception:
+            return
+        self._increment_executor_counter(
+            "stream.executor.retryable_failure",
+            attributes=self._executor_counter_attributes(plan),
+        )
+
+    def _return_unaccepted_work_to_retry(
+        self,
+        future: Future[_PreparedStreamWorkCompletion],
+        entry: _InFlightStreamPreparation,
+    ) -> None:
+        """Release unaccepted worker output through the durable retry path."""
+
+        try:
+            future.result()
+        except Exception as error:
+            self._fail_claimed_work_retryably(
+                entry.plan,
+                entry.lease,
+                error,
+                error_code="LOCAL_EXECUTOR_PREPARATION_FAILED",
+            )
+        except BaseException:
+            self._fail_claimed_work_retryably(
+                entry.plan,
+                entry.lease,
+                RuntimeError("executor worker interrupted"),
+                error_code="LOCAL_EXECUTOR_INTERRUPTED",
+            )
+        else:
+            self._fail_claimed_work_retryably(
+                entry.plan,
+                entry.lease,
+                RuntimeError("executor batch ended before terminal acceptance"),
+                error_code="LOCAL_EXECUTOR_BATCH_ABORTED",
+            )
+
+    def _shutdown_executors(
+        self,
+        executors: Iterable[ThreadPoolExecutor],
+        in_flight: dict[Future[_PreparedStreamWorkCompletion], _InFlightStreamPreparation],
+    ) -> None:
+        """Drain worker threads without letting live durable leases lapse."""
+
+        executor_pool = tuple(executors)
+        for executor in executor_pool:
+            executor.shutdown(wait=False)
+        next_heartbeat_at = monotonic()
+        try:
+            while in_flight:
+                if monotonic() >= next_heartbeat_at:
+                    self._heartbeat_in_flight(in_flight.values())
+                    next_heartbeat_at = monotonic() + self._heartbeat_interval_seconds()
+                done, _pending = wait(
+                    tuple(in_flight),
+                    timeout=max(0.0, next_heartbeat_at - monotonic()),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in tuple(future for future in in_flight if future in done):
+                    entry = in_flight.pop(future)
+                    self._return_unaccepted_work_to_retry(future, entry)
+                    self._record_executor_finished()
+        finally:
+            for executor in executor_pool:
+                executor.shutdown(wait=True)
+            for future, entry in tuple(in_flight.items()):
+                del in_flight[future]
+                self._return_unaccepted_work_to_retry(future, entry)
+                self._record_executor_finished()
+
+    def _heartbeat_interval_seconds(self) -> float:
+        return max(0.05, self._lease_seconds / 2)
+
+    def _durable_backlog(self) -> int:
+        try:
+            return self._scheduler.backlog(now=self._now()).active_backlog
+        except Exception:
+            return 0
+
+    def _executor_attributes(
+        self,
+        plan: StreamWorkItemPlan,
+        durable_backlog: int,
+    ) -> dict[str, str | int]:
+        controller_limit = self._scheduler.backpressure_controller_limit
+        return {
+            "backpressure_controller_key": self._scheduler.backpressure_controller_key,
+            "backpressure_controller_limit": controller_limit,
+            "durable_backlog": durable_backlog,
+            "effective_global_max_concurrency": min(
+                self._executor_config.max_concurrency,
+                controller_limit,
+            ),
+            "effective_stage_max_concurrency": min(
+                self._executor_config.concurrency_for(plan.stage),
+                controller_limit,
+            ),
+            "global_max_concurrency": self._executor_config.max_concurrency,
+            "stage": plan.stage.value,
+            "stage_max_concurrency": self._executor_config.concurrency_for(plan.stage),
+        }
+
+    def _executor_counter_attributes(self, plan: StreamWorkItemPlan) -> dict[str, str | int]:
+        controller_limit = self._scheduler.backpressure_controller_limit
+        return {
+            "backpressure_controller_key": self._scheduler.backpressure_controller_key,
+            "backpressure_controller_limit": controller_limit,
+            "effective_global_max_concurrency": min(
+                self._executor_config.max_concurrency,
+                controller_limit,
+            ),
+            "effective_stage_max_concurrency": min(
+                self._executor_config.concurrency_for(plan.stage),
+                controller_limit,
+            ),
+            "global_max_concurrency": self._executor_config.max_concurrency,
+            "stage": plan.stage.value,
+            "stage_max_concurrency": self._executor_config.concurrency_for(plan.stage),
+        }
+
+    def _record_executor_claim(
+        self,
+        plan: StreamWorkItemPlan,
+        durable_backlog: int,
+    ) -> None:
+        with self._executor_lock:
+            self._executor_in_flight += 1
+            self._executor_maximum_in_flight = max(
+                self._executor_maximum_in_flight,
+                self._executor_in_flight,
+            )
+            self._executor_maximum_durable_backlog = max(
+                self._executor_maximum_durable_backlog,
+                durable_backlog,
+            )
+            self._executor_claimed_work_count += 1
+        self._increment_executor_counter(
+            "stream.executor.claimed",
+            attributes=self._executor_counter_attributes(plan),
+        )
+
+    def _record_executor_finished(self) -> None:
+        with self._executor_lock:
+            if self._executor_in_flight <= 0:
+                raise LocalStreamFinalizationError("executor in-flight accounting underflow")
+            self._executor_in_flight -= 1
+
+    def _record_executor_accept(self, plan: StreamWorkItemPlan) -> None:
+        with self._executor_lock:
+            self._executor_accepted_work_count += 1
+        self._increment_executor_counter(
+            "stream.executor.accepted",
+            attributes=self._executor_counter_attributes(plan),
+        )
+
+    def _begin_executor_span(
+        self,
+        name: str,
+        attributes: dict[str, str | int],
+    ) -> object | None:
+        observer = self._runtime_observer
+        if observer is None:
+            return None
+        try:
+            with self._observer_lock:
+                return observer.begin_span(name, attributes)
+        except Exception:
+            return None
+
+    def _end_executor_span(
+        self,
+        token: object | None,
+        *,
+        status: RuntimeSpanStatus = RuntimeSpanStatus.OK,
+        error_type: str | None = None,
+    ) -> None:
+        if token is None or self._runtime_observer is None:
+            return
+        try:
+            with self._observer_lock:
+                self._runtime_observer.end_span(
+                    token,
+                    status=status,
+                    error_type=error_type,
+                )
+        except Exception:
+            return
+
+    def _increment_executor_counter(
+        self,
+        name: str,
+        *,
+        attributes: dict[str, str | int],
+    ) -> None:
+        with self._observer_lock:
+            runtime_increment(self._runtime_observer, name, attributes=attributes)
 
     def artifact_path_for(self, reference: ArtifactEvidenceRef) -> Path:
         """Resolve an explicit local locator for one exact artifact reference."""
@@ -736,6 +1554,7 @@ class LocalConformanceStreamFinalizer:
         # own claims, leases, and terminal acceptance; this hook owns neither
         # scheduling state nor QA/event reduction semantics.
         if self._stage_terminal_executor is not None:
+            require_outside_authority_transaction(activity="stream stage terminal execution")
             terminal = self._stage_terminal_executor(plan)
             if terminal is not None:
                 checked_terminal = StreamTerminalEvidence.model_validate(
@@ -765,7 +1584,7 @@ class LocalConformanceStreamFinalizer:
                 expected_outcome = _stream_terminal_outcome(inference)[0]
                 if checked_terminal.outcome is not expected_outcome:
                     raise LocalStreamFinalizationError(
-                        'provider terminal outcome conflicts with its model inference'
+                        "provider terminal outcome conflicts with its model inference"
                     )
                 return _PreparedStreamWorkCompletion(terminal_evidence=checked_terminal)
         if (
@@ -836,9 +1655,7 @@ class LocalConformanceStreamFinalizer:
             for slot in declaration.ordered_six_slot_segment_or_explicit_absence_closure
         )
         semantic_status: LocalStreamWindowSemanticStatus = (
-            "ABSTAINED"
-            if degraded_upstream
-            else ("PROPOSED" if has_media else "NO_EVENTS")
+            "ABSTAINED" if degraded_upstream else ("PROPOSED" if has_media else "NO_EVENTS")
         )
         semantic_evidence = create_local_stream_window_semantic_evidence_v2(
             schema_ref=self._schema_refs.window_semantic_evidence_v2,
@@ -991,7 +1808,7 @@ class LocalConformanceStreamFinalizer:
             terminal_outcome = terminal_outcomes_by_key.get(upstream_plan.work_logical_key)
             if terminal_outcome is None:
                 raise LocalStreamFinalizationError(
-                    'causal window reduction lacks upstream terminal outcome'
+                    "causal window reduction lacks upstream terminal outcome"
                 )
             expected_provider_task = _PRE_EOS_PROVIDER_TASK_BY_STAGE.get(upstream_plan.stage)
             provider_schema_ref = self._schema_refs.model_inference
@@ -1031,22 +1848,21 @@ class LocalConformanceStreamFinalizer:
                 expected_outcome = _stream_terminal_outcome(inference)[0]
                 if terminal_outcome is not expected_outcome:
                     raise LocalStreamFinalizationError(
-                        'causal upstream terminal outcome conflicts with its model inference'
+                        "causal upstream terminal outcome conflicts with its model inference"
                     )
                 if (
                     inference.status is ProviderInferenceStatus.SUCCEEDED
                     and not inference.output_valid
                 ):
                     raise LocalStreamFinalizationError(
-                        'successful provider model inference has invalid output'
+                        "successful provider model inference has invalid output"
                     )
                 if inference.stage is not expected_provider_task:
                     raise LocalStreamFinalizationError(
                         "causal upstream model inference task does not match its stage"
                     )
                 if (
-                    terminal_outcome
-                    not in {TerminalOutcome.SUCCEEDED, TerminalOutcome.NO_EVENTS}
+                    terminal_outcome not in {TerminalOutcome.SUCCEEDED, TerminalOutcome.NO_EVENTS}
                     or not inference.output_valid
                 ):
                     # Provider stages are DEGRADABLE dependencies. Preserve the
@@ -1106,7 +1922,7 @@ class LocalConformanceStreamFinalizer:
         *,
         expected_task: ProviderVisionTask,
     ) -> ProviderModelInference:
-        '''Load and bind one exact provider artifact to its expected stream stage.'''
+        """Load and bind one exact provider artifact to its expected stream stage."""
 
         try:
             inference = ProviderModelInference.model_validate_json(
@@ -1115,15 +1931,15 @@ class LocalConformanceStreamFinalizer:
             )
         except ValueError as error:
             raise LocalStreamFinalizationError(
-                'causal upstream provider evidence is not a model inference'
+                "causal upstream provider evidence is not a model inference"
             ) from error
         if inference.stage is not expected_task:
             raise LocalStreamFinalizationError(
-                'causal upstream model inference task does not match its stage'
+                "causal upstream model inference task does not match its stage"
             )
         if inference.status is ProviderInferenceStatus.SUCCEEDED and not inference.output_valid:
             raise LocalStreamFinalizationError(
-                'successful provider model inference has invalid output'
+                "successful provider model inference has invalid output"
             )
         return inference
 

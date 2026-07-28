@@ -368,6 +368,41 @@ def test_qa_dense_mock_preserves_missing_target_as_incomplete() -> None:
     assert result.consumptions[-1].effective_artifact_sha256 is None
 
 
+def test_qa_dense_png_policy_rejects_jpeg_experiment_artifacts() -> None:
+    plan = _plan()
+    lineage = _lineage(_sampling_plan())
+    alignment = _alignment()
+    frame_index = _frame_index(alignment, lineage, empty_camera=None)
+
+    def jpeg_artifact_resolver(camera_id: CameraId, frame) -> MaterializedFrameArtifactFact:
+        resolved = _artifact_resolver(camera_id, frame)
+        return resolved.model_copy(
+            update={
+                "artifact": resolved.artifact.model_copy(
+                    update={
+                        "uri": resolved.artifact.uri.removesuffix(".png") + ".jpg",
+                        "media_type": "image/jpeg",
+                    }
+                )
+            }
+        )
+
+    materialized = ExplicitTargetPackageMaterializer().materialize(
+        plan=plan,
+        frame_index=frame_index,
+        artifact_resolver=jpeg_artifact_resolver,
+        created_at="2026-07-19T01:00:00Z",
+    )
+    consumer = DeterministicSupplementalQaDenseConsumer()
+
+    with pytest.raises(ValueError, match="artifact media type is unsupported"):
+        consumer.consume(
+            materialized,
+            consumer.prepare(materialized),
+            artifact_bytes_resolver=_artifact_bytes_resolver,
+        )
+
+
 def test_exact_manifest_and_semantic_tampering_fail_closed() -> None:
     materialized = _materialized()
     with pytest.raises(ValueError, match="manifest_sha256"):

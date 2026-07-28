@@ -6,6 +6,12 @@ from typing import Any
 import pytest
 
 from robata.runtime.capacity import (
+    BackpressureControllerKind,
+    BackpressureObservation,
+    BackpressureRecordingBacklog,
+    BackpressureScenarioKind,
+    BackpressureScenarioReport,
+    BackpressureStabilityReport,
     BottleneckKind,
     CapacityEvidenceClass,
     CapacityRegressionPolicy,
@@ -17,9 +23,12 @@ from robata.runtime.capacity import (
     SyntheticLoadProfile,
     SyntheticOutcome,
     WorkerScalingReport,
+    build_backpressure_stability_report,
     build_measured_capacity_report,
     build_worker_scaling_report,
+    compare_backpressure_stability_reports,
     compare_capacity_reports,
+    compare_fixed_and_adaptive_backpressure,
     compare_measured_capacity_reports,
     evaluate_local_slo,
     generate_synthetic_load,
@@ -613,3 +622,212 @@ def test_required_worker_count_for_rtf_uses_ceiling_and_rejects_zero_rate() -> N
     assert required_worker_count_for_rtf(25.0, target_recording_rtf=25.0) == 1
     with pytest.raises(ValueError, match='finite and positive'):
         required_worker_count_for_rtf(0.0)
+
+
+def _backpressure_scenario(
+    kind: BackpressureScenarioKind,
+    *,
+    adaptive: bool,
+) -> BackpressureScenarioReport:
+    peak = 5 if adaptive else 8
+    end = 0 if kind is BackpressureScenarioKind.DRAIN else (1 if adaptive else 2)
+    arrival_rate = 10.0 if kind is BackpressureScenarioKind.OVERLOAD else 6.0
+    service_rate = 8.0 if kind is BackpressureScenarioKind.OVERLOAD else 6.0
+    quota = 0 if kind is BackpressureScenarioKind.PROVIDER_QUOTA else 8
+
+    def recording_backlogs(depth: int) -> tuple[BackpressureRecordingBacklog, ...]:
+        if kind is not BackpressureScenarioKind.FAIRNESS:
+            return ()
+        first_depth = max(0, depth - 2)
+        return (
+            BackpressureRecordingBacklog(
+                recording_key="recording-a",
+                backlog_depth=first_depth,
+            ),
+            BackpressureRecordingBacklog(
+                recording_key="recording-b",
+                backlog_depth=depth - first_depth,
+            ),
+        )
+
+    observations = [
+        BackpressureObservation(
+            observed_at_ms=0,
+            backlog_depth=peak,
+            controller_limit=8,
+            arrival_rate_per_second=arrival_rate,
+            service_rate_per_second=service_rate,
+            backlog_slope_per_second=float(end - peak),
+            oldest_backlog_age_ms=50,
+            provider_quota=quota,
+            worker_utilization=0.9,
+            recording_backlogs=recording_backlogs(peak),
+        ),
+        BackpressureObservation(
+            observed_at_ms=1_000,
+            backlog_depth=end,
+            controller_limit=6 if adaptive else 8,
+            arrival_rate_per_second=arrival_rate,
+            service_rate_per_second=service_rate,
+            backlog_slope_per_second=float(end - peak),
+            oldest_backlog_age_ms=0 if end == 0 else 100,
+            provider_quota=4 if kind is BackpressureScenarioKind.PROVIDER_QUOTA else quota,
+            worker_utilization=0.8,
+            recording_backlogs=recording_backlogs(end),
+        ),
+    ]
+    if kind is BackpressureScenarioKind.OSCILLATION and adaptive:
+        observations.append(
+            BackpressureObservation(
+                observed_at_ms=2_000,
+                backlog_depth=end,
+                controller_limit=7,
+                arrival_rate_per_second=arrival_rate,
+                service_rate_per_second=service_rate,
+                backlog_slope_per_second=0.0,
+                oldest_backlog_age_ms=100,
+                provider_quota=quota,
+                worker_utilization=0.8,
+            )
+        )
+    return BackpressureScenarioReport(kind, tuple(observations))
+
+
+def _backpressure_report(
+    controller_kind: BackpressureControllerKind,
+    *,
+    workload_fingerprint: str = "local-backpressure-workload-v1",
+) -> BackpressureStabilityReport:
+    scenarios = tuple(
+        _backpressure_scenario(kind, adaptive=controller_kind is BackpressureControllerKind.AIMD)
+        for kind in reversed(tuple(BackpressureScenarioKind))
+    )
+    return build_backpressure_stability_report(
+        version="local-backpressure-stability-v1",
+        workload_fingerprint=workload_fingerprint,
+        controller_kind=controller_kind,
+        controller_version=f"{controller_kind.value.lower()}-controller-v1",
+        controller_policy_digest=f"{controller_kind.value.lower()}-policy-digest",
+        scenarios=scenarios,
+    )
+
+
+def test_backpressure_stability_keeps_unknown_signals_and_signed_drain_explicit() -> None:
+    drain = BackpressureScenarioReport(
+        BackpressureScenarioKind.DRAIN,
+        (
+            BackpressureObservation(
+                observed_at_ms=0,
+                backlog_depth=4,
+                controller_limit=8,
+                backlog_slope_per_second=-4.0,
+            ),
+            BackpressureObservation(
+                observed_at_ms=1_000,
+                backlog_depth=0,
+                controller_limit=8,
+                backlog_slope_per_second=-4.0,
+            ),
+        ),
+    )
+    report = build_backpressure_stability_report(
+        version="local-backpressure-stability-v1",
+        workload_fingerprint="local-backpressure-workload-v1",
+        controller_kind=BackpressureControllerKind.FIXED,
+        controller_version="fixed-controller-v1",
+        controller_policy_digest="fixed-policy-digest",
+        scenarios=(drain,),
+    )
+
+    assert drain.mean_arrival_rate_per_second is None
+    assert drain.mean_service_rate_per_second is None
+    assert drain.minimum_provider_quota is None
+    assert drain.mean_worker_utilization is None
+    assert drain.net_backlog_slope_per_second == pytest.approx(-4.0)
+    assert drain.drain_completed is True
+    assert drain.missing_signal_kinds == (
+        "ARRIVAL_RATE",
+        "SERVICE_RATE",
+        "PROVIDER_QUOTA",
+        "WORKER_UTILIZATION",
+    )
+    assert report.complete_scenario_matrix is False
+    assert report.measurement_status == "NOT_MEASURED"
+    assert report.qualification_status == "NOT_PRODUCTION_QUALIFIED"
+    assert report.production_eligible is False
+
+    with pytest.raises(ValueError, match="reconcile"):
+        BackpressureObservation(
+            observed_at_ms=0,
+            backlog_depth=2,
+            controller_limit=4,
+            recording_backlogs=(
+                BackpressureRecordingBacklog("recording-a", 1),
+                BackpressureRecordingBacklog("recording-b", 2),
+            ),
+        )
+
+
+def test_backpressure_stability_compares_complete_fixed_and_adaptive_matrix() -> None:
+    fixed = _backpressure_report(BackpressureControllerKind.FIXED)
+    adaptive = _backpressure_report(BackpressureControllerKind.AIMD)
+
+    comparison = compare_fixed_and_adaptive_backpressure(fixed, adaptive)
+
+    assert fixed.complete_scenario_matrix is True
+    assert adaptive.complete_scenario_matrix is True
+    assert comparison.comparable is True
+    assert comparison.non_comparable_reasons == ()
+    assert comparison.adaptive_matches_or_beats_fixed is True
+    assert compare_backpressure_stability_reports(fixed, adaptive) == comparison
+    assert (
+        fixed.report_digest == _backpressure_report(BackpressureControllerKind.FIXED).report_digest
+    )
+    assert fixed.scenario(BackpressureScenarioKind.OVERLOAD).overload_observed is True
+    assert fixed.scenario(BackpressureScenarioKind.PROVIDER_QUOTA).minimum_provider_quota == 0
+    assert fixed.scenario(BackpressureScenarioKind.DRAIN).drain_completed is True
+    assert (
+        adaptive.scenario(
+            BackpressureScenarioKind.OSCILLATION
+        ).controller_limit_direction_reversal_count
+        == 1
+    )
+    assert fixed.scenario(BackpressureScenarioKind.FAIRNESS).recording_backlog_spread_peak == 4
+    assert adaptive.scenario(BackpressureScenarioKind.FAIRNESS).recording_backlog_spread_peak == 1
+    assert [item.scenario for item in comparison.scenario_comparisons] == sorted(
+        BackpressureScenarioKind,
+        key=lambda item: item.value,
+    )
+    assert comparison.measurement_status == "NOT_MEASURED"
+    assert comparison.qualification_status == "NOT_PRODUCTION_QUALIFIED"
+    assert comparison.production_eligible is False
+
+
+def test_backpressure_comparison_refuses_incomplete_or_changed_workload() -> None:
+    fixed = build_backpressure_stability_report(
+        version="local-backpressure-stability-v1",
+        workload_fingerprint="fixed-workload",
+        controller_kind=BackpressureControllerKind.FIXED,
+        controller_version="fixed-controller-v1",
+        controller_policy_digest="fixed-policy-digest",
+        scenarios=(_backpressure_scenario(BackpressureScenarioKind.STEADY, adaptive=False),),
+    )
+    adaptive = build_backpressure_stability_report(
+        version="local-backpressure-stability-v1",
+        workload_fingerprint="adaptive-workload",
+        controller_kind=BackpressureControllerKind.AIMD,
+        controller_version="aimd-controller-v1",
+        controller_policy_digest="aimd-policy-digest",
+        scenarios=(_backpressure_scenario(BackpressureScenarioKind.STEADY, adaptive=True),),
+    )
+
+    comparison = compare_fixed_and_adaptive_backpressure(fixed, adaptive)
+
+    assert comparison.comparable is False
+    assert comparison.scenario_comparisons == ()
+    assert comparison.adaptive_matches_or_beats_fixed is None
+    assert comparison.non_comparable_reasons == (
+        "BASELINE_SCENARIO_MATRIX_INCOMPLETE",
+        "CANDIDATE_SCENARIO_MATRIX_INCOMPLETE",
+        "WORKLOAD_FINGERPRINT_CHANGED",
+    )

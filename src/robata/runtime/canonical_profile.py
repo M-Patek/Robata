@@ -476,6 +476,42 @@ class ProfileMetricAvailability(StrEnum):
     NOT_AVAILABLE = "NOT_AVAILABLE"
 
 
+class SQLiteOperationMeasurements(StrictModel):
+    """Operation-attributed SQLite facts from the scheduler authority.
+
+    begin_lock_wait_duration_ns is the elapsed duration of SQLite's BEGIN call,
+    including lock wait and local SQLite overhead. SQLite's Python API does not expose
+    VFS fsync calls, so their count remains explicitly unavailable instead of being
+    inferred from commits.
+    """
+
+    operation: NonEmptyString
+    connection_count: NonNegativeInt
+    connection_setup_duration_ns: NonNegativeInt
+    transaction_count: NonNegativeInt
+    begin_lock_wait_duration_ns: NonNegativeInt
+    transaction_duration_ns: NonNegativeInt
+    operation_duration_ns: NonNegativeInt
+    commit_duration_ns: NonNegativeInt
+    rollback_duration_ns: NonNegativeInt
+    rows_committed: NonNegativeInt
+    rows_rolled_back: NonNegativeInt
+    retry_count: NonNegativeInt
+    rollback_count: NonNegativeInt
+    busy_or_locked_failure_count: NonNegativeInt
+    fsync_count_status: ProfileMetricAvailability
+    fsync_count: NonNegativeInt | None = None
+
+    @model_validator(mode="after")
+    def validate_fsync_measurement(self) -> Self:
+        if self.fsync_count_status is ProfileMetricAvailability.NOT_AVAILABLE:
+            if self.fsync_count is not None:
+                raise ValueError("unavailable SQLite fsync count must be null")
+        elif self.fsync_count is None:
+            raise ValueError("available SQLite fsync count requires a value")
+        return self
+
+
 class SQLiteProfileMeasurements(StrictModel):
     """SQLite work and byte-accounting facts with explicit scope boundaries.
 
@@ -503,6 +539,7 @@ class SQLiteProfileMeasurements(StrictModel):
     sqlite_write_bytes: NonNegativeInt | None = None
     process_read_bytes: RuntimeResourceMeasurement
     process_write_bytes: RuntimeResourceMeasurement
+    operations: tuple[SQLiteOperationMeasurements, ...] = ()
 
     @model_validator(mode="after")
     def validate_sqlite_measurements(self) -> Self:
@@ -542,6 +579,10 @@ class SQLiteProfileMeasurements(StrictModel):
             and self.transaction_count != self.read_transaction_count + self.write_transaction_count
         ):
             raise ValueError("SQLite transaction counts do not reconcile")
+        operations = tuple(item.operation for item in self.operations)
+        if operations != tuple(sorted(operations)) or len(set(operations)) != len(operations):
+            raise ValueError("SQLite operation measurements must be unique and ordered")
+
         return self
 
 
@@ -566,12 +607,56 @@ class ProfileStageResource(StrictModel):
         return self
 
 
+class CompletionProfileMeasurements(StrictModel):
+    """Size facts for completion command construction and ordered roots."""
+
+    detail_bytes_status: ProfileMetricAvailability
+    detail_bytes: NonNegativeInt | None = None
+    command_bytes_status: ProfileMetricAvailability
+    command_bytes: NonNegativeInt | None = None
+    processing_run_bytes_status: ProfileMetricAvailability
+    processing_run_bytes: NonNegativeInt | None = None
+    ordered_root_collection_count_status: ProfileMetricAvailability
+    ordered_root_collection_count: NonNegativeInt | None = None
+    ordered_root_leaf_count_status: ProfileMetricAvailability
+    ordered_root_leaf_count: NonNegativeInt | None = None
+
+    @model_validator(mode="after")
+    def validate_completion_measurements(self) -> Self:
+        for status, value, name in (
+            (self.detail_bytes_status, self.detail_bytes, "detail_bytes"),
+            (self.command_bytes_status, self.command_bytes, "command_bytes"),
+            (
+                self.processing_run_bytes_status,
+                self.processing_run_bytes,
+                "processing_run_bytes",
+            ),
+            (
+                self.ordered_root_collection_count_status,
+                self.ordered_root_collection_count,
+                "ordered_root_collection_count",
+            ),
+            (
+                self.ordered_root_leaf_count_status,
+                self.ordered_root_leaf_count,
+                "ordered_root_leaf_count",
+            ),
+        ):
+            if status is ProfileMetricAvailability.NOT_AVAILABLE:
+                if value is not None:
+                    raise ValueError(f"unavailable {name} must be null")
+            elif value is None:
+                raise ValueError(f"{status.value.lower()} {name} requires a value")
+        return self
+
+
 class CanonicalProfileMeasurements(StrictModel):
     """Profile-only resource projection independent of capacity-rate eligibility."""
 
     workload_fingerprint: Sha256Digest
     source_bytes: NonNegativeInt
     recording_count: PositiveInt
+    completion: CompletionProfileMeasurements | None = None
     recording_worker_count: PositiveInt
     camera_count: Literal[6]
     provider_mode: ProviderMode
@@ -1116,7 +1201,9 @@ def build_canonical_profile_measurements(
             sqlite_write_bytes=None,
             process_read_bytes=observer.resources.read_bytes_delta,
             process_write_bytes=observer.resources.write_bytes_delta,
+            operations=_sqlite_operation_measurements(observer),
         ),
+        completion=_completion_profile_measurements(observer),
         stages=_profile_stage_resources(observer),
     )
 
@@ -1468,6 +1555,8 @@ def _profile_resource_comparisons(
             candidate_sqlite.write_transaction_count,
         ),
     }
+    values.update(_sqlite_operation_comparison_values(baseline_sqlite, candidate_sqlite))
+    values.update(_completion_comparison_values(baseline.completion, candidate.completion))
     return tuple(
         ProfileResourceComparison(
             metric=name,
@@ -1486,6 +1575,116 @@ def _profile_resource_comparisons(
             candidate_value,
         ) in sorted(values.items())
     )
+
+
+def _completion_comparison_values(
+    baseline: CompletionProfileMeasurements | None,
+    candidate: CompletionProfileMeasurements | None,
+) -> dict[
+    str,
+    tuple[
+        ProfileMetricAvailability,
+        int | None,
+        ProfileMetricAvailability,
+        int | None,
+    ],
+]:
+    """Project completion payload and ordered-root sizes into profile comparisons."""
+
+    def metric_value(
+        measurement: CompletionProfileMeasurements | None,
+        name: str,
+    ) -> tuple[ProfileMetricAvailability, int | None]:
+        if measurement is None:
+            return (ProfileMetricAvailability.NOT_AVAILABLE, None)
+        status = cast(ProfileMetricAvailability, getattr(measurement, f"{name}_status"))
+        value = cast(int | None, getattr(measurement, name))
+        return status, value
+
+    names = (
+        "command_bytes",
+        "detail_bytes",
+        "ordered_root_collection_count",
+        "ordered_root_leaf_count",
+        "processing_run_bytes",
+    )
+    return {
+        f"completion.{name}": (*metric_value(baseline, name), *metric_value(candidate, name))
+        for name in names
+    }
+
+
+def _sqlite_operation_comparison_values(
+    baseline: SQLiteProfileMeasurements,
+    candidate: SQLiteProfileMeasurements,
+) -> dict[
+    str,
+    tuple[
+        ProfileMetricAvailability,
+        int | None,
+        ProfileMetricAvailability,
+        int | None,
+    ],
+]:
+    """Project scheduler operations into the existing comparable resource surface."""
+
+    baseline_by_operation = {item.operation: item for item in baseline.operations}
+    candidate_by_operation = {item.operation: item for item in candidate.operations}
+    metric_names = (
+        "begin_lock_wait_duration_ns",
+        "busy_or_locked_failure_count",
+        "commit_duration_ns",
+        "connection_count",
+        "connection_setup_duration_ns",
+        "fsync_count",
+        "operation_duration_ns",
+        "rollback_count",
+        "rollback_duration_ns",
+        "rows_committed",
+        "rows_rolled_back",
+        "retry_count",
+        "transaction_count",
+        "transaction_duration_ns",
+    )
+    values: dict[
+        str,
+        tuple[
+            ProfileMetricAvailability,
+            int | None,
+            ProfileMetricAvailability,
+            int | None,
+        ],
+    ] = {}
+    for operation in sorted(set(baseline_by_operation) | set(candidate_by_operation)):
+        baseline_operation = baseline_by_operation.get(operation)
+        candidate_operation = candidate_by_operation.get(operation)
+        for metric_name in metric_names:
+            baseline_status, baseline_value = _sqlite_operation_metric_value(
+                baseline_operation,
+                metric_name,
+            )
+            candidate_status, candidate_value = _sqlite_operation_metric_value(
+                candidate_operation,
+                metric_name,
+            )
+            values[f"sqlite.operation.{operation}.{metric_name}"] = (
+                baseline_status,
+                baseline_value,
+                candidate_status,
+                candidate_value,
+            )
+    return values
+
+
+def _sqlite_operation_metric_value(
+    operation: SQLiteOperationMeasurements | None,
+    metric_name: str,
+) -> tuple[ProfileMetricAvailability, int | None]:
+    if operation is None:
+        return (ProfileMetricAvailability.NOT_AVAILABLE, None)
+    if metric_name == "fsync_count":
+        return (operation.fsync_count_status, operation.fsync_count)
+    return (ProfileMetricAvailability.AVAILABLE, cast(int, getattr(operation, metric_name)))
 
 
 def _resource_comparison_values(
@@ -1542,6 +1741,120 @@ def _sqlite_observer_counts(
         if write:
             write_count += counter.value
     return (sum(connections) if connections else None, total, total - write_count, write_count)
+
+
+def _sqlite_operation_measurements(
+    observer: RuntimeProfileSnapshot,
+) -> tuple[SQLiteOperationMeasurements, ...]:
+    """Aggregate scheduler facts without turning generic process I/O into SQLite facts."""
+
+    fields = (
+        "connection_count",
+        "connection_setup_duration_ns",
+        "transaction_count",
+        "begin_lock_wait_duration_ns",
+        "transaction_duration_ns",
+        "operation_duration_ns",
+        "commit_duration_ns",
+        "rollback_duration_ns",
+        "rows_committed",
+        "rows_rolled_back",
+        "retry_count",
+        "rollback_count",
+        "busy_or_locked_failure_count",
+    )
+    values_by_operation: dict[str, dict[str, int]] = {}
+
+    def values_for(operation: str) -> dict[str, int]:
+        return values_by_operation.setdefault(operation, dict.fromkeys(fields, 0))
+
+    span_fields = {
+        "sqlite.work_scheduler.connection_setup": "connection_setup_duration_ns",
+        "sqlite.work_scheduler.begin": "begin_lock_wait_duration_ns",
+        "sqlite.work_scheduler.transaction": "transaction_duration_ns",
+        "sqlite.work_scheduler.operation": "operation_duration_ns",
+        "sqlite.work_scheduler.commit": "commit_duration_ns",
+        "sqlite.work_scheduler.rollback": "rollback_duration_ns",
+    }
+    for span in observer.spans:
+        field = span_fields.get(span.name)
+        if field is None:
+            continue
+        attributes = {attribute.name: attribute.value for attribute in span.attributes}
+        operation = attributes.get("operation")
+        if isinstance(operation, str) and operation:
+            values_for(operation)[field] += span.elapsed_ns
+
+    counter_fields = {
+        "sqlite.work_scheduler.connections": "connection_count",
+        "sqlite.work_scheduler.transactions": "transaction_count",
+        "sqlite.work_scheduler.rows_committed": "rows_committed",
+        "sqlite.work_scheduler.rows_rolled_back": "rows_rolled_back",
+        "sqlite.work_scheduler.work_retries": "retry_count",
+        "sqlite.work_scheduler.rollbacks": "rollback_count",
+        "sqlite.work_scheduler.busy_or_locked_failures": "busy_or_locked_failure_count",
+    }
+    for counter in observer.counters:
+        field = counter_fields.get(counter.name)
+        if field is None:
+            continue
+        attributes = {attribute.name: attribute.value for attribute in counter.attributes}
+        operation = attributes.get("operation")
+        if isinstance(operation, str) and operation:
+            values_for(operation)[field] += counter.value
+
+    return tuple(
+        SQLiteOperationMeasurements(
+            operation=operation,
+            **values,
+            fsync_count_status=ProfileMetricAvailability.NOT_AVAILABLE,
+            fsync_count=None,
+        )
+        for operation, values in sorted(values_by_operation.items())
+    )
+
+
+def _completion_profile_measurements(
+    observer: RuntimeProfileSnapshot,
+) -> CompletionProfileMeasurements:
+    """Expose exact P3 counters and preserve absence separately from known zero leaves."""
+
+    root_collections = _counter_total(observer, "completion.command.root_collections")
+    detail_bytes = _counter_total(observer, "completion.command.detail_bytes")
+    command_bytes = _counter_total(observer, "completion.command.command_bytes")
+    processing_run_bytes = _counter_total(
+        observer,
+        "completion.command.processing_run_bytes",
+    )
+    root_leaves = _counter_total(observer, "completion.command.root_leaves")
+
+    def observed(value: int | None) -> tuple[ProfileMetricAvailability, int | None]:
+        return (
+            (ProfileMetricAvailability.AVAILABLE, value)
+            if value is not None
+            else (ProfileMetricAvailability.NOT_AVAILABLE, None)
+        )
+
+    detail_status, detail_value = observed(detail_bytes)
+    command_status, command_value = observed(command_bytes)
+    processing_status, processing_value = observed(processing_run_bytes)
+    collections_status, collections_value = observed(root_collections)
+    leaves_status, leaves_value = observed(root_leaves)
+    if root_collections is not None and root_leaves is None:
+        leaves_status = ProfileMetricAvailability.AVAILABLE
+        leaves_value = 0
+    return CompletionProfileMeasurements(
+        detail_bytes_status=detail_status,
+        detail_bytes=detail_value,
+        command_bytes_status=command_status,
+        command_bytes=command_value,
+        processing_run_bytes_status=processing_status,
+        processing_run_bytes=processing_value,
+        ordered_root_collection_count_status=collections_status,
+        ordered_root_collection_count=collections_value,
+        ordered_root_leaf_count_status=leaves_status,
+        ordered_root_leaf_count=leaves_value,
+    )
 
 
 def _profile_stage_resources(observer: RuntimeProfileSnapshot) -> tuple[ProfileStageResource, ...]:
@@ -2061,6 +2374,7 @@ __all__ = [
     "ProfileStageResource",
     "ReconciliationStatus",
     "SQLiteDatabaseSnapshot",
+    "SQLiteOperationMeasurements",
     "SQLiteProfileMeasurements",
     "SQLiteReadError",
     "SQLiteTableRowCount",

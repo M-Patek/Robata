@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import cache
 from pathlib import Path
@@ -21,9 +21,17 @@ from robata.contracts.hashing import (
     CanonicalizationError,
     canonical_json_bytes,
     exact_bytes_sha256,
+    semantic_sha256,
 )
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry, SchemaRegistryError
 from robata.inference.adapter import JsonSchemaRef
+from robata.inference.calibration import (
+    ACCEPTED_INFERENCE_CALIBRATION_EXTRACTOR_VERSION,
+    CalibrationArtifact,
+    CalibrationAssociation,
+    CalibrationScoreSource,
+    accepted_calibration_score_input,
+)
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
     ENRICHED_OUTPUT_SCHEMA_VERSION,
@@ -61,14 +69,15 @@ PARSED_PROVIDER_CLAIM_SCHEMA_ID: Final = "https://schemas.robata.dev/parsed-prov
 SELECTED_ATTEMPT_OUTPUT_SCHEMA_ID: Final = "https://schemas.robata.dev/selected-attempt-output"
 
 _CONTRACT_VERSION: Final = "1.0.0"
-_SCHEMA_VERSION: Final = 1
+_SCHEMA_VERSION: Final = 2
+_V1_SCHEMA_VERSION: Final = 1
 _APPLICATION_ID: Final = 0x5249454C  # "RIEL": Robata inference evidence ledger.
 _BUSY_TIMEOUT_MS: Final = 30_000
 _JOURNAL_MODE_RETRY_ATTEMPTS: Final = 100
 _JOURNAL_MODE_RETRY_DELAY_SECONDS: Final = 0.01
 _RAW_CAS_POINTER_PREFIX: Final = b"robata-cas-v1:"
 
-_SCHEMA_SQL: Final = """
+_V1_SCHEMA_SQL: Final = """
 CREATE TABLE inference_intents (
     inference_id TEXT PRIMARY KEY,
     logical_invocation_id TEXT NOT NULL,
@@ -243,7 +252,61 @@ CREATE INDEX enriched_provider_outputs_selection_idx
     ON enriched_provider_outputs (selection_id, artifact_id);
 """
 
-_APPEND_ONLY_TABLES: Final = (
+_CALIBRATION_SCHEMA_SQL: Final = """
+CREATE TABLE calibration_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    artifact_sha256 TEXT NOT NULL UNIQUE,
+    score_family TEXT NOT NULL,
+    fitting_method TEXT NOT NULL CHECK (
+        fitting_method IN ('IDENTITY', 'PLATT_LOGISTIC', 'ISOTONIC_LINEAR')
+    ),
+    applicability_sha256 TEXT NOT NULL,
+    payload_json BLOB NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    UNIQUE (artifact_id, artifact_sha256)
+);
+
+CREATE TABLE inference_calibration_associations (
+    association_id TEXT PRIMARY KEY,
+    selection_id TEXT NOT NULL,
+    inference_id TEXT NOT NULL,
+    score_family TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (
+        outcome IN (
+            'APPLIED',
+            'RAW_FALLBACK_MISSING_ARTIFACT',
+            'RAW_FALLBACK_INAPPLICABLE',
+            'RAW_FALLBACK_UNAVAILABLE_SCORE'
+        )
+    ),
+    raw_score REAL CHECK (raw_score IS NULL OR (raw_score >= 0.0 AND raw_score <= 1.0)),
+    calibrated_probability REAL CHECK (
+        calibrated_probability IS NULL
+        OR (calibrated_probability >= 0.0 AND calibrated_probability <= 1.0)
+    ),
+    deterministic_inputs_sha256 TEXT NOT NULL,
+    calibration_artifact_id TEXT,
+    calibration_artifact_sha256 TEXT,
+    payload_json BLOB NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    UNIQUE (selection_id, score_family),
+    CHECK (
+        (calibration_artifact_id IS NULL AND calibration_artifact_sha256 IS NULL)
+        OR (calibration_artifact_id IS NOT NULL AND calibration_artifact_sha256 IS NOT NULL)
+    ),
+    FOREIGN KEY (selection_id, inference_id)
+        REFERENCES inference_attempt_selections (selection_id, inference_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (calibration_artifact_id, calibration_artifact_sha256)
+        REFERENCES calibration_artifacts (artifact_id, artifact_sha256)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX inference_calibration_associations_inference_idx
+    ON inference_calibration_associations (inference_id, association_id);
+"""
+
+_V1_APPEND_ONLY_TABLES: Final = (
     "inference_intents",
     "raw_provider_responses",
     "model_inference_terminals",
@@ -253,6 +316,13 @@ _APPEND_ONLY_TABLES: Final = (
     "selected_attempt_outputs",
     "enriched_provider_outputs",
 )
+
+_CALIBRATION_APPEND_ONLY_TABLES: Final = (
+    "calibration_artifacts",
+    "inference_calibration_associations",
+)
+
+_APPEND_ONLY_TABLES: Final = (*_V1_APPEND_ONLY_TABLES, *_CALIBRATION_APPEND_ONLY_TABLES)
 
 
 def _split_sql_script(script: str) -> tuple[str, ...]:
@@ -290,9 +360,21 @@ def _append_only_triggers(table: str) -> tuple[str, str]:
     )
 
 
+_V1_SCHEMA_STATEMENTS: Final = (
+    *_split_sql_script(_V1_SCHEMA_SQL),
+    *(statement for table in _V1_APPEND_ONLY_TABLES for statement in _append_only_triggers(table)),
+)
+_MIGRATION_1_TO_2_STATEMENTS: Final = (
+    *_split_sql_script(_CALIBRATION_SCHEMA_SQL),
+    *(
+        statement
+        for table in _CALIBRATION_APPEND_ONLY_TABLES
+        for statement in _append_only_triggers(table)
+    ),
+)
 _SCHEMA_STATEMENTS: Final = (
-    *_split_sql_script(_SCHEMA_SQL),
-    *(statement for table in _APPEND_ONLY_TABLES for statement in _append_only_triggers(table)),
+    *_V1_SCHEMA_STATEMENTS,
+    *_MIGRATION_1_TO_2_STATEMENTS,
 )
 
 
@@ -310,6 +392,10 @@ class _LedgerState:
     parsed: dict[str, ParsedProviderClaimArtifact]
     selected: dict[str, SelectedAttemptOutput]
     enriched: dict[str, OrchestratorEnrichedOutput]
+    calibration_artifacts: dict[str, CalibrationArtifact] = field(default_factory=dict)
+    calibration_associations: dict[tuple[str, str], CalibrationAssociation] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +411,8 @@ class _LedgerCache:
     selected_by_digest: dict[str, SelectedAttemptOutput]
     enriched_by_logical_key: dict[str, OrchestratorEnrichedOutput]
     enriched_by_semantic_sha256: dict[str, OrchestratorEnrichedOutput]
+    calibration_artifacts_by_sha256: dict[str, CalibrationArtifact]
+    calibration_associations_by_id: dict[str, CalibrationAssociation]
 
 
 class _CachedDependencyMissing(SQLiteInferenceEvidenceLedgerError):
@@ -372,6 +460,12 @@ def _build_ledger_cache(
         },
         enriched_by_semantic_sha256={
             item.semantic_sha256: item for item in state.enriched.values()
+        },
+        calibration_artifacts_by_sha256={
+            item.artifact_sha256: item for item in state.calibration_artifacts.values()
+        },
+        calibration_associations_by_id={
+            item.association_id: item for item in state.calibration_associations.values()
         },
     )
 
@@ -484,6 +578,7 @@ class SQLiteInferenceEvidenceLedger:
 
         with self._state_lock:
             for _ in range(2):
+
                 def audit(connection: sqlite3.Connection) -> tuple[_LedgerCache, int]:
                     self._verify_database(connection)
                     state = self._load_state(connection)
@@ -496,9 +591,7 @@ class SQLiteInferenceEvidenceLedger:
                     operation_name="verify_integrity",
                     operation=audit,
                 )
-                current_data_version = _pragma_int(
-                    self._owned_connection_locked(), "data_version"
-                )
+                current_data_version = _pragma_int(self._owned_connection_locked(), "data_version")
                 if current_data_version == snapshot_data_version:
                     self._cache = refreshed
                     self._cache_data_version = snapshot_data_version
@@ -541,6 +634,8 @@ class SQLiteInferenceEvidenceLedger:
             ("parsed", "parsed_provider_claims", "artifact_id"),
             ("selected", "selected_attempt_outputs", "selection_id"),
             ("enriched", "enriched_provider_outputs", "artifact_id"),
+            ("calibration_artifact", "calibration_artifacts", "artifact_id"),
+            ("calibration_association", "inference_calibration_associations", "association_id"),
         ):
             for row in connection.execute(
                 f"SELECT {key_column}, payload_json FROM {table}"
@@ -977,6 +1072,7 @@ class SQLiteInferenceEvidenceLedger:
         """Refresh the typed cache from one stable SQLite read snapshot."""
 
         for _ in range(2):
+
             def reload_cache(connection: sqlite3.Connection) -> tuple[_LedgerCache, int]:
                 self._verify_database(connection)
                 state = self._load_state(connection)
@@ -989,9 +1085,7 @@ class SQLiteInferenceEvidenceLedger:
                 operation_name="reload_cache",
                 operation=reload_cache,
             )
-            current_data_version = _pragma_int(
-                self._owned_connection_locked(), "data_version"
-            )
+            current_data_version = _pragma_int(self._owned_connection_locked(), "data_version")
             if current_data_version == snapshot_data_version:
                 self._cache = refreshed
                 self._cache_data_version = snapshot_data_version
@@ -1107,9 +1201,7 @@ class SQLiteInferenceEvidenceLedger:
                         raise
                     self._reload_cache_locked()
                     continue
-                current_data_version = _pragma_int(
-                    self._owned_connection_locked(), "data_version"
-                )
+                current_data_version = _pragma_int(self._owned_connection_locked(), "data_version")
                 if current_data_version != snapshot_data_version:
                     self._reload_cache_locked()
                 else:
@@ -1319,8 +1411,7 @@ class SQLiteInferenceEvidenceLedger:
         return self._cached_read(
             operation_name="list_raw_provider_responses",
             cached=lambda cache: tuple(
-                cache.state.raw[artifact_id]
-                for artifact_id in sorted(cache.state.raw)
+                cache.state.raw[artifact_id] for artifact_id in sorted(cache.state.raw)
             ),
             database=load,
         )
@@ -2007,6 +2098,188 @@ class SQLiteInferenceEvidenceLedger:
             database=lambda connection: self._enriched_by_artifact_id(connection, artifact_id),
         )
 
+    def _append_cached_calibration_artifact(
+        self,
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+        artifact: CalibrationArtifact,
+        payload: bytes,
+    ) -> tuple[CalibrationArtifact, _LedgerCache]:
+        state = cache.state
+        candidates = {
+            item.artifact_id: item
+            for item in (
+                state.calibration_artifacts.get(artifact.artifact_id),
+                cache.calibration_artifacts_by_sha256.get(artifact.artifact_sha256),
+            )
+            if item is not None
+        }
+        existing = _exact_existing(
+            tuple(candidates.values()),
+            artifact,
+            conflict="calibration artifact identity has conflicting content",
+        )
+        if existing is not None:
+            return existing, cache
+        connection.execute(
+            """
+            INSERT INTO calibration_artifacts (
+                artifact_id, artifact_sha256, score_family, fitting_method,
+                applicability_sha256, payload_json, payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact.artifact_id,
+                artifact.artifact_sha256,
+                artifact.applicability.score_family,
+                artifact.fitting_method.value,
+                semantic_sha256(artifact.applicability),
+                sqlite3.Binary(payload),
+                exact_bytes_sha256(payload),
+            ),
+        )
+        updated_state = replace(
+            state,
+            calibration_artifacts={
+                **state.calibration_artifacts,
+                artifact.artifact_id: artifact,
+            },
+        )
+        return artifact, self._updated_cache(
+            cache,
+            updated_state,
+            ("calibration_artifact", artifact.artifact_id, payload),
+        )
+
+    def append_calibration_artifact(self, artifact: CalibrationArtifact) -> CalibrationArtifact:
+        """Append or replay one frozen internal calibration artifact."""
+
+        checked, payload = self._prepare_internal_model(
+            artifact,
+            CalibrationArtifact,
+            "calibration artifact",
+        )
+        return self._cached_write(
+            operation_name="append_calibration_artifact",
+            operation=lambda connection, cache: self._append_cached_calibration_artifact(
+                connection,
+                cache,
+                checked,
+                payload,
+            ),
+        )
+
+    def get_calibration_artifact(self, artifact_id: str) -> CalibrationArtifact | None:
+        """Return one content-addressed calibration artifact by internal identity."""
+
+        return self._cached_read(
+            operation_name="get_calibration_artifact",
+            cached=lambda cache: cache.state.calibration_artifacts.get(artifact_id),
+            database=lambda connection: self._calibration_artifact_by_id(connection, artifact_id),
+        )
+
+    def _append_cached_calibration_association(
+        self,
+        connection: sqlite3.Connection,
+        cache: _LedgerCache,
+        association: CalibrationAssociation,
+        payload: bytes,
+    ) -> tuple[CalibrationAssociation, _LedgerCache]:
+        state = cache.state
+        key = (association.selection_id, association.score_family)
+        candidates = {
+            item.association_id: item
+            for item in (
+                state.calibration_associations.get(key),
+                cache.calibration_associations_by_id.get(association.association_id),
+            )
+            if item is not None
+        }
+        existing = _exact_existing(
+            tuple(candidates.values()),
+            association,
+            conflict="calibration association identity has conflicting content",
+        )
+        if existing is not None:
+            return existing, cache
+        self._validate_calibration_association(association, state)
+        connection.execute(
+            """
+            INSERT INTO inference_calibration_associations (
+                association_id, selection_id, inference_id, score_family, outcome,
+                raw_score, calibrated_probability, deterministic_inputs_sha256,
+                calibration_artifact_id, calibration_artifact_sha256,
+                payload_json, payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                association.association_id,
+                association.selection_id,
+                association.inference_id,
+                association.score_family,
+                association.outcome.value,
+                association.raw_score,
+                association.calibrated_probability,
+                association.deterministic_inputs_sha256,
+                association.calibration_artifact_id,
+                association.calibration_artifact_sha256,
+                sqlite3.Binary(payload),
+                exact_bytes_sha256(payload),
+            ),
+        )
+        updated_state = replace(
+            state,
+            calibration_associations={
+                **state.calibration_associations,
+                key: association,
+            },
+        )
+        return association, self._updated_cache(
+            cache,
+            updated_state,
+            ("calibration_association", association.association_id, payload),
+        )
+
+    def append_calibration_association(
+        self,
+        association: CalibrationAssociation,
+    ) -> CalibrationAssociation:
+        """Append/replay a calibration outcome without modifying its terminal inference."""
+
+        checked, payload = self._prepare_internal_model(
+            association,
+            CalibrationAssociation,
+            "calibration association",
+        )
+        return self._cached_write(
+            operation_name="append_calibration_association",
+            operation=lambda connection, cache: self._append_cached_calibration_association(
+                connection,
+                cache,
+                checked,
+                payload,
+            ),
+        )
+
+    def get_calibration_association(
+        self,
+        selection_id: str,
+        score_family: str,
+    ) -> CalibrationAssociation | None:
+        """Return the one append-only calibration result for a selected score family."""
+
+        return self._cached_read(
+            operation_name="get_calibration_association",
+            cached=lambda cache: cache.state.calibration_associations.get(
+                (selection_id, score_family)
+            ),
+            database=lambda connection: self._calibration_association_by_key(
+                connection,
+                selection_id,
+                score_family,
+            ),
+        )
+
     def _resolve_pin(self, schema_id: str, version: str) -> SchemaRef:
         try:
             return self._schema_registry.resolve_version(schema_id, version).ref
@@ -2049,6 +2322,25 @@ class SQLiteInferenceEvidenceLedger:
         if isinstance(checked, InferenceIntent):
             _validate_intent(checked)
             self._validate_intent_output_schema(checked)
+        return checked, payload
+
+    def _prepare_internal_model(
+        self,
+        value: _ModelT,
+        model_type: type[_ModelT],
+        description: str,
+    ) -> tuple[_ModelT, bytes]:
+        """Validate canonical internal evidence without inventing a wire-schema pin."""
+
+        if not isinstance(value, model_type):
+            raise TypeError(f"value must be a {model_type.__name__}")
+        try:
+            checked = model_type.model_validate(value.model_dump(mode="python"), strict=True)
+            payload = canonical_json_bytes(checked)
+        except (CanonicalizationError, ValidationError, TypeError, ValueError) as exc:
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"{description} failed strict validation"
+            ) from exc
         return checked, payload
 
     def _validate_contract_payload(self, contract: str, value: BaseModel) -> None:
@@ -2183,7 +2475,7 @@ class SQLiteInferenceEvidenceLedger:
                         raise SQLiteInferenceEvidenceLedgerError(
                             "refusing to adopt a nonempty or claimed unversioned SQLite database"
                         )
-                elif preflight_version != _SCHEMA_VERSION:
+                elif preflight_version not in {_V1_SCHEMA_VERSION, _SCHEMA_VERSION}:
                     raise SQLiteInferenceEvidenceLedgerError(
                         f"unsupported inference evidence schema version: {preflight_version}"
                     )
@@ -2218,13 +2510,15 @@ class SQLiteInferenceEvidenceLedger:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
                     connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                elif user_version != _SCHEMA_VERSION:
-                    raise SQLiteInferenceEvidenceLedgerError(
-                        f"unsupported inference evidence schema version: {user_version}"
-                    )
                 elif application_id != _APPLICATION_ID:
                     raise SQLiteInferenceEvidenceLedgerError(
                         "inference evidence database has an unexpected application identity"
+                    )
+                elif user_version == _V1_SCHEMA_VERSION:
+                    self._migrate_v1_to_v2(connection)
+                elif user_version != _SCHEMA_VERSION:
+                    raise SQLiteInferenceEvidenceLedgerError(
+                        f"unsupported inference evidence schema version: {user_version}"
                     )
                 self._verify_database(connection)
                 state = self._load_state(connection)
@@ -2248,6 +2542,27 @@ class SQLiteInferenceEvidenceLedger:
         finally:
             if connection is not None:
                 connection.close()
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Upgrade only an exact v1 append-only ledger inside the opening transaction."""
+
+        if _database_schema_fingerprint(connection) != _expected_v1_schema_fingerprint():
+            raise SQLiteInferenceEvidenceLedgerError(
+                "SQLite inference evidence v1 DDL does not match the canonical schema"
+            )
+        quick = connection.execute("PRAGMA quick_check(1)").fetchone()
+        if quick is None or quick[0] != "ok":
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"SQLite quick_check failed for inference evidence migration: {quick!r}"
+            )
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "SQLite foreign-key check found orphaned inference evidence before migration"
+            )
+        for statement in _MIGRATION_1_TO_2_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     def _connect(self) -> sqlite3.Connection:
         with runtime_span(
@@ -2300,9 +2615,7 @@ class SQLiteInferenceEvidenceLedger:
     def _owned_connection_locked(self) -> sqlite3.Connection:
         connection = self._connection
         if self._closed or connection is None:
-            raise SQLiteInferenceEvidenceLedgerError(
-                "SQLite inference evidence ledger is closed"
-            )
+            raise SQLiteInferenceEvidenceLedgerError("SQLite inference evidence ledger is closed")
         if self._database_path.is_symlink():
             raise SQLiteInferenceEvidenceLedgerError(
                 f"inference evidence database became a symlink: {self._database_path}"
@@ -2617,7 +2930,30 @@ class SQLiteInferenceEvidenceLedger:
                 ).fetchall()
             )
         }
-        return replace(state, enriched=enriched)
+        state = replace(state, enriched=enriched)
+        calibration_artifacts = {
+            item.artifact_id: item
+            for item in (
+                self._calibration_artifact_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM calibration_artifacts ORDER BY artifact_id"
+                ).fetchall()
+            )
+        }
+        state = replace(state, calibration_artifacts=calibration_artifacts)
+        calibration_associations = {
+            (item.selection_id, item.score_family): item
+            for item in (
+                self._calibration_association_from_row(row, state)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM inference_calibration_associations
+                    ORDER BY selection_id, score_family
+                    """
+                ).fetchall()
+            )
+        }
+        return replace(state, calibration_associations=calibration_associations)
 
     def _intent_by_inference_id(
         self,
@@ -3317,6 +3653,120 @@ class SQLiteInferenceEvidenceLedger:
             )
         )
 
+    def _calibration_artifact_from_row(self, row: sqlite3.Row) -> CalibrationArtifact:
+        artifact = self._internal_model_from_row(
+            row,
+            CalibrationArtifact,
+            "calibration artifact",
+        )
+        _require_columns(
+            row,
+            (
+                ("artifact_id", artifact.artifact_id),
+                ("artifact_sha256", artifact.artifact_sha256),
+                ("score_family", artifact.applicability.score_family),
+                ("fitting_method", artifact.fitting_method.value),
+                ("applicability_sha256", semantic_sha256(artifact.applicability)),
+            ),
+            "calibration artifact",
+        )
+        return artifact
+
+    def _calibration_artifact_by_id(
+        self,
+        connection: sqlite3.Connection,
+        artifact_id: str,
+    ) -> CalibrationArtifact | None:
+        row = connection.execute(
+            "SELECT * FROM calibration_artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        return None if row is None else self._calibration_artifact_from_row(row)
+
+    def _calibration_association_from_database_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> CalibrationAssociation:
+        selection_id = _row_text(row, "selection_id")
+        inference_id = _row_text(row, "inference_id")
+        selection = self._selection_by_id(connection, selection_id)
+        terminal = self._terminal_by_inference_id(connection, inference_id)
+        artifact_value: object = row["calibration_artifact_id"]
+        if artifact_value is not None and not isinstance(artifact_value, str):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "SQLite calibration artifact identity is neither text nor null"
+            )
+        artifact = (
+            None
+            if artifact_value is None
+            else self._calibration_artifact_by_id(connection, artifact_value)
+        )
+        state = _LedgerState(
+            intents={},
+            raw={},
+            terminals={} if terminal is None else {terminal.inference_id: terminal},
+            raw_artifacts={},
+            selections=(
+                {}
+                if selection is None
+                else {(selection.logical_invocation_id, selection.policy_version): selection}
+            ),
+            parsed={},
+            selected={},
+            enriched={},
+            calibration_artifacts={} if artifact is None else {artifact.artifact_id: artifact},
+        )
+        return self._calibration_association_from_row(row, state)
+
+    def _calibration_association_by_key(
+        self,
+        connection: sqlite3.Connection,
+        selection_id: str,
+        score_family: str,
+    ) -> CalibrationAssociation | None:
+        row = connection.execute(
+            """
+            SELECT * FROM inference_calibration_associations
+            WHERE selection_id = ? AND score_family = ?
+            """,
+            (selection_id, score_family),
+        ).fetchone()
+        return (
+            None
+            if row is None
+            else self._calibration_association_from_database_row(connection, row)
+        )
+
+    def _calibration_association_from_row(
+        self,
+        row: sqlite3.Row,
+        state: _LedgerState,
+    ) -> CalibrationAssociation:
+        association = self._internal_model_from_row(
+            row,
+            CalibrationAssociation,
+            "calibration association",
+        )
+        _require_columns(
+            row,
+            (
+                ("association_id", association.association_id),
+                ("selection_id", association.selection_id),
+                ("inference_id", association.inference_id),
+                ("score_family", association.score_family),
+                ("outcome", association.outcome.value),
+                ("raw_score", association.raw_score),
+                ("calibrated_probability", association.calibrated_probability),
+                ("deterministic_inputs_sha256", association.deterministic_inputs_sha256),
+                ("calibration_artifact_id", association.calibration_artifact_id),
+                ("calibration_artifact_sha256", association.calibration_artifact_sha256),
+            ),
+            "calibration association",
+        )
+        self._validate_calibration_association(association, state)
+        return association
+
     def _intent_from_row(
         self,
         row: sqlite3.Row,
@@ -3621,6 +4071,31 @@ class SQLiteInferenceEvidenceLedger:
                 f"persisted {contract} failed strict validation"
             ) from exc
 
+    @staticmethod
+    def _internal_model_from_row(
+        row: sqlite3.Row,
+        model_type: type[_ModelT],
+        description: str,
+    ) -> _ModelT:
+        raw = _row_bytes(row, "payload_json")
+        if _row_text(row, "payload_sha256") != exact_bytes_sha256(raw):
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"persisted {description} payload digest is inconsistent"
+            )
+        try:
+            value = model_type.model_validate_json(raw, strict=True)
+            if canonical_json_bytes(value) != raw:
+                raise SQLiteInferenceEvidenceLedgerError(
+                    f"persisted {description} is not canonical JSON"
+                )
+            return value
+        except SQLiteInferenceEvidenceLedgerError:
+            raise
+        except (CanonicalizationError, ValidationError, TypeError, ValueError) as exc:
+            raise SQLiteInferenceEvidenceLedgerError(
+                f"persisted {description} failed strict validation"
+            ) from exc
+
     def _validate_terminal(
         self,
         terminal: ModelInference,
@@ -3823,6 +4298,153 @@ class SQLiteInferenceEvidenceLedger:
             raise SQLiteInferenceEvidenceLedgerError(
                 "enriched output references an unregistered schema artifact"
             ) from exc
+
+    def _validate_calibration_association(
+        self,
+        association: CalibrationAssociation,
+        state: _LedgerState,
+    ) -> None:
+        """Bind internal calibration only to an existing accepted terminal selection."""
+
+        selection = next(
+            (
+                item
+                for item in state.selections.values()
+                if item.selection_id == association.selection_id
+            ),
+            None,
+        )
+        terminal = state.terminals.get(association.inference_id)
+        if (
+            selection is None
+            or terminal is None
+            or selection.inference_id != association.inference_id
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association requires an accepted selection for the same inference"
+            )
+        self._validate_selection(selection, terminal)
+        selected = state.selected.get(association.selection_id)
+        if (
+            selected is None
+            or selected.inference_id != association.inference_id
+            or selected.selection_id != association.selection_id
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association requires the persisted accepted selected output"
+            )
+        self._validate_calibration_score_source(
+            association,
+            terminal=terminal,
+            selected=selected,
+            state=state,
+        )
+        if (
+            association.evaluated_at != selection.selected_at
+            or association.created_at != selection.selected_at
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association timestamps must equal accepted selection time"
+            )
+        artifact: CalibrationArtifact | None
+        if association.calibration_artifact_id is None:
+            artifact = None
+        else:
+            artifact = state.calibration_artifacts.get(association.calibration_artifact_id)
+            if (
+                artifact is None
+                or artifact.artifact_sha256 != association.calibration_artifact_sha256
+            ):
+                raise SQLiteInferenceEvidenceLedgerError(
+                    "calibration association artifact identity or digest is inconsistent"
+                )
+        try:
+            expected = CalibrationAssociation.create(
+                selection_id=association.selection_id,
+                inference=terminal,
+                score_family=association.score_family,
+                runtime_revision=association.runtime_revision,
+                preprocess_revision=association.preprocess_revision,
+                evaluated_at=association.evaluated_at,
+                raw_score=association.raw_score,
+                deterministic_inputs=association.deterministic_inputs,
+                policy_decision=association.policy_decision,
+                calibration_artifact=artifact,
+                created_at=association.created_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association cannot be reconstructed"
+            ) from exc
+        if association != expected:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association does not reproduce its frozen evidence"
+            )
+
+    @staticmethod
+    def _validate_calibration_score_source(
+        association: CalibrationAssociation,
+        *,
+        terminal: ModelInference,
+        selected: SelectedAttemptOutput,
+        state: _LedgerState,
+    ) -> None:
+        """Recompute the sole scalar source from already persisted accepted evidence."""
+
+        inputs = association.deterministic_inputs
+        if inputs.get("extractor_version") != ACCEPTED_INFERENCE_CALIBRATION_EXTRACTOR_VERSION:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association has an unknown accepted-evidence extractor"
+            )
+        raw_source = inputs.get("score_source")
+        if not isinstance(raw_source, str):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association must name its calibrated score source"
+            )
+        try:
+            score_source = CalibrationScoreSource(raw_source)
+        except ValueError as exc:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association names an unsupported score source"
+            ) from exc
+        enriched_artifact_id = inputs.get("enriched_output_artifact_id")
+        if not isinstance(enriched_artifact_id, str):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association must cite an enriched output artifact"
+            )
+        enriched = state.enriched.get(enriched_artifact_id)
+        if (
+            enriched is None
+            or enriched.selected_attempt != selected
+            or enriched.task is not terminal.stage
+        ):
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association requires the persisted accepted enriched output"
+            )
+        if score_source is CalibrationScoreSource.TERMINAL_REPORTED_CONFIDENCE:
+            source_claim_ordinal: int | None = None
+        else:
+            source_claim_ordinal = inputs.get("source_claim_ordinal")
+        try:
+            raw_score, expected_inputs = accepted_calibration_score_input(
+                score_source=score_source,
+                source_claim_ordinal=source_claim_ordinal,
+                inference=terminal,
+                selected_output=selected,
+                enriched_output=enriched,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association score source cannot be reconstructed"
+            ) from exc
+        if dict(inputs) != expected_inputs:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association score evidence does not match accepted lineage"
+            )
+        if association.raw_score != raw_score:
+            raise SQLiteInferenceEvidenceLedgerError(
+                "calibration association raw score does not match accepted lineage"
+            )
 
 
 def _validate_intent(intent: InferenceIntent) -> None:
@@ -4148,6 +4770,18 @@ def _database_schema_fingerprint(connection: sqlite3.Connection) -> tuple[object
         )
         table_facts.append((table, columns, indexes, foreign_keys))
     return objects, tuple(table_facts)
+
+
+@cache
+def _expected_v1_schema_fingerprint() -> tuple[object, ...]:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        for statement in _V1_SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        return _database_schema_fingerprint(connection)
+    finally:
+        connection.close()
 
 
 @cache

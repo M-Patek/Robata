@@ -20,6 +20,7 @@ from robata.application.canonical.local_composition import (  # noqa: E402
     run_local_canonical_mcap,
 )
 from robata.contracts.hashing import canonical_json_bytes  # noqa: E402
+from robata.durability import sync_directory  # noqa: E402
 from robata.runtime.canonical_profile import (  # noqa: E402
     CanonicalProfileError,
     CanonicalProfileReport,
@@ -145,6 +146,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, destination)
+        sync_directory(destination.parent)
     except OSError as error:
         with suppress(OSError):
             temporary_path.unlink(missing_ok=True)

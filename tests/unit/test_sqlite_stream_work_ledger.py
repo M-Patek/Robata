@@ -1,8 +1,13 @@
 import sqlite3
 from pathlib import Path
 
-from robata.adapters.sqlite_stream_work_ledger import SQLiteStreamWorkLedger
-from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler
+import pytest
+
+from robata.adapters.sqlite_stream_work_ledger import (
+    SQLiteStreamWorkLedger,
+    SQLiteStreamWorkLedgerConflict,
+)
+from robata.adapters.sqlite_work_scheduler import SQLiteWorkScheduler, WorkFenceError
 
 
 def test_v1_pending_terminal_columns_migrate_and_reopen(tmp_path: Path) -> None:
@@ -65,7 +70,7 @@ def test_v1_pending_terminal_columns_migrate_and_reopen(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(stream_work_plans)").fetchall()
         }
 
-    assert version == (2,)
+    assert version == (3,)
     assert {
         "pending_terminal_json",
         "pending_lease_epoch",
@@ -73,3 +78,53 @@ def test_v1_pending_terminal_columns_migrate_and_reopen(tmp_path: Path) -> None:
     } <= columns
 
     SQLiteStreamWorkLedger(SQLiteWorkScheduler(database_path))
+
+
+def test_backpressure_controller_owner_fence_and_policy_pin(tmp_path: Path) -> None:
+    database_path = tmp_path / "work.sqlite3"
+    ledger = SQLiteStreamWorkLedger(SQLiteWorkScheduler(database_path))
+    ledger.register_plan(
+        plan_key="plan-key",
+        plan_json=b"{}",
+        source_subject_json=b"{}",
+        composition_config_json=b"{}",
+    )
+
+    first = ledger.claim_backpressure_controller(
+        plan_key="plan-key",
+        controller_key="window-admission",
+        policy_version="policy-v1",
+        owner_id="owner-one",
+        initial_state_json=b'{"state":"initial"}',
+    )
+    same_owner = ledger.claim_backpressure_controller(
+        plan_key="plan-key",
+        controller_key="window-admission",
+        policy_version="policy-v1",
+        owner_id="owner-one",
+        initial_state_json=b'{"state":"ignored"}',
+    )
+    assert same_owner == first
+
+    second = ledger.claim_backpressure_controller(
+        plan_key="plan-key",
+        controller_key="window-admission",
+        policy_version="policy-v1",
+        owner_id="owner-two",
+        initial_state_json=b'{"state":"ignored"}',
+    )
+    assert second.owner_fence == first.owner_fence + 1
+    assert second.state_json == first.state_json
+    with pytest.raises(WorkFenceError):
+        ledger.save_backpressure_controller(first, state_json=b'{"state":"stale"}')
+
+    saved = ledger.save_backpressure_controller(second, state_json=b'{"state":"next"}')
+    assert saved.state_json == b'{"state":"next"}'
+    with pytest.raises(SQLiteStreamWorkLedgerConflict, match="policy version"):
+        ledger.claim_backpressure_controller(
+            plan_key="plan-key",
+            controller_key="window-admission",
+            policy_version="policy-v2",
+            owner_id="owner-three",
+            initial_state_json=b'{"state":"ignored"}',
+        )

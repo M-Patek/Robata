@@ -6,6 +6,8 @@ import heapq
 import math
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import pairwise
+from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from robata.contracts.hashing import semantic_sha256
@@ -910,6 +912,762 @@ def _comparison_kind(
     if scaling:
         return MeasuredCapacityComparisonKind.RECORDING_WORKER_SCALING
     return MeasuredCapacityComparisonKind.LIKE_FOR_LIKE
+
+
+class BackpressureControllerKind(StrEnum):
+    """Control law recorded by a local backpressure qualification run."""
+
+    FIXED = "FIXED"
+    AIMD = "AIMD"
+
+
+class BackpressureScenarioKind(StrEnum):
+    """Required local operating conditions for a controller comparison."""
+
+    STEADY = "STEADY"
+    BURST = "BURST"
+    OVERLOAD = "OVERLOAD"
+    PROVIDER_QUOTA = "PROVIDER_QUOTA"
+    DRAIN = "DRAIN"
+    OSCILLATION = "OSCILLATION"
+    FAIRNESS = "FAIRNESS"
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureRecordingBacklog:
+    """One recording's complete visible backlog at an observation point."""
+
+    recording_key: str
+    backlog_depth: int
+    oldest_age_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty("recording_key", self.recording_key)
+        _require_nonnegative_int("backlog_depth", self.backlog_depth)
+        if self.oldest_age_ms is not None:
+            _require_nonnegative_int("oldest_age_ms", self.oldest_age_ms)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "recording_key": self.recording_key,
+            "backlog_depth": self.backlog_depth,
+            "oldest_age_ms": self.oldest_age_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureObservation:
+    """One local, monotonic-clock controller observation.
+
+    Optional rate, quota, slope, age, and utilization inputs deliberately retain
+    "None" when their instrument was unavailable. In particular, zero provider
+    quota is an explicit observed condition rather than an unknown placeholder.
+    When per-recording backlogs are supplied, they are a complete partition of the
+    global backlog for that observation.
+    """
+
+    observed_at_ms: int
+    backlog_depth: int
+    controller_limit: int
+    arrival_rate_per_second: float | None = None
+    service_rate_per_second: float | None = None
+    backlog_slope_per_second: float | None = None
+    oldest_backlog_age_ms: int | None = None
+    provider_quota: int | None = None
+    worker_utilization: float | None = None
+    recording_backlogs: tuple[BackpressureRecordingBacklog, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_int("observed_at_ms", self.observed_at_ms)
+        _require_nonnegative_int("backlog_depth", self.backlog_depth)
+        _require_positive_int("controller_limit", self.controller_limit)
+        _require_optional_finite_nonnegative(
+            "arrival_rate_per_second",
+            self.arrival_rate_per_second,
+        )
+        _require_optional_finite_nonnegative(
+            "service_rate_per_second",
+            self.service_rate_per_second,
+        )
+        _require_optional_finite("backlog_slope_per_second", self.backlog_slope_per_second)
+        if self.oldest_backlog_age_ms is not None:
+            _require_nonnegative_int("oldest_backlog_age_ms", self.oldest_backlog_age_ms)
+        if self.provider_quota is not None:
+            _require_nonnegative_int("provider_quota", self.provider_quota)
+        if self.worker_utilization is not None:
+            _require_unit_interval("worker_utilization", self.worker_utilization)
+        if not isinstance(self.recording_backlogs, tuple):
+            raise TypeError("recording_backlogs must be a tuple")
+        recording_keys: list[str] = []
+        for item in self.recording_backlogs:
+            if not isinstance(item, BackpressureRecordingBacklog):
+                raise TypeError("recording_backlogs must contain BackpressureRecordingBacklog")
+            recording_keys.append(item.recording_key)
+        if recording_keys != sorted(recording_keys) or len(set(recording_keys)) != len(
+            recording_keys
+        ):
+            raise ValueError("recording_backlogs must be unique and ordered by recording_key")
+        if (
+            self.recording_backlogs
+            and sum(item.backlog_depth for item in self.recording_backlogs) != self.backlog_depth
+        ):
+            raise ValueError("recording_backlogs must reconcile to backlog_depth")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "observed_at_ms": self.observed_at_ms,
+            "arrival_rate_per_second": self.arrival_rate_per_second,
+            "service_rate_per_second": self.service_rate_per_second,
+            "backlog_depth": self.backlog_depth,
+            "backlog_slope_per_second": self.backlog_slope_per_second,
+            "oldest_backlog_age_ms": self.oldest_backlog_age_ms,
+            "provider_quota": self.provider_quota,
+            "worker_utilization": self.worker_utilization,
+            "controller_limit": self.controller_limit,
+            "recording_backlogs": [item.as_dict() for item in self.recording_backlogs],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureScenarioReport:
+    """Auditable local observation sequence for one named operating condition."""
+
+    scenario: BackpressureScenarioKind
+    observations: tuple[BackpressureObservation, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scenario, BackpressureScenarioKind):
+            raise TypeError("scenario must be a BackpressureScenarioKind")
+        if not isinstance(self.observations, tuple) or not self.observations:
+            raise ValueError("observations must be a nonempty tuple")
+        previous_at_ms: int | None = None
+        for item in self.observations:
+            if not isinstance(item, BackpressureObservation):
+                raise TypeError("observations must contain BackpressureObservation")
+            if previous_at_ms is not None and item.observed_at_ms <= previous_at_ms:
+                raise ValueError("observations must be strictly ordered by observed_at_ms")
+            previous_at_ms = item.observed_at_ms
+
+    @property
+    def observation_duration_ms(self) -> int:
+        return self.observations[-1].observed_at_ms - self.observations[0].observed_at_ms
+
+    @property
+    def arrival_rate_sample_count(self) -> int:
+        return sum(item.arrival_rate_per_second is not None for item in self.observations)
+
+    @property
+    def service_rate_sample_count(self) -> int:
+        return sum(item.service_rate_per_second is not None for item in self.observations)
+
+    @property
+    def backlog_slope_sample_count(self) -> int:
+        return sum(item.backlog_slope_per_second is not None for item in self.observations)
+
+    @property
+    def provider_quota_sample_count(self) -> int:
+        return sum(item.provider_quota is not None for item in self.observations)
+
+    @property
+    def worker_utilization_sample_count(self) -> int:
+        return sum(item.worker_utilization is not None for item in self.observations)
+
+    @property
+    def mean_arrival_rate_per_second(self) -> float | None:
+        return _optional_mean(
+            tuple(
+                item.arrival_rate_per_second
+                for item in self.observations
+                if item.arrival_rate_per_second is not None
+            )
+        )
+
+    @property
+    def mean_service_rate_per_second(self) -> float | None:
+        return _optional_mean(
+            tuple(
+                item.service_rate_per_second
+                for item in self.observations
+                if item.service_rate_per_second is not None
+            )
+        )
+
+    @property
+    def mean_worker_utilization(self) -> float | None:
+        return _optional_mean(
+            tuple(
+                item.worker_utilization
+                for item in self.observations
+                if item.worker_utilization is not None
+            )
+        )
+
+    @property
+    def peak_worker_utilization(self) -> float | None:
+        values = tuple(
+            item.worker_utilization
+            for item in self.observations
+            if item.worker_utilization is not None
+        )
+        return None if not values else max(values)
+
+    @property
+    def minimum_provider_quota(self) -> int | None:
+        values = tuple(
+            item.provider_quota for item in self.observations if item.provider_quota is not None
+        )
+        return None if not values else min(values)
+
+    @property
+    def backlog_peak(self) -> int:
+        return max(item.backlog_depth for item in self.observations)
+
+    @property
+    def backlog_end(self) -> int:
+        return self.observations[-1].backlog_depth
+
+    @property
+    def oldest_backlog_age_peak_ms(self) -> int | None:
+        values = tuple(
+            item.oldest_backlog_age_ms
+            for item in self.observations
+            if item.oldest_backlog_age_ms is not None
+        )
+        return None if not values else max(values)
+
+    @property
+    def net_backlog_slope_per_second(self) -> float | None:
+        if self.observation_duration_ms == 0:
+            return None
+        return (self.backlog_end - self.observations[0].backlog_depth) / (
+            self.observation_duration_ms / 1_000
+        )
+
+    @property
+    def controller_limit_min(self) -> int:
+        return min(item.controller_limit for item in self.observations)
+
+    @property
+    def controller_limit_max(self) -> int:
+        return max(item.controller_limit for item in self.observations)
+
+    @property
+    def controller_limit_change_count(self) -> int:
+        return sum(
+            right.controller_limit != left.controller_limit
+            for left, right in pairwise(self.observations)
+        )
+
+    @property
+    def controller_limit_direction_reversal_count(self) -> int:
+        directions: list[int] = []
+        for left, right in pairwise(self.observations):
+            delta = right.controller_limit - left.controller_limit
+            if delta > 0:
+                directions.append(1)
+            elif delta < 0:
+                directions.append(-1)
+        return sum(right != left for left, right in pairwise(directions))
+
+    @property
+    def overload_observed(self) -> bool:
+        return any(
+            item.arrival_rate_per_second is not None
+            and item.service_rate_per_second is not None
+            and item.arrival_rate_per_second > item.service_rate_per_second
+            for item in self.observations
+        )
+
+    @property
+    def provider_quota_exhausted(self) -> bool:
+        return any(item.provider_quota == 0 for item in self.observations)
+
+    @property
+    def drain_completed(self) -> bool | None:
+        if self.backlog_peak == 0:
+            return None
+        return self.backlog_end == 0
+
+    @property
+    def fairness_observed(self) -> bool:
+        return any(len(item.recording_backlogs) > 1 for item in self.observations)
+
+    @property
+    def recording_count_peak(self) -> int:
+        return max(len(item.recording_backlogs) for item in self.observations)
+
+    @property
+    def recording_backlog_spread_peak(self) -> int | None:
+        spreads = tuple(
+            max(item.backlog_depth for item in observation.recording_backlogs)
+            - min(item.backlog_depth for item in observation.recording_backlogs)
+            for observation in self.observations
+            if len(observation.recording_backlogs) > 1
+        )
+        return None if not spreads else max(spreads)
+
+    @property
+    def missing_signal_kinds(self) -> tuple[str, ...]:
+        missing: list[str] = []
+        if self.arrival_rate_sample_count == 0:
+            missing.append("ARRIVAL_RATE")
+        if self.service_rate_sample_count == 0:
+            missing.append("SERVICE_RATE")
+        if self.backlog_slope_sample_count == 0:
+            missing.append("BACKLOG_SLOPE")
+        if self.provider_quota_sample_count == 0:
+            missing.append("PROVIDER_QUOTA")
+        if self.worker_utilization_sample_count == 0:
+            missing.append("WORKER_UTILIZATION")
+        return tuple(missing)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "scenario": self.scenario.value,
+            "observation_count": len(self.observations),
+            "observation_duration_ms": self.observation_duration_ms,
+            "arrival_rate_sample_count": self.arrival_rate_sample_count,
+            "service_rate_sample_count": self.service_rate_sample_count,
+            "backlog_slope_sample_count": self.backlog_slope_sample_count,
+            "provider_quota_sample_count": self.provider_quota_sample_count,
+            "worker_utilization_sample_count": self.worker_utilization_sample_count,
+            "mean_arrival_rate_per_second": self.mean_arrival_rate_per_second,
+            "mean_service_rate_per_second": self.mean_service_rate_per_second,
+            "mean_worker_utilization": self.mean_worker_utilization,
+            "peak_worker_utilization": self.peak_worker_utilization,
+            "minimum_provider_quota": self.minimum_provider_quota,
+            "backlog_peak": self.backlog_peak,
+            "backlog_end": self.backlog_end,
+            "oldest_backlog_age_peak_ms": self.oldest_backlog_age_peak_ms,
+            "net_backlog_slope_per_second": self.net_backlog_slope_per_second,
+            "controller_limit_min": self.controller_limit_min,
+            "controller_limit_max": self.controller_limit_max,
+            "controller_limit_change_count": self.controller_limit_change_count,
+            "controller_limit_direction_reversal_count": (
+                self.controller_limit_direction_reversal_count
+            ),
+            "overload_observed": self.overload_observed,
+            "provider_quota_exhausted": self.provider_quota_exhausted,
+            "drain_completed": self.drain_completed,
+            "fairness_observed": self.fairness_observed,
+            "recording_count_peak": self.recording_count_peak,
+            "recording_backlog_spread_peak": self.recording_backlog_spread_peak,
+            "missing_signal_kinds": list(self.missing_signal_kinds),
+            "observations": [item.as_dict() for item in self.observations],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureStabilityReport:
+    """Local-only controller stability evidence, never a production qualification."""
+
+    version: str
+    workload_fingerprint: str
+    controller_kind: BackpressureControllerKind
+    controller_version: str
+    controller_policy_digest: str
+    scenarios: tuple[BackpressureScenarioReport, ...]
+    evidence_note: Literal["LOCAL_ONLY_NOT_PRODUCTION_QUALIFIED"] = (
+        "LOCAL_ONLY_NOT_PRODUCTION_QUALIFIED"
+    )
+    production_eligible: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        _require_nonempty("version", self.version)
+        _require_nonempty("workload_fingerprint", self.workload_fingerprint)
+        if not isinstance(self.controller_kind, BackpressureControllerKind):
+            raise TypeError("controller_kind must be a BackpressureControllerKind")
+        _require_nonempty("controller_version", self.controller_version)
+        _require_nonempty("controller_policy_digest", self.controller_policy_digest)
+        if not isinstance(self.scenarios, tuple) or not self.scenarios:
+            raise ValueError("scenarios must be a nonempty tuple")
+        scenario_kinds: list[BackpressureScenarioKind] = []
+        for item in self.scenarios:
+            if not isinstance(item, BackpressureScenarioReport):
+                raise TypeError("scenarios must contain BackpressureScenarioReport")
+            scenario_kinds.append(item.scenario)
+        if len(set(scenario_kinds)) != len(scenario_kinds):
+            raise ValueError("scenarios must not contain duplicate scenario kinds")
+        if self.evidence_note != "LOCAL_ONLY_NOT_PRODUCTION_QUALIFIED":
+            raise ValueError("backpressure stability reports are local-only evidence")
+        if self.production_eligible:
+            raise ValueError("backpressure stability reports cannot grant production eligibility")
+
+    @property
+    def report_digest(self) -> str:
+        return semantic_sha256(
+            {
+                "version": self.version,
+                "workload_fingerprint": self.workload_fingerprint,
+                "controller_kind": self.controller_kind.value,
+                "controller_version": self.controller_version,
+                "controller_policy_digest": self.controller_policy_digest,
+                "scenarios": [item.as_dict() for item in self.scenarios],
+                "evidence_note": self.evidence_note,
+            }
+        )
+
+    @property
+    def scenario_kinds(self) -> frozenset[BackpressureScenarioKind]:
+        return frozenset(item.scenario for item in self.scenarios)
+
+    @property
+    def missing_required_scenarios(self) -> tuple[BackpressureScenarioKind, ...]:
+        return tuple(item for item in BackpressureScenarioKind if item not in self.scenario_kinds)
+
+    @property
+    def complete_scenario_matrix(self) -> bool:
+        return not self.missing_required_scenarios
+
+    @property
+    def measurement_status(self) -> Literal["NOT_MEASURED"]:
+        return 'NOT_MEASURED'
+
+    @property
+    def qualification_status(self) -> Literal["NOT_PRODUCTION_QUALIFIED"]:
+        return 'NOT_PRODUCTION_QUALIFIED'
+
+    def scenario(self, kind: BackpressureScenarioKind) -> BackpressureScenarioReport:
+        if not isinstance(kind, BackpressureScenarioKind):
+            raise TypeError("kind must be a BackpressureScenarioKind")
+        for item in self.scenarios:
+            if item.scenario is kind:
+                return item
+        raise KeyError(f"scenario not present: {kind.value}")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "report_digest": self.report_digest,
+            "workload_fingerprint": self.workload_fingerprint,
+            "controller_kind": self.controller_kind.value,
+            "controller_version": self.controller_version,
+            "controller_policy_digest": self.controller_policy_digest,
+            "complete_scenario_matrix": self.complete_scenario_matrix,
+            "missing_required_scenarios": [item.value for item in self.missing_required_scenarios],
+            "scenarios": [item.as_dict() for item in self.scenarios],
+            "evidence_note": self.evidence_note,
+            "measurement_status": self.measurement_status,
+            "qualification_status": self.qualification_status,
+            "production_eligible": self.production_eligible,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureScenarioComparison:
+    """Fixed-versus-AIMD deltas for the same local scenario."""
+
+    scenario: BackpressureScenarioKind
+    fixed: BackpressureScenarioReport
+    adaptive: BackpressureScenarioReport
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scenario, BackpressureScenarioKind):
+            raise TypeError("scenario must be a BackpressureScenarioKind")
+        if not isinstance(self.fixed, BackpressureScenarioReport):
+            raise TypeError("fixed must be a BackpressureScenarioReport")
+        if not isinstance(self.adaptive, BackpressureScenarioReport):
+            raise TypeError("adaptive must be a BackpressureScenarioReport")
+        if self.fixed.scenario is not self.scenario or self.adaptive.scenario is not self.scenario:
+            raise ValueError("scenario comparison reports must match scenario")
+
+    @property
+    def backlog_peak_delta(self) -> int:
+        return self.adaptive.backlog_peak - self.fixed.backlog_peak
+
+    @property
+    def backlog_end_delta(self) -> int:
+        return self.adaptive.backlog_end - self.fixed.backlog_end
+
+    @property
+    def service_rate_delta_per_second(self) -> float | None:
+        return _optional_difference(
+            self.adaptive.mean_service_rate_per_second,
+            self.fixed.mean_service_rate_per_second,
+        )
+
+    @property
+    def utilization_peak_delta(self) -> float | None:
+        return _optional_difference(
+            self.adaptive.peak_worker_utilization,
+            self.fixed.peak_worker_utilization,
+        )
+
+    @property
+    def fairness_backlog_spread_delta(self) -> int | None:
+        if (
+            self.adaptive.recording_backlog_spread_peak is None
+            or self.fixed.recording_backlog_spread_peak is None
+        ):
+            return None
+        return (
+            self.adaptive.recording_backlog_spread_peak - self.fixed.recording_backlog_spread_peak
+        )
+
+    @property
+    def adaptive_matches_or_beats_fixed(self) -> bool | None:
+        if (
+            self.adaptive.mean_service_rate_per_second is None
+            or self.fixed.mean_service_rate_per_second is None
+        ):
+            return None
+        if (
+            self.adaptive.recording_backlog_spread_peak is None
+            and self.fixed.recording_backlog_spread_peak is not None
+        ) or (
+            self.adaptive.recording_backlog_spread_peak is not None
+            and self.fixed.recording_backlog_spread_peak is None
+        ):
+            return None
+        checks = [
+            self.adaptive.backlog_peak <= self.fixed.backlog_peak,
+            self.adaptive.backlog_end <= self.fixed.backlog_end,
+            (self.adaptive.mean_service_rate_per_second >= self.fixed.mean_service_rate_per_second),
+        ]
+        if self.adaptive.recording_backlog_spread_peak is not None:
+            assert self.fixed.recording_backlog_spread_peak is not None
+            checks.append(
+                self.adaptive.recording_backlog_spread_peak
+                <= self.fixed.recording_backlog_spread_peak
+            )
+        return all(checks)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "scenario": self.scenario.value,
+            "backlog_peak_delta": self.backlog_peak_delta,
+            "backlog_end_delta": self.backlog_end_delta,
+            "service_rate_delta_per_second": self.service_rate_delta_per_second,
+            "utilization_peak_delta": self.utilization_peak_delta,
+            "fairness_backlog_spread_delta": self.fairness_backlog_spread_delta,
+            "adaptive_matches_or_beats_fixed": self.adaptive_matches_or_beats_fixed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackpressureStabilityComparison:
+    """Conservative fixed-versus-AIMD local comparison with explicit gaps."""
+
+    fixed: BackpressureStabilityReport
+    adaptive: BackpressureStabilityReport
+    comparable: bool
+    non_comparable_reasons: tuple[str, ...]
+    scenario_comparisons: tuple[BackpressureScenarioComparison, ...]
+    production_eligible: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fixed, BackpressureStabilityReport):
+            raise TypeError("fixed must be a BackpressureStabilityReport")
+        if not isinstance(self.adaptive, BackpressureStabilityReport):
+            raise TypeError("adaptive must be a BackpressureStabilityReport")
+        if not isinstance(self.comparable, bool):
+            raise TypeError("comparable must be boolean")
+        if tuple(sorted(set(self.non_comparable_reasons))) != self.non_comparable_reasons:
+            raise ValueError("non_comparable_reasons must be unique and ordered")
+        for reason in self.non_comparable_reasons:
+            _require_nonempty("non_comparable_reasons", reason)
+        if self.comparable and self.non_comparable_reasons:
+            raise ValueError("comparable comparison cannot carry non-comparable reasons")
+        if not self.comparable and self.scenario_comparisons:
+            raise ValueError("non-comparable comparison must not carry scenario comparisons")
+        if self.comparable:
+            expected = tuple(sorted(BackpressureScenarioKind, key=lambda item: item.value))
+            actual = tuple(item.scenario for item in self.scenario_comparisons)
+            if actual != expected:
+                raise ValueError("comparable comparison must cover every scenario")
+        if self.production_eligible:
+            raise ValueError("backpressure comparisons cannot grant production eligibility")
+
+    @property
+    def adaptive_matches_or_beats_fixed(self) -> bool | None:
+        if not self.comparable:
+            return None
+        values = tuple(item.adaptive_matches_or_beats_fixed for item in self.scenario_comparisons)
+        if any(value is None for value in values):
+            return None
+        return all(value is True for value in values)
+
+    @property
+    def comparison_digest(self) -> str:
+        return semantic_sha256(
+            {
+                "fixed_report_digest": self.fixed.report_digest,
+                "adaptive_report_digest": self.adaptive.report_digest,
+                "comparable": self.comparable,
+                "non_comparable_reasons": list(self.non_comparable_reasons),
+                "scenario_comparisons": [item.as_dict() for item in self.scenario_comparisons],
+            }
+        )
+
+    @property
+    def measurement_status(self) -> Literal["NOT_MEASURED"]:
+        return 'NOT_MEASURED'
+
+    @property
+    def qualification_status(self) -> Literal["NOT_PRODUCTION_QUALIFIED"]:
+        return "NOT_PRODUCTION_QUALIFIED"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "comparison_digest": self.comparison_digest,
+            "fixed_report_digest": self.fixed.report_digest,
+            "adaptive_report_digest": self.adaptive.report_digest,
+            "comparable": self.comparable,
+            "non_comparable_reasons": list(self.non_comparable_reasons),
+            "scenario_comparisons": [item.as_dict() for item in self.scenario_comparisons],
+            "adaptive_matches_or_beats_fixed": self.adaptive_matches_or_beats_fixed,
+            "measurement_status": self.measurement_status,
+            "qualification_status": self.qualification_status,
+            "production_eligible": self.production_eligible,
+        }
+
+
+def build_local_backpressure_stability_report(
+    *,
+    version: str,
+    workload_fingerprint: str,
+    controller_kind: BackpressureControllerKind,
+    controller_version: str,
+    controller_policy_digest: str,
+    scenarios: tuple[BackpressureScenarioReport, ...],
+) -> BackpressureStabilityReport:
+    """Build a deterministic local-only stability artifact from raw observations."""
+
+    if not isinstance(scenarios, tuple):
+        raise TypeError("scenarios must be a tuple")
+    return BackpressureStabilityReport(
+        version=version,
+        workload_fingerprint=workload_fingerprint,
+        controller_kind=controller_kind,
+        controller_version=controller_version,
+        controller_policy_digest=controller_policy_digest,
+        scenarios=tuple(sorted(scenarios, key=lambda item: item.scenario.value)),
+    )
+
+
+def build_backpressure_stability_report(
+    *,
+    version: str,
+    workload_fingerprint: str,
+    controller_kind: BackpressureControllerKind,
+    controller_version: str,
+    controller_policy_digest: str,
+    scenarios: tuple[BackpressureScenarioReport, ...],
+) -> BackpressureStabilityReport:
+    """Compatibility name for the local-only backpressure report builder."""
+
+    return build_local_backpressure_stability_report(
+        version=version,
+        workload_fingerprint=workload_fingerprint,
+        controller_kind=controller_kind,
+        controller_version=controller_version,
+        controller_policy_digest=controller_policy_digest,
+        scenarios=scenarios,
+    )
+
+
+def compare_fixed_and_adaptive_backpressure(
+    fixed: BackpressureStabilityReport,
+    adaptive: BackpressureStabilityReport,
+) -> BackpressureStabilityComparison:
+    """Compare a fixed baseline to AIMD only when the local evidence is complete."""
+
+    if not isinstance(fixed, BackpressureStabilityReport):
+        raise TypeError("fixed must be a BackpressureStabilityReport")
+    if not isinstance(adaptive, BackpressureStabilityReport):
+        raise TypeError("adaptive must be a BackpressureStabilityReport")
+    reasons: list[str] = []
+    if fixed.controller_kind is not BackpressureControllerKind.FIXED:
+        reasons.append("BASELINE_NOT_FIXED")
+    if adaptive.controller_kind is not BackpressureControllerKind.AIMD:
+        reasons.append("CANDIDATE_NOT_AIMD")
+    if fixed.workload_fingerprint != adaptive.workload_fingerprint:
+        reasons.append("WORKLOAD_FINGERPRINT_CHANGED")
+    if fixed.scenario_kinds != adaptive.scenario_kinds:
+        reasons.append("SCENARIO_SET_CHANGED")
+    if not fixed.complete_scenario_matrix:
+        reasons.append("BASELINE_SCENARIO_MATRIX_INCOMPLETE")
+    if not adaptive.complete_scenario_matrix:
+        reasons.append("CANDIDATE_SCENARIO_MATRIX_INCOMPLETE")
+    if not reasons:
+        for scenario in BackpressureScenarioKind:
+            _append_backpressure_signal_gaps(
+                reasons,
+                "FIXED",
+                fixed.scenario(scenario),
+            )
+            _append_backpressure_signal_gaps(
+                reasons,
+                "ADAPTIVE",
+                adaptive.scenario(scenario),
+            )
+            _append_backpressure_scenario_gaps(
+                reasons,
+                "FIXED",
+                fixed.scenario(scenario),
+            )
+            _append_backpressure_scenario_gaps(
+                reasons,
+                "ADAPTIVE",
+                adaptive.scenario(scenario),
+            )
+    reasons = sorted(set(reasons))
+    comparisons = ()
+    if not reasons:
+        comparisons = tuple(
+            BackpressureScenarioComparison(
+                scenario=scenario,
+                fixed=fixed.scenario(scenario),
+                adaptive=adaptive.scenario(scenario),
+            )
+            for scenario in sorted(BackpressureScenarioKind, key=lambda item: item.value)
+        )
+    return BackpressureStabilityComparison(
+        fixed=fixed,
+        adaptive=adaptive,
+        comparable=not reasons,
+        non_comparable_reasons=tuple(reasons),
+        scenario_comparisons=comparisons,
+    )
+
+
+def compare_backpressure_stability_reports(
+    fixed: BackpressureStabilityReport,
+    adaptive: BackpressureStabilityReport,
+) -> BackpressureStabilityComparison:
+    """Compatibility name for fixed-versus-adaptive stability comparison."""
+
+    return compare_fixed_and_adaptive_backpressure(fixed, adaptive)
+
+
+def _append_backpressure_signal_gaps(
+    reasons: list[str],
+    controller_label: str,
+    scenario: BackpressureScenarioReport,
+) -> None:
+    required_signals = ("ARRIVAL_RATE", "BACKLOG_SLOPE", "SERVICE_RATE", "WORKER_UTILIZATION")
+    missing = set(scenario.missing_signal_kinds)
+    for signal in required_signals:
+        if signal in missing:
+            reasons.append(f"{controller_label}_{scenario.scenario.value}_MISSING_{signal}")
+
+
+def _append_backpressure_scenario_gaps(
+    reasons: list[str],
+    controller_label: str,
+    scenario: BackpressureScenarioReport,
+) -> None:
+    if scenario.scenario is BackpressureScenarioKind.OVERLOAD and not scenario.overload_observed:
+        reasons.append(f"{controller_label}_OVERLOAD_NOT_OBSERVED")
+    if (
+        scenario.scenario is BackpressureScenarioKind.PROVIDER_QUOTA
+        and not scenario.provider_quota_exhausted
+    ):
+        reasons.append(f"{controller_label}_PROVIDER_QUOTA_NOT_EXHAUSTED")
+    if scenario.scenario is BackpressureScenarioKind.DRAIN and scenario.drain_completed is None:
+        reasons.append(f"{controller_label}_DRAIN_NOT_OBSERVED")
+    if scenario.scenario is BackpressureScenarioKind.FAIRNESS and not scenario.fairness_observed:
+        reasons.append(f"{controller_label}_FAIRNESS_NOT_OBSERVED")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1969,6 +2727,29 @@ def _optional_latency_ratio(
     return candidate.p95_ms / baseline.p95_ms
 
 
+def _optional_mean(values: tuple[float, ...]) -> float | None:
+    return None if not values else sum(values) / len(values)
+
+
+def _optional_difference(candidate: float | None, baseline: float | None) -> float | None:
+    if candidate is None or baseline is None:
+        return None
+    return candidate - baseline
+
+
+def _require_optional_finite(name: str, value: object) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be finite or None")
+
+
+def _require_optional_finite_nonnegative(name: str, value: object) -> None:
+    _require_optional_finite(name, value)
+    if value is not None and value < 0:
+        raise ValueError(f"{name} must be nonnegative or None")
+
+
 def _require_finite_positive(name: str, value: object) -> None:
     if (
         isinstance(value, bool)
@@ -2021,6 +2802,14 @@ def _validate_ordinals(
 
 
 __all__ = [
+    "BackpressureControllerKind",
+    "BackpressureObservation",
+    "BackpressureRecordingBacklog",
+    "BackpressureScenarioComparison",
+    "BackpressureScenarioKind",
+    "BackpressureScenarioReport",
+    "BackpressureStabilityComparison",
+    "BackpressureStabilityReport",
     "BottleneckKind",
     "CapacityEvidenceClass",
     "CapacityRegressionPolicy",
@@ -2043,9 +2832,13 @@ __all__ = [
     'WorkerCapacityProjection',
     'WorkerScalingPoint',
     'WorkerScalingReport',
+    "build_backpressure_stability_report",
+    "build_local_backpressure_stability_report",
     "build_measured_capacity_report",
     'build_worker_scaling_report',
+    "compare_backpressure_stability_reports",
     "compare_capacity_reports",
+    "compare_fixed_and_adaptive_backpressure",
     "compare_measured_capacity_reports",
     "evaluate_local_slo",
     "generate_synthetic_load",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -15,6 +16,7 @@ from robata.adapters.sqlite_work_scheduler import (
     SQLiteWorkScheduler,
     WorkFenceError,
     WorkNotFoundError,
+    active_authority_transaction_operation,
 )
 from robata.application.canonical.bounded_media import (
     BoundedWindowPlan,
@@ -26,6 +28,7 @@ from robata.application.canonical.bounded_media import (
     WindowClosureReason,
     WindowMember,
 )
+from robata.application.canonical.local_composition import _local_stream_delivery_authority
 from robata.application.canonical.stream_scheduler import (
     DEFAULT_STREAM_BACKPRESSURE_CONFIG,
     DurableStreamWindowScheduler,
@@ -46,9 +49,18 @@ from robata.contracts.stream_common import (
     StreamStage,
     TerminalOutcome,
 )
-from robata.contracts.stream_planning import create_expected_window_plan
+from robata.contracts.stream_planning import (
+    ExpectedWindowDeclaration,
+    create_expected_window_plan,
+)
 from robata.contracts.stream_source import PreEosCaptureSubject, create_pre_eos_capture_subject
-from robata.queue.backpressure import BackpressureConfig, PressureClass
+from robata.queue.backpressure import (
+    BackpressureConfig,
+    BackpressureControllerMode,
+    BackpressureRuntimeSignals,
+    PressureClass,
+    QueueMetrics,
+)
 from robata.queue.models import WorkItemState
 from robata.queue.stage import DependencyCriticality
 from robata.queue.stream_models import (
@@ -78,7 +90,7 @@ def _schema(value: int) -> SchemaRef:
     )
 
 
-def _capture() -> PreEosCaptureSubject:
+def _capture(*, acquisition_id: str = "acquisition-1") -> PreEosCaptureSubject:
     authority = AuthorityBinding(
         authority_id="authority",
         authority_epoch=1,
@@ -90,7 +102,7 @@ def _capture() -> PreEosCaptureSubject:
         capture_authority_id="capture-authority",
         capture_authority_epoch=1,
         capture_assignment_policy_version="capture-assignment-v1",
-        acquisition_id="acquisition-1",
+        acquisition_id=acquisition_id,
         acquisition_epoch=1,
         channel_bindings=tuple(
             ChannelBinding(
@@ -194,6 +206,7 @@ def _composition(
     stream_run_id: int = 60,
     database_path: Path | None = None,
     backpressure_config: BackpressureConfig | None = None,
+    backpressure_signal_provider=None,
 ) -> DurableStreamWindowScheduler:
     policy = StreamPolicyBinding(version="policy-v1", semantic_sha256=_digest(50))
     plan = create_expected_window_plan(
@@ -219,9 +232,58 @@ def _composition(
             if backpressure_config is None
             else backpressure_config
         ),
+        backpressure_signal_provider=backpressure_signal_provider,
         clock=lambda: _NOW,
         boundary_observer=observer,
     )
+
+
+def test_delivery_extension_reuses_existing_stream_authority(
+    tmp_path: Path,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    authority = SQLiteWorkScheduler(
+        tmp_path / "work.sqlite3",
+        runtime_observer=recorder,
+    )
+    composition = _composition(
+        tmp_path,
+        capture=_capture(),
+        scheduler=authority,
+    )
+
+    delivery = _local_stream_delivery_authority((composition,))
+
+    assert composition.execution_scheduler is authority
+    assert delivery.authority is authority
+    snapshot = recorder.snapshot()
+
+    def transactions_for(operation: str) -> int:
+        return sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.transactions"
+            and any(
+                attribute.name == "operation" and attribute.value == operation
+                for attribute in counter.attributes
+            )
+        )
+
+    def connections_for(operation: str) -> int:
+        return sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.work_scheduler.connections"
+            and any(
+                attribute.name == "operation" and attribute.value == operation
+                for attribute in counter.attributes
+            )
+        )
+
+    # Delivery setup shares the stream scheduler rather than reopening and initializing
+    # another scheduler against the same authority database.
+    assert transactions_for("initialize_schema") == 1
+    assert connections_for("initialize_schema") == 1
 
 
 def test_append_emission_batches_window_append_plan_and_publish(
@@ -373,9 +435,9 @@ def test_seal_batches_final_windows_and_durably_records_planner_eos(
     assert transactions("plan_many") == 1
     assert transactions("authority.stream_work.mark_published_many") == 1
     with sqlite3.connect(authority.database_path) as connection:
-        planner_eos = connection.execute(
-            "SELECT planner_eos_sha256 FROM stream_plans"
-        ).fetchone()[0]
+        planner_eos = connection.execute("SELECT planner_eos_sha256 FROM stream_plans").fetchone()[
+            0
+        ]
     assert planner_eos is not None
 
 
@@ -533,6 +595,75 @@ def test_projection_crash_before_batch_publish_replays_once_on_restart(
     assert projected_count == 5
 
 
+@pytest.mark.parametrize(
+    ("operation_name", "crash_after_commit"),
+    (
+        pytest.param(
+            "authority.stream_work.append_windows",
+            False,
+            id="append-windows-before-commit",
+        ),
+        pytest.param(
+            "authority.stream_work.append_windows",
+            True,
+            id="append-windows-after-commit",
+        ),
+        pytest.param(
+            "authority.stream_work.mark_published_many",
+            False,
+            id="mark-published-many-before-commit",
+        ),
+        pytest.param(
+            "authority.stream_work.mark_published_many",
+            True,
+            id="mark-published-many-after-commit",
+        ),
+    ),
+)
+def test_stream_projection_commit_crash_reopens_and_exactly_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    operation_name: str,
+    crash_after_commit: bool,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+    original_commit = execution._commit
+    crashed = False
+
+    def crash_at_projection_commit(connection: sqlite3.Connection) -> None:
+        nonlocal crashed
+        if not crashed and active_authority_transaction_operation() == operation_name:
+            crashed = True
+            if crash_after_commit:
+                original_commit(connection)
+            raise SystemExit(f"injected {operation_name} commit crash")
+        original_commit(connection)
+
+    monkeypatch.setattr(execution, "_commit", crash_at_projection_commit)
+
+    with pytest.raises(SystemExit, match="commit crash"):
+        composition.append_window(_window(capture, 0))
+
+    assert crashed
+    reopened_authority = SQLiteWorkScheduler(execution.database_path)
+    reopened = _composition(tmp_path, capture=capture, scheduler=reopened_authority)
+
+    assert reopened.append_window(_window(capture, 0)) == reopened.declarations()[0]
+    with sqlite3.connect(reopened_authority.database_path) as connection:
+        counts = (
+            connection.execute("SELECT COUNT(*) FROM expected_windows").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM stream_work_plans").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM work_items").fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM stream_work_plans WHERE publication_state = 'PUBLISHED'"
+            ).fetchone()[0],
+        )
+    assert counts == (1, 5, 5, 5)
+
+
 def test_hot_stream_reads_do_not_scan_pending_terminal_intents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -595,6 +726,208 @@ def test_backpressure_throttles_only_new_windows_and_recovers_same_policy(
     assert recovered.backpressure_snapshot().decision.pressure_class is PressureClass.NORMAL
     recovered.append_window(_window(capture, 1))
     assert len(recovered.declarations()) == 2
+
+
+def test_backpressure_observations_preserve_unknowns_and_replay_after_restart(
+    tmp_path: Path,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    composition = _composition(tmp_path, capture=capture, scheduler=execution)
+    with sqlite3.connect(execution.database_path) as connection:
+        raw_config = connection.execute(
+            "SELECT composition_config_json FROM stream_plans WHERE plan_key = ?",
+            (composition.plan_key,),
+        ).fetchone()[0]
+    stored_config = json.loads(raw_config)
+    assert set(stored_config["backpressure_config"]) == {
+        "backlog_slope_threshold",
+        "oldest_age_threshold_ms",
+        "queue_depth_threshold",
+        "version",
+    }
+
+    empty = composition.backpressure_snapshot(now=_NOW)
+    assert empty.metrics.arrival_rate is None
+    assert empty.metrics.service_rate is None
+    assert empty.metrics.backlog_slope is None
+    assert empty.metrics.provider_quota is None
+    assert empty.metrics.worker_utilization is None
+
+    composition.append_window(_window(capture, 0))
+    measured = composition.backpressure_snapshot(now=_NOW + timedelta(seconds=1))
+    assert measured.metrics.arrival_rate == 5.0
+    assert measured.metrics.service_rate == 0.0
+    assert measured.metrics.backlog_slope == 5.0
+
+    quota_exhausted = QueueMetrics(depth=measured.metrics.depth, oldest_age_ms=0, provider_quota=0)
+    expected = composition.backpressure_snapshot(
+        now=_NOW + timedelta(seconds=2),
+        metrics=quota_exhausted,
+    )
+    recovered = DurableStreamWindowScheduler.recover_registered(
+        execution_scheduler=execution,
+        stream_run_id=_uuid(60),
+        clock=lambda: _NOW + timedelta(seconds=2),
+    )[0]
+    replayed = recovered.backpressure_snapshot(
+        now=_NOW + timedelta(seconds=2),
+        metrics=quota_exhausted,
+    )
+
+    assert not expected.decision.admitted
+    assert replayed.decision == expected.decision
+
+
+def test_runtime_backpressure_signals_drive_durable_adaptive_controller(
+    tmp_path: Path,
+) -> None:
+    capture = _capture()
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    signals = BackpressureRuntimeSignals(provider_quota=12, worker_utilization=0.5)
+
+    def signal_provider() -> BackpressureRuntimeSignals:
+        return signals
+
+    policy = BackpressureConfig(
+        version="adaptive-runtime-signals-v1",
+        queue_depth_threshold=64,
+        oldest_age_threshold_ms=60_000,
+        backlog_slope_threshold=100.0,
+        controller_version="adaptive-runtime-controller-v1",
+        controller_key="local-provider:partition-a",
+        controller_mode=BackpressureControllerMode.AIMD,
+        minimum_limit=1,
+        maximum_limit=4,
+        additive_increase=1,
+        multiplicative_decrease=0.5,
+        cooldown_ms=0,
+        worker_utilization_threshold=0.8,
+    )
+    composition = _composition(
+        tmp_path,
+        capture=capture,
+        scheduler=execution,
+        backpressure_config=policy,
+        backpressure_signal_provider=signal_provider,
+    )
+
+    normal = composition.backpressure_snapshot(now=_NOW)
+    assert composition.backpressure_controller_key == "local-provider:partition-a"
+    assert normal.metrics.provider_quota == 12
+    assert normal.metrics.worker_utilization == 0.5
+    assert normal.decision.admitted is True
+    assert normal.decision.controller_limit == 4
+
+    signals = BackpressureRuntimeSignals(provider_quota=12, worker_utilization=0.9)
+    utilized = composition.backpressure_snapshot(now=_NOW + timedelta(seconds=1))
+    assert utilized.decision.admitted is False
+    assert utilized.decision.signals == ("WORKER_UTILIZATION",)
+    assert utilized.decision.controller_limit == 2
+
+    signals = BackpressureRuntimeSignals(provider_quota=0, worker_utilization=0.1)
+    quota_exhausted = composition.backpressure_snapshot(now=_NOW + timedelta(seconds=2))
+    assert quota_exhausted.decision.admitted is False
+    assert quota_exhausted.decision.signals == ("PROVIDER_QUOTA",)
+    assert quota_exhausted.decision.controller_limit == 1
+
+    recovered = DurableStreamWindowScheduler.recover_registered(
+        execution_scheduler=execution,
+        stream_run_id=_uuid(60),
+        backpressure_signal_provider=signal_provider,
+        clock=lambda: _NOW + timedelta(seconds=2),
+    )[0]
+    assert recovered.backpressure_controller_key == "local-provider:partition-a"
+    assert recovered.backpressure_controller_limit == 1
+
+    explicit = recovered.backpressure_snapshot(
+        now=_NOW + timedelta(seconds=3),
+        metrics=QueueMetrics(depth=0, oldest_age_ms=0),
+    )
+    assert explicit.metrics.provider_quota is None
+    assert explicit.metrics.worker_utilization is None
+
+
+def test_partition_recording_fairness_is_atomic_across_instances_and_restart(
+    tmp_path: Path,
+) -> None:
+    """One partition cannot build more than one active window beyond a peer."""
+
+    execution = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
+    policy = BackpressureConfig(
+        version="recording-fairness-v1",
+        queue_depth_threshold=1_000,
+        oldest_age_threshold_ms=60_000,
+        backlog_slope_threshold=1_000.0,
+        controller_key="provider-a:partition-a",
+    )
+    first_capture = _capture(acquisition_id="acquisition-fairness-a")
+    second_capture = _capture(acquisition_id="acquisition-fairness-b")
+    first = _composition(
+        tmp_path,
+        capture=first_capture,
+        scheduler=execution,
+        stream_run_id=601,
+        backpressure_config=policy,
+    )
+    second = _composition(
+        tmp_path,
+        capture=second_capture,
+        scheduler=SQLiteWorkScheduler(execution.database_path),
+        stream_run_id=601,
+        backpressure_config=policy,
+    )
+
+    barrier = Barrier(2)
+
+    def append_initial(
+        composition: DurableStreamWindowScheduler,
+        capture: PreEosCaptureSubject,
+    ) -> ExpectedWindowDeclaration:
+        barrier.wait()
+        return composition.append_window(_window(capture, 0))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(append_initial, first, first_capture)
+        second_future = pool.submit(append_initial, second, second_capture)
+        assert first_future.result().ordinal == 0
+        assert second_future.result().ordinal == 0
+
+    first.append_window(_window(first_capture, 1))
+    with pytest.raises(StreamBackpressureThrottle) as caught:
+        first.append_window(_window(first_capture, 2))
+    assert caught.value.decision.signals == ("RECORDING_FAIRNESS",)
+    assert len(first.declarations()) == 2
+
+    second.append_window(_window(second_capture, 1))
+    with pytest.raises(StreamBackpressureThrottle) as batch_caught:
+        first.append_windows(
+            (
+                _window(first_capture, 2),
+                _window(first_capture, 3),
+            )
+        )
+    assert batch_caught.value.decision.signals == ("RECORDING_FAIRNESS",)
+    assert len(first.declarations()) == 2
+
+    recovered = {
+        composition.plan_key: composition
+        for composition in DurableStreamWindowScheduler.recover_registered(
+            execution_scheduler=SQLiteWorkScheduler(execution.database_path),
+            stream_run_id=_uuid(601),
+            clock=lambda: _NOW,
+        )
+    }
+    recovered_first = recovered[first.plan_key]
+    recovered_second = recovered[second.plan_key]
+
+    recovered_first.append_window(_window(first_capture, 2))
+    with pytest.raises(StreamBackpressureThrottle):
+        recovered_first.append_window(_window(first_capture, 3))
+    recovered_second.append_window(_window(second_capture, 2))
+
+    assert len(recovered_first.declarations()) == 3
+    assert len(recovered_second.declarations()) == 3
 
 
 def test_composition_requires_scheduler_authority_database_path(tmp_path: Path) -> None:
@@ -828,6 +1161,7 @@ def test_forged_capability_expiry_cannot_create_pending_terminal(
             (root.work_item_id,),
         ).fetchone()
     assert pending == (None, None, None)
+
 
 def test_backdated_evidence_cannot_revive_expired_authority_lease(
     tmp_path: Path,

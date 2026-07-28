@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from robata.contracts.hashing import canonical_json_bytes  # noqa: E402
 from robata.contracts.measurement_truth import EvidenceClass  # noqa: E402
+from robata.durability import sync_directory  # noqa: E402
 from robata.runtime.measurement_truth import load_profile_evidence_register  # noqa: E402
 
 
@@ -61,6 +62,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, destination)
+        sync_directory(destination.parent)
     except OSError:
         with suppress(OSError):
             temporary_path.unlink(missing_ok=True)

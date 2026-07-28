@@ -41,7 +41,7 @@ from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 from robata.contracts.logical_nodes import RunNodeDisposition
 from robata.contracts.pipeline import SamplingPurpose
-from robata.contracts.qa import ProductQAIssue
+from robata.contracts.qa import ProductQAConfidenceKind, ProductQAIssue
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.temporal import PackageLineage
 from robata.event_pipeline.candidate import (
@@ -74,14 +74,29 @@ from robata.inference.adapter import (
     VisionInferenceSuccess,
     VisionUsage,
 )
+from robata.inference.calibration import (
+    AcceptedInferenceCalibrationBridge,
+    CalibrationApplicability,
+    CalibrationArtifact,
+    CalibrationAssociation,
+    CalibrationAssociationOutcome,
+    CalibrationBinding,
+    CalibrationBridgeError,
+    CalibrationFittingMethod,
+    CalibrationGroupedSplitLineage,
+    CalibrationScoreSource,
+    CalibrationTrainingPopulation,
+)
 from robata.inference.call_barrier import InferenceCallReduction
 from robata.inference.enrichment import (
     ENRICHED_OUTPUT_SCHEMA_ID,
     ENRICHED_OUTPUT_SCHEMA_VERSION,
     PROVIDER_CLAIM_SCHEMA_ID,
+    OrchestratorEnrichedOutput,
     ProviderClaimKind,
     ProviderObservation,
     ProviderReferenceCatalog,
+    SelectedAttemptOutput,
 )
 from robata.inference.input_plan import (
     INFERENCE_INPUT_PLANNER_VERSION,
@@ -92,10 +107,12 @@ from robata.inference.input_plan import (
 )
 from robata.inference.models import (
     ConcurrencyClass,
+    InferenceAttemptSelection,
     InferenceFailure,
     InferenceStatus,
     InputMode,
     ModelCapabilities,
+    ModelInference,
     Retryability,
     VisionTask,
 )
@@ -119,6 +136,7 @@ from robata.ports.logical_node_registry import (
 from robata.qa_pipeline.completion import DenseQAOutcome, QACompletionStatus
 from robata.qa_pipeline.dense import DenseQAStatus
 from robata.qa_pipeline.product import ProductQACascadeStatus, ProductQAClassState
+from robata.runtime.observability import RuntimeObserver, RuntimeProfileRecorder
 from robata.sampling.materializer import (
     CanonicalSixCameraFrameIndex,
     FrameArtifactResolver,
@@ -143,6 +161,9 @@ TOKEN_POLICY_VERSION = "provider-token-v1"
 PARSER_VERSION = "strict-provider-claim-v1"
 REDUCTION_POLICY = "ordered-claims-v1"
 REDUCTION_POLICY_VERSION = "1.0"
+CALIBRATION_SCORE_FAMILY = "offline-coarse-qa-provider-self-report.v1"
+CALIBRATION_RUNTIME_REVISION = "offline-fixture-runtime-v1"
+CALIBRATION_PREPROCESS_REVISION = "offline-fixture-preprocess-v1"
 REQUESTED_INTERVAL = NanosecondInterval(start_ns=0, end_ns=1_000_000_000)
 _RUN_ID_COUNTER = count(20_000)
 
@@ -622,8 +643,14 @@ def _harness(
     protocol_only_adapter: bool = False,
     repository: InMemoryEventIdentityRegistryRepository | None = None,
     inference_evidence_path: Path | None = None,
+    calibration_bridge_factory: Callable[
+        [SQLiteInferenceEvidenceLedger, InferencePolicy],
+        AcceptedInferenceCalibrationBridge,
+    ]
+    | None = None,
     barrier_path: Path | None = None,
     clock: Callable[[], datetime] | None = None,
+    runtime_observer: RuntimeObserver | None = None,
     frame_index_override: CanonicalSixCameraFrameIndex | None = None,
 ) -> _Harness:
     registry = SchemaRegistry()
@@ -766,6 +793,12 @@ def _harness(
         if inference_evidence_path is not None
         else None
     )
+    if calibration_bridge_factory is None:
+        calibration_bridge = None
+    else:
+        if inference_evidence is None:
+            raise ValueError("calibration bridge requires durable inference evidence")
+        calibration_bridge = calibration_bridge_factory(inference_evidence, coarse_qa_policy)
     barrier_storage = SQLiteBarrierStorage(barrier_path) if barrier_path is not None else None
     raw_store: RawProviderBytesStore = (
         inference_evidence if inference_evidence is not None else InMemoryRawProviderBytesStore()
@@ -845,9 +878,11 @@ def _harness(
         execution_policy=execution_policy,
         inference_ledger=inference_evidence,
         evidence_store=inference_evidence,
+        calibration_bridge=calibration_bridge,
         barrier_storage=barrier_storage,
         call_barrier_storage=barrier_storage,
         clock=clock if clock is not None else lambda: NOW,
+        runtime_observer=runtime_observer,
     )
     context = _v2_context()
     plan = _sampling_plan()
@@ -878,6 +913,91 @@ def _harness(
         logical_node_registry=logical_node_registry,
         protocol_adapter=protocol_adapter,
     )
+
+
+def _coarse_calibration_artifact(policy: InferencePolicy) -> CalibrationArtifact:
+    applicability = CalibrationApplicability(
+        score_family=CALIBRATION_SCORE_FAMILY,
+        provider=policy.provider,
+        model_name=policy.model_name,
+        model_version=policy.model_version,
+        adapter_version=policy.adapter_version,
+        runtime_revision=CALIBRATION_RUNTIME_REVISION,
+        preprocess_revision=CALIBRATION_PREPROCESS_REVISION,
+        prompt_version=policy.prompt_version,
+        prompt_sha256=policy.prompt_sha256,
+        stage=policy.task,
+    )
+    return CalibrationArtifact.create(
+        applicability=applicability,
+        fitting_method=CalibrationFittingMethod.PLATT_LOGISTIC,
+        fitting_parameters={"slope": 5.0, "intercept": -2.0},
+        training_population=CalibrationTrainingPopulation(
+            population_artifact_id="offline-calibration-population-v1",
+            population_sha256=_digest("offline-calibration-population-v1"),
+            label_set_sha256=_digest("offline-calibration-labels-v1"),
+            member_count=48,
+            labelled_member_count=48,
+        ),
+        grouped_split_lineage=CalibrationGroupedSplitLineage(
+            split_artifact_id="offline-calibration-grouped-split-v1",
+            split_sha256=_digest("offline-calibration-grouped-split-v1"),
+            grouping_key="recording-camera-time",
+            leakage_policy_version="1.0",
+            development_group_sha256=_digest("offline-calibration-development-v1"),
+            calibration_group_sha256=_digest("offline-calibration-fit-v1"),
+            frozen_evaluation_group_sha256=_digest("offline-calibration-eval-v1"),
+        ),
+        fitted_at=NOW_TEXT,
+        valid_from=NOW_TEXT,
+        valid_until=None,
+        created_at=NOW_TEXT,
+    )
+
+
+def _coarse_calibration_bridge(
+    ledger: SQLiteInferenceEvidenceLedger,
+    policy: InferencePolicy,
+) -> AcceptedInferenceCalibrationBridge:
+    return AcceptedInferenceCalibrationBridge(
+        store=ledger,
+        bindings=(
+            CalibrationBinding(
+                task=policy.task,
+                score_family=CALIBRATION_SCORE_FAMILY,
+                runtime_revision=CALIBRATION_RUNTIME_REVISION,
+                preprocess_revision=CALIBRATION_PREPROCESS_REVISION,
+                score_source=CalibrationScoreSource.ENRICHED_CLAIM_REPORTED_CONFIDENCE,
+                source_claim_ordinal=0,
+                calibration_artifact=_coarse_calibration_artifact(policy),
+            ),
+        ),
+    )
+
+
+class _FailingCoarseCalibrationBridge(AcceptedInferenceCalibrationBridge):
+    """Inject a detached ledger failure without changing accepted lineage."""
+
+    def record_accepted(
+        self,
+        *,
+        task: VisionTask,
+        inference: ModelInference,
+        selection: InferenceAttemptSelection,
+        selected_output: SelectedAttemptOutput,
+        enriched_output: OrchestratorEnrichedOutput,
+    ) -> tuple[CalibrationAssociation, ...]:
+        del inference, selection, selected_output, enriched_output
+        if task is VisionTask.QA_COARSE:
+            raise CalibrationBridgeError("simulated calibration ledger outage")
+        return ()
+
+
+def _failing_coarse_calibration_bridge(
+    ledger: SQLiteInferenceEvidenceLedger,
+    _policy: InferencePolicy,
+) -> AcceptedInferenceCalibrationBridge:
+    return _FailingCoarseCalibrationBridge(store=ledger, bindings=())
 
 
 def _processing_run(
@@ -3250,3 +3370,141 @@ def test_out_of_part_evidence_is_rejected_after_all_parts_reach_terminal(
     )
     assert harness.repository.snapshot(harness.context.recording_identity).generation == 0
     _assert_offline(result, harness)
+
+
+def test_runner_records_detached_calibration_after_accepted_lineage(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "inference-evidence.sqlite3"
+    harness = _harness(
+        _claim_bytes,
+        logical_registry_root=tmp_path / "logical-registry",
+        coarse_response_factory=lambda request: _coarse_claim_bytes(
+            request,
+            observation=ProviderObservation.DEGRADED,
+            model_reported_score=0.8,
+        ),
+        inference_evidence_path=evidence_path,
+        calibration_bridge_factory=_coarse_calibration_bridge,
+    )
+
+    result = _run(harness)
+
+    assert result.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert result.error is None
+    assert result.coarse_qa_result is not None
+    assert result.product_qa_result is not None
+    assert harness.inference_evidence is not None
+    with sqlite3.connect(evidence_path) as connection:
+        selection_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT association.selection_id
+                FROM inference_calibration_associations AS association
+                WHERE association.score_family = ?
+                ORDER BY association.selection_id
+                """,
+                (CALIBRATION_SCORE_FAMILY,),
+            )
+        )
+
+    assert len(selection_ids) == len(result.coarse_qa_result.source_outputs)
+    assert selection_ids
+    for selection_id in selection_ids:
+        association = harness.inference_evidence.get_calibration_association(
+            selection_id,
+            CALIBRATION_SCORE_FAMILY,
+        )
+        assert association is not None
+        selected_output = harness.inference_evidence.get_selected_output(selection_id)
+        assert selected_output is not None
+        selection = harness.inference_evidence.get_selection(
+            selected_output.logical_invocation_id,
+            selected_output.selection_policy_version,
+        )
+        assert selection is not None
+        assert association.outcome is CalibrationAssociationOutcome.APPLIED
+        assert association.raw_score == pytest.approx(0.8)
+        assert association.calibrated_probability == pytest.approx(0.8807970779778823)
+        assert association.evaluated_at == selection.selected_at
+        assert association.created_at == selection.selected_at
+        assert association.deterministic_inputs["source_claim_ordinal"] == 0
+        assert association.deterministic_inputs["score_available"] is True
+        assert association.calibration_artifact_id is not None
+
+    coarse_model_evidence = tuple(
+        evidence
+        for coverage in result.product_qa_result.class_coverage
+        for evidence in coverage.evidence
+        if any(reference.startswith("qa_coarse-source:") for reference in evidence.evidence_refs)
+    )
+    assert coarse_model_evidence
+    assert all(item.confidence == pytest.approx(0.8) for item in coarse_model_evidence)
+    assert all(
+        item.confidence_kind is ProductQAConfidenceKind.MODEL_REPORTED
+        for item in coarse_model_evidence
+    )
+    _assert_offline(result, harness)
+
+
+def test_runner_isolates_detached_calibration_ledger_failures(
+    tmp_path: Path,
+) -> None:
+    def coarse_response(request: VisionInferenceRequest) -> OfflineFixtureResponse:
+        return _coarse_claim_bytes(
+            request,
+            observation=ProviderObservation.DEGRADED,
+            model_reported_score=0.8,
+        )
+
+    run_id = _uuid(9_901)
+    baseline_harness = _harness(
+        _claim_bytes,
+        logical_registry_root=tmp_path / "baseline-logical-registry",
+        coarse_response_factory=coarse_response,
+    )
+    baseline = _run(
+        baseline_harness,
+        processing_run=_processing_run(baseline_harness, run_id=run_id),
+    )
+
+    recorder = RuntimeProfileRecorder()
+    failing_harness = _harness(
+        _claim_bytes,
+        logical_registry_root=tmp_path / "failing-logical-registry",
+        coarse_response_factory=coarse_response,
+        inference_evidence_path=tmp_path / "failing-inference-evidence.sqlite3",
+        calibration_bridge_factory=_failing_coarse_calibration_bridge,
+        runtime_observer=recorder,
+    )
+    observed = _run(
+        failing_harness,
+        processing_run=_processing_run(failing_harness, run_id=run_id),
+    )
+
+    assert baseline.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert observed.status is CanonicalOfflineRunStatus.SUCCEEDED
+    assert observed.error is None
+    assert observed.coarse_qa_result == baseline.coarse_qa_result
+    assert observed.qa_completion_result == baseline.qa_completion_result
+    assert observed.product_qa_result == baseline.product_qa_result
+    assert observed.output_decision == baseline.output_decision
+    assert observed.hypotheses == baseline.hypotheses
+    assert tuple(part.enriched_output for part in observed.part_results) == tuple(
+        part.enriched_output for part in baseline.part_results
+    )
+
+    failures = tuple(
+        counter
+        for counter in recorder.snapshot().counters
+        if counter.name == "inference.calibration_association_failures"
+    )
+    assert len(failures) == 1
+    assert observed.coarse_qa_result is not None
+    assert failures[0].value == len(observed.coarse_qa_result.source_outputs)
+    assert {attribute.name: attribute.value for attribute in failures[0].attributes} == {
+        "error_type": "CalibrationBridgeError",
+        "task": VisionTask.QA_COARSE.value,
+    }
+    _assert_offline(observed, failing_harness)

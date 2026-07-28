@@ -27,6 +27,7 @@ from robata.inference.models import ModelCapabilities
 from robata.inference.runpod import (
     RunPodDeploymentConfiguration,
     RunPodEndpointConfig,
+    RunPodNativeBatchQualification,
     RunPodRetryPolicy,
 )
 from robata.runtime.capacity import (
@@ -142,7 +143,6 @@ class TwoH100ProviderConfiguration(StrictModel):
         retry_policy: object,
     ) -> None:
         """Reject a report configuration that does not match the active adapter."""
-
 
         if not isinstance(endpoint_config, RunPodEndpointConfig):
             raise TypeError("endpoint_config must be a RunPodEndpointConfig")
@@ -930,6 +930,11 @@ async def run_provider_saturation_point(
         capabilities=adapter.capabilities_snapshot,
         retry_policy=adapter.retry_policy,
     )
+    if (
+        configuration.native_batch_enabled
+        and adapter.native_batch_qualification_state != "QUALIFICATION_MEASUREMENT"
+    ):
+        raise ValueError("native batch saturation requires a scoped qualification measurement")
     capacity_input = await workload(adapter, context)
     if not isinstance(capacity_input, MeasuredCapacityInput):
         raise TypeError("workload must return a MeasuredCapacityInput")
@@ -1078,6 +1083,45 @@ class TwoH100ProviderQualificationReport(StrictModel):
             retry_policy=adapter.retry_policy,
             points=points,
             evidence_class=evidence_class,
+        )
+
+    def native_batch_qualification(
+        self,
+        *,
+        qualification_report_uri: str,
+        handler_contract_evidence_uri: str,
+        handler_contract_evidence_sha256: str,
+        streaming_wait_deadline_evidence_uri: str,
+        streaming_wait_deadline_evidence_sha256: str,
+    ) -> RunPodNativeBatchQualification:
+        """Return a non-promotional authorization bound to this sealed P6 report.
+
+        The handler and streaming-gate artifacts remain separate because the
+        saturation curve cannot itself prove an endpoint's queueing semantics.
+        Ordinary adapter construction rejects native batch until both artifacts
+        and this representative report have been supplied.
+        """
+
+        if self.evidence_class is not CapacityEvidenceClass.PRODUCTION_QUALIFICATION:
+            raise ValueError(
+                "native batch authorization requires production-qualification evidence"
+            )
+        if not self.configuration.native_batch_enabled:
+            raise ValueError("native batch authorization requires an enabled qualification config")
+        if not self.endpoint_config.native_batch_enabled:
+            raise ValueError("native batch authorization requires an enabled endpoint")
+        return RunPodNativeBatchQualification.create(
+            config=self.endpoint_config,
+            capabilities=self.capabilities,
+            retry_policy=self.retry_policy,
+            qualification_report_uri=qualification_report_uri,
+            qualification_report_sha256=exact_bytes_sha256(
+                canonical_json_bytes(self.model_dump(mode="json"))
+            ),
+            handler_contract_evidence_uri=handler_contract_evidence_uri,
+            handler_contract_evidence_sha256=handler_contract_evidence_sha256,
+            streaming_wait_deadline_evidence_uri=streaming_wait_deadline_evidence_uri,
+            streaming_wait_deadline_evidence_sha256=(streaming_wait_deadline_evidence_sha256),
         )
 
     @property
