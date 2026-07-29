@@ -44,9 +44,7 @@ def _metric_policy(
         event_start_end_tolerance_ns=100,
         boundary_tolerance_ns=100,
         calibration_bin_count=4,
-        governance_approval_id=(
-            context.governance_approval_id if context is not None else None
-        ),
+        governance_approval_id=(context.governance_approval_id if context is not None else None),
         governance_approval_digest=(
             context.governance_approval_digest if context is not None else None
         ),

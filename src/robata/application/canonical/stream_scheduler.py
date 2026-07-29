@@ -1130,7 +1130,7 @@ class DurableStreamWindowScheduler(SinglePassPlanningSink):
         return self._stream_item_from(
             plan,
             execution,
-            evidence=self._accepted_evidence(stored),
+            evidence=self._accepted_evidence(stored=stored),
         )
 
     def complete(

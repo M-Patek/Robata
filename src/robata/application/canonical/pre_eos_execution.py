@@ -1,4 +1,4 @@
-﻿"""Provider-neutral execution of eligible stream stages before recording EOS.
+"""Provider-neutral execution of eligible stream stages before recording EOS.
 
 The stream scheduler owns leases and terminal acceptance.  This module only
 bridges an already-ready stream work plan to the canonical inference pipeline,
@@ -189,9 +189,7 @@ class ProviderNeutralStreamStageExecutor:
                 "pre-EOS invocation task does not match the stream stage"
             )
 
-        orchestrated = _run_synchronously(
-            self._pipeline.execute_pre_eos_inference(invocation)
-        )
+        orchestrated = _run_synchronously(self._pipeline.execute_pre_eos_inference(invocation))
         if not isinstance(orchestrated, OrchestratedAttemptResult):
             raise TypeError(
                 "pipeline.execute_pre_eos_inference must return OrchestratedAttemptResult"
@@ -257,9 +255,7 @@ def _stream_terminal_outcome(
         return TerminalOutcome.SUCCEEDED, None, None
 
     failure = terminal.failure
-    reason_code = (
-        failure.code if failure is not None else f"INFERENCE_{terminal.status.value}"
-    )
+    reason_code = failure.code if failure is not None else f"INFERENCE_{terminal.status.value}"
     reason_detail = None if failure is None else failure.detail
     outcome = (
         TerminalOutcome.CANCELLED
@@ -325,4 +321,3 @@ __all__ = [
     "ProviderNeutralStreamStageExecutor",
     "StreamInvocationFactory",
 ]
-

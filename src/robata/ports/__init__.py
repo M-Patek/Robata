@@ -104,12 +104,12 @@ from robata.ports.video_export import (
 
 __all__ = [
     "COMPRESSED_IMAGE_SCHEMA",
-    'ArtifactBlobReconciliationState',
+    "ArtifactBlobReconciliationState",
     "ArtifactBlobSource",
     "ArtifactRegistry",
     "ArtifactRegistryError",
     "ArtifactRegistryErrorCode",
-    'ArtifactRegistryReconciliation',
+    "ArtifactRegistryReconciliation",
     "BlobStore",
     "Broker",
     "BrokerAdapter",

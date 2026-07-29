@@ -3269,7 +3269,7 @@ def _restore_normalized_rgb24_cache_surface(data: bytes) -> tuple[Any, int, int]
             buffer[target_start : target_start + row_bytes] = pixels[
                 source_start : source_start + row_bytes
             ]
-        plane.update(buffer)
+        plane.update(bytes(buffer))
         frame.pts = 0
         frame.time_base = Fraction(1, 1)
     except Exception:

@@ -25,12 +25,12 @@ def test_production_report_create_normalizes_nested_mapping_inputs() -> None:
     assert raw_report == typed_report
 
 
-@pytest.mark.parametrize('mode', ('python', 'json'))
+@pytest.mark.parametrize("mode", ("python", "json"))
 def test_production_report_create_normalizes_provider_report_mapping(mode: str) -> None:
     typed = _report_inputs()
     raw = {
         **typed,
-        'provider_saturation': typed['provider_saturation'].model_dump(mode=mode),
+        "provider_saturation": typed["provider_saturation"].model_dump(mode=mode),
     }
 
     assert RepresentativeProductionQualificationReport.create(**raw) == (
@@ -52,9 +52,7 @@ def test_production_report_create_rejects_boolean_numeric_mapping_values() -> No
     raw_quality["decision"]["approved_gates"][0]["actual_value"] = True
 
     with pytest.raises(ValueError):
-        RepresentativeProductionQualificationReport.create(
-            **{**typed, "quality": raw_quality}
-        )
+        RepresentativeProductionQualificationReport.create(**{**typed, "quality": raw_quality})
 
 
 def test_production_report_create_rejects_provider_boolean_numeric_mapping_value() -> None:

@@ -110,9 +110,7 @@ def _normalise(source: Mapping[str, Any]) -> dict[str, Any]:
     record = deepcopy(dict(source))
     projection_version = _projection_version(record)
     if projection_version is not None and projection_version != EVENT_INDEX_PROJECTION_VERSION:
-        raise EventIndexError(
-            f"unsupported EventIndex projection version: {projection_version!r}"
-        )
+        raise EventIndexError(f"unsupported EventIndex projection version: {projection_version!r}")
     if projection_version is not None:
         record["projection_version"] = projection_version
         # Keep one canonical internal spelling so JSON/legacy alias replays
@@ -128,8 +126,7 @@ def _normalise(source: Mapping[str, Any]) -> dict[str, Any]:
     ):
         value = record.get(field)
         if value is not None and (
-            not isinstance(value, str)
-            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
         ):
             raise EventIndexError(f"{field} must be a lowercase SHA-256 digest")
     record["start_ns"] = _nanoseconds(record.get("start_ns"), "start_ns")
@@ -348,7 +345,8 @@ class EventIndex:
         """Resolve a globally unique revision ID, if present."""
 
         matches = [
-            item for (event_id, candidate), item in self._memberships.items()
+            item
+            for (event_id, candidate), item in self._memberships.items()
             if candidate == revision_id
         ]
         if len(matches) > 1:

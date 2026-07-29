@@ -184,8 +184,7 @@ class LocalQualityCapacityQualificationPackage(StrictModel):
             "| --- | --- | --- |",
         ]
         lines.extend(
-            f"| {scenario.scenario_id} | YES | YES |"
-            for scenario in self.recovery_scenarios
+            f"| {scenario.scenario_id} | YES | YES |" for scenario in self.recovery_scenarios
         )
         return "\n".join(lines) + "\n"
 
@@ -219,9 +218,7 @@ def build_local_quality_capacity_qualification_package(
         TypeAdapter(LocalRecoveryScenario).validate_python(scenario, strict=True)
         for scenario in recovery_scenarios
     )
-    ordered_scenarios = tuple(
-        sorted(checked_scenarios, key=lambda scenario: scenario.scenario_id)
-    )
+    ordered_scenarios = tuple(sorted(checked_scenarios, key=lambda scenario: scenario.scenario_id))
     return LocalQualityCapacityQualificationPackage(
         context=checked_context,
         pareto=checked_pareto,
@@ -790,7 +787,7 @@ def representative_production_qualification_report_projection(
 
 
 def _normalize_measured_capacity_input(value: object) -> object:
-    '''Restore enum-bearing capacity dataclasses from a serialized mapping.'''
+    """Restore enum-bearing capacity dataclasses from a serialized mapping."""
     if isinstance(value, MeasuredCapacityReport):
         return value
 
@@ -836,6 +833,7 @@ def _normalize_service_capacity_input(value: object) -> RepresentativeServiceCap
         values,
         strict=True,
     )
+
 
 def _reject_lossy_scalar_coercion(
     raw: object,
@@ -888,9 +886,9 @@ def _normalize_provider_saturation_input(
         _reject_lossy_scalar_coercion(value, report)
         return report
     values: dict[str, Any] = dict(value)
-    raw_configuration = values.get('configuration')
+    raw_configuration = values.get("configuration")
     if isinstance(raw_configuration, Mapping):
-        values['configuration'] = TwoH100ProviderConfiguration.model_validate(
+        values["configuration"] = TwoH100ProviderConfiguration.model_validate(
             raw_configuration,
             strict=False,
         )
@@ -1149,9 +1147,7 @@ class RepresentativeProductionQualificationReport(StrictModel):
             "preprocess_policy_sha256",
         ):
             if getattr(self.quality, field_name) != getattr(self.scope, field_name):
-                raise ValueError(
-                    f"quality {field_name} does not match qualification scope"
-                )
+                raise ValueError(f"quality {field_name} does not match qualification scope")
         if self.scope.benchmark_manifest_digest != self.quality.context.benchmark_manifest_digest:
             raise ValueError("quality context benchmark does not match qualification scope")
         if self.scope.governed_corpus_digest != self.quality.context.governed_corpus_digest:
@@ -1239,7 +1235,6 @@ class RepresentativeProductionQualificationReport(StrictModel):
             raise ValueError(
                 "technical requirements state does not match the external gate evidence"
             )
-
 
     def _validate_provider_operating_points(self) -> None:
         if (
@@ -1330,7 +1325,6 @@ class RepresentativeProductionQualificationReport(StrictModel):
         ):
             raise ValueError("canonical soak evidence must cover at least 24 hours")
 
-
     def as_dict(self) -> dict[str, object]:
         """Return the complete JSON-ready, non-promotional P10 report."""
 
@@ -1355,7 +1349,7 @@ class RepresentativeProductionQualificationReport(StrictModel):
             "## Quality coverage",
             f"- QA classes: {len(self.quality_coverage.qa_class_ids)}",
             f"- Media matrix entries: {len(self.quality_coverage.media_profiles)}",
-            f"- Geometry views: {", ".join(self.quality_coverage.preprocess_views)}",
+            f"- Geometry views: {', '.join(self.quality_coverage.preprocess_views)}",
             "",
             "## Capacity and deadlines",
             (

@@ -140,7 +140,13 @@ class CanonicalRecordingAssociationJob(StrictModel):
             "production_eligible": False,
         }
         draft = cls.model_construct(
-            **values,
+            schema_version="1.0",
+            projection_version=CANONICAL_RECORDING_ASSOCIATION_JOB_PROJECTION_VERSION,
+            recording=recording,
+            policy=policy,
+            inputs=ordered_inputs,
+            bridge_evidence=ordered_bridges,
+            production_eligible=False,
             semantic_sha256="0" * 64,
             logical_key=f"{CANONICAL_RECORDING_ASSOCIATION_JOB_KEY_NAMESPACE}:{'0' * 64}",
         )

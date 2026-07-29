@@ -71,10 +71,14 @@ class ProductQAClassCoverage(StrictModel):
                 raise ValueError("NO_ISSUE coverage cannot carry evidence or unresolved reason")
         elif self.evidence:
             raise ValueError("unresolved product coverage cannot claim issue evidence")
-        if self.state in {
-            ProductQAClassState.ABSTAINED,
-            ProductQAClassState.INCOMPLETE_INPUT,
-        } and not self.reason_codes:
+        if (
+            self.state
+            in {
+                ProductQAClassState.ABSTAINED,
+                ProductQAClassState.INCOMPLETE_INPUT,
+            }
+            and not self.reason_codes
+        ):
             raise ValueError("unresolved product coverage requires a reason code")
         return self
 
@@ -97,9 +101,7 @@ class ProductQACascadeResult(StrictModel):
             raise ValueError("product QA cascade must cover all 21 classes in vocabulary order")
 
         observed = tuple(
-            evidence
-            for coverage in self.class_coverage
-            for evidence in coverage.evidence
+            evidence for coverage in self.class_coverage for evidence in coverage.evidence
         )
         if (
             self.product_result.assessment.recording_id != self.recording_id
@@ -257,10 +259,7 @@ def _canonical_evidence(
         checked.append(
             ProductQAIssueEvidence.model_validate(value.model_dump(mode="python"), strict=True)
         )
-    unique = {
-        item.model_dump_json(): item
-        for item in checked
-    }
+    unique = {item.model_dump_json(): item for item in checked}
     return tuple(sorted(unique.values(), key=_evidence_sort_key))
 
 

@@ -201,8 +201,7 @@ class RetrievalLatencyProfile(StrictModel):
     def from_samples(cls, samples_ms: Iterable[float]) -> Self:
         raw_values = tuple(samples_ms)
         if any(
-            isinstance(value, bool) or not isinstance(value, (int, float))
-            for value in raw_values
+            isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_values
         ):
             raise ValueError("latency samples must be numeric")
         values = sorted(float(value) for value in raw_values)
@@ -235,8 +234,7 @@ class RetrievalRecallProfile(StrictModel):
     @model_validator(mode="after")
     def validate_recall(self) -> Self:
         if any(
-            not key.isdigit() or int(key) < 1 or str(int(key)) != key
-            for key in self.recall_at_k
+            not key.isdigit() or int(key) < 1 or str(int(key)) != key for key in self.recall_at_k
         ):
             raise ValueError("recall_at_k keys must be canonical positive decimal k values")
         return self
@@ -252,10 +250,6 @@ class RetrievalCostProfile(StrictModel):
     provider_tokens: NonNegativeInt = 0
     cpu_ms: NonNegativeFloat = 0.0
     estimated_cost: NonNegativeFloat = 0.0
-
-
-
-
 
 
 class RetrievalCostMetrics(RetrievalCostProfile):
@@ -330,8 +324,7 @@ class RetrievalLatencySummary(RetrievalLatencyProfile):
     def from_samples(cls, samples_ms: Iterable[float]) -> Self:
         raw_values = tuple(samples_ms)
         if any(
-            isinstance(value, bool) or not isinstance(value, (int, float))
-            for value in raw_values
+            isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_values
         ):
             raise ValueError("latency samples must be numeric")
         values = sorted(float(value) for value in raw_values)
@@ -342,6 +335,7 @@ class RetrievalLatencySummary(RetrievalLatencyProfile):
 
         def nearest(percentile: float) -> float:
             import math as _math
+
             return values[max(0, min(len(values) - 1, _math.ceil(percentile * len(values)) - 1))]
 
         return cls(
@@ -350,6 +344,7 @@ class RetrievalLatencySummary(RetrievalLatencyProfile):
             p95_ms=nearest(0.95),
             p99_ms=nearest(0.99),
         )
+
 
 class BackfillWriteDisposition(StrEnum):
     """Outcome returned by an idempotent vector sink."""
@@ -451,15 +446,10 @@ class RetrievalBackfillReport(StrictModel):
 async def run_embedding_backfill(
     targets: Sequence[RetrievalBackfillTarget],
     *,
-    encoder: Callable[
-        [RetrievalBackfillTarget], Awaitable[Sequence[float]] | Sequence[float]
-    ],
+    encoder: Callable[[RetrievalBackfillTarget], Awaitable[Sequence[float]] | Sequence[float]],
     writer: Callable[
         [RetrievalEmbeddingWrite],
-        Awaitable[BackfillWriteDisposition | bool | None]
-        | BackfillWriteDisposition
-        | bool
-        | None,
+        Awaitable[BackfillWriteDisposition | bool | None] | BackfillWriteDisposition | bool | None,
     ],
     encoder_name: str,
     model_version: str,
@@ -532,9 +522,7 @@ async def run_embedding_backfill(
                     target=target,
                     status=status,
                     error=(
-                        "writer returned no successful disposition"
-                        if status == "FAILED"
-                        else None
+                        "writer returned no successful disposition" if status == "FAILED" else None
                     ),
                 )
             except Exception as exc:  # failure is recorded; other targets continue
@@ -586,17 +574,14 @@ class RetrievalFilterObservation(StrictModel):
             if self.vector_candidate_count is None
             else self.vector_candidate_count
         )
-        result_count = (
-            len(self.result_ids) if self.result_count is None else self.result_count
-        )
+        result_count = len(self.result_ids) if self.result_count is None else self.result_count
         for name, values in (
             ("structured", self.structured_ids),
             ("vector", self.vector_ids),
             ("result", self.result_ids),
         ):
             if values and (
-                tuple(values) != tuple(sorted(values))
-                or len(set(values)) != len(values)
+                tuple(values) != tuple(sorted(values)) or len(set(values)) != len(values)
             ):
                 raise ValueError(f"{name} IDs must be sorted and unique")
         if (
@@ -753,6 +738,7 @@ def calculate_vector_recall(
             )
         )
     return tuple(points)
+
 
 class RetrievalQualificationProfile(StrictModel):
     """Frozen local retrieval profile with an explicit external boundary."""

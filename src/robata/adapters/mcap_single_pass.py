@@ -540,19 +540,17 @@ def _envelope_from_spool(metadata: Any, payload: bytes) -> H264PacketEnvelope:
             raise SinglePassMcapError("H.264 spool NAL types are invalid")
         actual_nal_types = _annex_b_nal_types(payload)
         if not nal_types_raw or any(value < 0 or value > 31 for value in nal_types_raw):
-            raise SinglePassMcapError('H.264 spool NAL types are out of range')
+            raise SinglePassMcapError("H.264 spool NAL types are out of range")
         if tuple(nal_types_raw) != actual_nal_types:
-            raise SinglePassMcapError(
-                'H.264 spool NAL types differ from the access-unit payload'
-            )
-        is_keyframe = metadata['is_keyframe']
+            raise SinglePassMcapError("H.264 spool NAL types differ from the access-unit payload")
+        is_keyframe = metadata["is_keyframe"]
         if type(is_keyframe) is not bool or is_keyframe != (5 in actual_nal_types):
             raise SinglePassMcapError(
-                'H.264 spool keyframe flag differs from the access-unit payload'
+                "H.264 spool keyframe flag differs from the access-unit payload"
             )
-        source_locator = metadata['source_locator']
+        source_locator = metadata["source_locator"]
         if not isinstance(source_locator, str) or not source_locator:
-            raise SinglePassMcapError('H.264 spool source locator is invalid')
+            raise SinglePassMcapError("H.264 spool source locator is invalid")
         packet = EncodedMediaPacket(
             traversal_index=_json_int(metadata["traversal_index"]),
             camera_id=CameraId(metadata["camera_id"]),

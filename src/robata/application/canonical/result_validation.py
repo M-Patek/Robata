@@ -928,9 +928,7 @@ class CanonicalOfflineRunResult(StrictModel):
         # Fresh canonical runs still use the default strict path below and must
         # retain the complete 21-class product projection before completion.
         validation_context = info.context if isinstance(info.context, dict) else {}
-        allow_missing_product_qa = (
-            validation_context.get("allow_missing_product_qa", False) is True
-        )
+        allow_missing_product_qa = validation_context.get("allow_missing_product_qa", False) is True
         expected_run_status = CanonicalProcessingRunPrimaryStatus(self.status.value)
         if (
             self.processing_run.run_id != self.run_id
@@ -1154,11 +1152,10 @@ class CanonicalOfflineRunResult(StrictModel):
                 action_evidence_results=tuple(
                     item.evidence_result for item in self.action_evidence_executions
                 ),
-                boundary_results=tuple(
-                    item.result for item in self.boundary_refinement_executions
-                ),
+                boundary_results=tuple(item.result for item in self.boundary_refinement_executions),
                 context=product_context,
-                pipeline_incomplete=self.status not in {
+                pipeline_incomplete=self.status
+                not in {
                     CanonicalOfflineRunStatus.SUCCEEDED,
                     CanonicalOfflineRunStatus.NO_EVENTS,
                     CanonicalOfflineRunStatus.ABSTAINED,
@@ -1421,13 +1418,12 @@ class CanonicalOfflineRunResult(StrictModel):
             or self.qa_completion_result.status is not QACompletionStatus.QA_COMPLETE
         ):
             raise ValueError("completed run requires a QA_COMPLETE prerequisite")
-        if not allow_missing_product_qa and completed and (
-            self.product_qa_context is None
-            or self.product_qa_result is None
+        if (
+            not allow_missing_product_qa
+            and completed
+            and (self.product_qa_context is None or self.product_qa_result is None)
         ):
-            raise ValueError(
-                "completed run requires its complete 21-class product QA projection"
-            )
+            raise ValueError("completed run requires its complete 21-class product QA projection")
         if self.input_plan is not None and (
             self.qa_completion_result is None
             or self.qa_completion_result.status is not QACompletionStatus.QA_COMPLETE

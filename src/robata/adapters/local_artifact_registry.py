@@ -562,28 +562,28 @@ class LocalArtifactRegistry:
         remove_duplicates: bool = False,
         strict: bool = False,
     ) -> ArtifactRegistryReconciliation:
-        '''Reconcile registry metadata with exact blobs and crash leftovers.
+        """Reconcile registry metadata with exact blobs and crash leftovers.
 
         SQLite metadata remains authoritative. Missing or corrupt registered blobs are
         reported and never deleted; only unreferenced files can be removed, and cleanup
         is opt-in. This makes a restart after blob-first publication deterministic while
         preserving evidence for an operator or a later object-store repair.
-        '''
+        """
 
         for name, value in (
-            ('remove_orphans', remove_orphans),
-            ('remove_partials', remove_partials),
-            ('remove_duplicates', remove_duplicates),
-            ('strict', strict),
+            ("remove_orphans", remove_orphans),
+            ("remove_partials", remove_partials),
+            ("remove_duplicates", remove_duplicates),
+            ("strict", strict),
         ):
             if not isinstance(value, bool):
                 raise ArtifactRegistryError(
                     ArtifactRegistryErrorCode.INVALID_REQUEST,
-                    f'{name} must be a boolean',
+                    f"{name} must be a boolean",
                 )
 
         self._assert_storage_layout()
-        with runtime_span(self._runtime_observer, 'sqlite.artifact_registry.reconcile'):
+        with runtime_span(self._runtime_observer, "sqlite.artifact_registry.reconcile"):
             metadata = self._registered_blob_metadata()
             expected_digests = {digest for _artifact_id, digest, _bytes in metadata}
             missing: list[str] = []
@@ -643,38 +643,38 @@ class LocalArtifactRegistry:
             )
             runtime_increment(
                 self._runtime_observer,
-                'sqlite.artifact_registry.reconciliation_runs',
-                attributes={'strict': strict},
+                "sqlite.artifact_registry.reconciliation_runs",
+                attributes={"strict": strict},
             )
             if report.issue_count:
                 runtime_increment(
                     self._runtime_observer,
-                    'sqlite.artifact_registry.reconciliation_issues',
+                    "sqlite.artifact_registry.reconciliation_issues",
                     value=report.issue_count,
-                    attributes={'strict': strict},
+                    attributes={"strict": strict},
                 )
             if report.removed_blob_paths:
                 runtime_increment(
                     self._runtime_observer,
-                    'sqlite.artifact_registry.reconciliation_removed',
+                    "sqlite.artifact_registry.reconciliation_removed",
                     value=len(report.removed_blob_paths),
-                    attributes={'strict': strict},
+                    attributes={"strict": strict},
                 )
 
         if strict and not report.reconciled:
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                'artifact registry reconciliation found unresolved storage discrepancies',
+                "artifact registry reconciliation found unresolved storage discrepancies",
             )
         return report
 
     def reconcile_storage(self, **kwargs: object) -> ArtifactRegistryReconciliation:
-        '''Compatibility alias for callers naming the backing store explicitly.'''
+        """Compatibility alias for callers naming the backing store explicitly."""
 
         return self.reconcile(**kwargs)  # type: ignore[arg-type]
 
     def reconcile_blobs(self, **kwargs: object) -> ArtifactRegistryReconciliation:
-        '''Compatibility alias for blob-oriented repair tooling.'''
+        """Compatibility alias for blob-oriented repair tooling."""
 
         return self.reconcile(**kwargs)  # type: ignore[arg-type]
 
@@ -683,21 +683,21 @@ class LocalArtifactRegistry:
         try:
             with self._observed_transaction_scope(
                 connection,
-                operation='reconcile_metadata',
+                operation="reconcile_metadata",
                 write=False,
             ):
                 rows = connection.execute(
-                    '''
+                    """
                     SELECT artifact_id, exact_sha256, byte_count
                     FROM artifacts
                     ORDER BY artifact_id
-                    '''
+                    """
                 ).fetchall()
                 return tuple(
                     (
-                        _row_text(row, 'artifact_id'),
-                        _row_text(row, 'exact_sha256'),
-                        _row_int(row, 'byte_count'),
+                        _row_text(row, "artifact_id"),
+                        _row_text(row, "exact_sha256"),
+                        _row_int(row, "byte_count"),
                     )
                     for row in rows
                 )
@@ -706,7 +706,7 @@ class LocalArtifactRegistry:
         except sqlite3.Error as error:
             raise ArtifactRegistryError(
                 ArtifactRegistryErrorCode.INTEGRITY_ERROR,
-                f'cannot read artifact metadata for reconciliation: {error}',
+                f"cannot read artifact metadata for reconciliation: {error}",
             ) from error
         finally:
             connection.close()
@@ -718,7 +718,7 @@ class LocalArtifactRegistry:
         orphan: list[Path] = []
         partial: list[Path] = []
         duplicate: list[Path] = []
-        for path in sorted(self._blob_root.rglob('*'), key=lambda value: value.as_posix()):
+        for path in sorted(self._blob_root.rglob("*"), key=lambda value: value.as_posix()):
             try:
                 file_stat = path.lstat()
             except OSError:
@@ -731,7 +731,7 @@ class LocalArtifactRegistry:
                 continue
             relative = path.relative_to(self._blob_root)
             name = path.name
-            if name.startswith('.put-'):
+            if name.startswith(".put-"):
                 partial.append(path)
                 continue
             digest_match = _SHA256_PATTERN.fullmatch(name)

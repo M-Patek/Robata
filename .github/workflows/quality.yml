@@ -11,6 +11,14 @@ permissions:
 
 jobs:
   live-tree:
+    name: live-tree (shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      ROBATA_TEST_SHARD_INDEX: ${{ matrix.shard }}
+      ROBATA_TEST_SHARD_TOTAL: 8
     runs-on: windows-latest
     timeout-minutes: 30
 
@@ -41,6 +49,7 @@ jobs:
           --basetemp "$env:RUNNER_TEMP\robata-tests"
 
       - name: Lint and format check
+        if: matrix.shard == 0
         run: |
           uv run ruff check .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -48,9 +57,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Type check
+        if: matrix.shard == 0
         run: uv run mypy
 
       - name: Verify schemas and documentation
+        if: matrix.shard == 0
         run: |
           uv run python scripts/verify_schema_registry.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -58,6 +69,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Enforce published Schema immutability
+        if: matrix.shard == 0
         shell: pwsh
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -77,6 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build clean tracked-source evidence
+        if: matrix.shard == 0
         shell: pwsh
         run: |
           $manifest = "$env:RUNNER_TEMP\robata-source-release-manifest.json"
@@ -84,6 +97,7 @@ jobs:
           uv run python scripts/check_release_hygiene.py --archive-output $archive --expected-commit "${{ github.sha }}" > $manifest
 
       - name: Publish source archive and manifest
+        if: matrix.shard == 0
         uses: actions/upload-artifact@v7
         with:
           name: robata-source-${{ github.sha }}
@@ -92,3 +106,15 @@ jobs:
             ${{ runner.temp }}/robata-source-release-manifest.json
           if-no-files-found: error
           retention-days: 14
+
+  quality:
+    name: quality
+    needs: live-tree
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every live-tree shard
+        env:
+          LIVE_TREE_RESULT: ${{ needs.live-tree.result }}
+        run: |
+          test "$LIVE_TREE_RESULT" = "success"

@@ -117,11 +117,14 @@ def test_ledger_reuses_one_owned_connection_until_closed(tmp_path: Path) -> None
     assert ledger.get_intent(intent.inference_id) == intent
     assert ledger._connection is connection
     snapshot = recorder.snapshot()
-    assert sum(
-        counter.value
-        for counter in snapshot.counters
-        if counter.name == "sqlite.inference_evidence.connections"
-    ) == 1
+    assert (
+        sum(
+            counter.value
+            for counter in snapshot.counters
+            if counter.name == "sqlite.inference_evidence.connections"
+        )
+        == 1
+    )
 
     ledger.close()
     ledger.close()

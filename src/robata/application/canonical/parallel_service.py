@@ -435,13 +435,21 @@ class CanonicalLocalRecordingService:
         | None = None,
     ) -> None:
         workers = _positive_int(recording_worker_count, "recording_worker_count")
-        ingress_capacity = workers if ingress_queue_capacity is None else _positive_int(
-            ingress_queue_capacity,
-            "ingress_queue_capacity",
+        ingress_capacity = (
+            workers
+            if ingress_queue_capacity is None
+            else _positive_int(
+                ingress_queue_capacity,
+                "ingress_queue_capacity",
+            )
         )
-        provider_workers = workers if provider_concurrency is None else _positive_int(
-            provider_concurrency,
-            "provider_concurrency",
+        provider_workers = (
+            workers
+            if provider_concurrency is None
+            else _positive_int(
+                provider_concurrency,
+                "provider_concurrency",
+            )
         )
         provider_capacity = (
             max(1, workers * 2)

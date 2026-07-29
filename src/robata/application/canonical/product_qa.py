@@ -166,9 +166,7 @@ class CanonicalProductQAProjector:
             candidate_reduction_result,
             CandidateReductionResult,
         ):
-            raise TypeError(
-                "candidate_reduction_result must be a CandidateReductionResult or None"
-            )
+            raise TypeError("candidate_reduction_result must be a CandidateReductionResult or None")
         for action_evidence_result in action_evidence_results:
             if not isinstance(action_evidence_result, ActionEvidenceResult):
                 raise TypeError("action_evidence_results must contain ActionEvidenceResult")
@@ -229,9 +227,7 @@ class CanonicalProductQAProjector:
                         incomplete_reasons.append(reason)
 
         if qa_completion_result.status is not QACompletionStatus.QA_COMPLETE:
-            incomplete_reasons.append(
-                f"QA_COMPLETION_{qa_completion_result.status.value}"
-            )
+            incomplete_reasons.append(f"QA_COMPLETION_{qa_completion_result.status.value}")
 
         if candidate_reduction_result is not None:
             observed.extend(_candidate_evidence(candidate_reduction_result))
@@ -315,8 +311,7 @@ def _media_quality_evidence(
         confidence=confidence,
         confidence_kind=confidence_kind,
         evidence_refs=(
-            "media-quality:"
-            f"{report.semantic_sha256}:{camera_id.value}:{timestamp_ns}:{flag.value}",
+            f"media-quality:{report.semantic_sha256}:{camera_id.value}:{timestamp_ns}:{flag.value}",
         ),
         note=note,
     )
@@ -401,10 +396,14 @@ def _action_evidence(result: ActionEvidenceResult) -> tuple[ProductQAIssueEviden
     evidence: list[ProductQAIssueEvidence] = []
     for camera_id in CAMERA_IDS:
         for observation in result.camera_evidence[camera_id].observations:
-            if observation.observation not in {
-                ProviderObservation.SUPPORTING,
-                ProviderObservation.PARTIAL,
-            } or observation.interval is None:
+            if (
+                observation.observation
+                not in {
+                    ProviderObservation.SUPPORTING,
+                    ProviderObservation.PARTIAL,
+                }
+                or observation.interval is None
+            ):
                 continue
             issue = _product_issue(observation.label)
             if issue is None:

@@ -43,14 +43,14 @@ class ArtifactRegistryErrorCode(StrEnum):
 
 
 class ArtifactBlobReconciliationState(StrEnum):
-    '''States observed while reconciling the blob store with registry metadata.'''
+    """States observed while reconciling the blob store with registry metadata."""
 
-    REGISTERED = 'REGISTERED'
-    MISSING = 'MISSING'
-    CORRUPT = 'CORRUPT'
-    ORPHAN = 'ORPHAN'
-    PARTIAL = 'PARTIAL'
-    DUPLICATE = 'DUPLICATE'
+    REGISTERED = "REGISTERED"
+    MISSING = "MISSING"
+    CORRUPT = "CORRUPT"
+    ORPHAN = "ORPHAN"
+    PARTIAL = "PARTIAL"
+    DUPLICATE = "DUPLICATE"
 
 
 class ArtifactRegistryError(RuntimeError):
@@ -73,7 +73,7 @@ class PublishedArtifactDerivation:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactRegistryReconciliation:
-    '''A bounded observation of registry metadata and content-addressed blobs.'''
+    """A bounded observation of registry metadata and content-addressed blobs."""
 
     registered_artifact_count: int
     visible_artifact_count: int
@@ -169,18 +169,18 @@ class ArtifactRegistry(Protocol):
         remove_duplicates: bool = False,
         strict: bool = False,
     ) -> ArtifactRegistryReconciliation:
-        '''Reconcile metadata, exact blobs, and crash leftovers in backing storage.'''
+        """Reconcile metadata, exact blobs, and crash leftovers in backing storage."""
 
     def verify_derivation(self, logical_key: str) -> ArtifactRegistrySnapshot:
         """Verify registry metadata, full lineage, and every exact blob."""
 
 
 __all__ = [
-    'ArtifactBlobReconciliationState',
+    "ArtifactBlobReconciliationState",
     "ArtifactBlobSource",
     "ArtifactRegistry",
     "ArtifactRegistryError",
     "ArtifactRegistryErrorCode",
-    'ArtifactRegistryReconciliation',
+    "ArtifactRegistryReconciliation",
     "PublishedArtifactDerivation",
 ]

@@ -308,9 +308,7 @@ class LocalFrameQualityAnalyzer:
             raise ValueError("decoded frame view dimensions must remain stable per analyzer")
         blur_score_milli = _blur_score_milli(gray, dimensions)
         scene_change_milli = (
-            None
-            if self._previous_gray is None
-            else _scene_change_milli(gray, self._previous_gray)
+            None if self._previous_gray is None else _scene_change_milli(gray, self._previous_gray)
         )
         frame_delta_milli = (
             None
@@ -644,10 +642,10 @@ def _scene_change_milli(current: bytes, previous: bytes) -> int:
     for value in previous:
         previous_hist[min(15, value // 16)] += 1
     distance = sum(
-        abs(left - right)
-        for left, right in zip(current_hist, previous_hist, strict=True)
+        abs(left - right) for left, right in zip(current_hist, previous_hist, strict=True)
     )
     return _rounded_ratio(distance * 1_000, len(current))
+
 
 def _cadence_gaps(
     camera_id: CameraId,

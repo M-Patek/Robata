@@ -1321,11 +1321,11 @@ class BackpressureStabilityReport:
 
     @property
     def measurement_status(self) -> Literal["NOT_MEASURED"]:
-        return 'NOT_MEASURED'
+        return "NOT_MEASURED"
 
     @property
     def qualification_status(self) -> Literal["NOT_PRODUCTION_QUALIFIED"]:
-        return 'NOT_PRODUCTION_QUALIFIED'
+        return "NOT_PRODUCTION_QUALIFIED"
 
     def scenario(self, kind: BackpressureScenarioKind) -> BackpressureScenarioReport:
         if not isinstance(kind, BackpressureScenarioKind):
@@ -1501,7 +1501,7 @@ class BackpressureStabilityComparison:
 
     @property
     def measurement_status(self) -> Literal["NOT_MEASURED"]:
-        return 'NOT_MEASURED'
+        return "NOT_MEASURED"
 
     @property
     def qualification_status(self) -> Literal["NOT_PRODUCTION_QUALIFIED"]:
@@ -1612,7 +1612,7 @@ def compare_fixed_and_adaptive_backpressure(
                 adaptive.scenario(scenario),
             )
     reasons = sorted(set(reasons))
-    comparisons = ()
+    comparisons: tuple[BackpressureScenarioComparison, ...] = ()
     if not reasons:
         comparisons = tuple(
             BackpressureScenarioComparison(
@@ -1835,7 +1835,7 @@ class SyntheticCapacityReport:
 
 @dataclass(frozen=True, slots=True)
 class WorkerScalingPoint:
-    '''One local observation in a recording-worker scaling matrix.'''
+    """One local observation in a recording-worker scaling matrix."""
 
     worker_count: int
     report: SyntheticCapacityReport
@@ -1845,39 +1845,39 @@ class WorkerScalingPoint:
     queue_bounded: bool | None
 
     def __post_init__(self) -> None:
-        _require_positive_int('worker_count', self.worker_count)
+        _require_positive_int("worker_count", self.worker_count)
         if not isinstance(self.report, SyntheticCapacityReport):
-            raise TypeError('report must be a SyntheticCapacityReport')
+            raise TypeError("report must be a SyntheticCapacityReport")
         if not isinstance(self.drain_report, SyntheticCapacityReport):
-            raise TypeError('drain_report must be a SyntheticCapacityReport')
+            raise TypeError("drain_report must be a SyntheticCapacityReport")
         if self.report.worker_count != self.worker_count:
-            raise ValueError('scaling point worker_count does not match report')
+            raise ValueError("scaling point worker_count does not match report")
         if self.drain_report.worker_count != self.worker_count:
-            raise ValueError('scaling point worker_count does not match drain report')
+            raise ValueError("scaling point worker_count does not match drain report")
         if self.report.profile_digest != self.drain_report.profile_digest:
-            raise ValueError('scaling point reports must share a workload profile')
+            raise ValueError("scaling point reports must share a workload profile")
         if self.throughput_ratio is not None and (
             isinstance(self.throughput_ratio, bool)
             or not isinstance(self.throughput_ratio, (int, float))
             or math.isnan(self.throughput_ratio)
         ):
-            raise ValueError('throughput_ratio must be finite or infinity')
+            raise ValueError("throughput_ratio must be finite or infinity")
         if self.queue_capacity is not None:
-            _require_positive_int('queue_capacity', self.queue_capacity)
+            _require_positive_int("queue_capacity", self.queue_capacity)
             if not isinstance(self.queue_bounded, bool):
-                raise TypeError('queue_bounded must be boolean when queue_capacity is set')
+                raise TypeError("queue_bounded must be boolean when queue_capacity is set")
         elif self.queue_bounded is not None:
-            raise ValueError('queue_bounded requires queue_capacity')
+            raise ValueError("queue_bounded requires queue_capacity")
 
     @property
     def capacity(self) -> SyntheticCapacityReport:
-        '''Compatibility alias for callers that call the observation capacity.'''
+        """Compatibility alias for callers that call the observation capacity."""
 
         return self.report
 
     @property
     def speedup(self) -> float | None:
-        '''Throughput speedup relative to the one-worker baseline.'''
+        """Throughput speedup relative to the one-worker baseline."""
 
         return self.throughput_ratio
 
@@ -1907,26 +1907,26 @@ class WorkerScalingPoint:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            'worker_count': self.worker_count,
-            'throughput_ratio': self.throughput_ratio,
-            'recording_hours_per_wall_hour': self.report.recording_hours_per_wall_hour,
-            'camera_video_hours_per_wall_hour': self.report.camera_video_hours_per_wall_hour,
-            'backlog_peak': self.backlog_peak,
-            'backlog_end': self.backlog_end,
-            'drain_backlog_end': self.drain_backlog_end,
-            'backlog_drained': self.backlog_drained,
-            'queue_capacity': self.queue_capacity,
-            'queue_bounded': self.queue_bounded,
-            'bottlenecks': [item.value for item in self.bottlenecks],
-            'evidence_class': self.report.evidence_class,
-            'measurement_status': self.report.measurement_status,
-            'production_eligible': self.report.production_eligible,
+            "worker_count": self.worker_count,
+            "throughput_ratio": self.throughput_ratio,
+            "recording_hours_per_wall_hour": self.report.recording_hours_per_wall_hour,
+            "camera_video_hours_per_wall_hour": self.report.camera_video_hours_per_wall_hour,
+            "backlog_peak": self.backlog_peak,
+            "backlog_end": self.backlog_end,
+            "drain_backlog_end": self.drain_backlog_end,
+            "backlog_drained": self.backlog_drained,
+            "queue_capacity": self.queue_capacity,
+            "queue_bounded": self.queue_bounded,
+            "bottlenecks": [item.value for item in self.bottlenecks],
+            "evidence_class": self.report.evidence_class,
+            "measurement_status": self.report.measurement_status,
+            "production_eligible": self.report.production_eligible,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerScalingReport:
-    '''Local 1/2/4/N worker scaling and saturation evidence.'''
+    """Local 1/2/4/N worker scaling and saturation evidence."""
 
     profile_version: str
     profile_digest: str
@@ -1938,52 +1938,53 @@ class WorkerScalingReport:
     four_worker_speedup: float | None
 
     def __post_init__(self) -> None:
-        _require_nonempty('profile_version', self.profile_version)
-        _require_nonempty('profile_digest', self.profile_digest)
+        _require_nonempty("profile_version", self.profile_version)
+        _require_nonempty("profile_digest", self.profile_digest)
         if not isinstance(self.worker_counts, tuple) or not self.worker_counts:
-            raise ValueError('worker_counts must be a nonempty tuple')
+            raise ValueError("worker_counts must be a nonempty tuple")
         if self.worker_counts != tuple(sorted(set(self.worker_counts))):
-            raise ValueError('worker_counts must be sorted and unique')
+            raise ValueError("worker_counts must be sorted and unique")
         for count in self.worker_counts:
-            _require_positive_int('worker count', count)
+            _require_positive_int("worker count", count)
         if self.worker_counts[0] != 1:
-            raise ValueError('worker_counts must include one-worker baseline')
-        if not isinstance(self.points, tuple) or tuple(
-            item.worker_count for item in self.points
-        ) != self.worker_counts:
-            raise ValueError('scaling points must match worker_counts')
+            raise ValueError("worker_counts must include one-worker baseline")
+        if (
+            not isinstance(self.points, tuple)
+            or tuple(item.worker_count for item in self.points) != self.worker_counts
+        ):
+            raise ValueError("scaling points must match worker_counts")
         for point in self.points:
             if point.report.profile_digest != self.profile_digest:
-                raise ValueError('scaling point profile digest does not match report')
-        _require_finite_positive('target_recording_rtf', self.target_recording_rtf)
+                raise ValueError("scaling point profile digest does not match report")
+        _require_finite_positive("target_recording_rtf", self.target_recording_rtf)
         if self.capacity_projection is not None and not isinstance(
             self.capacity_projection, WorkerCapacityProjection
         ):
-            raise TypeError('capacity_projection must be a WorkerCapacityProjection or None')
+            raise TypeError("capacity_projection must be a WorkerCapacityProjection or None")
         if self.queue_capacity is not None:
-            _require_positive_int('queue_capacity', self.queue_capacity)
+            _require_positive_int("queue_capacity", self.queue_capacity)
             if any(point.queue_capacity != self.queue_capacity for point in self.points):
-                raise ValueError('scaling points must use report queue_capacity')
+                raise ValueError("scaling points must use report queue_capacity")
         elif any(point.queue_capacity is not None for point in self.points):
-            raise ValueError('scaling points cannot carry an unbound queue capacity')
+            raise ValueError("scaling points cannot carry an unbound queue capacity")
         if self.four_worker_speedup is not None and (
             isinstance(self.four_worker_speedup, bool)
             or not isinstance(self.four_worker_speedup, (int, float))
             or math.isnan(self.four_worker_speedup)
         ):
-            raise ValueError('four_worker_speedup must be finite or infinity')
+            raise ValueError("four_worker_speedup must be finite or infinity")
 
     @property
     def evidence_class(self) -> str:
-        return 'SYNTHETIC_LOCAL'
+        return "SYNTHETIC_LOCAL"
 
     @property
     def measurement_status(self) -> str:
-        return 'NOT_MEASURED'
+        return "NOT_MEASURED"
 
     @property
     def qualification_status(self) -> str:
-        return 'NOT_PRODUCTION_QUALIFIED'
+        return "NOT_PRODUCTION_QUALIFIED"
 
     @property
     def production_eligible(self) -> bool:
@@ -2022,24 +2023,24 @@ class WorkerScalingReport:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            'profile_version': self.profile_version,
-            'profile_digest': self.profile_digest,
-            'worker_counts': list(self.worker_counts),
-            'target_recording_rtf': self.target_recording_rtf,
-            'capacity_projection': (
+            "profile_version": self.profile_version,
+            "profile_digest": self.profile_digest,
+            "worker_counts": list(self.worker_counts),
+            "target_recording_rtf": self.target_recording_rtf,
+            "capacity_projection": (
                 None if self.capacity_projection is None else self.capacity_projection.as_dict()
             ),
-            'queue_capacity': self.queue_capacity,
-            'queues_bounded': self.queues_bounded,
-            'backlog_drains_after_burst': self.backlog_drains_after_burst,
-            'four_worker_speedup': self.four_worker_speedup,
-            'four_worker_meets_2_5x': self.four_worker_meets_2_5x,
-            'saturation_worker_count': self.saturation_worker_count,
-            'points': [point.as_dict() for point in self.points],
-            'evidence_class': self.evidence_class,
-            'measurement_status': self.measurement_status,
-            'qualification_status': self.qualification_status,
-            'production_eligible': self.production_eligible,
+            "queue_capacity": self.queue_capacity,
+            "queues_bounded": self.queues_bounded,
+            "backlog_drains_after_burst": self.backlog_drains_after_burst,
+            "four_worker_speedup": self.four_worker_speedup,
+            "four_worker_meets_2_5x": self.four_worker_meets_2_5x,
+            "saturation_worker_count": self.saturation_worker_count,
+            "points": [point.as_dict() for point in self.points],
+            "evidence_class": self.evidence_class,
+            "measurement_status": self.measurement_status,
+            "qualification_status": self.qualification_status,
+            "production_eligible": self.production_eligible,
         }
 
 
@@ -2182,16 +2183,16 @@ class CapacityRegressionResult:
 
 @dataclass(frozen=True, slots=True)
 class WorkerCapacityProjection:
-    '''Translate one observed worker rate.'''
+    """Translate one observed worker rate."""
 
     recording_rtf: float
     target_recording_rtf: float
     required_worker_count: int
 
     def __post_init__(self) -> None:
-        _require_finite_positive('recording_rtf', self.recording_rtf)
-        _require_finite_positive('target_recording_rtf', self.target_recording_rtf)
-        _require_positive_int('required_worker_count', self.required_worker_count)
+        _require_finite_positive("recording_rtf", self.recording_rtf)
+        _require_finite_positive("target_recording_rtf", self.target_recording_rtf)
+        _require_positive_int("required_worker_count", self.required_worker_count)
 
     @property
     def required_cpu_worker_count(self) -> int:
@@ -2203,11 +2204,11 @@ class WorkerCapacityProjection:
 
     @property
     def evidence_class(self) -> str:
-        return 'SYNTHETIC_LOCAL'
+        return "SYNTHETIC_LOCAL"
 
     @property
     def measurement_status(self) -> str:
-        return 'NOT_MEASURED'
+        return "NOT_MEASURED"
 
     @property
     def production_eligible(self) -> bool:
@@ -2215,14 +2216,14 @@ class WorkerCapacityProjection:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            'recording_rtf': self.recording_rtf,
-            'target_recording_rtf': self.target_recording_rtf,
-            'required_worker_count': self.required_worker_count,
-            'required_cpu_worker_count': self.required_cpu_worker_count,
-            'required_nvme_worker_count': self.required_nvme_worker_count,
-            'evidence_class': self.evidence_class,
-            'measurement_status': self.measurement_status,
-            'production_eligible': self.production_eligible,
+            "recording_rtf": self.recording_rtf,
+            "target_recording_rtf": self.target_recording_rtf,
+            "required_worker_count": self.required_worker_count,
+            "required_cpu_worker_count": self.required_cpu_worker_count,
+            "required_nvme_worker_count": self.required_nvme_worker_count,
+            "evidence_class": self.evidence_class,
+            "measurement_status": self.measurement_status,
+            "production_eligible": self.production_eligible,
         }
 
 
@@ -2281,9 +2282,9 @@ def simulate_capacity(
     _require_positive_int("worker_count", worker_count)
     units = generate_synthetic_load(profile)
     if cutoff_ms is not None:
-        _require_positive_int('cutoff_ms', cutoff_ms)
+        _require_positive_int("cutoff_ms", cutoff_ms)
         if cutoff_ms < units[-1].arrival_at_ms:
-            raise ValueError('cutoff_ms must include the complete arrival schedule')
+            raise ValueError("cutoff_ms must include the complete arrival schedule")
     if (
         profile.observation_window_ms is not None
         and profile.observation_window_ms < units[-1].arrival_at_ms
@@ -2475,10 +2476,10 @@ def required_worker_count_for_rtf(
     *,
     target_recording_rtf: float = 25.0,
 ) -> int:
-    '''Return the ceiling worker count for a measured per-worker recording RTF.'''
+    """Return the ceiling worker count for a measured per-worker recording RTF."""
 
-    _require_finite_positive('recording_rtf', recording_rtf)
-    _require_finite_positive('target_recording_rtf', target_recording_rtf)
+    _require_finite_positive("recording_rtf", recording_rtf)
+    _require_finite_positive("target_recording_rtf", target_recording_rtf)
     return max(1, math.ceil(target_recording_rtf / recording_rtf))
 
 
@@ -2489,28 +2490,25 @@ def run_worker_scaling(
     target_recording_rtf: float = 25.0,
     queue_capacity: int | None = None,
 ) -> WorkerScalingReport:
-    '''Run a deterministic 1/2/4/N worker matrix with backlog and drain evidence.'''
+    """Run a deterministic 1/2/4/N worker matrix with backlog and drain evidence."""
 
     if not isinstance(profile, SyntheticLoadProfile):
-        raise TypeError('profile must be SyntheticLoadProfile')
+        raise TypeError("profile must be SyntheticLoadProfile")
     if not isinstance(worker_counts, tuple):
-        raise TypeError('worker_counts must be a tuple')
+        raise TypeError("worker_counts must be a tuple")
     if not worker_counts:
-        raise ValueError('worker_counts must be nonempty')
+        raise ValueError("worker_counts must be nonempty")
     if worker_counts != tuple(sorted(set(worker_counts))):
-        raise ValueError('worker_counts must be sorted and unique')
+        raise ValueError("worker_counts must be sorted and unique")
     for count in worker_counts:
-        _require_positive_int('worker count', count)
+        _require_positive_int("worker count", count)
     if worker_counts[0] != 1:
-        raise ValueError('worker_counts must include one-worker baseline')
-    _require_finite_positive('target_recording_rtf', target_recording_rtf)
+        raise ValueError("worker_counts must include one-worker baseline")
+    _require_finite_positive("target_recording_rtf", target_recording_rtf)
     if queue_capacity is not None:
-        _require_positive_int('queue_capacity', queue_capacity)
+        _require_positive_int("queue_capacity", queue_capacity)
 
-    measured = {
-        count: simulate_capacity(profile, worker_count=count)
-        for count in worker_counts
-    }
+    measured = {count: simulate_capacity(profile, worker_count=count) for count in worker_counts}
     points: list[WorkerScalingPoint] = []
     baseline_rate = measured[1].recording_hours_per_wall_hour
     for count in worker_counts:
@@ -2581,7 +2579,7 @@ def build_worker_scaling_report(
     target_recording_rtf: float = 25.0,
     queue_capacity: int | None = None,
 ) -> WorkerScalingReport:
-    '''Named builder retained for profile/report command integrations.'''
+    """Named builder retained for profile/report command integrations."""
 
     return run_worker_scaling(
         profile,
@@ -2746,7 +2744,7 @@ def _require_optional_finite(name: str, value: object) -> None:
 
 def _require_optional_finite_nonnegative(name: str, value: object) -> None:
     _require_optional_finite(name, value)
-    if value is not None and value < 0:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
         raise ValueError(f"{name} must be nonnegative or None")
 
 
@@ -2757,7 +2755,7 @@ def _require_finite_positive(name: str, value: object) -> None:
         or not math.isfinite(value)
         or value <= 0
     ):
-        raise ValueError(f'{name} must be finite and positive')
+        raise ValueError(f"{name} must be finite and positive")
 
 
 def _require_nonempty(name: str, value: object) -> None:
@@ -2829,20 +2827,20 @@ __all__ = [
     "SyntheticObservation",
     "SyntheticOutcome",
     "SyntheticWorkUnit",
-    'WorkerCapacityProjection',
-    'WorkerScalingPoint',
-    'WorkerScalingReport',
+    "WorkerCapacityProjection",
+    "WorkerScalingPoint",
+    "WorkerScalingReport",
     "build_backpressure_stability_report",
     "build_local_backpressure_stability_report",
     "build_measured_capacity_report",
-    'build_worker_scaling_report',
+    "build_worker_scaling_report",
     "compare_backpressure_stability_reports",
     "compare_capacity_reports",
     "compare_fixed_and_adaptive_backpressure",
     "compare_measured_capacity_reports",
     "evaluate_local_slo",
     "generate_synthetic_load",
-    'required_worker_count_for_rtf',
-    'run_worker_scaling',
+    "required_worker_count_for_rtf",
+    "run_worker_scaling",
     "simulate_capacity",
 ]

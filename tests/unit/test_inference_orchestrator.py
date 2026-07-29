@@ -413,8 +413,7 @@ def test_intent_is_persisted_before_dispatch_and_success_is_idempotent() -> None
     assert len(store.list_selections()) == 1
 
 
-def test_orchestrate_with_selection_returns_fresh_selection_replays_and_keeps_wrapper_compatibility(
-) -> None:
+def test_orchestrate_with_selection_returns_fresh_and_replays_compatibly() -> None:
     """The runner can reuse the selection returned by the same orchestration call."""
 
     orchestrator, adapter, store = _orchestrator(_success)
@@ -452,6 +451,7 @@ def test_orchestrate_with_selection_returns_no_selection_for_terminal_failure() 
     assert result.selection is None
     assert store.list_selections() == ()
     assert adapter.infer_calls == 1
+
 
 def test_orchestrated_selection_handoff_is_task_local_and_matches_concurrent_results() -> None:
     """A direct prior call and sibling deliveries cannot leak a stale selection."""

@@ -101,7 +101,7 @@ class ReadOnlyLocalRunProjection:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                f"{self._database_path.as_uri()}?mode=ro",
+                f"{self._database_path.as_uri()}?mode=ro&immutable=1",
                 uri=True,
                 isolation_level=None,
             )

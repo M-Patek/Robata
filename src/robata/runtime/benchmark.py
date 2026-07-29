@@ -534,8 +534,7 @@ class RecordingWorkerBatchFacts:
     def cancellation_restart_replayable(self) -> bool:
         return (
             self.cancelled_recording_count == 0
-            or self.replay_verified_cancelled_recording_count
-            == self.cancelled_recording_count
+            or self.replay_verified_cancelled_recording_count == self.cancelled_recording_count
         )
 
     @property
@@ -756,13 +755,9 @@ class MeasuredRecordingWorkerRun:
             "optional_work_admitted_count": self.facts.optional_work_admitted_count,
             "optional_work_shed_count": self.facts.optional_work_shed_count,
             "optional_work_shed_fraction": self.optional_work_shed_fraction,
-            "optional_work_shedding_actions": list(
-                self.facts.optional_work_shedding_actions
-            ),
+            "optional_work_shedding_actions": list(self.facts.optional_work_shedding_actions),
             "named_shared_resource_limit": self.facts.named_shared_resource_limit,
-            "concurrency": (
-                None if self.concurrency is None else self.concurrency.as_dict()
-            ),
+            "concurrency": (None if self.concurrency is None else self.concurrency.as_dict()),
             "queues": [queue.as_dict() for queue in self.facts.queues],
         }
 
@@ -909,8 +904,7 @@ class MeasuredRecordingWorkerScalingReport:
     @property
     def four_worker_outcome_explained(self) -> bool:
         return self.four_worker_run.sustainable and (
-            self.four_worker_meets_2_5x
-            or self.four_worker_named_shared_resource_limit is not None
+            self.four_worker_meets_2_5x or self.four_worker_named_shared_resource_limit is not None
         )
 
     @property
@@ -959,9 +953,7 @@ class MeasuredRecordingWorkerScalingReport:
         if saturation_worker_count is None:
             return None
         return all(
-            run.sustainable
-            for run in self.runs
-            if run.worker_count >= saturation_worker_count
+            run.sustainable for run in self.runs if run.worker_count >= saturation_worker_count
         )
 
     @property
@@ -1075,11 +1067,7 @@ class MeasuredRecordingWorkerScalingReport:
     def optional_work_shedding_actions(self) -> tuple[str, ...]:
         return tuple(
             sorted(
-                {
-                    action
-                    for run in self.runs
-                    for action in run.facts.optional_work_shedding_actions
-                }
+                {action for run in self.runs for action in run.facts.optional_work_shedding_actions}
             )
         )
 
@@ -1143,8 +1131,7 @@ class MeasuredRecordingWorkerScalingReport:
                 None if self.capacity_projection is None else self.capacity_projection.as_dict()
             ),
             "runs": [
-                run.as_dict(throughput_ratio=run.recording_rtf / baseline_rtf)
-                for run in self.runs
+                run.as_dict(throughput_ratio=run.recording_rtf / baseline_rtf) for run in self.runs
             ],
             "evidence_class": self.evidence_class,
             "measurement_status": self.measurement_status,
@@ -1271,9 +1258,7 @@ def run_measured_recording_worker_matrix(
                 provider_mode=provider_mode,
                 execution_mode=execution_mode,
                 concurrency=(
-                    None
-                    if concurrency_factory is None
-                    else concurrency_factory(worker_count)
+                    None if concurrency_factory is None else concurrency_factory(worker_count)
                 ),
                 clock_ns=clock_ns,
             )

@@ -187,6 +187,8 @@ def test_geometry_map_cache_is_bounded_and_profile_camera_dimensions_are_checked
             policy=policy,
             calibration=first,
         )
+
+
 def test_geometry_lineage_and_aligned_timestamp_are_self_consistent() -> None:
     artifact = materialize_geometry_view(
         _frame(),

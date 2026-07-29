@@ -602,14 +602,14 @@ def test_worker_scaling_reports_speedup_backlog_drain_and_local_projection() -> 
     assert report.capacity_projection is not None
     assert report.capacity_projection.required_cpu_worker_count == 1
     assert report.capacity_projection.required_nvme_worker_count == 1
-    assert report.evidence_class == 'SYNTHETIC_LOCAL'
-    assert report.measurement_status == 'NOT_MEASURED'
+    assert report.evidence_class == "SYNTHETIC_LOCAL"
+    assert report.measurement_status == "NOT_MEASURED"
     assert report.production_eligible is False
-    assert report.as_dict()['worker_counts'] == [1, 2, 4, 8]
+    assert report.as_dict()["worker_counts"] == [1, 2, 4, 8]
 
 
 def test_worker_scaling_rejects_unordered_matrix_and_reports_unbounded_queue() -> None:
-    with pytest.raises(ValueError, match='sorted and unique'):
+    with pytest.raises(ValueError, match="sorted and unique"):
         run_worker_scaling(_profile(), worker_counts=(1, 4, 2))
 
     report = build_worker_scaling_report(_profile(unit_count=10), queue_capacity=1)
@@ -620,7 +620,7 @@ def test_worker_scaling_rejects_unordered_matrix_and_reports_unbounded_queue() -
 def test_required_worker_count_for_rtf_uses_ceiling_and_rejects_zero_rate() -> None:
     assert required_worker_count_for_rtf(10.0, target_recording_rtf=25.0) == 3
     assert required_worker_count_for_rtf(25.0, target_recording_rtf=25.0) == 1
-    with pytest.raises(ValueError, match='finite and positive'):
+    with pytest.raises(ValueError, match="finite and positive"):
         required_worker_count_for_rtf(0.0)
 
 

@@ -125,9 +125,12 @@ def test_subject_keys_are_injective_and_failed_rows_are_replay_safe() -> None:
         artifact_sha256="a" * 64,
     )
     assert unbound.projection_key != bound.projection_key
-    assert _request(unbound.event_revision_id).idempotency_key != _request(
-        subject=bound,
-    ).idempotency_key
+    assert (
+        _request(unbound.event_revision_id).idempotency_key
+        != _request(
+            subject=bound,
+        ).idempotency_key
+    )
 
     store = InMemoryVectorProjectionStore()
     request = _request()
@@ -187,5 +190,3 @@ def test_backfill_is_bounded_and_encoder_input_is_modality_specific() -> None:
             subject=VectorProjectionSubject(event_revision_id="r"),
             embedding=_spec(),
         )
-
-

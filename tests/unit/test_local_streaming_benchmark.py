@@ -339,7 +339,6 @@ def test_mock_latency_distribution_requires_canonical_order() -> None:
         )
 
 
-
 def _worker_facts(
     *,
     recording_count: int = 4,
@@ -426,10 +425,12 @@ def test_measured_worker_report_requires_named_limit_when_four_workers_do_not_sc
     ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 10 * hour_ns))
 
     measured = run_measured_recording_worker_matrix(
-        lambda worker_count: lambda: _worker_facts(
-            named_shared_resource_limit=(
-                None if worker_count < 4 else "offline fixture provider concurrency=2"
-            ),
+        lambda worker_count: (
+            lambda: _worker_facts(
+                named_shared_resource_limit=(
+                    None if worker_count < 4 else "offline fixture provider concurrency=2"
+                ),
+            )
         ),
         workload_id="e" * 64,
         recording_count=4,
@@ -442,11 +443,9 @@ def test_measured_worker_report_requires_named_limit_when_four_workers_do_not_sc
     assert report.four_worker_speedup == pytest.approx(2.0)
     assert report.four_worker_meets_2_5x is False
     assert (
-        report.four_worker_named_shared_resource_limit
-        == "offline fixture provider concurrency=2"
+        report.four_worker_named_shared_resource_limit == "offline fixture provider concurrency=2"
     )
     assert report.four_worker_outcome_explained is True
-
 
 
 def test_verified_cancellation_replay_remains_state_affine_and_sustainable() -> None:
@@ -526,10 +525,10 @@ def test_n_worker_saturation_reports_named_resource_limit() -> None:
     resource_limit = "offline fixture provider concurrency=4"
 
     report = run_measured_recording_worker_matrix(
-        lambda worker_count: lambda: _worker_facts(
-            named_shared_resource_limit=(
-                resource_limit if worker_count == 8 else None
-            ),
+        lambda worker_count: (
+            lambda: _worker_facts(
+                named_shared_resource_limit=(resource_limit if worker_count == 8 else None),
+            )
         ),
         workload_id="d" * 64,
         recording_count=4,
@@ -554,13 +553,15 @@ def test_measured_worker_report_keeps_stage_concurrency_and_shedding_units() -> 
     ticks = iter((0, 4 * hour_ns, 5 * hour_ns, 7 * hour_ns, 8 * hour_ns, 9 * hour_ns))
 
     report = run_measured_recording_worker_matrix(
-        lambda _worker_count: lambda: _worker_facts(
-            admission_rejection_count=2,
-            lease_recovery_count=1,
-            lease_recovery_succeeded_count=1,
-            optional_work_offered_count=10,
-            optional_work_shed_count=3,
-            optional_work_shedding_actions=("STOP_OPTIONAL_DEEP",),
+        lambda _worker_count: (
+            lambda: _worker_facts(
+                admission_rejection_count=2,
+                lease_recovery_count=1,
+                lease_recovery_succeeded_count=1,
+                optional_work_offered_count=10,
+                optional_work_shed_count=3,
+                optional_work_shedding_actions=("STOP_OPTIONAL_DEEP",),
+            )
         ),
         workload_id="s" * 64,
         recording_count=4,

@@ -21,7 +21,7 @@ from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic, sleep
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, Any, ClassVar, Concatenate, cast
 
 from pydantic import Field, StringConstraints
 
@@ -430,12 +430,14 @@ def _unlock_layered_media_cache_process(stream: Any) -> None:
     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
-def _with_layered_media_root_lock(operation: Callable[..., Any]) -> Callable[..., Any]:
+def _with_layered_media_root_lock[ReturnT, CacheT, **P](
+    operation: Callable[Concatenate[CacheT, P], ReturnT],
+) -> Callable[Concatenate[CacheT, P], ReturnT]:
     """Serialize cache internals across every local handle for the same root."""
 
     @wraps(operation)
-    def locked(cache: Any, *args: Any, **kwargs: Any) -> Any:
-        with cache._lock:
+    def locked(cache: CacheT, /, *args: P.args, **kwargs: P.kwargs) -> ReturnT:
+        with cast(Any, cache)._lock:
             return operation(cache, *args, **kwargs)
 
     return locked

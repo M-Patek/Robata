@@ -12,7 +12,7 @@ from functools import cache
 from pathlib import Path
 from threading import RLock
 from time import sleep
-from typing import Final, TypeVar
+from typing import Final, TypeVar, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ValidationError
@@ -4424,7 +4424,7 @@ class SQLiteInferenceEvidenceLedger:
         if score_source is CalibrationScoreSource.TERMINAL_REPORTED_CONFIDENCE:
             source_claim_ordinal: int | None = None
         else:
-            source_claim_ordinal = inputs.get("source_claim_ordinal")
+            source_claim_ordinal = cast(int, inputs.get("source_claim_ordinal"))
         try:
             raw_score, expected_inputs = accepted_calibration_score_input(
                 score_source=score_source,

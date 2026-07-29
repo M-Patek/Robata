@@ -1672,7 +1672,7 @@ class SQLiteStreamWorkLedger:
                     if cursor.rowcount != 1:
                         raise SQLiteStreamWorkLedgerError("stream migration metadata row missing")
                     version = _EXTENSION_SCHEMA_VERSION
-                    existing_objects = _EXTENSION_OBJECT_NAMES
+                    existing_objects = set(_EXTENSION_OBJECT_NAMES)
                 if version != _EXTENSION_SCHEMA_VERSION:
                     raise SQLiteStreamWorkLedgerError(
                         "stream extension belongs to another schema version"

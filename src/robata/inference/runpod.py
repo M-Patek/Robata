@@ -688,6 +688,11 @@ class RunPodVisionAdapter:
             raise TypeError("native_batch_qualification must be a RunPodNativeBatchQualification")
         if type(native_batch_qualification_measurement) is not bool:
             raise TypeError("native_batch_qualification_measurement must be a bool")
+        native_batch_qualification_state: Literal[
+            "DISABLED",
+            "QUALIFIED_EVIDENCE",
+            "QUALIFICATION_MEASUREMENT",
+        ]
         if config.native_batch_enabled:
             if native_batch_qualification is not None:
                 if native_batch_qualification_measurement:

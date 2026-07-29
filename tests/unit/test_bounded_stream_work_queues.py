@@ -228,7 +228,6 @@ def test_restart_recovery_releases_expired_lease_and_replays_work(tmp_path: Path
     assert published == [plan.work_item_id]
 
 
-
 def test_admission_rejects_work_from_a_different_recording_run(tmp_path: Path) -> None:
     scheduler = SQLiteWorkScheduler(tmp_path / "work.sqlite3")
     foreign_plan = _plan(40, run_id=_uuid(711))
@@ -334,7 +333,6 @@ def test_heartbeat_keeps_a_slow_publisher_fenced_until_success(tmp_path: Path) -
 
     assert provider_calls == 1
     assert scheduler.get(plan.work_item_id).state is WorkItemState.SUCCEEDED
-
 
 
 def test_non_graceful_stop_releases_queued_publish_lease_for_restart(tmp_path: Path) -> None:

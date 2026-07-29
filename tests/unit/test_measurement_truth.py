@@ -99,7 +99,7 @@ def test_default_scope_fingerprint_hashes_the_source_checkout() -> None:
     report = _v3_report(replayed=False)
     scope = build_profile_evidence_register(report).scope
     assert scope.inputs.code_digest == repository_code_digest(Path(__file__).parents[2])
-    assert repository_code_digest(Path(__file__).parents[2] / 'src') == scope.inputs.code_digest
+    assert repository_code_digest(Path(__file__).parents[2] / "src") == scope.inputs.code_digest
 
 
 def test_scope_and_register_digests_reject_tampering() -> None:
@@ -183,9 +183,7 @@ def test_local_conformance_is_not_measured_and_cannot_be_promoted() -> None:
     assert register.measurement_status is MeasurementStatus.NOT_MEASURED
     assert register.production_eligible is False
 
-    measured_model = register.model_copy(
-        update={"measurement_status": MeasurementStatus.MEASURED}
-    )
+    measured_model = register.model_copy(update={"measurement_status": MeasurementStatus.MEASURED})
     measured = measured_model.model_dump(mode="python")
     measured["register_digest"] = semantic_sha256(
         scope_evidence_register_projection(measured_model)
@@ -203,16 +201,16 @@ def test_local_conformance_is_not_measured_and_cannot_be_promoted() -> None:
 
 
 def test_profile_builder_cannot_self_label_production_qualification() -> None:
-    with pytest.raises(ValueError, match='external qualification gate'):
+    with pytest.raises(ValueError, match="external qualification gate"):
         build_profile_evidence_register(
             _v3_report(replayed=False),
             evidence_class=EvidenceClass.PRODUCTION_QUALIFIED,
-            observed_at='2026-01-01T00:00:00Z',
+            observed_at="2026-01-01T00:00:00Z",
         )
 
 
 def test_explicit_empty_observation_time_is_rejected() -> None:
-    with pytest.raises(ValidationError, match='observed_at'):
+    with pytest.raises(ValidationError, match="observed_at"):
         ScopeEvidenceRegister.create(
             scope=_scope(),
             evidence_class=EvidenceClass.LOCAL_BENCHMARK,
@@ -220,26 +218,26 @@ def test_explicit_empty_observation_time_is_rejected() -> None:
             workload=_workload(),
             environment=_environment(),
             axes=MeasurementAxes(decoded_frames=12),
-            observed_at='',
+            observed_at="",
             measurement_status=MeasurementStatus.MEASURED,
         )
 
 
 def test_explicit_empty_environment_labels_are_rejected() -> None:
     report = _v3_report(replayed=False)
-    with pytest.raises(ValidationError, match='provider'):
+    with pytest.raises(ValidationError, match="provider"):
         build_profile_evidence_register(
             report,
             evidence_class=EvidenceClass.LOCAL_BENCHMARK,
-            provider='',
-            observed_at='2026-01-01T00:00:00Z',
+            provider="",
+            observed_at="2026-01-01T00:00:00Z",
         )
-    with pytest.raises(ValidationError, match='hardware'):
+    with pytest.raises(ValidationError, match="hardware"):
         build_profile_evidence_register(
             report,
             evidence_class=EvidenceClass.LOCAL_BENCHMARK,
-            hardware='',
-            observed_at='2026-01-01T00:00:00Z',
+            hardware="",
+            observed_at="2026-01-01T00:00:00Z",
         )
 
 

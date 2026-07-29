@@ -369,6 +369,7 @@ def _projection_interval(value: object) -> tuple[int, int]:
         start, end = value.get("start_ns"), value.get("end_ns")
     else:
         start, end = getattr(value, "start_ns", None), getattr(value, "end_ns", None)
+
     def parse(raw: object, field: str) -> int:
         if isinstance(raw, bool):
             raise ValueError(f"{field} must be an integer nanosecond")
@@ -449,9 +450,7 @@ def canonical_event_index_revision_projection(
     lineage = _projection_mapping(lineage_value, field="lineage")
     subject_value = root.get("subject")
     subject = (
-        _projection_mapping(subject_value, field="subject")
-        if subject_value is not None
-        else None
+        _projection_mapping(subject_value, field="subject") if subject_value is not None else None
     )
     selection_value = root.get("selection", root.get("current", root))
     selection = _projection_mapping(selection_value, field="selection")
@@ -503,9 +502,7 @@ def canonical_event_index_revision_projection(
     )
     evidence_class = _projection_text(payload.get("evidence_class"), field="evidence_class")
     camera_sources = _projection_camera_sources(payload)
-    camera_statuses: dict[str, str] = {
-        item["camera_id"]: item["status"] for item in camera_sources
-    }
+    camera_statuses: dict[str, str] = {item["camera_id"]: item["status"] for item in camera_sources}
     # Keep explicit camera statuses if a producer supplied them; camera source
     # citations are only a fallback and must not erase a richer QA status.
     supplied_statuses = payload.get("camera_statuses")

@@ -40,9 +40,7 @@ VECTOR_PROJECTION_SEMANTIC_PROJECTION_VERSION: Literal["vector-projection-v1"] =
 )
 # These versions make the structured subject/idempotency key migration
 # explicit.  Delimiter-concatenated opaque IDs are not injective.
-VECTOR_PROJECTION_SUBJECT_KEY_VERSION: Literal["vector-subject-key-v2"] = (
-    "vector-subject-key-v2"
-)
+VECTOR_PROJECTION_SUBJECT_KEY_VERSION: Literal["vector-subject-key-v2"] = "vector-subject-key-v2"
 VECTOR_PROJECTION_IDEMPOTENCY_KEY_VERSION: Literal["vector-idempotency-key-v2"] = (
     "vector-idempotency-key-v2"
 )
@@ -378,16 +376,18 @@ class VectorSearchQuery(StrictModel):
     embedding_id: NonEmptyString
     tenant_id: NonEmptyString | None = None
     query_vector: tuple[FiniteFloat, ...] = Field(
-        min_length=1,
-        validation_alias=AliasChoices("query_vector", "vector", "embedding_vector")
+        min_length=1, validation_alias=AliasChoices("query_vector", "vector", "embedding_vector")
     )
     candidate_event_revision_ids: tuple[NonEmptyString, ...] = ()
     candidate_subject_ids: tuple[NonEmptyString, ...] = ()
     limit: Annotated[int, Field(strict=True, ge=1, le=1000)] = 50
-    min_score: Annotated[
-        float,
-        Field(strict=True, ge=-1.0, le=1.0, allow_inf_nan=False),
-    ] | None = None
+    min_score: (
+        Annotated[
+            float,
+            Field(strict=True, ge=-1.0, le=1.0, allow_inf_nan=False),
+        ]
+        | None
+    ) = None
 
     @field_validator("query_vector")
     @classmethod
@@ -583,4 +583,3 @@ __all__ = [
     "VectorStoreRequest",
     "VectorSubjectType",
 ]
-

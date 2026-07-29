@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from enum import StrEnum
-from typing import Annotated, Final, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self, cast
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -76,7 +76,7 @@ class EncodingPolicyProvenance(StrictModel):
         draft = cls.model_construct(
             provenance_version="encoding-policy-provenance-v1",
             policy_digest="0" * 64,
-            **values,
+            **cast(Any, values),
         )
         return cls.model_validate(
             {
@@ -206,16 +206,22 @@ class EncodingSpeedDelta(StrictModel):
 
     @model_validator(mode="after")
     def validate_delta(self) -> Self:
-        values = (
-            self.baseline_encode_duration_ns,
-            self.alternate_encode_duration_ns,
-            self.delta_ns,
-        )
         if self.measurement_status == MeasurementStatus.NOT_MEASURED:
-            if any(value is not None for value in values):
+            if any(
+                value is not None
+                for value in (
+                    self.baseline_encode_duration_ns,
+                    self.alternate_encode_duration_ns,
+                    self.delta_ns,
+                )
+            ):
                 raise ValueError("NOT_MEASURED speed cannot retain values")
             return self
-        if any(value is None for value in values):
+        if (
+            self.baseline_encode_duration_ns is None
+            or self.alternate_encode_duration_ns is None
+            or self.delta_ns is None
+        ):
             raise ValueError("MEASURED speed requires baseline, alternate, and delta")
         if self.baseline_encode_duration_ns < 0 or self.alternate_encode_duration_ns < 0:
             raise ValueError("speed durations must be nonnegative")
@@ -234,12 +240,22 @@ class EncodingSizeDelta(StrictModel):
 
     @model_validator(mode="after")
     def validate_delta(self) -> Self:
-        values = (self.baseline_total_bytes, self.alternate_total_bytes, self.delta_bytes)
         if self.measurement_status == MeasurementStatus.NOT_MEASURED:
-            if any(value is not None for value in values):
+            if any(
+                value is not None
+                for value in (
+                    self.baseline_total_bytes,
+                    self.alternate_total_bytes,
+                    self.delta_bytes,
+                )
+            ):
                 raise ValueError("NOT_MEASURED size cannot retain values")
             return self
-        if any(value is None for value in values):
+        if (
+            self.baseline_total_bytes is None
+            or self.alternate_total_bytes is None
+            or self.delta_bytes is None
+        ):
             raise ValueError("MEASURED size requires baseline, alternate, and delta")
         if self.delta_bytes != self.alternate_total_bytes - self.baseline_total_bytes:
             raise ValueError("size delta does not match bytes")
@@ -258,18 +274,26 @@ class EncodingQualityDelta(StrictModel):
 
     @model_validator(mode="after")
     def validate_delta(self) -> Self:
-        values = (
-            self.metric_name,
-            self.metric_policy_digest,
-            self.baseline_score,
-            self.alternate_score,
-            self.delta_score,
-        )
         if self.measurement_status == MeasurementStatus.NOT_MEASURED:
-            if any(value is not None for value in values):
+            if any(
+                value is not None
+                for value in (
+                    self.metric_name,
+                    self.metric_policy_digest,
+                    self.baseline_score,
+                    self.alternate_score,
+                    self.delta_score,
+                )
+            ):
                 raise ValueError("NOT_MEASURED quality cannot retain values")
             return self
-        if any(value is None for value in values):
+        if (
+            self.metric_name is None
+            or self.metric_policy_digest is None
+            or self.baseline_score is None
+            or self.alternate_score is None
+            or self.delta_score is None
+        ):
             raise ValueError("MEASURED quality requires metric identity and scores")
         if not math.isclose(
             self.delta_score,
@@ -291,12 +315,22 @@ class EncodingEndToEndDelta(StrictModel):
 
     @model_validator(mode="after")
     def validate_delta(self) -> Self:
-        values = (self.baseline_duration_ns, self.alternate_duration_ns, self.delta_ns)
         if self.measurement_status == MeasurementStatus.NOT_MEASURED:
-            if any(value is not None for value in values):
+            if any(
+                value is not None
+                for value in (
+                    self.baseline_duration_ns,
+                    self.alternate_duration_ns,
+                    self.delta_ns,
+                )
+            ):
                 raise ValueError("NOT_MEASURED end-to-end cannot retain values")
             return self
-        if any(value is None for value in values):
+        if (
+            self.baseline_duration_ns is None
+            or self.alternate_duration_ns is None
+            or self.delta_ns is None
+        ):
             raise ValueError("MEASURED end-to-end requires baseline, alternate, and delta")
         if self.baseline_duration_ns < 0 or self.alternate_duration_ns < 0:
             raise ValueError("end-to-end durations must be nonnegative")
@@ -328,7 +362,7 @@ class RepresentativeParityEvidence(StrictModel):
         draft = cls.model_construct(
             evidence_version="alternate-encoding-representative-parity-v1",
             evidence_digest="0" * 64,
-            **values,
+            **cast(Any, values),
         )
         return cls.model_validate(
             {
@@ -406,7 +440,7 @@ class RepresentativeParitySignoff(StrictModel):
         draft = cls.model_construct(
             signoff_version="alternate-encoding-parity-signoff-v1",
             signoff_digest="0" * 64,
-            **values,
+            **cast(Any, values),
         )
         return cls.model_validate(
             {

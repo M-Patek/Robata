@@ -141,9 +141,7 @@ def test_recording_service_bounds_ingress_claims_state_and_cancels_pending() -> 
     fixture_root = Path(__file__).parents[1] / "fixtures"
     source_one = fixture_root / "canonical" / "source-recording.json"
     source_two = fixture_root / "schema_upcasting" / "schema-catalog.json"
-    source_three = (
-        fixture_root / "schema_upcasting" / "golden" / "synthetic-v1-to-v2.input.json"
-    )
+    source_three = fixture_root / "schema_upcasting" / "golden" / "synthetic-v1-to-v2.input.json"
 
     def runner(_job: CanonicalLocalFixtureJob) -> CanonicalLocalRunReceiptLike:
         started.set()
@@ -156,15 +154,11 @@ def test_recording_service_bounds_ingress_claims_state_and_cancels_pending() -> 
         fixture_runner=runner,  # type: ignore[arg-type]
     )
     try:
-        first = service.submit_fixture(
-            CanonicalLocalFixtureJob(source_one, Path("state-one"))
-        )
+        first = service.submit_fixture(CanonicalLocalFixtureJob(source_one, Path("state-one")))
         assert started.wait(timeout=1)
 
         with pytest.raises(CanonicalLocalCompositionError) as duplicate:
-            service.submit_fixture(
-                CanonicalLocalFixtureJob(source_one, Path("state-one"))
-            )
+            service.submit_fixture(CanonicalLocalFixtureJob(source_one, Path("state-one")))
         assert duplicate.value.code is CanonicalLocalCompositionErrorCode.BACKPRESSURE
 
         with pytest.raises(CanonicalLocalCompositionError) as same_recording:
@@ -177,13 +171,9 @@ def test_recording_service_bounds_ingress_claims_state_and_cancels_pending() -> 
             )
         assert same_recording.value.code is CanonicalLocalCompositionErrorCode.BACKPRESSURE
 
-        pending = service.submit_fixture(
-            CanonicalLocalFixtureJob(source_two, Path("state-two"))
-        )
+        pending = service.submit_fixture(CanonicalLocalFixtureJob(source_two, Path("state-two")))
         with pytest.raises(CanonicalLocalCompositionError) as saturated:
-            service.submit_fixture(
-                CanonicalLocalFixtureJob(source_three, Path("state-three"))
-            )
+            service.submit_fixture(CanonicalLocalFixtureJob(source_three, Path("state-three")))
         assert saturated.value.code is CanonicalLocalCompositionErrorCode.BACKPRESSURE
 
         service.close(wait=False, cancel_pending=True)
@@ -281,9 +271,7 @@ def test_async_recording_batch_does_not_block_when_ingress_is_full() -> None:
     fixture_root = Path(__file__).parents[1] / "fixtures"
     source_one = fixture_root / "canonical" / "source-recording.json"
     source_two = fixture_root / "schema_upcasting" / "schema-catalog.json"
-    source_three = (
-        fixture_root / "schema_upcasting" / "golden" / "synthetic-v1-to-v2.input.json"
-    )
+    source_three = fixture_root / "schema_upcasting" / "golden" / "synthetic-v1-to-v2.input.json"
 
     def runner(_job: CanonicalLocalFixtureJob) -> CanonicalLocalRunReceiptLike:
         started.set()
@@ -352,6 +340,7 @@ def test_cancelling_active_async_recording_keeps_worker_usable() -> None:
         fixture_runner=runner,  # type: ignore[arg-type]
     )
     try:
+
         async def cancel_active() -> None:
             task = asyncio.create_task(
                 service.arun_fixture(CanonicalLocalFixtureJob(source_one, Path("cancel-state")))

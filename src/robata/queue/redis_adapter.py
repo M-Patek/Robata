@@ -1,4 +1,4 @@
-﻿"""Atomic Redis transport for the provider-neutral :mod:`task_queue` port.
+"""Atomic Redis transport for the provider-neutral :mod:`task_queue` port.
 
 The durable scheduler remains authoritative.  This adapter only manages broker
 local delivery: admission, priority selection, leases, retry/DLQ, and result
@@ -403,10 +403,13 @@ class RedisTaskQueue(InspectableTaskQueue):
         self._prefix = key_prefix.rstrip(":")
         self._backoff = _backoff(retry_backoff_seconds)
         self._max_size = max_size
-        self._tombstone_ttl = _positive_seconds(
-            retired_lease_ttl_seconds,
-            "retired_lease_ttl_seconds",
-        ) // 1_000_000
+        self._tombstone_ttl = (
+            _positive_seconds(
+                retired_lease_ttl_seconds,
+                "retired_lease_ttl_seconds",
+            )
+            // 1_000_000
+        )
         self._client = client
         self._runtime_observer = runtime_observer
         self._failure_injector = failure_injector
@@ -654,6 +657,7 @@ class RedisTaskQueue(InspectableTaskQueue):
             failure_reason=optional_text("failure_reason"),
             result=result,
         )
+
     def _task_token(self, task_id: TaskId) -> str:
         if not isinstance(task_id, TaskId):
             raise TaskQueueError(TaskQueueErrorCode.INVALID_REQUEST, "task_id must be TaskId")

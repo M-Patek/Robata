@@ -271,9 +271,7 @@ class BoundedStreamWorkQueuesConfig:
             raise TypeError("optional_stages must contain Stage values")
         if len(set(self.optional_stages)) != len(self.optional_stages):
             raise ValueError("optional_stages must be unique")
-        if self.optional_work_predicate is not None and not callable(
-            self.optional_work_predicate
-        ):
+        if self.optional_work_predicate is not None and not callable(self.optional_work_predicate):
             raise TypeError("optional_work_predicate must be callable or None")
         if not self.optional_work_shedding_actions:
             raise ValueError("optional_work_shedding_actions must not be empty")
@@ -666,9 +664,7 @@ class BoundedStreamWorkQueues:
             if tracked:
                 self._cancel_requested_ids.add(checked_id)
         checked_reason_detail = (
-            None
-            if reason_detail is None
-            else _require_nonempty(reason_detail, "reason_detail")
+            None if reason_detail is None else _require_nonempty(reason_detail, "reason_detail")
         )
         try:
             cancelled = self._scheduler.cancel(
@@ -1172,9 +1168,7 @@ class BoundedStreamWorkQueues:
                 return
             try:
                 work_item_id = (
-                    value
-                    if isinstance(value, str)
-                    else value.claim.work_item.work_item_id
+                    value if isinstance(value, str) else value.claim.work_item.work_item_id
                 )
                 if isinstance(value, _PublishTask):
                     # The task no longer has a worker that can stop this
@@ -1307,7 +1301,6 @@ class BoundedStreamWorkQueues:
             worker.join()
 
 
-
 def _is_scheduler(value: object) -> bool:
     return all(
         callable(getattr(value, method, None))
@@ -1342,9 +1335,7 @@ def _claim_with_lease(claim: WorkLeaseClaim, lease: WorkLease) -> WorkLeaseClaim
     if lease == claim.lease:
         return claim
     return WorkLeaseClaim(
-        work_item=claim.work_item.model_copy(
-            update={"lease_expires_at": lease.lease_expires_at}
-        ),
+        work_item=claim.work_item.model_copy(update={"lease_expires_at": lease.lease_expires_at}),
         lease=lease,
     )
 

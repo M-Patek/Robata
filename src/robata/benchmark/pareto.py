@@ -122,9 +122,7 @@ class LocalSamplingDenseParetoReport(StrictModel):
     model_identifier: NonEmptyString
     prompt_version: SchemaVersion
     evidence_class: Literal["LOCAL_CONFORMANCE"] = "LOCAL_CONFORMANCE"
-    provider_mode: Literal["LOCAL_OFFLINE_FIXTURE", "NO_PROVIDER_CALLS"] = (
-        "LOCAL_OFFLINE_FIXTURE"
-    )
+    provider_mode: Literal["LOCAL_OFFLINE_FIXTURE", "NO_PROVIDER_CALLS"] = "LOCAL_OFFLINE_FIXTURE"
     measurement_status: Literal["NOT_MEASURED"] = "NOT_MEASURED"
     production_quality_status: Literal["NOT_MEASURED"] = "NOT_MEASURED"
     production_eligible: Literal[False] = False
@@ -238,8 +236,7 @@ def build_local_sampling_dense_pareto_report(
 
     checked_policies = tuple(policies)
     if not all(
-        isinstance(policy, LocalSamplingDensePolicyObservation)
-        for policy in checked_policies
+        isinstance(policy, LocalSamplingDensePolicyObservation) for policy in checked_policies
     ):
         raise TypeError("policies must contain LocalSamplingDensePolicyObservation values")
     ordered_policies = tuple(sorted(checked_policies, key=lambda policy: policy.policy_id))
@@ -271,9 +268,7 @@ def _pareto_policy_ids(
         policy.policy_id
         for policy in policies
         if not any(
-            _dominates(other, policy)
-            for other in policies
-            if other.policy_id != policy.policy_id
+            _dominates(other, policy) for other in policies if other.policy_id != policy.policy_id
         )
     )
 

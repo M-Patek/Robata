@@ -6,7 +6,7 @@ from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 
 from robata.adapters.mcap_single_pass import (
     AppendOnlyH264SpoolBranch,
@@ -129,7 +129,7 @@ class _ObservedFallbackIncrementalSession:
 
     @property
     def facts(self) -> ExportedCameraVideoFacts:
-        return self._session.facts
+        return cast(ExportedCameraVideoFacts, self._session.facts)
 
 
 class _NvdecIncrementalSession:
@@ -242,7 +242,7 @@ class _NvdecIncrementalSession:
         session = (
             self._fallback_session if self._fallback_session is not None else self._target_session
         )
-        return session.facts
+        return cast(ExportedCameraVideoFacts, session.facts)
 
     def _activate_cpu_fallback(
         self,

@@ -499,7 +499,7 @@ def _encode_jpeg_rgb24(
             f"unsupported JPEG chroma subsampling: {chroma_subsampling!r}",
         )
     try:
-        encoder = av.CodecContext.create("mjpeg", "w")
+        encoder: Any = av.CodecContext.create("mjpeg", "w")
         encoder.width = rgb_frame.width
         encoder.height = rgb_frame.height
         encoder.pix_fmt = chroma_subsampling
