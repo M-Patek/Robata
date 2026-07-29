@@ -762,6 +762,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
     { name = "types-jsonschema" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
@@ -793,6 +794,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6,<8" },
     { name = "ruff", specifier = ">=0.9,<1" },
     { name = "types-jsonschema", specifier = ">=4.23,<5" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
 
 [[package]]
