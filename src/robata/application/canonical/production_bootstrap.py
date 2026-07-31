@@ -14,11 +14,11 @@ from typing import Annotated, Literal, Self
 from pydantic import StringConstraints, ValidationError, model_validator
 
 from robata.application.canonical.production_composition import ProductionPrimaryRunPodBinding
+from robata.application.canonical.production_routing import ModelDeployment, ProductionRoute
 from robata.application.canonical.production_runtime import ProductionCaptureAuthorityBinding
 from robata.contracts.common import Sha256Digest, StrictModel
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.inference.models import ModelCapabilities
-from robata.inference.routing import ModelDeployment, ProductionRoute
 from robata.inference.runpod import RunPodRetryPolicy
 from robata.queue.outbox import OutboxRetryPolicy
 

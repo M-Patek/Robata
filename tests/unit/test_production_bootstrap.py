@@ -15,6 +15,12 @@ from robata.application.canonical.production_bootstrap import (
     load_production_runtime_bootstrap_configuration,
 )
 from robata.application.canonical.production_composition import ProductionPrimaryRunPodBinding
+from robata.application.canonical.production_routing import (
+    ModelDeployment,
+    ProductionRoute,
+    ProductionRouteAuthorization,
+    endpoint_config_digest,
+)
 from robata.application.canonical.production_runtime import ProductionCaptureAuthorityBinding
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.inference.models import (
@@ -22,12 +28,6 @@ from robata.inference.models import (
     InputMode,
     ModelCapabilities,
     VisionTask,
-)
-from robata.inference.routing import (
-    ModelDeployment,
-    ProductionRoute,
-    ProductionRouteAuthorization,
-    endpoint_config_digest,
 )
 from robata.inference.runpod import (
     RunPodDeploymentConfiguration,

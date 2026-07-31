@@ -40,9 +40,9 @@ from robata.application.canonical.production_composition import (
     ProductionCompositionContract,
     ProductionPrimaryRunPodBinding,
 )
+from robata.application.canonical.production_routing import ProductionRoute, endpoint_config_digest
 from robata.contracts.common import StrictModel
 from robata.contracts.schema_registry import SchemaRegistry, default_schema_registry
-from robata.inference.routing import ProductionRoute, endpoint_config_digest
 from robata.inference.runpod import RunPodVisionAdapter
 from robata.queue.outbox import OutboxRetryPolicy
 

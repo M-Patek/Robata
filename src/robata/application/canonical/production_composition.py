@@ -19,14 +19,14 @@ from pydantic import Field, StringConstraints, model_validator
 
 from robata.adapters.pgvector_runtime import PgVectorRuntimeConfig
 from robata.adapters.r2_object_store import R2ObjectStoreConfig
-from robata.contracts.common import Sha256Digest, StrictModel
-from robata.contracts.hashing import semantic_sha256
-from robata.inference.routing import (
+from robata.application.canonical.production_routing import (
     ModelDeployment,
     ProductionRoute,
     ProductionRouteAuthorization,
     endpoint_config_digest,
 )
+from robata.contracts.common import Sha256Digest, StrictModel
+from robata.contracts.hashing import semantic_sha256
 from robata.inference.runpod import RunPodEndpointConfig
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]

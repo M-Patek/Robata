@@ -17,13 +17,13 @@ from robata.application.canonical.production_composition import (
     ProductionCompositionErrorCode,
     ProductionPrimaryRunPodBinding,
 )
-from robata.contracts.retrieval import VectorBackend
-from robata.inference.routing import (
+from robata.application.canonical.production_routing import (
     ModelDeployment,
     ProductionRoute,
     ProductionRouteAuthorization,
     endpoint_config_digest,
 )
+from robata.contracts.retrieval import VectorBackend
 from robata.inference.runpod import RunPodDeploymentConfiguration, RunPodEndpointConfig
 
 
