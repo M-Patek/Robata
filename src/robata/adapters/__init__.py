@@ -28,6 +28,15 @@ from robata.adapters.pgvector_runtime import (
     create_verified_pgvector_projection_store,
     create_verified_pgvector_projection_store_from_environment,
 )
+from robata.adapters.postgres_completion_evidence import (
+    PostgresBarrierStorage,
+    PostgresBarrierStorageError,
+    PostgresCanonicalAdapterError,
+    PostgresInferenceEvidenceLedger,
+    PostgresInferenceEvidenceLedgerError,
+    PostgresPrimaryCompletionRepository,
+    PostgresPrimaryOutboxDeliveryStore,
+)
 from robata.adapters.r2_object_store import (
     R2Credentials,
     R2ObjectStore,
@@ -137,6 +146,13 @@ __all__ = [
     "PgVectorConnectionConfig",
     "PgVectorCredentials",
     "PgVectorRuntimeConfig",
+    "PostgresBarrierStorage",
+    "PostgresBarrierStorageError",
+    "PostgresCanonicalAdapterError",
+    "PostgresInferenceEvidenceLedger",
+    "PostgresInferenceEvidenceLedgerError",
+    "PostgresPrimaryCompletionRepository",
+    "PostgresPrimaryOutboxDeliveryStore",
     "PyAvFrameMaterializer",
     "PyAvH264DecoderProbe",
     "PyAvH264Mp4Exporter",
