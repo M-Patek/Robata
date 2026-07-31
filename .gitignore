@@ -24,6 +24,10 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.production.example
+
+# Production deployment inputs are mounted out-of-band and must never enter git.
+/secrets/
 
 # Build and editor output
 build/

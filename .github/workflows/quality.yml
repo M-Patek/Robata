@@ -107,14 +107,66 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  canonical-postgres:
+    name: canonical-postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: robata_ci
+          POSTGRES_PASSWORD: robata_ci_password
+          POSTGRES_USER: robata_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U robata_ci -d robata_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ROBATA_TEST_POSTGRES_DSN: postgresql://robata_ci:robata_ci_password@localhost:5432/robata_ci
+
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.11.29'
+          enable-cache: true
+
+      - name: Sync locked PostgreSQL test environment
+        run: uv sync --locked --dev --extra pgvector
+
+      - name: Test canonical PostgreSQL adapters
+        run: >-
+          uv run pytest -q -p no:cacheprovider
+          tests/integration/test_postgres_work_authority_integration.py
+          tests/integration/test_postgres_completion_evidence.py
+          tests/integration/test_postgres_logical_review_integration.py
+          tests/integration/test_postgres_read_model_integration.py
+          tests/integration/test_postgres_production_roles.py
+
   quality:
     name: quality
-    needs: live-tree
+    needs: [live-tree, canonical-postgres]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require every live-tree shard
+      - name: Require every live-tree shard and canonical PostgreSQL job
         env:
           LIVE_TREE_RESULT: ${{ needs.live-tree.result }}
+          CANONICAL_POSTGRES_RESULT: ${{ needs.canonical-postgres.result }}
         run: |
           test "$LIVE_TREE_RESULT" = "success"
+          test "$CANONICAL_POSTGRES_RESULT" = "success"

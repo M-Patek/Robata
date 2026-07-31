@@ -1,0 +1,74 @@
+name: robata-production
+
+secrets:
+  canonical-postgres-ca:
+    file: ${CANONICAL_POSTGRES_CA_FILE:?CANONICAL_POSTGRES_CA_FILE must point to the production PostgreSQL CA certificate}
+  production-runtime-config:
+    file: ${ROBATA_PRODUCTION_RUNTIME_CONFIG_FILE:?ROBATA_PRODUCTION_RUNTIME_CONFIG_FILE must point to the reviewed runtime bootstrap JSON}
+  primary-qualification-report:
+    file: ${ROBATA_PRIMARY_QUALIFICATION_REPORT_FILE:?ROBATA_PRIMARY_QUALIFICATION_REPORT_FILE must point to the pinned qualification report}
+  primary-release-decision:
+    file: ${ROBATA_PRIMARY_RELEASE_DECISION_FILE:?ROBATA_PRIMARY_RELEASE_DECISION_FILE must point to the pinned release decision}
+
+x-canonical-runtime: &canonical-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile.production
+  image: robata-canonical:production
+  env_file:
+    - path: ${ROBATA_RUNTIME_ENV_FILE:-.env.production}
+      required: true
+  secrets:
+    - source: canonical-postgres-ca
+      target: postgres-ca.pem
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  restart: "no"
+
+services:
+  canonical-migrate:
+    <<: *canonical-runtime
+    command: ["scripts/migrate_canonical_postgres.py"]
+
+  canonical-postgres-verify:
+    <<: *canonical-runtime
+    depends_on:
+      canonical-migrate:
+        condition: service_completed_successfully
+    command: ["scripts/verify_canonical_postgres_deployment.py"]
+
+  optional-adapter-preflight:
+    <<: *canonical-runtime
+    depends_on:
+      canonical-postgres-verify:
+        condition: service_completed_successfully
+    command:
+      - scripts/preflight_optional_adapters.py
+      - --r2
+      - --pgvector
+      - --verify-pgvector
+      - --runpod
+
+  canonical-r2-reconcile:
+    <<: *canonical-runtime
+    profiles: ["operator"]
+    depends_on:
+      canonical-postgres-verify:
+        condition: service_completed_successfully
+    command: ["scripts/reconcile_r2_raw_evidence.py", "--mode", "all"]
+  canonical-runtime-verify:
+    <<: *canonical-runtime
+    depends_on:
+      optional-adapter-preflight:
+        condition: service_completed_successfully
+    secrets:
+      - source: canonical-postgres-ca
+        target: postgres-ca.pem
+      - source: production-runtime-config
+        target: production-runtime.json
+      - source: primary-qualification-report
+        target: primary-qualification-report.json
+      - source: primary-release-decision
+        target: primary-release-decision.json
+    command: ["scripts/verify_production_canonical_runtime.py"]
