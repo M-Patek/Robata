@@ -22,6 +22,7 @@ from robata.adapters.r2_object_store import (
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.contracts.object_storage import ObjectByteRange, ObjectPutRequest, ObjectVisibility
 from robata.ports.object_storage import ObjectStoreError, ObjectStoreErrorCode
+from robata.runtime.observability import RuntimeProfileRecorder, RuntimeSpanStatus
 
 
 class _S3Error(RuntimeError):
@@ -192,6 +193,86 @@ def _request(
         media_type="application/octet-stream",
         object_version=version,
     )
+
+
+def _counter_map(
+    recorder: RuntimeProfileRecorder,
+    name: str,
+) -> dict[tuple[tuple[str, object], ...], int]:
+    return {
+        tuple((attribute.name, attribute.value) for attribute in counter.attributes): counter.value
+        for counter in recorder.snapshot().counters
+        if counter.name == name
+    }
+
+
+class _FailingRuntimeObserver:
+    def begin_span(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("observer is unavailable")
+
+    def end_span(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("observer is unavailable")
+
+    def increment_counter(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("observer is unavailable")
+
+
+def test_runtime_observer_records_direct_r2_calls_without_object_data() -> None:
+    recorder = RuntimeProfileRecorder()
+    client = _S3Double()
+    store = R2ObjectStore(_config(allow_delete=True), client, runtime_observer=recorder)
+    request = _request(
+        b"payload-must-not-appear-in-runtime-profile",
+        key="restricted/camera-secret.mcap",
+        version="telemetry-v1",
+    )
+
+    receipt = store.put(request)
+    assert store.head(receipt.locator).visibility is ObjectVisibility.VISIBLE
+    assert store.get(receipt.locator) == request.payload
+    store.delete(receipt.locator)
+    missing = store.locator_for("restricted/missing-secret.mcap", "telemetry-missing-v1")
+    assert store.head(missing).visibility is ObjectVisibility.MISSING
+    assert client.objects == {}
+
+    runtime = recorder.snapshot()
+    assert _counter_map(recorder, "r2.object_store.requests") == {
+        (("operation", "delete"),): 1,
+        (("operation", "get"),): 2,
+        (("operation", "head"),): 7,
+        (("operation", "put"),): 1,
+    }
+    spans = tuple(span for span in runtime.spans if span.name == "r2.object_store.request")
+    assert len(spans) == 11
+    assert all(
+        tuple((attribute.name, attribute.value) for attribute in span.attributes)
+        in {
+            (("operation", "delete"),),
+            (("operation", "get"),),
+            (("operation", "head"),),
+            (("operation", "put"),),
+        }
+        for span in spans
+    )
+    assert sum(span.status is RuntimeSpanStatus.ERROR for span in spans) == 2
+    profile_json = runtime.model_dump_json()
+    assert "restricted/camera-secret.mcap" not in profile_json
+    assert "restricted/missing-secret.mcap" not in profile_json
+    assert "payload-must-not-appear-in-runtime-profile" not in profile_json
+
+
+def test_runtime_observer_failures_do_not_change_r2_storage_behavior() -> None:
+    store = R2ObjectStore(
+        _config(),
+        _S3Double(),
+        runtime_observer=_FailingRuntimeObserver(),
+    )
+
+    receipt = store.put(_request())
+    assert store.get(receipt.locator) == b"camera-bytes"
 
 
 def test_put_uses_immutable_versioned_key_and_reconciles_exact_bytes() -> None:

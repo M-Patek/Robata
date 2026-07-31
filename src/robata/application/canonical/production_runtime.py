@@ -46,6 +46,7 @@ from robata.contracts.common import StrictModel
 from robata.contracts.schema_registry import SchemaRegistry, default_schema_registry
 from robata.inference.runpod import RunPodVisionAdapter
 from robata.queue.outbox import OutboxRetryPolicy
+from robata.runtime.observability import RuntimeObserver
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]
 
@@ -297,6 +298,7 @@ def build_production_canonical_runtime(
     outbox_retry_policy: OutboxRetryPolicy,
     schema_registry: SchemaRegistry | None = None,
     migrations_directory: Path | None = None,
+    runtime_observer: RuntimeObserver | None = None,
 ) -> ProductionCanonicalRuntime:
     """Verify and construct the production-only canonical authority graph.
 
@@ -353,12 +355,14 @@ def build_production_canonical_runtime(
         schema=contract.canonical_postgres.schema_name,
         tenant_setting=contract.canonical_postgres.tenant_context_setting,
         tenant_id=tenant.tenant_id,
+        runtime_observer=runtime_observer,
     )
     worker_authority = PostgresCanonicalAuthority(
         worker_factory,
         schema=contract.canonical_postgres.schema_name,
         tenant_setting=contract.canonical_postgres.tenant_context_setting,
         tenant_id=tenant.tenant_id,
+        runtime_observer=runtime_observer,
     )
     _verify_canonical_authority(application_authority, runtime_role="application")
     _verify_canonical_authority(worker_authority, runtime_role="worker")
@@ -372,7 +376,11 @@ def build_production_canonical_runtime(
         capture_authority_epoch=capture_authority.capture_authority_epoch,
         capture_assignment_policy_version=capture_authority.capture_assignment_policy_version,
     )
-    primary_completion = PostgresPrimaryCompletionRepository(worker_authority, registry=registry)
+    primary_completion = PostgresPrimaryCompletionRepository(
+        worker_authority,
+        registry=registry,
+        runtime_observer=runtime_observer,
+    )
     r2_artifacts = PostgresR2ArtifactAuthority(
         worker_authority,
         r2_object_store,
@@ -382,15 +390,27 @@ def build_production_canonical_runtime(
         worker_authority,
         registry,
         artifact_authority=r2_artifacts,
+        runtime_observer=runtime_observer,
     )
-    barriers = PostgresBarrierStorage(worker_authority)
+    barriers = PostgresBarrierStorage(
+        worker_authority,
+        runtime_observer=runtime_observer,
+    )
     outbox_delivery = PostgresPrimaryOutboxDeliveryStore(
         worker_authority,
         registry=registry,
         retry_policy=outbox_retry_policy,
+        runtime_observer=runtime_observer,
     )
-    logical_nodes = PostgresLogicalNodeRegistry(worker_authority, runtime_observer=None)
-    review_queue = PostgresReviewQueue(worker_authority, registry=registry)
+    logical_nodes = PostgresLogicalNodeRegistry(
+        worker_authority,
+        runtime_observer=runtime_observer,
+    )
+    review_queue = PostgresReviewQueue(
+        worker_authority,
+        registry=registry,
+        runtime_observer=runtime_observer,
+    )
     read_model = PostgresCanonicalReadModel(application_authority)
     try:
         verify_completion_evidence_schema(worker_authority)
