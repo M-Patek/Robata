@@ -50,6 +50,13 @@ services:
       - --verify-pgvector
       - --runpod
 
+  canonical-r2-reconcile:
+    <<: *canonical-runtime
+    profiles: ["operator"]
+    depends_on:
+      canonical-postgres-verify:
+        condition: service_completed_successfully
+    command: ["scripts/reconcile_r2_raw_evidence.py", "--mode", "all"]
   canonical-runtime-verify:
     <<: *canonical-runtime
     depends_on:

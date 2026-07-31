@@ -37,6 +37,13 @@ from robata.adapters.postgres_completion_evidence import (
     PostgresPrimaryCompletionRepository,
     PostgresPrimaryOutboxDeliveryStore,
 )
+from robata.adapters.postgres_r2_artifacts import (
+    PostgresR2ArtifactAuthority,
+    PostgresR2ArtifactError,
+    RawProviderR2ArtifactReceipt,
+    RawProviderR2ArtifactState,
+    RawProviderR2ObservationKind,
+)
 from robata.adapters.r2_object_store import (
     R2Credentials,
     R2ObjectStore,
@@ -153,6 +160,8 @@ __all__ = [
     "PostgresInferenceEvidenceLedgerError",
     "PostgresPrimaryCompletionRepository",
     "PostgresPrimaryOutboxDeliveryStore",
+    "PostgresR2ArtifactAuthority",
+    "PostgresR2ArtifactError",
     "PyAvFrameMaterializer",
     "PyAvH264DecoderProbe",
     "PyAvH264Mp4Exporter",
@@ -161,6 +170,9 @@ __all__ = [
     "R2ObjectStore",
     "R2ObjectStoreConfig",
     "R2S3Client",
+    "RawProviderR2ArtifactReceipt",
+    "RawProviderR2ArtifactState",
+    "RawProviderR2ObservationKind",
     "RedisIdempotentOutboxSink",
     "SQLiteBarrierStorage",
     "SQLiteBarrierStorageError",

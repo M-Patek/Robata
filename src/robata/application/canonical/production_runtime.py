@@ -31,6 +31,7 @@ from robata.adapters.postgres_logical_review import (
     PostgresReviewQueue,
 )
 from robata.adapters.postgres_migrations import PostgresMigrationRunner
+from robata.adapters.postgres_r2_artifacts import PostgresR2ArtifactAuthority
 from robata.adapters.postgres_read_model import PostgresCanonicalReadModel
 from robata.adapters.postgres_stream_work_ledger import PostgresStreamWorkLedger
 from robata.adapters.postgres_work_scheduler import PostgresWorkScheduler
@@ -72,6 +73,8 @@ _REQUIRED_CANONICAL_TABLES = (
     "primary_outbox_deliveries",
     "inference_intents",
     "raw_provider_responses",
+    "raw_provider_r2_artifact_receipts",
+    "raw_provider_r2_artifact_observations",
     "model_inference_terminals",
     "raw_provider_artifacts",
     "inference_attempt_selections",
@@ -224,6 +227,7 @@ class ProductionCanonicalRuntime:
     capture_authority: PostgresCaptureAuthority
     primary_completion: PostgresPrimaryCompletionRepository
     inference_evidence: PostgresInferenceEvidenceLedger
+    r2_artifact_authority: PostgresR2ArtifactAuthority
     barrier_storage: PostgresBarrierStorage
     outbox_delivery: PostgresPrimaryOutboxDeliveryStore
     logical_node_registry: PostgresLogicalNodeRegistry
@@ -369,7 +373,16 @@ def build_production_canonical_runtime(
         capture_assignment_policy_version=capture_authority.capture_assignment_policy_version,
     )
     primary_completion = PostgresPrimaryCompletionRepository(worker_authority, registry=registry)
-    evidence = PostgresInferenceEvidenceLedger(worker_authority, registry)
+    r2_artifacts = PostgresR2ArtifactAuthority(
+        worker_authority,
+        r2_object_store,
+        tenant_id=tenant.tenant_id,
+    )
+    evidence = PostgresInferenceEvidenceLedger(
+        worker_authority,
+        registry,
+        artifact_authority=r2_artifacts,
+    )
     barriers = PostgresBarrierStorage(worker_authority)
     outbox_delivery = PostgresPrimaryOutboxDeliveryStore(
         worker_authority,
@@ -381,6 +394,7 @@ def build_production_canonical_runtime(
     read_model = PostgresCanonicalReadModel(application_authority)
     try:
         verify_completion_evidence_schema(worker_authority)
+        r2_artifacts.verify_startup()
         logical_nodes.verify_startup()
         review_queue.verify_startup()
         read_model.verify_startup()
@@ -410,6 +424,7 @@ def build_production_canonical_runtime(
         capture_authority=capture,
         primary_completion=primary_completion,
         inference_evidence=evidence,
+        r2_artifact_authority=r2_artifacts,
         barrier_storage=barriers,
         outbox_delivery=outbox_delivery,
         logical_node_registry=logical_nodes,
@@ -441,6 +456,11 @@ def _verify_static_contract(
         raise ProductionRuntimeError(
             ProductionRuntimeErrorCode.INVALID_DEPENDENCY,
             "R2 object store configuration does not match the production contract",
+        )
+    if r2_object_store.config.allow_delete:
+        raise ProductionRuntimeError(
+            ProductionRuntimeErrorCode.INVALID_CONFIGURATION,
+            "production R2 configuration must disable application-level deletion",
         )
 
 

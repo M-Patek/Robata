@@ -30,6 +30,7 @@ from robata.adapters.postgres_authority import (
     PostgresConnection,
     PostgresCursor,
 )
+from robata.adapters.postgres_r2_artifacts import PostgresR2ArtifactAuthority
 from robata.adapters.sqlite_barrier import SQLiteBarrierStorage
 from robata.adapters.sqlite_inference_evidence import (
     _CONTRACT_VERSION,
@@ -331,12 +332,18 @@ class PostgresInferenceEvidenceLedger(
         schema_registry: SchemaRegistry,
         *,
         runtime_observer: RuntimeObserver | None = None,
+        artifact_authority: PostgresR2ArtifactAuthority | None = None,
     ) -> None:
         if not isinstance(authority, PostgresCanonicalAuthority):
             raise TypeError("authority must be PostgresCanonicalAuthority")
         if not isinstance(schema_registry, SchemaRegistry):
             raise TypeError("schema_registry must be a SchemaRegistry")
+        if artifact_authority is not None and not isinstance(
+            artifact_authority, PostgresR2ArtifactAuthority
+        ):
+            raise TypeError("artifact_authority must be PostgresR2ArtifactAuthority or None")
         self._authority = authority
+        self._artifact_authority = artifact_authority
         self._active_connection = ContextVar("postgres_inference_evidence_connection", default=None)
         self._state_lock = RLock()
         self._runtime_observer = runtime_observer
@@ -374,6 +381,12 @@ class PostgresInferenceEvidenceLedger(
                 "cannot resolve inference evidence schema governance"
             ) from error
 
+    @property
+    def artifact_authority(self) -> PostgresR2ArtifactAuthority | None:
+        """Return the optional required-production R2 mirror authority."""
+
+        return self._artifact_authority
+
     def close(self) -> None:
         """Mark this composition-owned adapter closed without owning a DB connection."""
 
@@ -400,6 +413,13 @@ class PostgresInferenceEvidenceLedger(
                 raise PostgresInferenceEvidenceLedgerError(
                     "cannot verify PostgreSQL inference evidence integrity"
                 ) from error
+            if self._artifact_authority is not None:
+                try:
+                    self._artifact_authority.verify_records(self._cache.state.raw.values())
+                except Exception as error:
+                    raise PostgresInferenceEvidenceLedgerError(
+                        "cannot verify immutable R2 raw-provider evidence mirrors"
+                    ) from error
 
     def verify_completion_seal(self) -> None:
         """Require a fresh persisted-state evidence audit at the completion boundary."""
@@ -488,9 +508,23 @@ class PostgresInferenceEvidenceLedger(
                     f"cannot append PostgreSQL inference evidence: {operation_name}"
                 ) from error
 
-    def _persist_raw_bytes(self, record: Any) -> bytes:
-        """Keep raw evidence in canonical PostgreSQL ``bytea`` for exact recovery."""
+    def get(self, artifact_id: str) -> Any:
+        record = SQLiteInferenceEvidenceLedger.get(self, artifact_id)
+        if self._artifact_authority is not None:
+            self._artifact_authority.verify_record(record)
+        return record
 
+    def list_records(self) -> tuple[Any, ...]:
+        records = SQLiteInferenceEvidenceLedger.list_records(self)
+        if self._artifact_authority is not None:
+            self._artifact_authority.verify_records(records)
+        return records
+
+    def _persist_raw_bytes(self, record: Any) -> bytes:
+        """Mirror raw evidence to immutable R2 before its PostgreSQL append."""
+
+        if self._artifact_authority is not None:
+            self._artifact_authority.stage_and_verify(record)
         return bytes(record.data)
 
 
@@ -797,6 +831,8 @@ def verify_completion_evidence_schema(authority: PostgresCanonicalAuthority) -> 
         "primary_outbox_deliveries",
         "inference_intents",
         "raw_provider_responses",
+        "raw_provider_r2_artifact_receipts",
+        "raw_provider_r2_artifact_observations",
         "model_inference_terminals",
         "raw_provider_artifacts",
         "inference_attempt_selections",

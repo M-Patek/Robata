@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from pydantic import StringConstraints, model_validator
 
+from robata.adapters.postgres_authority import require_outside_postgres_authority_transaction
 from robata.contracts.common import StrictModel
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.contracts.object_storage import (
@@ -60,6 +61,7 @@ class R2ObjectStoreConfig(StrictModel):
     connect_timeout_seconds: int = 10
     read_timeout_seconds: int = 120
     max_attempts: int = 3
+    allow_delete: bool = False
 
     @model_validator(mode="after")
     def validate_configuration(self) -> Self:
@@ -122,6 +124,7 @@ class R2ObjectStoreConfig(StrictModel):
                 environment, "R2_READ_TIMEOUT_SECONDS", 120
             ),
             max_attempts=_environment_positive_int(environment, "R2_MAX_ATTEMPTS", 3),
+            allow_delete=_environment_bool(environment, "R2_ALLOW_DELETE", False),
         )
 
 
@@ -172,7 +175,10 @@ class R2ObjectStore:
     def __init__(self, config: R2ObjectStoreConfig, client: R2S3Client) -> None:
         if not isinstance(config, R2ObjectStoreConfig):
             raise TypeError("config must be R2ObjectStoreConfig")
-        for name in ("put_object", "head_object", "get_object", "delete_object"):
+        required_methods: tuple[str, ...] = ("put_object", "head_object", "get_object")
+        if config.allow_delete:
+            required_methods += ("delete_object",)
+        for name in required_methods:
             if not callable(getattr(client, name, None)):
                 raise TypeError("client must provide the required S3 object methods")
         self._config = config
@@ -183,6 +189,7 @@ class R2ObjectStore:
         return self._config
 
     def put(self, request: ObjectPutRequest) -> ObjectPutReceipt:
+        require_outside_postgres_authority_transaction(activity="R2 PUT")
         if not isinstance(request, ObjectPutRequest):
             raise ObjectStoreError(
                 ObjectStoreErrorCode.INVALID_REQUEST, "request must be ObjectPutRequest"
@@ -191,8 +198,8 @@ class R2ObjectStore:
         locator = self._locator(request.key, version)
         existing = self.head(locator)
         if existing.visibility is ObjectVisibility.VISIBLE:
-            self._require_visible_exact(locator, request)
-            return self._receipt(locator, request)
+            visible = self._require_visible_exact(locator, request)
+            return self._receipt(visible.locator, request)
         if existing.visibility is ObjectVisibility.PARTIAL:
             raise ObjectStoreError(
                 ObjectStoreErrorCode.CONFLICT,
@@ -222,18 +229,19 @@ class R2ObjectStore:
             except ObjectStoreError:
                 raise mapped from error
             if concurrent.visibility is ObjectVisibility.VISIBLE:
-                self._require_visible_exact(locator, request)
-                return self._receipt(locator, request)
+                visible = self._require_visible_exact(locator, request)
+                return self._receipt(visible.locator, request)
             if concurrent.visibility is ObjectVisibility.PARTIAL:
                 raise ObjectStoreError(
                     ObjectStoreErrorCode.VISIBILITY_UNKNOWN,
                     "R2 object has incomplete integrity metadata after PUT failure",
                 ) from error
             raise mapped from error
-        self._require_visible_exact(locator, request)
-        return self._receipt(locator, request)
+        visible = self._require_visible_exact(locator, request)
+        return self._receipt(visible.locator, request)
 
     def head(self, locator: ObjectLocator) -> ObjectHead:
+        require_outside_postgres_authority_transaction(activity="R2 HEAD")
         key = self._key_from_locator(locator)
         try:
             response = self._client.head_object(Bucket=self._config.bucket, Key=key)
@@ -250,6 +258,7 @@ class R2ObjectStore:
         return self._head_from_response(locator, response)
 
     def get(self, locator: ObjectLocator, byte_range: ObjectByteRange | None = None) -> bytes:
+        require_outside_postgres_authority_transaction(activity="R2 GET")
         if not isinstance(locator, ObjectLocator):
             raise ObjectStoreError(
                 ObjectStoreErrorCode.INVALID_REQUEST, "locator must be ObjectLocator"
@@ -302,9 +311,15 @@ class R2ObjectStore:
         return payload
 
     def delete(self, locator: ObjectLocator) -> None:
+        require_outside_postgres_authority_transaction(activity="R2 DELETE")
         if not isinstance(locator, ObjectLocator):
             raise ObjectStoreError(
                 ObjectStoreErrorCode.INVALID_REQUEST, "locator must be ObjectLocator"
+            )
+        if not self._config.allow_delete:
+            raise ObjectStoreError(
+                ObjectStoreErrorCode.RETENTION_UNSUPPORTED,
+                "R2 deletion is disabled for immutable production retention",
             )
         if self.head(locator).visibility is ObjectVisibility.MISSING:
             raise ObjectStoreError(ObjectStoreErrorCode.NOT_FOUND, "R2 object is missing")
@@ -316,10 +331,26 @@ class R2ObjectStore:
             raise self._map_error(error) from error
 
     def reconcile(self, locator: ObjectLocator) -> ObjectHead:
+        require_outside_postgres_authority_transaction(activity="R2 RECONCILE")
         head = self.head(locator)
         if head.visibility is ObjectVisibility.VISIBLE:
             self.get(locator)
         return head
+
+    def locator_for(self, logical_key: str, object_version: str) -> ObjectLocator:
+        """Derive a deterministic locator without contacting the provider."""
+
+        if not isinstance(logical_key, str) or not logical_key.strip():
+            raise ObjectStoreError(
+                ObjectStoreErrorCode.INVALID_REQUEST,
+                "logical_key must be nonempty",
+            )
+        if not isinstance(object_version, str) or not object_version.strip():
+            raise ObjectStoreError(
+                ObjectStoreErrorCode.INVALID_REQUEST,
+                "object_version must be nonempty",
+            )
+        return self._locator(logical_key, object_version)
 
     def _locator(self, logical_key: str, version: str) -> ObjectLocator:
         physical_key = self._physical_key(logical_key, version)
@@ -413,7 +444,9 @@ class R2ObjectStore:
             visibility=ObjectVisibility.VISIBLE,
         )
 
-    def _require_visible_exact(self, locator: ObjectLocator, request: ObjectPutRequest) -> None:
+    def _require_visible_exact(
+        self, locator: ObjectLocator, request: ObjectPutRequest
+    ) -> ObjectHead:
         head = self.reconcile(locator)
         if head.visibility is not ObjectVisibility.VISIBLE:
             raise ObjectStoreError(
@@ -421,6 +454,7 @@ class R2ObjectStore:
                 f"R2 object is not visibly readable after PUT: {head.visibility.value}",
             )
         self._require_matching_existing(head, request)
+        return head
 
     @staticmethod
     def _require_matching_existing(head: ObjectHead, request: ObjectPutRequest) -> None:
@@ -520,6 +554,18 @@ def _environment_positive_int(environment: Mapping[str, str], name: str, default
     if parsed <= 0:
         raise ValueError(f"{name} must be positive")
     return parsed
+
+
+def _environment_bool(environment: Mapping[str, str], name: str, default: bool) -> bool:
+    value = environment.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be true or false")
 
 
 def _metadata_text(metadata: Mapping[object, object], key: str) -> str | None:

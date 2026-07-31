@@ -100,6 +100,8 @@ def _insert_minimal_graph(authority: PostgresCanonicalAuthority) -> dict[str, st
     outbox_bytes = b'{"outbox":"canonical"}'
     intent_bytes = b'{"intent":"canonical"}'
     raw_bytes = b'{"raw":"canonical"}'
+    provider_request_id = f"provider-request:{uuid4()}"
+    raw_digest = _digest(raw_bytes)
     terminal_bytes = b'{"terminal":"canonical"}'
     artifact_bytes = b'{"artifact":"canonical"}'
 
@@ -265,6 +267,40 @@ def _insert_minimal_graph(authority: PostgresCanonicalAuthority) -> dict[str, st
         )
         connection.execute(
             """
+            INSERT INTO raw_provider_r2_artifact_receipts (
+                artifact_id, inference_id, request_id, provider_request_id,
+                exact_bytes_sha256, byte_count, media_type, payload_bytes,
+                logical_key, object_uri, object_version, r2_config_sha256, state
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'application/json', %s, %s, %s, %s, %s, 'STAGED')
+            """,
+            (
+                raw_artifact_id,
+                inference_id,
+                request_id,
+                provider_request_id,
+                raw_digest,
+                len(raw_bytes),
+                raw_bytes,
+                f"raw-provider-responses/read-model/{raw_artifact_id}",
+                (
+                    "r2://robata-read-model/raw-provider-responses/read-model/"
+                    f"{raw_artifact_id}/.robata-versions/raw-v1-{raw_digest}"
+                ),
+                f"raw-v1-{raw_digest}",
+                "0" * 64,
+            ),
+        )
+        updated_receipt = connection.execute(
+            """
+            UPDATE raw_provider_r2_artifact_receipts
+            SET state = 'COMMITTED', committed_at = CURRENT_TIMESTAMP
+            WHERE artifact_id = %s AND state = 'STAGED'
+            """,
+            (raw_artifact_id,),
+        )
+        assert updated_receipt.rowcount == 1
+        connection.execute(
+            """
             INSERT INTO raw_provider_responses (
                 artifact_id, inference_id, request_id, provider_request_id,
                 exact_bytes_sha256, media_type, byte_count, raw_bytes
@@ -274,8 +310,8 @@ def _insert_minimal_graph(authority: PostgresCanonicalAuthority) -> dict[str, st
                 raw_artifact_id,
                 inference_id,
                 request_id,
-                f"provider-request:{uuid4()}",
-                _digest(raw_bytes),
+                provider_request_id,
+                raw_digest,
                 len(raw_bytes),
                 raw_bytes,
             ),
@@ -316,9 +352,9 @@ def _insert_minimal_graph(authority: PostgresCanonicalAuthority) -> dict[str, st
                 raw_artifact_id,
                 inference_id,
                 request_id,
-                _digest(raw_bytes),
+                raw_digest,
                 len(raw_bytes),
-                f"provider-request:{uuid4()}",
+                provider_request_id,
                 "2026-01-01T00:00:30.000000Z",
                 "https://schemas.robata.dev/raw-provider-response",
                 str(uuid4()),

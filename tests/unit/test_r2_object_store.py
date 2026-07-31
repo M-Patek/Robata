@@ -9,6 +9,10 @@ from hashlib import md5
 
 import pytest
 
+from robata.adapters.postgres_authority import (
+    PostgresAuthorityConfigurationError,
+    PostgresCanonicalAuthority,
+)
 from robata.adapters.r2_object_store import (
     R2Credentials,
     R2ObjectStore,
@@ -125,6 +129,39 @@ class _S3Double:
             raise _S3Error("NoSuchKey") from error
 
 
+class _AuthorityCursor:
+    rowcount = 1
+
+    def fetchone(self) -> Mapping[str, object] | None:
+        return None
+
+    def fetchall(self) -> tuple[Mapping[str, object], ...]:
+        return ()
+
+
+class _AuthorityConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.rolled_back = False
+
+    def execute(
+        self,
+        query: str,
+        params: tuple[object, ...] | None = None,
+    ) -> _AuthorityCursor:
+        del query, params
+        return _AuthorityCursor()
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _required_text(values: Mapping[str, object], key: str) -> str:
     value = values.get(key)
     if not isinstance(value, str):
@@ -132,11 +169,12 @@ def _required_text(values: Mapping[str, object], key: str) -> str:
     return value
 
 
-def _config() -> R2ObjectStoreConfig:
+def _config(*, allow_delete: bool = False) -> R2ObjectStoreConfig:
     return R2ObjectStoreConfig(
         endpoint_url="https://account-id.r2.cloudflarestorage.com",
         bucket="robata-production",
         prefix="artifacts/",
+        allow_delete=allow_delete,
     )
 
 
@@ -169,6 +207,7 @@ def test_put_uses_immutable_versioned_key_and_reconciles_exact_bytes() -> None:
     )
     assert client.put_count == 1
     stored = next(iter(client.objects.values()))
+    assert receipt.locator.etag == stored.etag
     assert stored.metadata["robata-sha256"] == receipt.sha256
     assert stored.metadata["robata-byte-count"] == str(receipt.byte_count)
     assert store.get(receipt.locator) == b"camera-bytes"
@@ -192,7 +231,7 @@ def test_replayed_exact_put_is_idempotent_and_conflicting_version_is_rejected() 
 
 def test_head_get_range_reconcile_and_delete_preserve_port_semantics() -> None:
     client = _S3Double()
-    store = R2ObjectStore(_config(), client)
+    store = R2ObjectStore(_config(allow_delete=True), client)
     receipt = store.put(_request(b"0123456789"))
 
     assert store.get(receipt.locator, ObjectByteRange(start=2, end=6)) == b"2345"
@@ -212,6 +251,42 @@ def test_head_get_range_reconcile_and_delete_preserve_port_semantics() -> None:
     assert missing_error.value.code is ObjectStoreErrorCode.NOT_FOUND
 
 
+def test_delete_is_refused_by_default_and_locator_derivation_is_pure() -> None:
+    client = _S3Double()
+    store = R2ObjectStore(_config(), client)
+    request = _request(key="raw/one.json", version="raw-v1")
+
+    locator = store.locator_for(request.key, "raw-v1")
+
+    assert client.objects == {}
+    receipt = store.put(request)
+    assert receipt.locator.uri == locator.uri
+    assert receipt.locator.object_version == locator.object_version
+    assert receipt.locator.etag is not None
+    with pytest.raises(ObjectStoreError) as deletion:
+        store.delete(receipt.locator)
+    assert deletion.value.code is ObjectStoreErrorCode.RETENTION_UNSUPPORTED
+    assert client.objects
+
+
+def test_r2_provider_calls_are_refused_inside_postgres_authority_transactions() -> None:
+    client = _S3Double()
+    store = R2ObjectStore(_config(), client)
+    connection = _AuthorityConnection()
+    authority = PostgresCanonicalAuthority(lambda: connection)
+
+    with pytest.raises(PostgresAuthorityConfigurationError):
+        authority.run_authority_transaction(
+            write=True,
+            operation_name="test.r2_inside_postgres_transaction",
+            operation=lambda _connection: store.put(_request()),
+        )
+
+    assert client.put_count == 0
+    assert connection.rolled_back is True
+    assert connection.closed is True
+
+
 def test_config_and_credentials_require_explicit_non_secret_environment_values() -> None:
     config = R2ObjectStoreConfig.from_environment(
         {
@@ -228,6 +303,7 @@ def test_config_and_credentials_require_explicit_non_secret_environment_values()
     assert config.endpoint_url == "https://account-id.r2.cloudflarestorage.com"
     assert config.normalized_prefix == "camera-artifacts/"
     assert config.connect_timeout_seconds == 11
+    assert config.allow_delete is False
     assert "super-secret" not in repr(credentials)
     with pytest.raises(ValueError, match="R2_BUCKET"):
         R2ObjectStoreConfig.from_environment({"R2_ACCOUNT_ID": "account-id"})

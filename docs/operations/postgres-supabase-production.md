@@ -157,8 +157,27 @@ docker compose --env-file .env.production -f compose.production.yaml build
 docker compose --env-file .env.production -f compose.production.yaml run --rm canonical-migrate
 docker compose --env-file .env.production -f compose.production.yaml run --rm canonical-postgres-verify
 docker compose --env-file .env.production -f compose.production.yaml run --rm optional-adapter-preflight
+```
+
+If the target contains raw provider responses created before migration `0005`,
+run the bounded operator reconciliation before `canonical-runtime-verify`, and
+repeat it until both counters are zero:
+
+```powershell
+docker compose --env-file .env.production -f compose.production.yaml run --rm canonical-r2-reconcile
+```
+
+Then construct and verify the production runtime:
+
+```powershell
 docker compose --env-file .env.production -f compose.production.yaml run --rm canonical-runtime-verify
 ```
+
+The command is exposed through the `operator` profile but can be targeted
+explicitly as above. Its default limit is 100. It reads only the current
+tenant's historical canonical raw bytes, writes their deterministic immutable
+R2 mirrors, and appends receipt facts. It never changes an existing raw
+response row.
 
 The first command's migration role is DDL-only. The second command makes
 read-only checks with app and worker credentials. The third command sends no
@@ -175,12 +194,44 @@ RunPod response evidence, and the Mage/Qwen qualification artifacts.
 
 ## R2 lifecycle
 
-`R2ObjectStore.put` writes one versioned physical key with conditional create,
-then performs a verified HEAD. If a provider response is lost, it re-reads the
-same immutable key and accepts it only when SHA-256, byte count, media type, and
-object version all match. `get` rechecks exact bytes. Use one R2 prefix per
-environment and treat deletion as a retention workflow, not normal pipeline
-cleanup.
+PostgreSQL remains the canonical exact-byte recovery store. R2 is a required,
+verified immutable mirror for new raw provider responses; it is not a pointer
+replacement for `raw_provider_responses.raw_bytes` and never changes a
+published evidence schema.
+
+1. The worker writes a tenant-bound `STAGED` receipt in
+   `raw_provider_r2_artifact_receipts`. It contains the raw bytes, SHA-256,
+   byte count, media type, a credential-free R2 configuration digest, and a
+   deterministic tenant-scoped logical key/version. The database permits only
+   that initial state; a receipt cannot begin as `COMMITTED`.
+2. Outside the PostgreSQL authority transaction, `R2ObjectStore.put` uses
+   conditional creation and exact HEAD/GET verification. A lost provider
+   response is reconciled only against the same immutable key and exact bytes.
+3. A second PostgreSQL transaction advances that receipt to `COMMITTED`,
+   persists the reconciled ETag when the provider exposes one, and appends a
+   `PUT_VERIFIED` observation. A database trigger rejects a new
+   `raw_provider_responses` row unless its receipt is committed and all raw
+   metadata and bytes match exactly.
+4. Completion-seal and raw-evidence reads recheck the R2 object against the
+   PostgreSQL bytes. Missing, partial, conflicting, or corrupt objects fail
+   closed and create an append-only observation when possible.
+
+A crash after staging is recoverable: the staged receipt retains exact bytes,
+and `PostgresR2ArtifactAuthority.reconcile_staged()` replays only the original
+deterministic key/version. It refuses a receipt whose R2 configuration digest
+does not match the active configuration before any provider I/O. It intentionally
+does not synthesize a raw evidence row; the typed inference ledger remains the
+sole owner of that append.
+
+`R2_ALLOW_DELETE` must remain `false`, and the bucket credentials/policy must
+also deny delete operations. Application code rejects deletion in that mode.
+Use one R2 prefix per environment. Bucket retention, object-lock behavior, and
+a negative delete canary against the real bucket remain external release
+evidence. PostgreSQL can enforce receipt order and byte equality but cannot
+cryptographically attest a remote R2 PUT; that final boundary relies on the
+non-owner worker role, R2 credentials that deny deletion, and runtime exact-byte
+verification. A principal allowed arbitrary direct canonical writes is therefore
+a trusted writer, not an external R2 proof boundary.
 
 ## External release gates
 

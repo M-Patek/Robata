@@ -30,12 +30,16 @@ from robata.adapters.postgres_completion_evidence import (
     verify_completion_evidence_schema,
 )
 from robata.adapters.postgres_migrations import PostgresMigrationRunner
+from robata.adapters.postgres_r2_artifacts import PostgresR2ArtifactAuthority
+from robata.adapters.r2_object_store import R2ObjectStore, R2ObjectStoreConfig
 from robata.application.canonical_run_membership import CanonicalProcessingRunContext
+from robata.contracts.hashing import exact_bytes_sha256
 from robata.contracts.schema_registry import SchemaRegistry
 from robata.queue.barrier import BarrierCoordinator
 from robata.queue.outbox import OutboxDeliveryStatus, OutboxRetryPolicy
 from robata.queue.stage import StageStatus
 from tests.integration.test_sqlite_primary_completion import _run_case
+from tests.unit.test_r2_object_store import _S3Double
 from tests.unit.test_sqlite_barrier import _completion, _declare, _reduction
 from tests.unit.test_sqlite_inference_evidence import _build_after_raw, _intent
 
@@ -53,7 +57,7 @@ def postgres_factory() -> ConnectionFactory:
 def migrated_postgres(postgres_factory: ConnectionFactory) -> None:
     migrations = Path(__file__).resolve().parents[2] / "db" / "migrations"
     application = PostgresMigrationRunner(postgres_factory, migrations).apply()
-    assert "0003" in application.applied_ids + application.already_applied_ids
+    assert "0005" in application.applied_ids + application.already_applied_ids
 
 
 @pytest.fixture
@@ -68,8 +72,7 @@ def postgres_runtime_factory(
         administrator.execute(f"CREATE ROLE {role_name} NOLOGIN")
         administrator.execute(f"GRANT USAGE ON SCHEMA robata_canonical TO {role_name}")
         administrator.execute(
-            f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
-            f"IN SCHEMA robata_canonical TO {role_name}"
+            f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA robata_canonical TO {role_name}"
         )
     finally:
         administrator.close()
@@ -98,16 +101,112 @@ def _authority(factory: ConnectionFactory, tenant_id: str) -> PostgresCanonicalA
     )
 
 
+def _r2_observation_kinds(
+    authority: PostgresCanonicalAuthority,
+    artifact_id: str,
+) -> tuple[str, ...]:
+    def operation(connection: PostgresConnection) -> tuple[str, ...]:
+        rows = connection.execute(
+            """
+            SELECT observation_kind
+            FROM raw_provider_r2_artifact_observations
+            WHERE artifact_id = %s
+            ORDER BY observed_at, observation_id
+            """,
+            (artifact_id,),
+        ).fetchall()
+        return tuple(str(row["observation_kind"]) for row in rows)
+
+    return authority.run_authority_transaction(
+        write=False,
+        operation_name="test.r2_observation_kinds",
+        operation=operation,
+    )
+
+
+def test_postgres_r2_receipts_cannot_begin_committed(
+    postgres_runtime_factory: ConnectionFactory,
+) -> None:
+    tenant_id = f"postgres-r2-receipt-{uuid4().hex}"
+    authority = _authority(postgres_runtime_factory, tenant_id)
+    ledger = PostgresInferenceEvidenceLedger(authority, SchemaRegistry())
+    _fixture, intent, raw_data = _intent()
+    assert ledger.append_intent(intent) == intent
+
+    artifact_id = str(uuid4())
+    provider_request_id = f"postgres-r2-receipt:{uuid4()}"
+    raw_digest = exact_bytes_sha256(raw_data)
+
+    def insert_initially_committed(connection: PostgresConnection) -> None:
+        connection.execute(
+            """
+            INSERT INTO raw_provider_r2_artifact_receipts (
+                artifact_id, inference_id, request_id, provider_request_id,
+                exact_bytes_sha256, byte_count, media_type, payload_bytes,
+                logical_key, object_uri, object_version, r2_config_sha256,
+                state, committed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, 'application/json', %s,
+                %s, %s, %s, %s, 'COMMITTED', CURRENT_TIMESTAMP
+            )
+            """,
+            (
+                artifact_id,
+                intent.inference_id,
+                intent.request_id,
+                provider_request_id,
+                raw_digest,
+                len(raw_data),
+                raw_data,
+                f"raw-provider-responses/receipt-test/{artifact_id}",
+                (
+                    "r2://robata-test/raw-provider-responses/receipt-test/"
+                    f"{artifact_id}/.robata-versions/raw-v1-{raw_digest}"
+                ),
+                f"raw-v1-{raw_digest}",
+                "0" * 64,
+            ),
+        )
+
+    with pytest.raises(Exception, match="raw provider R2 artifact receipts must begin staged"):
+        authority.run_authority_transaction(
+            write=True,
+            operation_name="test.r2_receipt_initially_committed",
+            operation=insert_initially_committed,
+        )
+
+
 def test_postgres_completion_outbox_evidence_and_barrier_happy_paths(
     postgres_runtime_factory: ConnectionFactory,
     tmp_path: Path,
 ) -> None:
-    authority = _authority(postgres_runtime_factory, f"postgres-integration-{uuid4().hex}")
+    tenant_id = f"postgres-integration-{uuid4().hex}"
+    authority = _authority(postgres_runtime_factory, tenant_id)
     verify_completion_evidence_schema(authority)
+    r2_client = _S3Double()
+    r2_object_store = R2ObjectStore(
+        R2ObjectStoreConfig(
+            endpoint_url="https://account-id.r2.cloudflarestorage.com",
+            bucket="robata-test",
+            prefix="canonical-evidence",
+        ),
+        r2_client,
+    )
+    artifact_authority = PostgresR2ArtifactAuthority(
+        authority,
+        r2_object_store,
+        tenant_id=tenant_id,
+    )
+    artifact_authority.verify_startup()
 
-    ledger = PostgresInferenceEvidenceLedger(authority, SchemaRegistry())
+    ledger = PostgresInferenceEvidenceLedger(
+        authority,
+        SchemaRegistry(),
+        artifact_authority=artifact_authority,
+    )
     fixture, intent, raw_data = _intent()
     assert ledger.append_intent(intent) == intent
+    r2_client.fail_after_write_once = True
     stored_raw = ledger.append(
         request_id=intent.request_id,
         provider_request_id="postgres-integration-provider",
@@ -130,6 +229,9 @@ def test_postgres_completion_outbox_evidence_and_barrier_happy_paths(
         evidence.enriched,
     ) == (evidence.parsed, evidence.selected, evidence.enriched)
     ledger.verify_completion_seal()
+    assert r2_client.put_count == 1
+    assert _r2_observation_kinds(authority, stored_raw.artifact_id) == ("PUT_VERIFIED",)
+    assert ledger.get(stored_raw.artifact_id) == stored_raw
     assert ledger.get_enriched_output(evidence.enriched.artifact_id) == evidence.enriched
 
     barrier_storage = PostgresBarrierStorage(authority)
