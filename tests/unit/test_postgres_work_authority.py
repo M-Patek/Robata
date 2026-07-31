@@ -31,6 +31,7 @@ from robata.queue.models import (
     WorkItemSubjectType,
 )
 from robata.queue.stage import DependencyCriticality, Stage
+from robata.runtime.observability import RuntimeProfileRecorder
 
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 _RUN_ID = "00000000-0000-4000-8000-000000000001"
@@ -428,6 +429,60 @@ def test_postgres_authority_rejects_nested_provider_work(
         operation_name="test.nested",
         operation=operation,
     )
+
+
+def test_postgres_authority_observes_transactions_and_retries_without_operation_ids() -> None:
+    harness = _PostgresSqliteHarness()
+    recorder = RuntimeProfileRecorder()
+    authority = PostgresCanonicalAuthority(
+        lambda: harness,
+        serialization_retries=1,
+        runtime_observer=recorder,
+    )
+    calls = 0
+
+    class _SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    def operation(_connection: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _SerializationFailure()
+        return "committed"
+
+    assert (
+        authority.run_authority_transaction(
+            write=True,
+            operation_name="sensitive.operation.name",
+            operation=operation,
+        )
+        == "committed"
+    )
+
+    snapshot = recorder.snapshot()
+
+    assert "sensitive.operation.name" not in snapshot.model_dump_json()
+    assert calls == 2
+    assert len(snapshot.spans) == 1
+    assert snapshot.spans[0].name == "postgres.authority.transaction"
+    assert [(item.name, item.value) for item in snapshot.spans[0].attributes] == [
+        ("operation_family", "OTHER"),
+        ("write", True),
+    ]
+    assert {
+        (counter.name, tuple((item.name, item.value) for item in counter.attributes)): counter.value
+        for counter in snapshot.counters
+    } == {
+        (
+            "postgres.authority.transaction_attempts",
+            (("operation_family", "OTHER"), ("write", True)),
+        ): 2,
+        (
+            "postgres.authority.transaction_retries",
+            (("operation_family", "OTHER"), ("write", True)),
+        ): 1,
+    }
 
 
 def test_p22_migration_is_transaction_runner_compatible() -> None:

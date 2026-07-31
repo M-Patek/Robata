@@ -9,9 +9,9 @@ making the production boundary testable with an S3-compatible double.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from importlib import import_module
-from typing import Annotated, Protocol, Self, cast
+from typing import Annotated, Literal, Protocol, Self, cast
 from urllib.parse import quote, unquote, urlsplit
 
 from pydantic import StringConstraints, model_validator
@@ -28,10 +28,12 @@ from robata.contracts.object_storage import (
     ObjectVisibility,
 )
 from robata.ports.object_storage import ObjectStoreError, ObjectStoreErrorCode
+from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]
 
 _METADATA_SHA256 = "robata-sha256"
+_R2Operation = Literal["put", "head", "get", "delete"]
 _METADATA_BYTE_COUNT = "robata-byte-count"
 _METADATA_MEDIA_TYPE = "robata-media-type"
 _METADATA_OBJECT_VERSION = "robata-object-version"
@@ -172,7 +174,13 @@ class R2ObjectStore:
     This is intentionally stronger than assuming a filesystem-style atomic rename.
     """
 
-    def __init__(self, config: R2ObjectStoreConfig, client: R2S3Client) -> None:
+    def __init__(
+        self,
+        config: R2ObjectStoreConfig,
+        client: R2S3Client,
+        *,
+        runtime_observer: RuntimeObserver | None = None,
+    ) -> None:
         if not isinstance(config, R2ObjectStoreConfig):
             raise TypeError("config must be R2ObjectStoreConfig")
         required_methods: tuple[str, ...] = ("put_object", "head_object", "get_object")
@@ -183,6 +191,7 @@ class R2ObjectStore:
                 raise TypeError("client must provide the required S3 object methods")
         self._config = config
         self._client = client
+        self._runtime_observer = runtime_observer
 
     @property
     def config(self) -> R2ObjectStoreConfig:
@@ -206,7 +215,9 @@ class R2ObjectStore:
                 "R2 object key/version exists without complete Robata integrity metadata",
             )
         try:
-            self._client.put_object(
+            self._client_call(
+                "put",
+                self._client.put_object,
                 Bucket=self._config.bucket,
                 Key=self._physical_key(request.key, version),
                 Body=request.payload,
@@ -244,7 +255,12 @@ class R2ObjectStore:
         require_outside_postgres_authority_transaction(activity="R2 HEAD")
         key = self._key_from_locator(locator)
         try:
-            response = self._client.head_object(Bucket=self._config.bucket, Key=key)
+            response = self._client_call(
+                "head",
+                self._client.head_object,
+                Bucket=self._config.bucket,
+                Key=key,
+            )
         except Exception as error:
             mapped = self._map_error(error)
             if mapped.code is ObjectStoreErrorCode.NOT_FOUND:
@@ -291,7 +307,7 @@ class R2ObjectStore:
         if byte_range is not None:
             arguments["Range"] = f"bytes={byte_range.start}-{byte_range.end - 1}"
         try:
-            response = self._client.get_object(**arguments)
+            response = self._client_call("get", self._client.get_object, **arguments)
         except Exception as error:
             raise self._map_error(error) from error
         payload = _read_response_body(response)
@@ -324,8 +340,11 @@ class R2ObjectStore:
         if self.head(locator).visibility is ObjectVisibility.MISSING:
             raise ObjectStoreError(ObjectStoreErrorCode.NOT_FOUND, "R2 object is missing")
         try:
-            self._client.delete_object(
-                Bucket=self._config.bucket, Key=self._key_from_locator(locator)
+            self._client_call(
+                "delete",
+                self._client.delete_object,
+                Bucket=self._config.bucket,
+                Key=self._key_from_locator(locator),
             )
         except Exception as error:
             raise self._map_error(error) from error
@@ -336,6 +355,27 @@ class R2ObjectStore:
         if head.visibility is ObjectVisibility.VISIBLE:
             self.get(locator)
         return head
+
+    def _client_call(
+        self,
+        operation: _R2Operation,
+        call: Callable[..., Mapping[str, object]],
+        **arguments: object,
+    ) -> Mapping[str, object]:
+        """Call one provider operation while recording only low-cardinality telemetry."""
+
+        attributes = {"operation": operation}
+        runtime_increment(
+            self._runtime_observer,
+            "r2.object_store.requests",
+            attributes=attributes,
+        )
+        with runtime_span(
+            self._runtime_observer,
+            "r2.object_store.request",
+            attributes,
+        ):
+            return call(**arguments)
 
     def locator_for(self, logical_key: str, object_version: str) -> ObjectLocator:
         """Derive a deterministic locator without contacting the provider."""

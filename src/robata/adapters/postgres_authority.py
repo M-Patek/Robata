@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
+from robata.runtime.observability import RuntimeObserver, runtime_increment, runtime_span
+
 Row = Mapping[str, object]
 T = TypeVar("T")
 
@@ -96,6 +98,7 @@ class PostgresCanonicalAuthority:
         tenant_setting: str | None = None,
         tenant_id: str | None = None,
         serialization_retries: int = 3,
+        runtime_observer: RuntimeObserver | None = None,
     ) -> None:
         if not callable(connection_factory):
             raise TypeError("connection_factory must be callable")
@@ -116,6 +119,7 @@ class PostgresCanonicalAuthority:
         self._tenant_setting = tenant_setting
         self._tenant_id = tenant_id
         self._serialization_retries = serialization_retries
+        self._runtime_observer = runtime_observer
 
     @property
     def schema(self) -> str:
@@ -154,8 +158,34 @@ class PostgresCanonicalAuthority:
                 f"{checked_name} inside {active}"
             )
 
+        runtime_attributes = _runtime_operation_attributes(checked_name, write=write)
+        with runtime_span(
+            self._runtime_observer,
+            "postgres.authority.transaction",
+            runtime_attributes,
+        ):
+            return self._run_authority_transaction(
+                write=write,
+                checked_name=checked_name,
+                operation=operation,
+                runtime_attributes=runtime_attributes,
+            )
+
+    def _run_authority_transaction(
+        self,
+        *,
+        write: bool,
+        checked_name: str,
+        operation: Callable[[PostgresConnection], T],
+        runtime_attributes: Mapping[str, str | bool],
+    ) -> T:
         attempt = 0
         while True:
+            runtime_increment(
+                self._runtime_observer,
+                "postgres.authority.transaction_attempts",
+                attributes=runtime_attributes,
+            )
             connection: PostgresConnection | None = None
             token = _ACTIVE_AUTHORITY_TRANSACTION.set(checked_name)
             try:
@@ -182,6 +212,11 @@ class PostgresCanonicalAuthority:
                     _is_retryable_serialization_failure(error)
                     and attempt < self._serialization_retries
                 ):
+                    runtime_increment(
+                        self._runtime_observer,
+                        "postgres.authority.transaction_retries",
+                        attributes=runtime_attributes,
+                    )
                     attempt += 1
                     continue
                 if isinstance(
@@ -307,6 +342,30 @@ def postgres_sqlstate(error: BaseException) -> str | None:
 
     sqlstate = getattr(error, "sqlstate", None)
     return sqlstate if isinstance(sqlstate, str) else None
+
+
+def _runtime_operation_attributes(
+    operation_name: str,
+    *,
+    write: bool,
+) -> dict[str, str | bool]:
+    """Return a fixed taxonomy without exporting caller-controlled operation names."""
+
+    if operation_name == "verify_startup" or operation_name.endswith(".verify_startup"):
+        family = "ORCHESTRATION"
+    elif operation_name.startswith("capture_authority."):
+        family = "SOURCE"
+    elif operation_name.startswith(("work_scheduler.", "stream_work.", "barrier.")):
+        family = "SCHEDULING"
+    elif operation_name.startswith(("inference_evidence.", "r2_artifacts.")):
+        family = "EVIDENCE"
+    elif operation_name.startswith(
+        ("primary_completion.", "outbox_delivery.", "logical_nodes.", "review.")
+    ):
+        family = "PUBLICATION"
+    else:
+        family = "OTHER"
+    return {"operation_family": family, "write": write}
 
 
 def _is_retryable_serialization_failure(error: BaseException) -> bool:

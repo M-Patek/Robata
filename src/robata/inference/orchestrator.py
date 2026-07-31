@@ -843,6 +843,22 @@ class InferenceOrchestrator:
         return self._ledger
 
     @property
+    def execution_gate(self) -> InferenceExecutionGate:
+        """Return the gate owned by this orchestrator's execution scope."""
+
+        return self._execution_gate
+
+    def policy_for(self, task: VisionTask) -> InferencePolicy:
+        """Return the configured policy for a task without dispatching work."""
+
+        return self._policy(task)
+
+    def adapter_for(self, task: VisionTask) -> VisionModelAdapter:
+        """Return the adapter selected for a task without dispatching work."""
+
+        return self._adapter(self._policy(task))
+
+    @property
     def intents(self) -> tuple[InferenceIntent, ...]:
         if not isinstance(self._ledger, InMemoryInferenceLedger):
             raise InferenceLedgerError("configured ledger does not expose in-memory snapshots")
