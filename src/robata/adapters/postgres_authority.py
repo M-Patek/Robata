@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
 Row = Mapping[str, object]
@@ -258,12 +259,18 @@ def psycopg_connection_factory(
 
     def factory() -> PostgresConnection:
         try:
-            from psycopg import connect
-            from psycopg.rows import dict_row
+            psycopg_module = import_module("psycopg")
+            psycopg_rows_module = import_module("psycopg.rows")
         except ImportError as error:
             raise PostgresAuthorityConfigurationError(
                 "Psycopg is required for PostgreSQL canonical authority; install robata[pgvector]"
             ) from error
+        connect = getattr(psycopg_module, "connect", None)
+        dict_row = getattr(psycopg_rows_module, "dict_row", None)
+        if not callable(connect) or dict_row is None:
+            raise PostgresAuthorityConfigurationError(
+                "Psycopg does not expose the required connect/dict_row API"
+            )
         return cast(
             PostgresConnection,
             connect(
