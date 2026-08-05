@@ -54,3 +54,6 @@ tmp/
 .tmp-*/
 .pytest-basetemp-*/
 .repo-link/
+
+# Local real-model qualification state and model caches
+/.local/
