@@ -9,6 +9,7 @@ from hashlib import md5
 
 import pytest
 
+import robata.adapters.r2_object_store as r2_object_store_module
 from robata.adapters.postgres_authority import (
     PostgresAuthorityConfigurationError,
     PostgresCanonicalAuthority,
@@ -18,6 +19,7 @@ from robata.adapters.r2_object_store import (
     R2ObjectStore,
     R2ObjectStoreConfig,
     create_boto3_r2_client,
+    create_r2_object_store_from_environment,
 )
 from robata.contracts.hashing import exact_bytes_sha256
 from robata.contracts.object_storage import ObjectByteRange, ObjectPutRequest, ObjectVisibility
@@ -390,6 +392,39 @@ def test_config_and_credentials_require_explicit_non_secret_environment_values()
         R2ObjectStoreConfig.from_environment({"R2_ACCOUNT_ID": "account-id"})
     with pytest.raises(ValueError, match="R2_ACCESS_KEY_ID"):
         R2Credentials.from_environment({"R2_SECRET_ACCESS_KEY": "super-secret"})
+
+
+def test_environment_factory_attaches_runtime_observer_and_keeps_default_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = RuntimeProfileRecorder()
+    client = _S3Double()
+
+    def fake_client_factory(config: R2ObjectStoreConfig, credentials: R2Credentials) -> _S3Double:
+        assert config.bucket == "robata-production"
+        assert credentials.access_key_id == "access"
+        return client
+
+    monkeypatch.setattr(r2_object_store_module, "create_boto3_r2_client", fake_client_factory)
+    environment = {
+        "R2_ACCOUNT_ID": "account-id",
+        "R2_BUCKET": "robata-production",
+        "R2_ACCESS_KEY_ID": "access",
+        "R2_SECRET_ACCESS_KEY": "super-secret",
+    }
+
+    observed_store = create_r2_object_store_from_environment(
+        environment,
+        runtime_observer=recorder,
+    )
+    receipt = observed_store.put(_request())
+    assert receipt.visibility is ObjectVisibility.VISIBLE
+    assert any(span.name == "r2.object_store.request" for span in recorder.snapshot().spans)
+
+    # The existing no-observer call shape remains valid for callers that do not
+    # need runtime profiling.
+    unobserved_store = create_r2_object_store_from_environment(environment)
+    assert unobserved_store.head(receipt.locator).visibility is ObjectVisibility.VISIBLE
 
 
 def test_locator_cannot_escape_configured_bucket_or_prefix() -> None:

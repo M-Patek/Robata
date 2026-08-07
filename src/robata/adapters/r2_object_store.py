@@ -574,12 +574,18 @@ def create_boto3_r2_client(config: R2ObjectStoreConfig, credentials: R2Credentia
     )
 
 
-def create_r2_object_store_from_environment(environment: Mapping[str, str]) -> R2ObjectStore:
+def create_r2_object_store_from_environment(
+    environment: Mapping[str, str],
+    *,
+    runtime_observer: RuntimeObserver | None = None,
+) -> R2ObjectStore:
     """Build the optional real adapter from an explicit, caller-owned environment map."""
 
     config = R2ObjectStoreConfig.from_environment(environment)
     return R2ObjectStore(
-        config, create_boto3_r2_client(config, R2Credentials.from_environment(environment))
+        config,
+        create_boto3_r2_client(config, R2Credentials.from_environment(environment)),
+        runtime_observer=runtime_observer,
     )
 
 

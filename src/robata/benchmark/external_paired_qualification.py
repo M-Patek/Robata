@@ -22,7 +22,7 @@ from typing import Annotated, Literal, cast
 from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from robata.adapters.sqlite_inference_evidence import SQLiteInferenceEvidenceLedger
-from robata.contracts.common import SchemaVersion, Sha256Digest, StrictModel
+from robata.contracts.common import Nanoseconds, SchemaVersion, Sha256Digest, StrictModel
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.contracts.logical_nodes import OpaqueUuid
 from robata.contracts.schema_registry import SchemaRef, SchemaRegistry
@@ -143,8 +143,8 @@ class ExternalPairedWorkloadManifest(StrictModel):
     mcap_id: OpaqueUuid
     camera_mapping_run_id: OpaqueUuid
     alignment_id: OpaqueUuid
-    start_ns: int
-    end_ns: int
+    start_ns: Nanoseconds
+    end_ns: Nanoseconds
     package_inputs: tuple[PackageInput, ...]
     input_config: dict[str, object] = Field(default_factory=dict)
     sampling_config: dict[str, object] = Field(default_factory=dict)

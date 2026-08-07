@@ -101,6 +101,14 @@ of work. A `NOT_MEASURED` stage has no span count or timing value. The same
 rule applies to quality-funnel steps, provider-cost inputs, handler telemetry,
 and billed cost. Do not calculate averages, totals, or quality loss from it.
 
+The non-canonical participation sidecar persists `excluded_boundaries` and
+`measured_boundaries` as derived lists. They are calculated from the declared
+boundary state and observed stage measurement, then checked again during strict
+JSON round-trip validation; consumers must reject a sidecar whose summaries do
+not agree with its boundary observations. `measured_boundaries` identifies
+stage-level classified spans only—it does not prove that every adapter inside a
+stage participated.
+
 The current P20 trace measures dispatch, terminal, provider-success,
 schema-valid, and pair-comparable funnel counts. Ground-truth quality remains
 `NOT_MEASURED`. Provider token/image/frame usage or cost is only an input

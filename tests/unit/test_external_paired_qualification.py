@@ -181,8 +181,8 @@ def _source() -> tuple[object, tuple[RenderedProviderItem, ...], tuple[PackageIn
                 CatalogFrame(
                     frame_id=_uuid(100 + ordinal),
                     ordinal=0,
-                    aligned_timestamp_ns=1_000_000 + ordinal,
-                    source_timestamp_ns=2_000_000 + ordinal,
+                    aligned_timestamp_ns=1_781_051_907_271_600_000 + ordinal,
+                    source_timestamp_ns=1_781_051_907_271_700_000 + ordinal,
                     source_artifact_uri=f"object://p20-source/{ordinal}.png",
                     source_artifact_sha256=_digest(200 + ordinal),
                     source_artifact_bytes=128,
@@ -370,8 +370,8 @@ def _fixture_files(tmp_path: Path) -> _FixtureFiles:
         mcap_id=_uuid(71),
         camera_mapping_run_id=_uuid(72),
         alignment_id=_uuid(73),
-        start_ns=100,
-        end_ns=200,
+        start_ns=1_781_051_907_271_600_000,
+        end_ns=1_781_051_907_272_600_000,
         package_inputs=package_inputs,
         input_config={"fixture": "p20-external-paired"},
         sampling_config={"policy": "p20-paired"},
@@ -497,6 +497,9 @@ def test_external_paired_launcher_replays_recorded_endpoints_without_promotion(
     rendered = output.read_text(encoding="utf-8")
     assert "runpod-test-secret-000000000000" not in rendered
     assert '"production_eligible":false' in rendered
+    workload_document = json.loads(files.workload.read_text(encoding="utf-8"))
+    assert workload_document["start_ns"] == "1781051907271600000"
+    assert workload_document["end_ns"] == "1781051907272600000"
 
     durable_report = _run(
         files,

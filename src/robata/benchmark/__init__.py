@@ -199,12 +199,18 @@ __all__ = [
     "DataSplitResult",
     "DataSplitter",
     "DenseSamplingExperiment",
+    "DeploymentRunManifest",
     "EventMetrics",
     "EventProposalExperiment",
     "EvidenceBoundMetrics",
     "EvidenceContextIdentity",
+    "ExecutionPlacementEvidence",
     "ExperimentMatrix",
+    "ExternalArtifactReference",
     "ExternalQualificationGateEvidence",
+    "FairLoadDeploymentEvidence",
+    "FairLoadModelComparisonReport",
+    "FairLoadQualificationStatus",
     "GateCategory",
     "GateResult",
     "GovernedQualityQualificationEvidence",
@@ -226,6 +232,8 @@ __all__ = [
     "MediaQualificationReport",
     "MediaSourceProfile",
     "MetricsCalculator",
+    "ModelCostEvidence",
+    "ModelQualityEvidence",
     "P15ExternalGateEvidence",
     "P15ExternalGateId",
     "P15ExternalGateStatus",
@@ -280,6 +288,7 @@ __all__ = [
     "RetrievalProfile",
     "RetrievalQualificationProfile",
     "RetrievalRecallProfile",
+    "SaturationOutcomeSummary",
     "ShadowComparisonExperiment",
     "SplitConfig",
     "SplitMetadataError",
@@ -326,6 +335,21 @@ __all__ = [
     "run_provider_saturation_point",
     "verify_local_p15_qualification_package_artifacts",
 ]
+
+_MODEL_COMPARISON_EXPORTS = frozenset(
+    {
+        "DeploymentRunManifest",
+        "ExecutionPlacementEvidence",
+        "ExternalArtifactReference",
+        "FairLoadDeploymentEvidence",
+        "FairLoadModelComparisonReport",
+        "FairLoadQualificationStatus",
+        "ModelCostEvidence",
+        "ModelQualityEvidence",
+        "SaturationOutcomeSummary",
+    }
+)
+
 
 _PROVIDER_QUALIFICATION_EXPORTS = frozenset(
     {
@@ -374,6 +398,8 @@ def __getattr__(name: str) -> object:
 
     if name in _PROVIDER_QUALIFICATION_EXPORTS:
         return getattr(import_module(".provider_qualification", __name__), name)
+    if name in _MODEL_COMPARISON_EXPORTS:
+        return getattr(import_module(".model_comparison", __name__), name)
     if name in _QUALIFICATION_EXPORTS:
         return getattr(import_module(".qualification", __name__), name)
     raise AttributeError(name)
