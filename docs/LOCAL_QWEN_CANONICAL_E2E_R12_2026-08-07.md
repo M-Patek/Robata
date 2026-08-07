@@ -271,14 +271,14 @@ publication/outbox/finalization：未闭合
 最终状态：INCOMPLETE / RUN_NOT_COMPLETABLE
 ```
 
-本报告只描述隔离 worktree 的本地运行；未触碰主 worktree 的 `/web`，本轮尚未提交或推送。
-## 11. 静态检查与测试
+本报告只描述隔离 worktree 的本地运行；未触碰主 worktree 的 `/web`。实现已分批提交并推送到 `codex/local-qwen-production-e2e-20260806`，draft PR 为 `#4`，不会自动合并。
+## 12. 静态检查与测试
 
-- 聚焦回归（本轮全套 canonical/Qwen 相关测试）：`108 passed in 367.53s`；mypy 修复后的 endpoint/adapter/real-model/binding/report 子集再次 `55 passed in 82.02s`。
+- 聚焦回归（本轮全套 canonical/Qwen 相关测试）：`108 passed in 367.53s`；mypy 修复后的 endpoint/adapter/real-model/binding/report 子集再次 `55 passed in 82.02s`；locked uv CI 环境中的 endpoint + binding 测试为 `19 passed in 34.50s`。
 - 全量回归：`1876 passed, 20 skipped in 1999.86s`；仅 pytest-asyncio fixture loop-scope deprecation warning。
 - Ruff check：20 个本轮 Python 文件全部通过。
 - Ruff format check：20 个文件均已格式化。
 - `py_compile`：使用临时 `PYTHONPYCACHEPREFIX` 后通过。
 - `git diff --check`：通过；仅 CRLF→LF 常规提示。
-- 全量 `mypy src/robata` 输出中已不再出现 `local_hf_endpoint.py` 的本轮新增 4 个错误；endpoint 在跟随完整依赖时不再贡献错误。使用 `--follow-imports=skip` 的孤立检查仍会因可选/跳过依赖被视为 `Any`，这不是运行时失败。
-- 全量 `mypy src/robata`：仍有 27 个跨模块/既有错误，集中在 `runtime/capacity.py`、`inference/orchestrator.py`（缺 `types-jsonschema`）、`storage/models.py` 和 `runtime/canonical_profile.py`；这不是本轮 Qwen endpoint 运行失败，但若 CI 将 full mypy 设为 required check，需要另行修复或补齐 stub 依赖。
+- FastAPI health route 已改为显式注册，消除不同 mypy 版本对动态 decorator 的 `misc` / `untyped-decorator` 分歧。
+- Locked CI 环境执行 `uv sync --locked --dev` 后，`uv run mypy` 为 `Success: no issues found in 278 source files`。全局 Anaconda 环境直接运行 mypy 会因缺少 locked stubs/optional dependency typing 产生环境差异，仓库和 CI 判定以 `uv.lock` 环境为准。
