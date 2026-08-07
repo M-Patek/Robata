@@ -44,6 +44,7 @@ dev = [
   "mcap-protobuf-support>=0.5,<1",
   "mypy>=1.14,<2",
   "pytest>=8.3,<10",
+  "pytest-asyncio>=0.24,<2",
   "pytest-cov>=6,<8",
   "ruff>=0.9,<1",
   "types-jsonschema>=4.23,<5",
@@ -59,6 +60,7 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
   "acceptance: exercises optional dependencies and local real-data samples",
+  "asyncio: runs a test coroutine under the pytest-asyncio event loop",
 ]
 
 [tool.ruff]

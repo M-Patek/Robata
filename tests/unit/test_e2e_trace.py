@@ -105,3 +105,27 @@ def test_postgres_operation_family_is_attributed_without_raw_operation_name() ->
     assert scheduling.measurement_status is E2ETraceMeasurementStatus.MEASURED
     assert scheduling.observed_span_count == 1
     assert unclassified == 0
+
+
+def test_local_canonical_operation_names_are_classified_by_semantic_stage() -> None:
+    recorder = RuntimeProfileRecorder(resource_sampler=_resource_sample)
+    names = (
+        "canonical.composition",
+        "sqlite.work_scheduler.transaction",
+        "sqlite.barrier.transaction",
+        "sqlite.inference_evidence.transaction",
+        "completion.storage.open",
+        "completion.run.begin",
+    )
+    for name in names:
+        with runtime_span(recorder, name):
+            pass
+
+    summaries, unclassified = summarize_e2e_trace_stages(recorder.snapshot())
+    by_stage = {item.stage: item for item in summaries}
+
+    assert by_stage[E2ETraceStage.ORCHESTRATION].observed_span_count == 2
+    assert by_stage[E2ETraceStage.SCHEDULING].observed_span_count == 2
+    assert by_stage[E2ETraceStage.EVIDENCE].observed_span_count == 1
+    assert by_stage[E2ETraceStage.PUBLICATION].observed_span_count == 1
+    assert unclassified == 0

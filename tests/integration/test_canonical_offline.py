@@ -17,6 +17,10 @@ from robata.adapters.local_logical_node_registry import LocalLogicalNodeRegistry
 from robata.adapters.sqlite_barrier import SQLiteBarrierStorage
 from robata.adapters.sqlite_inference_evidence import SQLiteInferenceEvidenceLedger
 from robata.admission.context import AdmittedRecordingContextV2
+from robata.application.canonical.models import (
+    CanonicalCandidateDenseWindow,
+    CanonicalRootWindow,
+)
 from robata.application.canonical.output_admission import (
     CANONICAL_FINAL_FUSION_CONTEXT_METADATA_KEY,
     CanonicalFinalFusionContext,
@@ -36,6 +40,10 @@ from robata.application.canonical_offline import (
     canonical_output_decision_projection,
 )
 from robata.application.canonical_run_membership import CanonicalProcessingRunContext
+from robata.contracts.admission_v2 import (
+    alignment_manifest_v2_semantic_projection,
+    mcap_ready_manifest_v2_semantic_projection,
+)
 from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.common import NanosecondInterval
 from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
@@ -46,9 +54,11 @@ from robata.contracts.schema_registry import SchemaRegistry
 from robata.contracts.temporal import PackageLineage
 from robata.event_pipeline.candidate import (
     CANDIDATE_EVENT_LOGICAL_KEY_NAMESPACE,
+    CANDIDATE_EVENT_UUID_DERIVATION_NAMESPACE,
     CANDIDATE_REDUCTION_LOGICAL_KEY_NAMESPACE,
     CandidateReductionResult,
     CanonicalCandidateEvent,
+    candidate_event_semantic_sha256,
 )
 from robata.event_pipeline.identity_registry import (
     AdmissionEvidenceClass,
@@ -3508,3 +3518,100 @@ def test_runner_isolates_detached_calibration_ledger_failures(
         "task": VisionTask.QA_COARSE.value,
     }
     _assert_offline(observed, failing_harness)
+
+
+def test_candidate_dense_window_clips_to_parent_interval_when_recording_continues(
+    tmp_path: Path,
+) -> None:
+    """Candidate padding must not request frames outside the admitted root window."""
+
+    harness = _harness(_claim_bytes, logical_registry_root=tmp_path)
+    result = _run(harness)
+    assert result.candidate_reduction_result is not None
+    source_candidate = result.candidate_reduction_result.candidates[0]
+
+    context = harness.context
+    recording = context.ready_manifest.recording.model_copy(
+        update={
+            "duration_ns": 5_000_000_000,
+            "end_utc": "2026-07-19T09:00:05Z",
+        }
+    )
+    ready_unbound = context.ready_manifest.model_copy(update={"recording": recording})
+    ready_digest = semantic_sha256(mcap_ready_manifest_v2_semantic_projection(ready_unbound))
+    ready = ready_unbound.model_copy(update={"ready_manifest_semantic_sha256": ready_digest})
+
+    alignment_unbound = context.alignment_manifest.model_copy(
+        update={"ready_manifest_semantic_sha256": ready_digest}
+    )
+    alignment_digest = semantic_sha256(alignment_manifest_v2_semantic_projection(alignment_unbound))
+    alignment = alignment_unbound.model_copy(update={"alignment_semantic_sha256": alignment_digest})
+    evaluation = context.evaluation.model_copy(
+        update={
+            "ready_manifest_semantic_sha256": ready_digest,
+            "alignment_semantic_sha256": alignment_digest,
+        }
+    )
+    context_values = context.model_dump(mode="python")
+    context_values.update(
+        {
+            "ready_manifest": ready,
+            "ready_manifest_semantic_sha256": ready_digest,
+            "alignment_manifest": alignment,
+            "alignment_semantic_sha256": alignment_digest,
+            "evaluation": evaluation,
+            "semantic_sha256": semantic_sha256(
+                {
+                    "recording_identity": context.recording_identity,
+                    "source_content_sha256": context.source_content_sha256,
+                    "validation_report_semantic_sha256": (
+                        context.validation_report.validation_report_semantic_sha256
+                    ),
+                    "ready_manifest_semantic_sha256": ready_digest,
+                    "camera_mapping_semantic_sha256": context.camera_mapping_semantic_sha256,
+                    "alignment_semantic_sha256": alignment_digest,
+                    "alignment_outcome": context.evaluation.alignment_outcome.value,
+                    "policy_sha256": context.policy.semantic_sha256,
+                }
+            ),
+        }
+    )
+    longer_context = AdmittedRecordingContextV2.model_validate(context_values, strict=True)
+
+    candidate_unbound = source_candidate.model_copy(
+        update={"alignment_semantic_sha256": alignment_digest}
+    )
+    candidate_digest = candidate_event_semantic_sha256(candidate_unbound)
+    candidate = candidate_unbound.model_copy(
+        update={
+            "candidate_logical_key": f"{CANDIDATE_EVENT_LOGICAL_KEY_NAMESPACE}:{candidate_digest}",
+            "candidate_event_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"{CANDIDATE_EVENT_UUID_DERIVATION_NAMESPACE}:{candidate_digest}",
+                )
+            ),
+        }
+    )
+    parent = CanonicalRootWindow.from_context(
+        context=longer_context,
+        requested_interval=REQUESTED_INTERVAL,
+        purpose=SamplingPurpose.QA_COARSE,
+        window_policy_version=harness.execution_policy.window_policy_version,
+        created_at=NOW_TEXT,
+    )
+
+    child = CanonicalCandidateDenseWindow.from_context(
+        context=longer_context,
+        candidate=candidate,
+        parent_window=parent,
+        window_policy_version="candidate-dense-regression-v1",
+        created_at=NOW_TEXT,
+    )
+
+    assert child.requested_interval == NanosecondInterval(
+        start_ns=-300_000_000,
+        end_ns=1_300_000_000,
+    )
+    assert child.interval == REQUESTED_INTERVAL
+    assert child.context_truncated is True

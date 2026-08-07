@@ -707,8 +707,54 @@ class LayeredMediaCache:
 
         return self.reconcile(**kwargs)  # type: ignore[arg-type]
 
+    def _cheap_capacity_summary(self) -> tuple[int, int, bool]:
+        """Return metadata bounds before falling back to a full integrity scan.
+
+        Entry metadata provides a conservative byte bound because shared blobs may be
+        counted more than once. If the bound is within both limits and every referenced
+        blob has the expected size, capacity cannot be exceeded and a SHA-256 walk is
+        unnecessary. Any malformed/missing/size-mismatched entry forces the existing
+        full scan; integrity cleanup remains available at startup or explicit reconciliation.
+        """
+
+        entry_count = 0
+        metadata_bytes = 0
+        for layer in _LAYERED_MEDIA_LAYERS:
+            directory = self._layer_directory(layer)
+            try:
+                paths = directory.iterdir()
+            except OSError:
+                return 0, 0, True
+            for path in paths:
+                if not path.name.endswith(_LAYERED_MEDIA_ENTRY_SUFFIX):
+                    continue
+                cache_key = path.name[: -len(_LAYERED_MEDIA_ENTRY_SUFFIX)]
+                try:
+                    _validate_layered_media_key(cache_key)
+                    entry = self._read_entry(layer, cache_key)
+                    if entry is None:
+                        return 0, 0, True
+                    blob_path = self._blob_path(entry.content_sha256)
+                    blob_stat = blob_path.lstat()
+                    if blob_path.is_symlink() or not stat.S_ISREG(blob_stat.st_mode):
+                        return 0, 0, True
+                except (OSError, ValueError, _LayeredMediaCacheCorruption):
+                    return 0, 0, True
+                if blob_stat.st_size != entry.size_bytes:
+                    return 0, 0, True
+                entry_count += 1
+                metadata_bytes += entry.size_bytes
+        return entry_count, metadata_bytes, False
+
     @_with_layered_media_root_lock
     def _enforce_capacity(self) -> None:
+        entry_count, metadata_bytes, requires_full_scan = self._cheap_capacity_summary()
+        if (
+            not requires_full_scan
+            and entry_count <= self.max_entries
+            and metadata_bytes <= self.max_bytes
+        ):
+            return
         scan = self._scan_storage()
         cleanup = self._cleanup_paths(
             scan,
@@ -1006,11 +1052,12 @@ class LayeredMediaCache:
         return touched
 
     def _next_access_sequence(self) -> int:
-        visible_sequence = max(
-            (entry.access_sequence for entry in self._scan_storage().entries.values()),
-            default=0,
-        )
-        self._access_sequence = max(self._access_sequence, visible_sequence)
+        """Advance local cache LRU metadata without rescanning blobs.
+
+        Startup/capacity/reconciliation retain full integrity scans; subsequent
+        touches are noncanonical local metadata and can advance in memory.
+        """
+
         self._access_sequence += 1
         return self._access_sequence
 

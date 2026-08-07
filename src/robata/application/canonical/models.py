@@ -434,8 +434,20 @@ class CanonicalCandidateDenseWindow(StrictModel):
                 "candidate dense window lineage does not match admission context"
             )
         requested = candidate.requested_dense_interval
-        effective_start = max(0, requested.start_ns)
-        effective_end = min(duration, requested.end_ns)
+        # Candidate padding is context around an event, not permission to escape the
+        # admitted parent window. The source bundle materializes only the canonical
+        # requested interval, so allowing dense context to extend past that window
+        # would make the resolver correctly reject an out-of-scope selected frame.
+        effective_start = max(
+            0,
+            parent_window.interval.start_ns,
+            requested.start_ns,
+        )
+        effective_end = min(
+            duration,
+            parent_window.interval.end_ns,
+            requested.end_ns,
+        )
         if effective_start >= effective_end:
             raise CanonicalOfflineConfigurationError(
                 "candidate dense request does not overlap the admitted recording"
