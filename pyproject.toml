@@ -59,6 +59,7 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
   "acceptance: exercises optional dependencies and local real-data samples",
+  "asyncio: runs a test coroutine under the pytest-asyncio event loop",
 ]
 
 [tool.ruff]
