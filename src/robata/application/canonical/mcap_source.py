@@ -243,6 +243,7 @@ from robata.tempfiles import make_temp_file
 # recording identifier, and the content-addressed blob names add 64 characters.
 MCAP_LAYERED_MEDIA_CACHE_DIRECTORY: Final = "c"
 MCAP_LAYERED_MEDIA_CACHE_NAMESPACE: Final = "v1"
+MCAP_LAYERED_MEDIA_CACHE_MAX_ENTRIES: Final = 4_096
 MCAP_LAYERED_MEDIA_CACHE_FORMAT: Final = "canonical-mcap-layered-media-v1"
 MCAP_LAYERED_MEDIA_RAW_SURFACE_VERSION: Final = "canonical-mcap-rgb24-surface-v1"
 MCAP_LAYERED_MEDIA_ENCODING_VERSION: Final = "canonical-mcap-evidence-encoding-v2"
@@ -1234,6 +1235,7 @@ def _load_canonical_mcap_source(
         cache=LayeredMediaCache(
             state_dir / MCAP_LAYERED_MEDIA_CACHE_DIRECTORY,
             namespace=MCAP_LAYERED_MEDIA_CACHE_NAMESPACE,
+            max_entries=MCAP_LAYERED_MEDIA_CACHE_MAX_ENTRIES,
         ),
         source_content_sha256=inspection.source_sha256,
         media_processing_policy=media_processing_policy,

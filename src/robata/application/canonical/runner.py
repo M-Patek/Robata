@@ -164,6 +164,7 @@ from robata.inference.enrichment import (
     ProviderClaimEnrichmentError,
     ProviderClaimKind,
     ProviderClaimPayload,
+    ProviderObservation,
     ProviderReferenceCatalog,
     RawProviderResponseArtifact,
     SelectedAttemptOutput,
@@ -191,6 +192,7 @@ from robata.inference.models import (
     VisionTask,
 )
 from robata.inference.offline_fixture import (
+    ProviderResponseParseCode,
     RawProviderBytesStore,
     RawProviderBytesStoreError,
     StrictProviderClaimParseError,
@@ -247,6 +249,110 @@ from robata.sampling.materializer import (
     PackageMaterializationError,
 )
 from robata.sampling.package_set import PackageSetBuilder, sampling_plan_digest
+
+_CANONICAL_DENSE_COORDINATE_REDUCTION_POLICY_VERSION = "severity-worst-then-earliest-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedOutputLineagePolicy:
+    """Explicitly bind a local compact-wire transformation into claim lineage.
+
+    This is deliberately separate from :class:`VisionModelAdapter`: a generic adapter
+    cannot opt into raw-parse recovery with a truthy attribute.  The composition must
+    inject one exact provider/model/adapter policy, and its semantic digest is bound
+    into the local runtime identity.  Recovered parsed artifacts use ``parser_version``
+    rather than the strict parser version so the transformation remains replay-visible.
+    """
+
+    version: str
+    parser_version: str
+    provider: str
+    model_name: str
+    model_version: str
+    adapter_version: str
+    normalization_contract_sha256: Sha256Digest
+    allowed_tasks: tuple[VisionTask, ...]
+    allowed_raw_media_types: tuple[str, ...] = (
+        "application/json",
+        "text/plain; charset=utf-8",
+    )
+    allowed_parse_codes: tuple[ProviderResponseParseCode, ...] = (
+        ProviderResponseParseCode.INVALID_JSON,
+    )
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "version",
+            "parser_version",
+            "provider",
+            "model_name",
+            "model_version",
+            "adapter_version",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be a nonempty string")
+        if len(self.normalization_contract_sha256) != 64:
+            raise ValueError("normalization_contract_sha256 must be a SHA-256 digest")
+        if not self.allowed_tasks or len(set(self.allowed_tasks)) != len(self.allowed_tasks):
+            raise ValueError("allowed_tasks must be nonempty and unique")
+        if not self.allowed_raw_media_types or any(
+            not isinstance(value, str) or not value for value in self.allowed_raw_media_types
+        ):
+            raise ValueError("allowed_raw_media_types must be nonempty strings")
+        if not self.allowed_parse_codes or len(set(self.allowed_parse_codes)) != len(
+            self.allowed_parse_codes
+        ):
+            raise ValueError("allowed_parse_codes must be nonempty and unique")
+
+    @property
+    def semantic_sha256(self) -> Sha256Digest:
+        return semantic_sha256(
+            {
+                "semantic_projection_version": "normalized-output-lineage-policy-v1",
+                "version": self.version,
+                "parser_version": self.parser_version,
+                "provider": self.provider,
+                "model_name": self.model_name,
+                "model_version": self.model_version,
+                "adapter_version": self.adapter_version,
+                "normalization_contract_sha256": self.normalization_contract_sha256,
+                "allowed_tasks": [task.value for task in self.allowed_tasks],
+                "allowed_raw_media_types": list(self.allowed_raw_media_types),
+                "allowed_parse_codes": [code.value for code in self.allowed_parse_codes],
+            }
+        )
+
+
+_DENSE_QA_OBSERVATION_SEVERITY = {
+    ProviderObservation.GOOD: 0,
+    ProviderObservation.DEGRADED: 1,
+    ProviderObservation.UNKNOWN: 2,
+    ProviderObservation.UNUSABLE: 3,
+}
+
+
+def _dense_coordinate_result_rank(result: CameraDenseResult) -> tuple[int, int]:
+    observation = result.claim.observation
+    severity = _DENSE_QA_OBSERVATION_SEVERITY.get(observation)
+    if severity is None:
+        raise DenseQAProjectionError(f"QA_DENSE observation is not reducible: {observation.value}")
+    interval_start = (
+        result.claim.interval.start_ns if result.claim.interval is not None else (1 << 63) - 1
+    )
+    # Prefer the most conservative status; ties retain the earliest evidence time.
+    return severity, -interval_start
+
+
+def _reduce_dense_coordinate_result(
+    current: CameraDenseResult,
+    candidate: CameraDenseResult,
+) -> CameraDenseResult:
+    return (
+        candidate
+        if _dense_coordinate_result_rank(candidate) > _dense_coordinate_result_rank(current)
+        else current
+    )
 
 
 class _CanonicalRunMembershipPublicationError(RuntimeError):
@@ -531,6 +637,7 @@ class CanonicalOfflinePipeline:
         adapter: VisionModelAdapter,
         raw_store: RawProviderBytesStore,
         parser: StrictProviderClaimParser,
+        normalized_output_lineage_policy: NormalizedOutputLineagePolicy | None = None,
         coarse_qa_policy: InferencePolicy,
         dense_qa_policy: InferencePolicy,
         event_proposal_policy: InferencePolicy | None = None,
@@ -561,6 +668,12 @@ class CanonicalOfflinePipeline:
             raise TypeError("raw_store must implement RawProviderBytesStore")
         if not isinstance(parser, StrictProviderClaimParser):
             raise TypeError("parser must be a StrictProviderClaimParser")
+        if normalized_output_lineage_policy is not None and not isinstance(
+            normalized_output_lineage_policy, NormalizedOutputLineagePolicy
+        ):
+            raise TypeError(
+                "normalized_output_lineage_policy must be NormalizedOutputLineagePolicy or None"
+            )
         if not isinstance(coarse_qa_policy, InferencePolicy):
             raise TypeError("coarse_qa_policy must be an InferencePolicy")
         if not isinstance(dense_qa_policy, InferencePolicy):
@@ -644,6 +757,7 @@ class CanonicalOfflinePipeline:
         self._dispatch_adapter = counting_adapter_type(adapter, runtime_observer=runtime_observer)
         self._raw_store = raw_store
         self._parser = parser
+        self._normalized_output_lineage_policy = normalized_output_lineage_policy
         self._coarse_qa_policy = coarse_qa_policy
         self._dense_qa_policy = dense_qa_policy
         self._event_proposal_policy = event_proposal_policy
@@ -1162,10 +1276,15 @@ class CanonicalOfflinePipeline:
                 start_ns=0,
                 end_ns=context.ready_manifest.recording.duration_ns,
             )
-            qa_completion_result = self._qa_completion_projector.project(
-                coarse_qa_result,
-                recording_interval=qa_recording_interval,
-            )
+            with runtime_span(
+                self._runtime_observer,
+                "reduction.qa_coarse_completion",
+                {"task": VisionTask.QA_COARSE.value},
+            ):
+                qa_completion_result = self._qa_completion_projector.project(
+                    coarse_qa_result,
+                    recording_interval=qa_recording_interval,
+                )
         except (TypeError, ValueError) as exc:
             return finish(
                 CanonicalOfflineRunStatus.INVALID_OUTPUT,
@@ -1226,15 +1345,20 @@ class CanonicalOfflinePipeline:
                     return membership_failure(exc)
 
             try:
-                dense_result = self._dense_qa_projector.project(
-                    manifest,
-                    tuple(item.unit_evidence for item in dense_executions),
-                )
-                qa_completion_result = self._qa_completion_projector.project(
-                    coarse_qa_result,
-                    dense_result,
-                    recording_interval=qa_recording_interval,
-                )
+                with runtime_span(
+                    self._runtime_observer,
+                    "reduction.qa_dense_completion",
+                    {"task": VisionTask.QA_DENSE.value},
+                ):
+                    dense_result = self._dense_qa_projector.project(
+                        manifest,
+                        tuple(item.unit_evidence for item in dense_executions),
+                    )
+                    qa_completion_result = self._qa_completion_projector.project(
+                        coarse_qa_result,
+                        dense_result,
+                        recording_interval=qa_recording_interval,
+                    )
             except (DenseQAProjectionError, TypeError, ValueError) as exc:
                 failure_code = "QA_DENSE_RESULT_REJECTED"
                 blocked = self._qa_completion_projector.block(
@@ -1953,32 +2077,91 @@ class CanonicalOfflinePipeline:
                 model_version=selected_terminal.model_version,
                 created_at=artifact_created_at,
             )
+            parsed_parser_version = self._execution_policy.parser_version
             parsed_artifact_id = _stable_uuid(
                 "parsed-provider-claim",
                 selected_terminal.inference_id,
                 stored_raw.exact_bytes_sha256,
                 inference_policy.output_schema.sha256,
-                self._execution_policy.parser_version,
+                parsed_parser_version,
             )
             parsed_claims = self._evidence_store.get_parsed_claim(parsed_artifact_id)
             if parsed_claims is None:
-                parsed_claims = self._parser.parse_artifact(
-                    stored=stored_raw,
-                    inference_id=selected_terminal.inference_id,
-                    provider=selected_terminal.provider,
-                    model_name=selected_terminal.model_name,
-                    model_version=selected_terminal.model_version,
-                    provider_claim_schema=inference_policy.output_schema,
-                    task=task,
-                    artifact_id=parsed_artifact_id,
-                    created_at=artifact_created_at,
-                )
+                try:
+                    parsed_claims = self._parser.parse_artifact(
+                        stored=stored_raw,
+                        inference_id=selected_terminal.inference_id,
+                        provider=selected_terminal.provider,
+                        model_name=selected_terminal.model_name,
+                        model_version=selected_terminal.model_version,
+                        provider_claim_schema=inference_policy.output_schema,
+                        task=task,
+                        artifact_id=parsed_artifact_id,
+                        created_at=artifact_created_at,
+                    )
+                except StrictProviderClaimParseError as parse_error:
+                    # Compact local wires are an explicit composition dependency,
+                    # never an adapter duck-typed bypass. The recovered artifact
+                    # receives a distinct parser identity and binds the exact
+                    # normalization contract digest into its deterministic ID.
+                    normalized_policy = self._normalized_output_lineage_policy
+                    if (
+                        normalized_policy is None
+                        or parse_error.code not in normalized_policy.allowed_parse_codes
+                        or stored_raw.media_type not in normalized_policy.allowed_raw_media_types
+                        or task not in normalized_policy.allowed_tasks
+                        or selected_terminal.provider != normalized_policy.provider
+                        or selected_terminal.model_name != normalized_policy.model_name
+                        or selected_terminal.model_version != normalized_policy.model_version
+                        or inference_policy.adapter_version != normalized_policy.adapter_version
+                    ):
+                        raise
+                    parsed_parser_version = normalized_policy.parser_version
+                    parsed_artifact_id = _stable_uuid(
+                        "parsed-provider-claim",
+                        selected_terminal.inference_id,
+                        stored_raw.exact_bytes_sha256,
+                        inference_policy.output_schema.sha256,
+                        parsed_parser_version,
+                        normalized_policy.semantic_sha256,
+                    )
+                    parsed_claims = self._evidence_store.get_parsed_claim(parsed_artifact_id)
+                    if parsed_claims is None:
+                        normalized_document = selected_terminal.normalized_output
+                        if not isinstance(normalized_document, dict):
+                            raise parse_error
+                        try:
+                            self._schema_registry.validate_pinned(
+                                _schema_ref(inference_policy.output_schema),
+                                normalized_document,
+                            )
+                            normalized_payload = ProviderClaimPayload.model_validate_json(
+                                canonical_json_bytes(normalized_document),
+                                strict=True,
+                            )
+                            if canonical_json_bytes(
+                                normalized_payload.model_dump(mode="json")
+                            ) != canonical_json_bytes(normalized_document):
+                                raise ValueError(
+                                    "normalized provider claims change under typed normalization"
+                                )
+                            parsed_claims = ParsedProviderClaimArtifact.create(
+                                artifact_id=parsed_artifact_id,
+                                raw_response=expected_raw,
+                                provider_claim_schema=inference_policy.output_schema,
+                                task=task,
+                                payload=normalized_payload,
+                                parser_version=parsed_parser_version,
+                                created_at=artifact_created_at,
+                            )
+                        except (TypeError, ValueError) as recovery_error:
+                            raise parse_error from recovery_error
             if (
                 parsed_claims.artifact_id != parsed_artifact_id
                 or parsed_claims.raw_response != expected_raw
                 or parsed_claims.provider_claim_schema != inference_policy.output_schema
                 or parsed_claims.task is not task
-                or parsed_claims.parser_version != self._execution_policy.parser_version
+                or parsed_claims.parser_version != parsed_parser_version
                 or parsed_claims.created_at != artifact_created_at
                 or parsed_claims.payload.model_dump(mode="json")
                 != selected_terminal.normalized_output
@@ -3035,7 +3218,7 @@ class CanonicalOfflinePipeline:
                 candidate=candidate,
                 parent_window=parent_window,
                 window_policy_version=(
-                    f"{self._execution_policy.window_policy_version}-candidate-dense-v1"
+                    f"{self._execution_policy.window_policy_version}-candidate-dense-v2"
                 ),
                 created_at=created_at,
             )
@@ -3372,8 +3555,8 @@ class CanonicalOfflinePipeline:
                 )
             ) from exc
 
-    @staticmethod
     def _build_dense_qa_unit_evidence(
+        self,
         *,
         unit: DenseQAWorkUnit,
         context: AdmittedRecordingContextV2,
@@ -3452,17 +3635,13 @@ class CanonicalOfflinePipeline:
                         "QA_DENSE accepts only package-camera QA observations"
                     )
                 coordinate = (claim.package_ordinal, claim.camera_id)
-                if coordinate in observations:
-                    raise DenseQAProjectionError(
-                        "QA_DENSE observations must cover each coordinate once"
-                    )
                 try:
                     local_status = CameraQAStatus(claim.observation.value)
                 except ValueError as exc:
                     raise DenseQAProjectionError(
                         "QA_DENSE observation has no local QA status"
                     ) from exc
-                observations[coordinate] = CameraDenseResult(
+                candidate_result = CameraDenseResult(
                     package_id=claim.package_id,
                     package_ordinal=claim.package_ordinal,
                     camera_id=claim.camera_id,
@@ -3470,6 +3649,21 @@ class CanonicalOfflinePipeline:
                     source_output=source,
                     claim=claim,
                     production_eligible=False,
+                )
+                current_result = observations.get(coordinate)
+                if current_result is None:
+                    observations[coordinate] = candidate_result
+                    continue
+                if (
+                    getattr(self._adapter, "dense_coordinate_reduction_policy_version", None)
+                    != _CANONICAL_DENSE_COORDINATE_REDUCTION_POLICY_VERSION
+                ):
+                    raise DenseQAProjectionError(
+                        "QA_DENSE observations must cover each coordinate once"
+                    )
+                observations[coordinate] = _reduce_dense_coordinate_result(
+                    current_result,
+                    candidate_result,
                 )
 
         expected_coordinates = tuple(
@@ -3814,6 +4008,33 @@ class CanonicalOfflinePipeline:
             raise CanonicalOfflineConfigurationError(
                 "parser version does not match execution policy"
             )
+        normalized_policy = self._normalized_output_lineage_policy
+        if normalized_policy is not None:
+            if normalized_policy.parser_version == execution.parser_version:
+                raise CanonicalOfflineConfigurationError(
+                    "normalized lineage parser version must differ from the strict parser"
+                )
+            if (
+                normalized_policy.provider != self._adapter.provider
+                or normalized_policy.model_name != self._inference_policy.model_name
+                or normalized_policy.model_version != self._inference_policy.model_version
+                or normalized_policy.adapter_version != self._inference_policy.adapter_version
+            ):
+                raise CanonicalOfflineConfigurationError(
+                    "normalized lineage policy does not match the bound adapter/model"
+                )
+            policy_tasks = {
+                self._coarse_qa_policy.task,
+                self._dense_qa_policy.task,
+                self._event_proposal_policy.task,
+                self._action_evidence_policy.task,
+                self._boundary_refinement_policy.task,
+                self._inference_policy.task,
+            }
+            if not policy_tasks.issubset(set(normalized_policy.allowed_tasks)):
+                raise CanonicalOfflineConfigurationError(
+                    "normalized lineage policy does not cover every bound inference task"
+                )
         rendering_policy = self._input_preparer.policy
         if (
             rendering_policy.reduction_policy != execution.reduction_policy
@@ -3832,4 +4053,8 @@ class CanonicalOfflinePipeline:
         return schema
 
 
-__all__ = ["CanonicalOfflinePipeline", "CanonicalPreEosInferenceInvocation"]
+__all__ = [
+    "CanonicalOfflinePipeline",
+    "CanonicalPreEosInferenceInvocation",
+    "NormalizedOutputLineagePolicy",
+]

@@ -650,15 +650,33 @@ def _stage_for_span(span: RuntimeSpanSnapshot) -> E2ETraceStage | None:
                 "OTHER": E2ETraceStage.ORCHESTRATION,
             }.get(operation_family)
 
-    if name.startswith(("qualification.", "runtime.")):
+    # Local canonical composition uses a few stable names that predate the
+    # generic production prefixes below. Keep them classified so a control
+    # trace does not lose orchestration/scheduler evidence merely because the
+    # local adapter names its SQLite operation family explicitly.
+    if name in {"completion.storage.open", "completion.recovery.lookup"}:
+        return E2ETraceStage.ORCHESTRATION
+    if name.startswith(("qualification.", "runtime.", "canonical.")):
         return E2ETraceStage.ORCHESTRATION
     if name.startswith(("source.", "mcap.", "capture.", "media.", "frame.", "nvdec.")):
         return E2ETraceStage.SOURCE
-    if name.startswith(("scheduler.", "stream.", "queue.", "work.", "barrier.")):
+    if name.startswith(
+        (
+            "scheduler.",
+            "stream.",
+            "queue.",
+            "work.",
+            "barrier.",
+            "sqlite.work_scheduler.",
+            "sqlite.barrier.",
+        )
+    ):
         return E2ETraceStage.SCHEDULING
     if name.startswith("inference."):
         return E2ETraceStage.INFERENCE
-    if name.startswith(("r2.", "postgres.", "sqlite.", "artifact.", "evidence.")):
+    if name.startswith(
+        ("r2.", "postgres.", "sqlite.", "artifact.", "evidence.", "quality.evidence.")
+    ):
         return E2ETraceStage.EVIDENCE
     if name.startswith(("reduction.", "fusion.")):
         return E2ETraceStage.REDUCTION
