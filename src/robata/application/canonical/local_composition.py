@@ -131,7 +131,10 @@ from robata.application.canonical.result_validation import (
     CanonicalBoundaryRefinementExecution,
     CanonicalOfflineRunResult,
 )
-from robata.application.canonical.runner import CanonicalOfflinePipeline
+from robata.application.canonical.runner import (
+    CanonicalOfflinePipeline,
+    NormalizedOutputLineagePolicy,
+)
 from robata.application.canonical.source_fixture import (
     CanonicalSourceBundle,
     CanonicalSourceFixture,
@@ -302,7 +305,7 @@ if TYPE_CHECKING:
     from robata.application.canonical.mcap_source import McapMediaProcessingPolicy
 
 
-LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v21"
+LOCAL_CANONICAL_COMPOSITION_VERSION = "canonical-local-composition-v22"
 LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION = "canonical-local-execution-clock-v1"
 LOCAL_CANONICAL_EXECUTION_TIME = "2026-07-20T00:00:00Z"
 _LOCAL_CANONICAL_EXECUTION_DATETIME: Final = datetime(2026, 7, 20, tzinfo=UTC)
@@ -316,6 +319,7 @@ LOCAL_CALIBRATION_RUNTIME_REVISION: Final = "local-conformance-fixture-runtime-v
 LOCAL_CALIBRATION_PREPROCESS_REVISION: Final = "local-conformance-preprocess-v1"
 LOCAL_ADAPTIVE_SAMPLING_POLICY_VERSION: Final = "local-adaptive-no-extra-work-v1"
 LOCAL_BOUNDARY_QUALIFICATION_POLICY_VERSION: Final = "local-boundary-qualification-sidecar-v1"
+LOCAL_CANONICAL_MODEL_BINDING_PROJECTION_VERSION: Final = "local-model-binding-v2"
 # Runtime-only dispatch bounds. They deliberately stay outside the canonical
 # execution policy: compatible batch grouping must not change identity/evidence.
 LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS: Final = 6
@@ -397,6 +401,135 @@ class LocalCanonicalRuntimeDescriptor(StrictModel):
     production_eligible: Literal[False]
 
 
+LocalCanonicalModelAdapterFactory = Callable[
+    [SQLiteInferenceEvidenceLedger, StrictProviderClaimParser], VisionModelAdapter
+]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCanonicalModelBinding:
+    """Explicit real-model dependencies for the local MCAP composition.
+
+    The fixture path deliberately does not construct this binding. Supplying one
+    to :func:`run_local_canonical_mcap` selects an adapter (or an adapter factory
+    that receives the composition-owned evidence ledger and parser), an immutable
+    capability snapshot, and one task policy for every canonical vision stage.
+    Real local model runs are intentionally serialized: one call part and one
+    adapter request may be active at a time.
+    """
+
+    capabilities: ModelCapabilities
+    coarse_qa_policy: InferencePolicy
+    dense_qa_policy: InferencePolicy
+    event_proposal_policy: InferencePolicy
+    action_evidence_policy: InferencePolicy
+    boundary_refinement_policy: InferencePolicy
+    inference_policy: InferencePolicy
+    adapter: VisionModelAdapter | None = None
+    adapter_factory: LocalCanonicalModelAdapterFactory | None = None
+    normalized_output_lineage_policy: NormalizedOutputLineagePolicy | None = None
+    max_concurrent_call_parts: int = 1
+    max_inference_batch_size: int = 1
+
+    def __post_init__(self) -> None:
+        if (self.adapter is None) == (self.adapter_factory is None):
+            raise ValueError("exactly one of adapter or adapter_factory is required")
+        if self.adapter_factory is not None and not callable(self.adapter_factory):
+            raise TypeError("adapter_factory must be callable")
+        if not isinstance(self.capabilities, ModelCapabilities):
+            raise TypeError("capabilities must be ModelCapabilities")
+        if self.normalized_output_lineage_policy is not None:
+            normalized_policy = self.normalized_output_lineage_policy
+            if not isinstance(normalized_policy, NormalizedOutputLineagePolicy):
+                raise TypeError(
+                    "normalized_output_lineage_policy must be NormalizedOutputLineagePolicy"
+                )
+            if (
+                normalized_policy.provider != self.capabilities.provider
+                or normalized_policy.model_name != self.capabilities.model_name
+                or normalized_policy.model_version != self.capabilities.model_version
+            ):
+                raise ValueError(
+                    "normalized_output_lineage_policy must match the capability model identity"
+                )
+        if self.adapter is not None:
+            if not callable(getattr(self.adapter, "capabilities", None)) or not callable(
+                getattr(self.adapter, "infer", None)
+            ):
+                raise TypeError("adapter must implement VisionModelAdapter")
+            adapter_provider = getattr(self.adapter, "provider", None)
+            if not isinstance(adapter_provider, str) or not adapter_provider:
+                raise TypeError("adapter.provider must be a nonempty string")
+            if adapter_provider != self.capabilities.provider:
+                raise ValueError("adapter.provider must match capabilities.provider")
+
+        for field, task, policy in (
+            ("coarse_qa_policy", VisionTask.QA_COARSE, self.coarse_qa_policy),
+            ("dense_qa_policy", VisionTask.QA_DENSE, self.dense_qa_policy),
+            ("event_proposal_policy", VisionTask.EVENT_PROPOSAL, self.event_proposal_policy),
+            ("action_evidence_policy", VisionTask.ACTION_EVIDENCE, self.action_evidence_policy),
+            (
+                "boundary_refinement_policy",
+                VisionTask.BOUNDARY_REFINEMENT,
+                self.boundary_refinement_policy,
+            ),
+            ("inference_policy", VisionTask.FUSION_ADJUDICATION, self.inference_policy),
+        ):
+            if not isinstance(policy, InferencePolicy):
+                raise TypeError(f"{field} must be InferencePolicy")
+            if policy.task is not task:
+                raise ValueError(f"{field} must target {task.value}")
+            if (
+                policy.provider != self.capabilities.provider
+                or policy.model_name != self.capabilities.model_name
+                or policy.model_version != self.capabilities.model_version
+            ):
+                raise ValueError(f"{field} must match the capability model identity")
+            if task not in self.capabilities.supported_tasks:
+                raise ValueError(f"capabilities do not support {task.value}")
+
+        for field, value in (
+            ("max_concurrent_call_parts", self.max_concurrent_call_parts),
+            ("max_inference_batch_size", self.max_inference_batch_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != 1:
+                raise ValueError(f"{field} must be 1 for a local model binding")
+
+    @property
+    def policies(
+        self,
+    ) -> tuple[
+        InferencePolicy,
+        InferencePolicy,
+        InferencePolicy,
+        InferencePolicy,
+        InferencePolicy,
+        InferencePolicy,
+    ]:
+        """Return policies in the local composition's stable task order."""
+
+        return (
+            self.coarse_qa_policy,
+            self.dense_qa_policy,
+            self.event_proposal_policy,
+            self.action_evidence_policy,
+            self.boundary_refinement_policy,
+            self.inference_policy,
+        )
+
+    @property
+    def fusion_policy(self) -> InferencePolicy:
+        """Alias the historic generic inference-policy name by its task."""
+
+        return self.inference_policy
+
+    @property
+    def max_batch_size(self) -> int:
+        """Alias the pipeline's inference-batch bound."""
+
+        return self.max_inference_batch_size
+
+
 @dataclass(frozen=True, slots=True)
 class _LocalCanonicalRuntime:
     registry: SchemaRegistry
@@ -427,12 +560,18 @@ class LocalPreEosExecutorContext:
 LocalPreEosExecutorFactory = Callable[[LocalPreEosExecutorContext], _StageTerminalExecutor]
 
 
-def local_canonical_runtime_descriptor() -> LocalCanonicalRuntimeDescriptor:
+def local_canonical_runtime_descriptor(
+    *,
+    model_binding: LocalCanonicalModelBinding | None = None,
+) -> LocalCanonicalRuntimeDescriptor:
     """Return the exact policy pins used by the local canonical composition."""
 
+    _require_model_binding(model_binding)
     registry = SchemaRegistry()
     execution_policy = _execution_policy()
-    policies = _local_inference_policies(registry)
+    policies = (
+        _local_inference_policies(registry) if model_binding is None else model_binding.policies
+    )
     runtime_policy_sha256 = _local_runtime_policy_sha256(
         coarse_qa_policy=policies[0],
         dense_qa_policy=policies[1],
@@ -440,6 +579,10 @@ def local_canonical_runtime_descriptor() -> LocalCanonicalRuntimeDescriptor:
         action_evidence_policy=policies[3],
         boundary_refinement_policy=policies[4],
         inference_policy=policies[5],
+        model_capabilities=None if model_binding is None else model_binding.capabilities,
+        normalized_output_lineage_policy=(
+            None if model_binding is None else model_binding.normalized_output_lineage_policy
+        ),
     )
     return LocalCanonicalRuntimeDescriptor(
         schema_version="1.0",
@@ -495,6 +638,55 @@ class LocalProviderCallDispatcher(Protocol):
         operation: Callable[[], Awaitable[object]],
     ) -> object:
         """Run one provider operation under the shared runtime bound."""
+
+
+class _PinnedCapabilityVisionModelAdapter:
+    """Fail closed if a factory adapter serves a snapshot other than the run binding."""
+
+    def __init__(self, delegate: VisionModelAdapter, expected: ModelCapabilities) -> None:
+        self._delegate = delegate
+        self._expected = expected
+
+    @property
+    def provider(self) -> str:
+        return self._delegate.provider
+
+    def __getattr__(self, name: str) -> object:
+        # Preserve explicitly optional local adapter capabilities such as dense
+        # coordinate reduction without weakening the pinned snapshot check.
+        return getattr(self._delegate, name)
+
+    async def capabilities(self, model_name: str, model_version: str) -> ModelCapabilities:
+        actual = await self._delegate.capabilities(model_name, model_version)
+        if actual != self._expected:
+            raise ValueError(
+                "model adapter capability snapshot differs from LocalCanonicalModelBinding"
+            )
+        return actual
+
+    async def infer(
+        self,
+        request: VisionInferenceRequest,
+    ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        return await self._delegate.infer(request)
+
+
+class _PinnedCapabilityBatchVisionModelAdapter(_PinnedCapabilityVisionModelAdapter):
+    """Preserve native batching while enforcing the exact capability snapshot."""
+
+    async def infer_batch(
+        self,
+        requests: tuple[VisionInferenceRequest, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        infer_batch = getattr(self._delegate, "infer_batch", None)
+        if not callable(infer_batch):
+            raise TypeError("delegate does not implement infer_batch")
+        outcome = await infer_batch(requests)
+        if not isinstance(outcome, tuple) or not all(
+            isinstance(item, (VisionInferenceSuccess, VisionInferenceFailure)) for item in outcome
+        ):
+            raise TypeError("model adapter returned an invalid batch inference result")
+        return cast(tuple[VisionInferenceSuccess | VisionInferenceFailure, ...], outcome)
 
 
 class _DispatchingVisionModelAdapter:
@@ -665,6 +857,7 @@ def run_local_canonical_mcap(
     media_runtime_provenance: MediaRuntimeProvenance | None = None,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    model_binding: LocalCanonicalModelBinding | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
     executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
@@ -681,7 +874,9 @@ def run_local_canonical_mcap(
     ``media_exporter`` and ``media_runtime_provenance`` provide the optional
     P4 target-media injection point. They are forwarded to the MCAP source
     bridge as runtime facts only; canonical source binding and wire identities
-    remain unchanged.
+    remain unchanged. ``model_binding`` selects an explicit local real-model
+    adapter, capability snapshot, and task policies while preserving the fixture
+    defaults whenever it is omitted.
     """
 
     from robata.application.canonical.mcap_source import (
@@ -699,6 +894,7 @@ def run_local_canonical_mcap(
     state_root = _require_path(state_dir, "state_dir")
     _require_run_key(run_key)
     _require_provider_dispatcher(provider_dispatcher)
+    _require_model_binding(model_binding)
     _require_media_runtime_injection(media_exporter, media_runtime_provenance)
     if stage_terminal_executor is not None and not callable(stage_terminal_executor):
         raise CanonicalLocalCompositionError(
@@ -932,6 +1128,7 @@ def run_local_canonical_mcap(
         supplemental_qa_evidence_loader=load_supplemental_qa_evidence,
         runtime_observer=runtime_observer,
         provider_dispatcher=provider_dispatcher,
+        model_binding=model_binding,
         stage_terminal_executor=stage_terminal_executor,
         pre_eos_executor_factory=pre_eos_executor_factory,
         executor_config=executor_config,
@@ -951,6 +1148,7 @@ def _run_local_canonical(
     supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    model_binding: LocalCanonicalModelBinding | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
     executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
@@ -968,6 +1166,7 @@ def _run_local_canonical(
             supplemental_qa_evidence_loader=supplemental_qa_evidence_loader,
             runtime_observer=runtime_observer,
             provider_dispatcher=provider_dispatcher,
+            model_binding=model_binding,
             stage_terminal_executor=stage_terminal_executor,
             pre_eos_executor_factory=pre_eos_executor_factory,
             executor_config=executor_config,
@@ -987,6 +1186,7 @@ def _run_local_canonical_inner(
     supplemental_qa_evidence_loader: _SupplementalQaEvidenceLoader | None = None,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    model_binding: LocalCanonicalModelBinding | None = None,
     stage_terminal_executor: _StageTerminalExecutor | None = None,
     pre_eos_executor_factory: LocalPreEosExecutorFactory | None = None,
     executor_config: LocalStreamExecutorConfig = DEFAULT_LOCAL_STREAM_EXECUTOR_CONFIG,
@@ -994,6 +1194,7 @@ def _run_local_canonical_inner(
 ) -> CanonicalLocalRunReceipt:
     """Run the shared canonical flow after source authorization and binding."""
 
+    _require_model_binding(model_binding)
     if (supplemental_qa_evidence_builder is None) != (supplemental_qa_evidence_loader is None):
         raise CanonicalLocalCompositionError(
             CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
@@ -1035,7 +1236,7 @@ def _run_local_canonical_inner(
         action_evidence_policy,
         boundary_refinement_policy,
         inference_policy,
-    ) = _local_inference_policies(registry)
+    ) = _local_inference_policies(registry) if model_binding is None else model_binding.policies
     runtime_policy_sha256 = _local_runtime_policy_sha256(
         coarse_qa_policy=coarse_qa_policy,
         dense_qa_policy=dense_qa_policy,
@@ -1043,6 +1244,10 @@ def _run_local_canonical_inner(
         action_evidence_policy=action_evidence_policy,
         boundary_refinement_policy=boundary_refinement_policy,
         inference_policy=inference_policy,
+        model_capabilities=None if model_binding is None else model_binding.capabilities,
+        normalized_output_lineage_policy=(
+            None if model_binding is None else model_binding.normalized_output_lineage_policy
+        ),
     )
     run_id = _run_id(
         source_binding_sha256=source_binding_sha256,
@@ -1071,6 +1276,7 @@ def _run_local_canonical_inner(
             observed_at=started_at,
             runtime_observer=runtime_observer,
             provider_dispatcher=provider_dispatcher,
+            model_binding=model_binding,
         )
 
     try:
@@ -1497,6 +1703,7 @@ def _build_runtime(
     observed_at: str,
     runtime_observer: RuntimeObserver | None = None,
     provider_dispatcher: LocalProviderCallDispatcher | None = None,
+    model_binding: LocalCanonicalModelBinding | None = None,
 ) -> _LocalCanonicalRuntime:
     """Compose runtime adapters from the exact policies bound into the run ID."""
 
@@ -1531,12 +1738,50 @@ def _build_runtime(
                 ),
             ),
         )
-        adapter: VisionModelAdapter = OfflineFixtureVisionAdapter(
-            capabilities=_capabilities(observed_at),
-            raw_store=inference_evidence,
-            parser=parser,
-            response_factory=_fixture_claim_bytes,
-        )
+        adapter: VisionModelAdapter
+        if model_binding is None:
+            adapter = OfflineFixtureVisionAdapter(
+                capabilities=_capabilities(observed_at),
+                raw_store=inference_evidence,
+                parser=parser,
+                response_factory=_fixture_claim_bytes,
+            )
+            max_concurrent_call_parts = LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS
+            max_inference_batch_size = LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE
+        else:
+            try:
+                candidate: object = (
+                    model_binding.adapter_factory(inference_evidence, parser)
+                    if model_binding.adapter_factory is not None
+                    else model_binding.adapter
+                )
+            except Exception as error:
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+                    f"model adapter construction failed: {error}",
+                ) from error
+            if not callable(getattr(candidate, "capabilities", None)) or not callable(
+                getattr(candidate, "infer", None)
+            ):
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+                    "model binding must provide a VisionModelAdapter",
+                )
+            adapter_provider = getattr(candidate, "provider", None)
+            if adapter_provider != model_binding.capabilities.provider:
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+                    "model adapter provider must match capabilities.provider",
+                )
+            candidate_adapter = cast(VisionModelAdapter, candidate)
+            pinned_type = (
+                _PinnedCapabilityBatchVisionModelAdapter
+                if callable(getattr(candidate_adapter, "infer_batch", None))
+                else _PinnedCapabilityVisionModelAdapter
+            )
+            adapter = pinned_type(candidate_adapter, model_binding.capabilities)
+            max_concurrent_call_parts = model_binding.max_concurrent_call_parts
+            max_inference_batch_size = model_binding.max_inference_batch_size
         if provider_dispatcher is not None:
             wrapper_type = (
                 _DispatchingBatchVisionModelAdapter
@@ -1574,6 +1819,9 @@ def _build_runtime(
             adapter=adapter,
             raw_store=inference_evidence,
             parser=parser,
+            normalized_output_lineage_policy=(
+                None if model_binding is None else model_binding.normalized_output_lineage_policy
+            ),
             coarse_qa_policy=coarse_qa_policy,
             dense_qa_policy=dense_qa_policy,
             event_proposal_policy=event_proposal_policy,
@@ -1586,8 +1834,8 @@ def _build_runtime(
                 runtime_observer=runtime_observer,
             ),
             execution_policy=execution_policy,
-            max_concurrent_call_parts=LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS,
-            max_inference_batch_size=LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE,
+            max_concurrent_call_parts=max_concurrent_call_parts,
+            max_inference_batch_size=max_inference_batch_size,
             max_inference_batch_queue_delay_ms=(LOCAL_CANONICAL_MAX_INFERENCE_BATCH_QUEUE_DELAY_MS),
             inference_ledger=inference_evidence,
             evidence_store=inference_evidence,
@@ -1766,39 +2014,56 @@ def _local_runtime_policy_sha256(
     action_evidence_policy: InferencePolicy,
     boundary_refinement_policy: InferencePolicy,
     inference_policy: InferencePolicy,
+    model_capabilities: ModelCapabilities | None = None,
+    normalized_output_lineage_policy: NormalizedOutputLineagePolicy | None = None,
 ) -> str:
     """Bind automatic recovery identity to the policies that drive the run."""
 
-    return semantic_sha256(
-        {
-            "semantic_projection_version": "canonical-local-runtime-policy-v10",
-            "pipeline_version": CANONICAL_OFFLINE_PIPELINE_VERSION,
-            "coarse_qa_inference_policy": coarse_qa_policy.model_dump(mode="json"),
-            "coarse_qa_projection_policy_version": LOCAL_COARSE_QA_POLICY_VERSION,
-            "qa_completion_policy_version": LOCAL_QA_COMPLETION_POLICY_VERSION,
-            "dense_qa_inference_policy": dense_qa_policy.model_dump(mode="json"),
-            "event_proposal_inference_policy": event_proposal_policy.model_dump(mode="json"),
-            "action_evidence_inference_policy": action_evidence_policy.model_dump(mode="json"),
-            "boundary_refinement_inference_policy": (
-                boundary_refinement_policy.model_dump(mode="json")
-            ),
-            "boundary_refinement_policy_version": "local-boundary-refinement-v1",
-            "provisional_fusion_policy": ProvisionalFusionPolicy.create(
-                version=LOCAL_PROVISIONAL_FUSION_POLICY_VERSION
-            ).model_dump(mode="json"),
-            "dense_qa_planning_policy": DenseQAPlanningPolicy(
-                version=LOCAL_QA_COMPLETION_POLICY_VERSION
-            ).model_dump(mode="json"),
-            "fusion_inference_policy": inference_policy.model_dump(mode="json"),
-            "local_stream_mock_executor_policy_version": (
-                LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION
-            ),
-            "local_stream_reduction_policy_version": (LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION),
-            "local_stream_recording_reduction_policy_version": (
-                LOCAL_STREAM_RECORDING_REDUCTION_POLICY_VERSION
+    projection: dict[str, object] = {
+        "semantic_projection_version": "canonical-local-runtime-policy-v11",
+        "pipeline_version": CANONICAL_OFFLINE_PIPELINE_VERSION,
+        "coarse_qa_inference_policy": coarse_qa_policy.model_dump(mode="json"),
+        "coarse_qa_projection_policy_version": LOCAL_COARSE_QA_POLICY_VERSION,
+        "qa_completion_policy_version": LOCAL_QA_COMPLETION_POLICY_VERSION,
+        "dense_qa_inference_policy": dense_qa_policy.model_dump(mode="json"),
+        "event_proposal_inference_policy": event_proposal_policy.model_dump(mode="json"),
+        "action_evidence_inference_policy": action_evidence_policy.model_dump(mode="json"),
+        "boundary_refinement_inference_policy": boundary_refinement_policy.model_dump(mode="json"),
+        "boundary_refinement_policy_version": "local-boundary-refinement-v1",
+        "provisional_fusion_policy": ProvisionalFusionPolicy.create(
+            version=LOCAL_PROVISIONAL_FUSION_POLICY_VERSION
+        ).model_dump(mode="json"),
+        "dense_qa_planning_policy": DenseQAPlanningPolicy(
+            version=LOCAL_QA_COMPLETION_POLICY_VERSION
+        ).model_dump(mode="json"),
+        "fusion_inference_policy": inference_policy.model_dump(mode="json"),
+        "local_stream_mock_executor_policy_version": LOCAL_STREAM_MOCK_EXECUTOR_POLICY_VERSION,
+        "local_stream_reduction_policy_version": LOCAL_STREAM_CAUSAL_REDUCTION_POLICY_VERSION,
+        "local_stream_recording_reduction_policy_version": (
+            LOCAL_STREAM_RECORDING_REDUCTION_POLICY_VERSION
+        ),
+    }
+    if normalized_output_lineage_policy is not None:
+        projection["normalized_output_lineage_policy"] = {
+            "version": normalized_output_lineage_policy.version,
+            "parser_version": normalized_output_lineage_policy.parser_version,
+            "semantic_sha256": normalized_output_lineage_policy.semantic_sha256,
+            "normalization_contract_sha256": (
+                normalized_output_lineage_policy.normalization_contract_sha256
             ),
         }
-    )
+    if model_capabilities is not None:
+        projection["model_binding_projection_version"] = (
+            LOCAL_CANONICAL_MODEL_BINDING_PROJECTION_VERSION
+        )
+        projection["model_capability_snapshot"] = {
+            "snapshot_id": model_capabilities.snapshot_id,
+            "snapshot_digest": model_capabilities.snapshot_digest,
+            "provider": model_capabilities.provider,
+            "model_name": model_capabilities.model_name,
+            "model_version": model_capabilities.model_version,
+        }
+    return semantic_sha256(projection)
 
 
 def _execution_policy() -> CanonicalOfflineExecutionPolicy:
@@ -2856,6 +3121,14 @@ def _require_provider_dispatcher(
         )
 
 
+def _require_model_binding(value: LocalCanonicalModelBinding | None) -> None:
+    if value is not None and not isinstance(value, LocalCanonicalModelBinding):
+        raise CanonicalLocalCompositionError(
+            CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+            "model_binding must be LocalCanonicalModelBinding or None",
+        )
+
+
 def _require_media_runtime_injection(
     media_exporter: object | None,
     media_runtime_provenance: MediaRuntimeProvenance | None,
@@ -2907,6 +3180,8 @@ __all__ = [
     "CanonicalLocalCompositionError",
     "CanonicalLocalCompositionErrorCode",
     "CanonicalLocalRunReceipt",
+    "LocalCanonicalModelAdapterFactory",
+    "LocalCanonicalModelBinding",
     "LocalPreEosExecutorContext",
     "LocalPreEosExecutorFactory",
     "LocalProviderCallDispatcher",
