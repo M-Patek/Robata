@@ -542,12 +542,13 @@ def create_local_hf_endpoint_app(service: LocalHfEndpointService) -> Any:
 
     app = fastapi.FastAPI(title="Robata Local HF Vision Endpoint", lifespan=lifespan)
 
-    @app.get("/healthz", response_model=LocalHfHealthResponse)  # type: ignore[misc]
     async def health() -> LocalHfHealthResponse:
         try:
             return service.health()
         except LocalHuggingFaceRuntimeError as error:
             raise fastapi.HTTPException(status_code=503, detail=str(error)) from error
+
+    app.get("/healthz", response_model=LocalHfHealthResponse)(health)
 
     async def infer(
         endpoint_request: LocalHfEndpointRequest,
