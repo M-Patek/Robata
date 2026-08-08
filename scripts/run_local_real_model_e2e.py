@@ -1,4 +1,9 @@
-"""Run one real local MCAP through one real local Hugging Face vision model."""
+"""Run the retained legacy-window real-model MCAP benchmark.
+
+Mage native codec/video uses ``scripts/run_local_mage_stream.py``.  This generic
+image/window benchmark requires an explicit legacy profile and never acts as
+the default local perception route.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,10 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
+from robata.application.canonical.perception_routing import (  # noqa: E402
+    LEGACY_QWEN_WINDOW_PROFILE,
+    require_explicit_legacy_window_route,
+)
 from robata.benchmark.local_real_model_e2e import (  # noqa: E402
     LocalRealModelE2EError,
     run_local_real_model_e2e,
@@ -41,6 +50,12 @@ def _positive_float(value: str) -> float:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="real local MCAP source")
+    parser.add_argument(
+        "--profile",
+        choices=(LEGACY_QWEN_WINDOW_PROFILE,),
+        required=True,
+        help=("explicit compatibility route; Mage vNext uses scripts/run_local_mage_stream.py"),
+    )
     parser.add_argument("--mapping-config", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument(
@@ -81,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        require_explicit_legacy_window_route(args.profile)
         report, report_path, trace_path, participation_path = run_local_real_model_e2e(
             source_path=args.source,
             mapping_config=args.mapping_config,

@@ -658,6 +658,18 @@ def _stage_for_span(span: RuntimeSpanSnapshot) -> E2ETraceStage | None:
         return E2ETraceStage.ORCHESTRATION
     if name.startswith(("qualification.", "runtime.", "canonical.")):
         return E2ETraceStage.ORCHESTRATION
+    if name == "perception.media_scan":
+        return E2ETraceStage.SOURCE
+    if name in {"perception.observe", "perception.refine"}:
+        return E2ETraceStage.INFERENCE
+    if name == "perception.project":
+        return E2ETraceStage.EVIDENCE
+    if name in {
+        "perception.temporal_reconcile",
+        "perception.fusion",
+        "perception.finalize",
+    }:
+        return E2ETraceStage.REDUCTION
     if name.startswith(("source.", "mcap.", "capture.", "media.", "frame.", "nvdec.")):
         return E2ETraceStage.SOURCE
     if name.startswith(

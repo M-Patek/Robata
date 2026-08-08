@@ -22,6 +22,8 @@ def test_mcap_cli_defaults_to_first_three_minutes() -> None:
     args = _parser().parse_args(
         [
             "recording.mcap",
+            "--profile",
+            "legacy_window_v1",
             "--mapping-config",
             "mapping.json",
             "--state-dir",
@@ -38,6 +40,8 @@ def test_mcap_cli_rejects_invalid_duration_cap(value: str) -> None:
         _parser().parse_args(
             [
                 "recording.mcap",
+                "--profile",
+                "legacy_window_v1",
                 "--mapping-config",
                 "mapping.json",
                 "--state-dir",
@@ -247,3 +251,16 @@ def test_mcap_media_runtime_injection_reaches_source_loader(
     source_loader(object(), object(), "stream-run")
     assert source_loader_calls[0]["media_exporter"] is exporter
     assert source_loader_calls[0]["media_runtime_provenance"] is declared
+
+
+def test_mcap_cli_requires_an_explicit_legacy_profile() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "recording.mcap",
+                "--mapping-config",
+                "mapping.json",
+                "--state-dir",
+                "state",
+            ]
+        )

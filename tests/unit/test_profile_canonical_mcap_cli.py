@@ -105,6 +105,8 @@ def _receipt(*, replayed: bool) -> CanonicalLocalRunReceipt:
 def _arguments(tmp_path: Path, output: Path) -> list[str]:
     return [
         str(tmp_path / "source.mcap"),
+        "--profile",
+        "legacy_window_v1",
         "--mapping-config",
         str(tmp_path / "mapping.json"),
         "--allow-unapproved-profile",
@@ -121,6 +123,8 @@ def test_parser_matches_canonical_defaults_and_requires_output() -> None:
     args = cli._parser().parse_args(
         [
             "source.mcap",
+            "--profile",
+            "legacy_window_v1",
             "--mapping-config",
             "mapping.json",
             "--state-dir",
@@ -136,6 +140,8 @@ def test_parser_matches_canonical_defaults_and_requires_output() -> None:
         cli._parser().parse_args(
             [
                 "source.mcap",
+                "--profile",
+                "legacy_window_v1",
                 "--mapping-config",
                 "mapping.json",
                 "--state-dir",
@@ -148,6 +154,8 @@ def test_parser_exposes_clean_worktree_gate() -> None:
     args = cli._parser().parse_args(
         [
             "source.mcap",
+            "--profile",
+            "legacy_window_v1",
             "--mapping-config",
             "mapping.json",
             "--state-dir",
@@ -167,6 +175,8 @@ def test_parser_rejects_invalid_duration(value: str) -> None:
         cli._parser().parse_args(
             [
                 "source.mcap",
+                "--profile",
+                "legacy_window_v1",
                 "--mapping-config",
                 "mapping.json",
                 "--state-dir",
@@ -338,3 +348,18 @@ def test_comparison_arguments_must_be_supplied_as_a_pair(
     error = json.loads(capsys.readouterr().err)
     assert error["code"] == "PROFILE_PRECONDITION_FAILED"
     assert "must be supplied together" in error["detail"]
+
+
+def test_profiler_requires_an_explicit_legacy_profile() -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            [
+                "source.mcap",
+                "--mapping-config",
+                "mapping.json",
+                "--state-dir",
+                "state",
+                "--output",
+                "profile.json",
+            ]
+        )
