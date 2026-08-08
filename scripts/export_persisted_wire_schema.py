@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+_PERCEPTION_SCHEMA_EXPORT_NAMES = frozenset({"perception-context-manifest", "mage-observation"})
+_CANONICAL_CAMERA_IDS = ("cam_01", "cam_02", "cam_03", "cam_04", "cam_05", "cam_06")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +30,24 @@ class WireSchemaSpec:
 
 
 WIRE_SCHEMAS = {
+    "perception-context-manifest": WireSchemaSpec(
+        module="robata.contracts.perception_stream",
+        model="PerceptionContextManifest",
+        document_id=("https://schemas.robata.dev/v1/perception-context-manifest.schema.json"),
+        title="PerceptionContextManifest",
+    ),
+    "mage-observation": WireSchemaSpec(
+        module="robata.contracts.perception_stream",
+        model="MageObservation",
+        document_id="https://schemas.robata.dev/v1/mage-observation.schema.json",
+        title="MageObservation",
+    ),
+    "perception-refine-request": WireSchemaSpec(
+        module="robata.contracts.perception_stream",
+        model="PerceptionRefineRequest",
+        document_id=("https://schemas.robata.dev/v1/perception-refine-request.schema.json"),
+        title="PerceptionRefineRequest",
+    ),
     "local-stream-window-inference-plan": WireSchemaSpec(
         module="robata.contracts.local_stream_causal",
         model="LocalStreamWindowInferencePlan",
@@ -235,6 +256,58 @@ def _close_model_objects(value: Any) -> None:
             _close_model_objects(nested)
 
 
+def _specialize_perception_six_camera_maps(
+    document: dict[str, Any],
+    validation_document: dict[str, Any],
+) -> None:
+    """Restore exact generic map semantics erased by SixCameraMap's serializer.
+
+    ``SixCameraMap`` is an exact six-key mapping at runtime.  Its field serializer
+    deliberately has an ``Any`` value return annotation to preserve canonical
+    mapping order, but Pydantic consequently emits a serialization JSON Schema
+    with ``additionalProperties: true``.  These unreleased perception wires are
+    registry validation contracts, so use the validation-mode map value schema to
+    publish six explicit camera properties with their concrete model types.
+    """
+
+    definitions = document.get("$defs")
+    validation_definitions = validation_document.get("$defs")
+    if not isinstance(definitions, dict) or not isinstance(validation_definitions, dict):
+        raise TypeError("perception schema export requires object $defs")
+
+    # Concrete map values are absent from the serialization-mode graph because
+    # the serializer returns Mapping[CameraId, Any].  Copy only absent defs so
+    # normal serialization definitions remain authoritative for the wire shape.
+    for definition_name, definition in validation_definitions.items():
+        definitions.setdefault(definition_name, deepcopy(definition))
+
+    for definition_name, map_schema in definitions.items():
+        if not definition_name.startswith("SixCameraMap_"):
+            continue
+        validation_map_schema = validation_definitions.get(definition_name)
+        if not isinstance(map_schema, dict) or not isinstance(validation_map_schema, dict):
+            raise TypeError(f"perception camera map {definition_name!r} must be an object")
+        value_schema = validation_map_schema.get("additionalProperties")
+        if not isinstance(value_schema, dict):
+            raise TypeError(
+                f"perception camera map {definition_name!r} lacks a concrete value schema"
+            )
+
+        title = map_schema.get("title")
+        map_schema.clear()
+        map_schema.update(
+            {
+                "additionalProperties": False,
+                "properties": {
+                    camera_id: deepcopy(value_schema) for camera_id in _CANONICAL_CAMERA_IDS
+                },
+                "required": list(_CANONICAL_CAMERA_IDS),
+                "title": title,
+                "type": "object",
+            }
+        )
+
+
 def export_schema(name: str, output: Path) -> None:
     spec = WIRE_SCHEMAS[name]
     module = importlib.import_module(spec.module)
@@ -243,6 +316,9 @@ def export_schema(name: str, output: Path) -> None:
         raise TypeError(f"{spec.module}.{spec.model} is not a Pydantic model")
 
     document = model.model_json_schema(mode="serialization")
+    if name in _PERCEPTION_SCHEMA_EXPORT_NAMES:
+        validation_document = model.model_json_schema(mode="validation")
+        _specialize_perception_six_camera_maps(document, validation_document)
     _close_model_objects(document)
     document["$schema"] = JSON_SCHEMA_DIALECT
     document["$id"] = spec.document_id
