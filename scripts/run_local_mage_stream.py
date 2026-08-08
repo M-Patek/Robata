@@ -3,10 +3,10 @@
 ``--execute`` is a concrete in-repository single-worker producer/consumer path:
 for each immutable focus segment it stream-copies one native-video file, measures
 local media health, and sends one Mage observation request to the declared endpoint.
-The default qualification profile keeps one observation in flight; callers may opt into a
-bounded second preparation slot, while endpoint generation remains single-flight. Results are
-consumed in ordinal order. No Qwen model is loaded, deleted, or selected unless a caller uses
-the explicit legacy route.
+The default sustained qualification profile keeps two bounded observations in flight: one
+active request and one preparation slot, while endpoint generation remains single-flight.
+Results are consumed in ordinal order. No Qwen model is loaded, deleted, or selected
+unless a caller uses the explicit legacy route.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ from robata.application.canonical.perception_routing import (  # noqa: E402
     MAGE_STREAM_VNEXT_PROFILE,
     resolve_perception_route,
 )
+from robata.benchmark.gpu_telemetry import NvidiaSmiGpuSampler  # noqa: E402
 from robata.contracts.cameras import CAMERA_ID_VALUES, CameraId  # noqa: E402
 from robata.inference.mage_video_adapter import (  # noqa: E402
     FileMageVideoResultArtifactReader,
@@ -252,19 +253,35 @@ def _parser() -> argparse.ArgumentParser:
         help="HTTP endpoint timeout for one idempotent native-video request",
     )
     parser.add_argument(
+        "--gpu-sample-interval-seconds",
+        type=_positive_float,
+        default=0.25,
+        help="nvidia-smi sampling interval for full-wall local qualification telemetry",
+    )
+    parser.add_argument(
+        "--gpu-telemetry-output",
+        type=Path,
+        default=None,
+        help="GPU telemetry JSON path; defaults to <artifact-dir>/gpu-telemetry.json",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=_positive_int,
-        default=512,
-        help="explicit Mage decoder output budget; identity-bound and A/B-testable",
+        default=256,
+        help=(
+            "compact Mage decoder output budget for sustained native execution; "
+            "identity-bound and qualification-gated"
+        ),
     )
     parser.add_argument(
         "--max-inflight-observations",
         type=_positive_int,
         choices=(1, 2),
-        default=1,
+        default=2,
         help=(
-            "bounded native-video requests in flight; default single-route mode is 1; "
-            "model generation remains provider-serialized"
+            "bounded native-video requests in flight; default sustained mode is 2 "
+            "(one active generation plus one preparation slot); model generation "
+            "remains provider-serialized"
         ),
     )
     parser.add_argument("--codec-mode", choices=("traditional", "neural"), default="traditional")
@@ -461,24 +478,35 @@ def _execute(
         refine_prompt_version=MAGE_STREAM_REFINE_PROMPT_VERSION,
         artifact_sink=artifact_store,
     )
-    result = execute_local_mage_stream(
-        plan=plan,
-        source_path=source,
-        selected_camera=CameraId(arguments.camera),
-        materializer=MageStreamMaterializer(
-            ffmpeg_binary=arguments.ffmpeg_binary,
-            ffprobe_binary=arguments.ffprobe_binary,
-            verify_packet_boundaries=True,
-        ),
-        codec_policy_version=codec_policy.policy_version,
-        resolver=resolver,
-        pipeline=pipeline,
-        artifact_store=artifact_store,
-        media_health_scanner=LocalMediaHealthScanner(ffprobe_binary=arguments.ffprobe_binary),
-        materialization_root=arguments.materialization_dir,
-        max_inflight_observations=arguments.max_inflight_observations,
-        durable_scheduler=durable_scheduler,
-    )
+    gpu_sampler = NvidiaSmiGpuSampler(interval_seconds=arguments.gpu_sample_interval_seconds)
+    gpu_sampler.start()
+    try:
+        result = execute_local_mage_stream(
+            plan=plan,
+            source_path=source,
+            selected_camera=CameraId(arguments.camera),
+            materializer=MageStreamMaterializer(
+                ffmpeg_binary=arguments.ffmpeg_binary,
+                ffprobe_binary=arguments.ffprobe_binary,
+                verify_packet_boundaries=True,
+            ),
+            codec_policy_version=codec_policy.policy_version,
+            resolver=resolver,
+            pipeline=pipeline,
+            artifact_store=artifact_store,
+            media_health_scanner=LocalMediaHealthScanner(ffprobe_binary=arguments.ffprobe_binary),
+            materialization_root=arguments.materialization_dir,
+            max_inflight_observations=arguments.max_inflight_observations,
+            durable_scheduler=durable_scheduler,
+        )
+    finally:
+        gpu_telemetry = gpu_sampler.stop()
+        gpu_telemetry_path = (
+            arguments.gpu_telemetry_output
+            if arguments.gpu_telemetry_output is not None
+            else arguments.artifact_dir / "gpu-telemetry.json"
+        )
+        _write_output(gpu_telemetry_path, gpu_telemetry.to_payload())
     durable_execution = result.durable_execution
     if durable_execution is None:
         raise LocalMageStreamRunnerError(
@@ -490,6 +518,15 @@ def _execute(
         "single_route": authority.as_projection(),
         "decoder": {"max_new_tokens": arguments.max_new_tokens},
         "queue_depth": result.queue_depth,
+        "execution_profile": result.execution_profile.value,
+        "execution_timing": result.timing.as_projection(),
+        "gpu_telemetry": {
+            "path": str(gpu_telemetry_path.expanduser().resolve()),
+            "measurement_status": gpu_telemetry.measurement_status.value,
+            "sample_count": len(gpu_telemetry.samples),
+            "device_summaries": [item.to_payload() for item in gpu_telemetry.summary],
+            "errors": list(gpu_telemetry.errors),
+        },
         "durable_execution": {
             "database_path": str(durable_scheduler.database_path),
             "run": {
