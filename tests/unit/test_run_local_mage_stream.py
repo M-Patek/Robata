@@ -129,6 +129,9 @@ def test_execute_uses_in_repository_composition_without_pipeline_runner_hook(
         module._parser().parse_args([str(source), "--start-ns", "0", "--end-ns", "8000000000"]),
         "pipeline_runner",
     )
+    parsed = module._parser().parse_args([str(source), "--start-ns", "0", "--end-ns", "8000000000"])
+    assert parsed.max_inflight_observations == 1
+    assert parsed.max_new_tokens == 512
 
 
 def test_execute_constructs_and_passes_the_default_vnext_scheduler(
@@ -212,7 +215,9 @@ def test_execute_constructs_and_passes_the_default_vnext_scheduler(
         "fetch_mage_video_endpoint_health": lambda **_kwargs: SimpleNamespace(
             model_identity=_FakeModelIdentity()
         ),
-        "MageVideoObservationAdapter": lambda **_kwargs: object(),
+        "MageVideoObservationAdapter": lambda **kwargs: (
+            captured.__setitem__("adapter_config", kwargs.get("config")) or object()
+        ),
         "MageVideoHttpTransport": lambda **_kwargs: object(),
         "FileMageVideoResultArtifactReader": lambda: object(),
         "StreamPerceptionPipeline": lambda **_kwargs: object(),
@@ -234,3 +239,16 @@ def test_execute_constructs_and_passes_the_default_vnext_scheduler(
     assert scheduler.scheduler_policy_version == DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION
     assert report["durable_execution"]["run"]["run_key"]
     assert report["durable_execution"]["stage_counts"]
+    assert report["single_route"] == {
+        "policy_version": "single-camera-mage-authority-v1",
+        "camera_id": "cam_01",
+        "authority_provider": "MAGE_NATIVE",
+        "shadow_encoder_mode": "DISABLED",
+        "worker_count": 1,
+        "generation_concurrency": 1,
+        "max_inflight_observations": 1,
+        "raw_refine_provider": "MAGE_NATIVE",
+    }
+    assert report["decoder"] == {"max_new_tokens": 512}
+    adapter_config = captured["adapter_config"]
+    assert adapter_config.max_new_tokens == 512
