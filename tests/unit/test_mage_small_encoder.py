@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from robata.inference.mage_small_encoder import (
     MageCompatibleSmallEncoder,
@@ -12,6 +11,8 @@ from robata.inference.mage_small_encoder import (
     select_mage_visual_token_runs,
     uniform_temporal_run_indices,
 )
+
+torch = pytest.importorskip("torch")
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
