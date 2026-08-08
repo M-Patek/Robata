@@ -64,6 +64,19 @@ class MageVideoLoadObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class MageVideoGenerationTelemetry:
+    """Non-wire timing breakdown for one native generation request."""
+
+    processor_lock_wait_seconds: float
+    processor_seconds: float
+    generation_lock_wait_seconds: float
+    input_materialization_seconds: float
+    generate_seconds: float
+    decode_seconds: float
+    total_request_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class MageVideoGenerationObservation:
     """Durable-result-safe output from a native video generation call."""
 
@@ -72,6 +85,7 @@ class MageVideoGenerationObservation:
     output_tokens: int
     generation_seconds: float
     output_text: str
+    telemetry: MageVideoGenerationTelemetry | None = None
 
 
 CodecDependencyChecker = Callable[[Mapping[str, Any], Path], None]
@@ -308,13 +322,23 @@ class MageVideoRuntime:
         # codec implementation still owns per-video cache and decoding errors.
         self._codec_dependency_checker(native_codec_config, self._model_directory)
         resident = self._acquire_resident_lease()
+        request_started = time.perf_counter()
+        processor_lock_wait_seconds = 0.0
+        processor_seconds = 0.0
+        generation_lock_wait_seconds = 0.0
+        input_materialization_seconds = 0.0
+        generation_seconds = 0.0
+        decode_seconds = 0.0
 
         try:
             # The processor owns native codec invocation and mutable prompt
             # templating state. Keep this region narrow so the next CPU
             # preparation can overlap an earlier GPU generation, but not another
             # processor call.
+            lock_wait_started = time.perf_counter()
             with self._processor_lock:
+                processor_lock_wait_seconds += time.perf_counter() - lock_wait_started
+                processor_started = time.perf_counter()
                 content: list[dict[str, str]] = [{"type": "video"} for _ in paths]
                 content.append({"type": "text", "text": prompt})
                 messages = [{"role": "user", "content": content}]
@@ -332,11 +356,15 @@ class MageVideoRuntime:
                     return_tensors="pt",
                     padding=True,
                 )
+                processor_seconds += time.perf_counter() - processor_started
 
             # The model remains single-flight. Input device materialization is
             # intentionally inside this region: it may allocate GPU tensors and
             # must not race model execution on a memory-constrained worker.
+            lock_wait_started = time.perf_counter()
             with self._generation_lock:
+                generation_lock_wait_seconds += time.perf_counter() - lock_wait_started
+                materialization_started = time.perf_counter()
                 device = _model_device(resident.model)
                 materialized_inputs = _move_inputs_to_device(inputs, device)
                 pixel_values = materialized_inputs.get("pixel_values")
@@ -345,6 +373,7 @@ class MageVideoRuntime:
                     move = getattr(pixel_values, "to", None)
                     if callable(move):
                         materialized_inputs["pixel_values"] = move(model_dtype)
+                input_materialization_seconds = time.perf_counter() - materialization_started
                 prompt_tokens = _token_count(materialized_inputs.get("input_ids"), "input_ids")
                 started = time.perf_counter()
                 # ``use_cache`` may create attention KV only for this call. It
@@ -363,8 +392,12 @@ class MageVideoRuntime:
             # ``batch_decode`` is also processor state. It must not race a
             # subsequent codec preparation, but it intentionally happens after
             # the GPU generation lock has been released.
+            lock_wait_started = time.perf_counter()
             with self._processor_lock:
+                processor_lock_wait_seconds += time.perf_counter() - lock_wait_started
+                decode_started = time.perf_counter()
                 output_text = _decode_generated_text(resident.processor, generated_only)
+                decode_seconds = time.perf_counter() - decode_started
         except MageVideoRuntimeError:
             raise
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as error:
@@ -375,12 +408,22 @@ class MageVideoRuntime:
 
         if not output_text:
             raise MageVideoRuntimeError("Mage video model returned an empty output")
+        total_request_seconds = time.perf_counter() - request_started
         return MageVideoGenerationObservation(
             input_video_count=len(paths),
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             generation_seconds=generation_seconds,
             output_text=output_text,
+            telemetry=MageVideoGenerationTelemetry(
+                processor_lock_wait_seconds=processor_lock_wait_seconds,
+                processor_seconds=processor_seconds,
+                generation_lock_wait_seconds=generation_lock_wait_seconds,
+                input_materialization_seconds=input_materialization_seconds,
+                generate_seconds=generation_seconds,
+                decode_seconds=decode_seconds,
+                total_request_seconds=total_request_seconds,
+            ),
         )
 
     def close(self) -> None:
@@ -867,6 +910,7 @@ __all__ = [
     "MAGE_VIDEO_RUNTIME_IDENTITY_VERSION",
     "MageVideoCodecDependencyError",
     "MageVideoGenerationObservation",
+    "MageVideoGenerationTelemetry",
     "MageVideoLoadObservation",
     "MageVideoLoadProfile",
     "MageVideoRuntime",

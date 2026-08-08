@@ -234,6 +234,11 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     assert generated.prompt_tokens == 5
     assert generated.output_tokens == 3
     assert generated.output_text == "codec answer"
+    assert generated.telemetry is not None
+    assert generated.telemetry.generate_seconds == generated.generation_seconds
+    assert generated.telemetry.total_request_seconds >= generated.generation_seconds
+    assert generated.telemetry.processor_seconds >= 0.0
+    assert generated.telemetry.input_materialization_seconds >= 0.0
     assert processor.messages == [
         {
             "role": "user",

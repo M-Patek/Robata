@@ -3,9 +3,10 @@
 ``--execute`` is a concrete in-repository single-worker producer/consumer path:
 for each immutable focus segment it stream-copies one native-video file, measures
 local media health, and sends one Mage observation request to the declared endpoint.
-At most two observations may be in flight so next-segment preparation can overlap
-serialized generation; results are consumed in ordinal order. No Qwen model is
-loaded, deleted, or selected unless a caller uses the explicit legacy route.
+The default qualification profile keeps one observation in flight; callers may opt into a
+bounded second preparation slot, while endpoint generation remains single-flight. Results are
+consumed in ordinal order. No Qwen model is loaded, deleted, or selected unless a caller uses
+the explicit legacy route.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from robata.contracts.cameras import CAMERA_ID_VALUES, CameraId  # noqa: E402
 from robata.inference.mage_video_adapter import (  # noqa: E402
     FileMageVideoResultArtifactReader,
     MageVideoObservationAdapter,
+    MageVideoObservationAdapterConfig,
 )
 from robata.inference.mage_video_endpoint import (  # noqa: E402
     MageVideoCodecPolicy,
@@ -79,6 +81,10 @@ from robata.perception.projectors import (  # noqa: E402
     EventProjector,
     EvidenceProjector,
     QaProjector,
+)
+from robata.perception.single_route import (  # noqa: E402
+    SingleCameraAuthority,
+    SingleCameraAuthorityPolicy,
 )
 from robata.perception.tracking import EventTrackPolicy, EventTrackReconciler  # noqa: E402
 
@@ -246,12 +252,19 @@ def _parser() -> argparse.ArgumentParser:
         help="HTTP endpoint timeout for one idempotent native-video request",
     )
     parser.add_argument(
+        "--max-new-tokens",
+        type=_positive_int,
+        default=512,
+        help="explicit Mage decoder output budget; identity-bound and A/B-testable",
+    )
+    parser.add_argument(
         "--max-inflight-observations",
         type=_positive_int,
         choices=(1, 2),
-        default=2,
+        default=1,
         help=(
-            "bounded native-video requests in flight; model generation remains provider-serialized"
+            "bounded native-video requests in flight; default single-route mode is 1; "
+            "model generation remains provider-serialized"
         ),
     )
     parser.add_argument("--codec-mode", choices=("traditional", "neural"), default="traditional")
@@ -390,6 +403,15 @@ def _codec_policy(arguments: argparse.Namespace) -> MageVideoCodecPolicy:
     )
 
 
+def _single_route_authority(arguments: argparse.Namespace) -> SingleCameraAuthority:
+    return SingleCameraAuthority(
+        SingleCameraAuthorityPolicy(
+            camera_id=CameraId(arguments.camera),
+            max_inflight_observations=arguments.max_inflight_observations,
+        )
+    )
+
+
 def _execute(
     *,
     arguments: argparse.Namespace,
@@ -402,6 +424,7 @@ def _execute(
         timeout_seconds=arguments.endpoint_timeout_seconds,
     )
     codec_policy = _codec_policy(arguments)
+    authority = _single_route_authority(arguments)
     resolver = LocalMaterializedSegmentResolver()
     artifact_store = LocalPerceptionArtifactStore(arguments.artifact_dir)
     scheduler_path = (
@@ -422,6 +445,7 @@ def _execute(
             timeout_seconds=arguments.endpoint_timeout_seconds,
         ),
         artifact_reader=FileMageVideoResultArtifactReader(),
+        config=MageVideoObservationAdapterConfig(max_new_tokens=arguments.max_new_tokens),
         accepted_binding_sink=artifact_store,
     )
     pipeline = StreamPerceptionPipeline(
@@ -463,6 +487,8 @@ def _execute(
     return {
         "performed": True,
         "execution_policy_version": LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION,
+        "single_route": authority.as_projection(),
+        "decoder": {"max_new_tokens": arguments.max_new_tokens},
         "queue_depth": result.queue_depth,
         "durable_execution": {
             "database_path": str(durable_scheduler.database_path),
@@ -644,6 +670,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "qwen_weights_preserved": True,
             "v1_limitation": V1_LIMITATION,
             "selected_camera": arguments.camera,
+            "single_route": _single_route_authority(arguments).as_projection(),
+            "decoder": {"max_new_tokens": arguments.max_new_tokens},
             "segment_boundary_mode": plan.policy.segmentation_mode.value,
             "source_path": str(source),
             "source_byte_count": source_byte_count,

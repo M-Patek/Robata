@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import sqlite3
 import time
@@ -65,6 +66,7 @@ _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_COMPLETE: Final = "COMPLETE"
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_LEASE_SECONDS: Final = 7_200.0
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS: Final = 7_260.0
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_POLL_SECONDS: Final = 0.025
+_LOGGER = logging.getLogger(__name__)
 
 NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]
 DurablePath = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=16384)]
@@ -868,6 +870,22 @@ class MageVideoEndpointService:
             max_new_tokens=request.decoder.max_new_tokens,
             codec_config=request.codec_policy.native_codec_config(),
         )
+        telemetry = getattr(generated, "telemetry", None)
+        if telemetry is not None:
+            _LOGGER.info(
+                "mage_video_generation_telemetry",
+                extra={
+                    "mage_request_id": request.request_id,
+                    "processor_lock_wait_seconds": telemetry.processor_lock_wait_seconds,
+                    "processor_seconds": telemetry.processor_seconds,
+                    "generation_lock_wait_seconds": telemetry.generation_lock_wait_seconds,
+                    "input_materialization_seconds": telemetry.input_materialization_seconds,
+                    "generate_seconds": telemetry.generate_seconds,
+                    "decode_seconds": telemetry.decode_seconds,
+                    "total_request_seconds": telemetry.total_request_seconds,
+                    "output_tokens": generated.output_tokens,
+                },
+            )
         self._assert_resident_runtime_identity()
         loaded = self._runtime.load_observation
         document = _build_result_artifact_document(
