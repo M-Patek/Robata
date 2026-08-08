@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
+from importlib import import_module
 from threading import RLock
 from time import perf_counter
 from typing import Any, Final, Literal
@@ -29,6 +30,15 @@ MAGE_SMALL_ENCODER_SELECTION_MODE: Final = "UNIFORM_TEMPORAL_RUN_KEEP_NO_EMPTY_S
 
 class MageSmallEncoderError(ValueError):
     """The shadow encoder could not preserve Mage token/placeholder invariants."""
+
+
+def _load_torch() -> Any:
+    try:
+        return import_module("torch")
+    except ModuleNotFoundError as error:
+        raise MageSmallEncoderError(
+            "Mage small-encoder execution requires the optional torch runtime"
+        ) from error
 
 
 class MageSmallEncoderPolicy(StrictModel):
@@ -120,7 +130,7 @@ class MageSmallEncoderInputs:
 def _feature_content_digest(value: Any) -> Sha256Digest:
     """Digest a stable float32 projection, not an unpublished tensor wire format."""
 
-    import torch
+    torch = _load_torch()
 
     detached = value.detach().to(device="cpu", dtype=torch.float32).contiguous()
     projection = (
@@ -237,7 +247,7 @@ def select_mage_visual_token_runs(
         int(mask[index]) for index in range(int(mask.shape[0])) if index not in removed_positions
     ]
 
-    import torch
+    torch = _load_torch()
 
     device = input_ids.device
     output_input_ids = torch.tensor([output_ids], dtype=input_ids.dtype, device=device)
@@ -300,7 +310,7 @@ class MageCompatibleSmallEncoder:
         with self._visual_lock:
             original_layers = visual.encoder.layers
             try:
-                import torch
+                torch = _load_torch()
 
                 visual.encoder.layers = torch.nn.ModuleList(
                     list(original_layers)[: self.policy.visual_layer_count]
@@ -320,7 +330,7 @@ class MageCompatibleSmallEncoder:
                 visual.encoder.layers = original_layers
 
     def prepare(self, inputs: Mapping[str, Any]) -> MageSmallEncoderInputs:
-        import torch
+        torch = _load_torch()
 
         started = perf_counter()
         input_ids = inputs.get("input_ids")
