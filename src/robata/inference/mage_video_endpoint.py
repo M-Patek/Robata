@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import uuid4
 
@@ -60,6 +61,7 @@ MAGE_VIDEO_RESULT_ARTIFACT_VERSION: Literal["mage-video-result-artifact-v2"] = (
 )
 MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_HEADER: Final = "Idempotency-Key"
 MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_POLICY_VERSION: Final = "mage-video-idempotency-policy-v2"
+MAGE_VIDEO_GENERATION_TELEMETRY_EVENT_VERSION: Final = "mage-video-generation-telemetry-event-v3"
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_TABLE: Final = "mage_video_endpoint_idempotency_v2"
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_PENDING: Final = "PENDING"
 _MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_COMPLETE: Final = "COMPLETE"
@@ -460,6 +462,52 @@ class MageVideoInferenceRuntime(Protocol):
     ) -> Any: ...
 
 
+class MageVideoGenerationTelemetrySink(Protocol):
+    """Non-authoritative sink for endpoint-local generation observations."""
+
+    def __call__(self, event: Mapping[str, Any], /) -> None: ...
+
+
+class MageVideoGenerationJsonlSink:
+    """Append canonical, versioned non-wire generation telemetry as JSONL.
+
+    Sink bytes are operational observations only. They are never referenced by
+    endpoint v2 response bytes, result artifacts, inference identity, replay, or
+    idempotency state.
+    """
+
+    def __init__(self, path: Path) -> None:
+        if not isinstance(path, Path):
+            raise TypeError("path must be pathlib.Path")
+        resolved = path.expanduser().resolve()
+        if resolved.exists() and not resolved.is_file():
+            raise ValueError("generation telemetry JSONL path must not be a directory")
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise MageVideoRuntimeError(
+                "generation telemetry JSONL parent could not be created"
+            ) from error
+        self._path = resolved
+        self._lock = Lock()
+
+    @property
+    def path(self) -> Path:
+        """Resolved JSONL destination used by the launcher diagnostics."""
+
+        return self._path
+
+    def __call__(self, event: Mapping[str, Any], /) -> None:
+        if not isinstance(event, Mapping):
+            raise TypeError("generation telemetry event must be a mapping")
+        line = canonical_json_bytes(dict(event)) + b"\n"
+        try:
+            with self._lock, self._path.open("ab") as stream:
+                stream.write(line)
+        except OSError as error:
+            raise MageVideoRuntimeError("generation telemetry JSONL append failed") from error
+
+
 class MageVideoEndpointIdempotencyConflictError(MageVideoRuntimeError):
     """A durable idempotency key was reused with a different binding."""
 
@@ -483,6 +531,7 @@ class MageVideoEndpointService:
         idempotency_state_path: Path,
         result_artifact_directory: Path,
         durable_input_roots: Sequence[Path],
+        generation_telemetry_sink: MageVideoGenerationTelemetrySink | None = None,
     ) -> None:
         if not isinstance(model_identity, MageVideoModelIdentity):
             raise TypeError("model_identity must be MageVideoModelIdentity")
@@ -501,12 +550,15 @@ class MageVideoEndpointService:
             raise ValueError("durable_input_roots must be nonempty")
         if any(not root.is_dir() for root in roots):
             raise ValueError("every durable_input_root must be an existing directory")
+        if generation_telemetry_sink is not None and not callable(generation_telemetry_sink):
+            raise TypeError("generation_telemetry_sink must be callable")
 
         self._runtime = runtime
         self._model_identity = model_identity
         self._idempotency_state_path = Path(idempotency_state_path).expanduser().resolve()
         self._result_artifact_directory = Path(result_artifact_directory).expanduser().resolve()
         self._durable_input_roots = roots
+        self._generation_telemetry_sink = generation_telemetry_sink
         self._initialize_storage()
 
     def _open_idempotency_connection(self) -> sqlite3.Connection:
@@ -883,6 +935,18 @@ class MageVideoEndpointService:
                     "generate_seconds": telemetry.generate_seconds,
                     "decode_seconds": telemetry.decode_seconds,
                     "total_request_seconds": telemetry.total_request_seconds,
+                    "generation_telemetry_version": telemetry.telemetry_version,
+                    "generation_started_monotonic_seconds": (
+                        telemetry.generation_started_monotonic_seconds
+                    ),
+                    "first_output_token_monotonic_seconds": (
+                        telemetry.first_output_token_monotonic_seconds
+                    ),
+                    "generation_completed_monotonic_seconds": (
+                        telemetry.generation_completed_monotonic_seconds
+                    ),
+                    "time_to_first_token_seconds": telemetry.time_to_first_token_seconds,
+                    "output_tokens_per_second": telemetry.output_tokens_per_second,
                     "output_tokens": generated.output_tokens,
                 },
             )
@@ -901,7 +965,7 @@ class MageVideoEndpointService:
             created_at=_server_authored_rfc3339_utc_timestamp(),
         )
         artifact_reference = self._persist_result_artifact(document)
-        return MageVideoEndpointResponse(
+        response = MageVideoEndpointResponse(
             request_id=request.request_id,
             inference_identity=inference_identity,
             camera_encoding_count=len(request.camera_encodings),
@@ -915,6 +979,48 @@ class MageVideoEndpointService:
             output_text=document.output_text,
             result_artifact=artifact_reference,
         )
+        self._emit_generation_telemetry(
+            request=request,
+            inference_identity=inference_identity,
+            generated=generated,
+            result_document=document,
+            result_reference=artifact_reference,
+        )
+        return response
+
+    def _emit_generation_telemetry(
+        self,
+        *,
+        request: MageVideoEndpointRequest,
+        inference_identity: MageVideoInferenceIdentity,
+        generated: Any,
+        result_document: MageVideoResultArtifactDocument,
+        result_reference: MageVideoResultArtifactReference,
+    ) -> None:
+        """Best-effort telemetry emission after authoritative artifact persistence."""
+
+        telemetry = getattr(generated, "telemetry", None)
+        sink = self._generation_telemetry_sink
+        if telemetry is None or sink is None:
+            return
+        try:
+            sink(
+                _build_generation_telemetry_event(
+                    request=request,
+                    inference_identity=inference_identity,
+                    generated=generated,
+                    telemetry=telemetry,
+                    result_document=result_document,
+                    result_reference=result_reference,
+                )
+            )
+        except Exception:
+            # Operational telemetry must never change a successful v2 result,
+            # artifact, idempotency decision, or replay boundary.
+            _LOGGER.exception(
+                "mage_video_generation_telemetry_sink_failed",
+                extra={"mage_request_id": request.request_id},
+            )
 
     def _assert_model_identity(self, request: MageVideoEndpointRequest) -> None:
         if request.model_identity != self._model_identity:
@@ -1260,6 +1366,70 @@ def _result_artifact_projection(document: MageVideoResultArtifactDocument) -> di
     return document.model_dump(mode="json", exclude={"artifact_identity"})
 
 
+def _build_generation_telemetry_event(
+    *,
+    request: MageVideoEndpointRequest,
+    inference_identity: MageVideoInferenceIdentity,
+    generated: Any,
+    telemetry: Any,
+    result_document: MageVideoResultArtifactDocument,
+    result_reference: MageVideoResultArtifactReference,
+) -> dict[str, Any]:
+    """Build a versioned operational event without extending the v2 wire contract."""
+
+    runtime_fields = (
+        "telemetry_version",
+        "request_started_monotonic_seconds",
+        "request_completed_monotonic_seconds",
+        "processor_started_monotonic_seconds",
+        "processor_completed_monotonic_seconds",
+        "input_materialization_started_monotonic_seconds",
+        "input_materialization_completed_monotonic_seconds",
+        "generation_started_monotonic_seconds",
+        "first_output_token_monotonic_seconds",
+        "generation_completed_monotonic_seconds",
+        "decode_started_monotonic_seconds",
+        "decode_completed_monotonic_seconds",
+        "processor_lock_wait_seconds",
+        "processor_seconds",
+        "generation_lock_wait_seconds",
+        "input_materialization_seconds",
+        "generate_seconds",
+        "decode_seconds",
+        "total_request_seconds",
+        "time_to_first_token_seconds",
+        "output_tokens_per_second",
+    )
+    runtime_telemetry: dict[str, Any] = {}
+    for field_name in runtime_fields:
+        if not hasattr(telemetry, field_name):
+            raise ValueError(f"runtime telemetry is missing {field_name}")
+        runtime_telemetry[field_name] = getattr(telemetry, field_name)
+    return {
+        "event_version": MAGE_VIDEO_GENERATION_TELEMETRY_EVENT_VERSION,
+        "request_id": request.request_id,
+        "context_id": request.context_manifest.context_id,
+        "inference_identity_sha256": semantic_sha256(inference_identity.model_dump(mode="json")),
+        "model_identity_sha256": mage_video_model_identity_sha256(request.model_identity),
+        "codec_policy_sha256": inference_identity.codec_policy_identity.policy_sha256,
+        "input_manifest_sha256": inference_identity.input_manifest_sha256,
+        "decoder_identity_sha256": inference_identity.decoder_identity_sha256,
+        "camera_encoding_count": len(request.camera_encodings),
+        "decoder_id": request.decoder.decoder_id,
+        "max_new_tokens": request.decoder.max_new_tokens,
+        "input_video_count": int(generated.input_video_count),
+        "prompt_tokens": int(generated.prompt_tokens),
+        "output_tokens": int(generated.output_tokens),
+        "output_budget_exhausted": (int(generated.output_tokens) >= request.decoder.max_new_tokens),
+        "result_artifact_identity": result_document.artifact_identity,
+        "result_artifact_exact_sha256": result_reference.content_sha256,
+        "result_artifact_created_at": result_document.created_at,
+        "model_load_seconds": result_document.load_seconds,
+        "model_load_included_in_run_wall": False,
+        "runtime_telemetry": runtime_telemetry,
+    }
+
+
 def _build_result_artifact_document(
     *,
     request: MageVideoEndpointRequest,
@@ -1367,6 +1537,7 @@ __all__ = [
     "MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_POLICY_VERSION",
     "MAGE_VIDEO_ENDPOINT_REQUEST_VERSION",
     "MAGE_VIDEO_ENDPOINT_RESPONSE_VERSION",
+    "MAGE_VIDEO_GENERATION_TELEMETRY_EVENT_VERSION",
     "MAGE_VIDEO_INFERENCE_IDENTITY_VERSION",
     "MAGE_VIDEO_MODEL_IDENTITY_VERSION",
     "MAGE_VIDEO_RESULT_ARTIFACT_VERSION",
@@ -1380,6 +1551,8 @@ __all__ = [
     "MageVideoEndpointRequest",
     "MageVideoEndpointResponse",
     "MageVideoEndpointService",
+    "MageVideoGenerationJsonlSink",
+    "MageVideoGenerationTelemetrySink",
     "MageVideoHealthResponse",
     "MageVideoInferenceIdentity",
     "MageVideoInferenceRuntime",

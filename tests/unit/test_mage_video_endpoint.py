@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,6 +21,7 @@ from robata.inference.mage_video_endpoint import (
     MageVideoEndpointIdempotencyConflictError,
     MageVideoEndpointRequest,
     MageVideoEndpointService,
+    MageVideoGenerationJsonlSink,
     MageVideoModelIdentity,
     MageVideoNeuralCodecParameters,
     MageVideoResultArtifactDocument,
@@ -30,6 +32,7 @@ from robata.inference.mage_video_endpoint import (
 )
 from robata.inference.mage_video_runtime import (
     MageVideoGenerationObservation,
+    MageVideoGenerationTelemetry,
     MageVideoLoadObservation,
     MageVideoLoadProfile,
     MageVideoRuntimeError,
@@ -43,6 +46,7 @@ class _FakeRuntime:
         *,
         runtime_identity: MageVideoRuntimeIdentity | None = None,
         load_observation_identity: MageVideoRuntimeIdentity | None = None,
+        generation_telemetry: MageVideoGenerationTelemetry | None = None,
     ) -> None:
         self.loaded = False
         self.runtime_identity = runtime_identity or MageVideoRuntimeIdentity()
@@ -58,6 +62,7 @@ class _FakeRuntime:
             execution_device="cuda:0",
             runtime_identity=load_observation_identity or self.runtime_identity,
         )
+        self.generation_telemetry = generation_telemetry
 
     def load(self) -> MageVideoLoadObservation:
         self.loaded = True
@@ -88,6 +93,7 @@ class _FakeRuntime:
             output_tokens=6,
             generation_seconds=0.75,
             output_text='{"scene_summary":"room"}',
+            telemetry=self.generation_telemetry,
         )
 
 
@@ -193,6 +199,7 @@ def _service(
     durable_root: Path,
     *,
     model_identity: MageVideoModelIdentity | None = None,
+    generation_telemetry_sink: Any | None = None,
 ) -> MageVideoEndpointService:
     return MageVideoEndpointService(
         runtime=runtime,
@@ -200,6 +207,7 @@ def _service(
         idempotency_state_path=tmp_path / "endpoint-idempotency.sqlite3",
         result_artifact_directory=tmp_path / "results",
         durable_input_roots=[durable_root],
+        generation_telemetry_sink=generation_telemetry_sink,
     )
 
 
@@ -265,6 +273,153 @@ def test_service_uses_durable_video_manifest_and_persists_explicit_result_artifa
     assert "hidden_state" not in MageVideoResultArtifactDocument.model_fields
     assert "past_key_values" not in MageVideoResultArtifactDocument.model_fields
     assert "recurrent_state" not in MageVideoResultArtifactDocument.model_fields
+
+
+def _generation_telemetry() -> MageVideoGenerationTelemetry:
+    return MageVideoGenerationTelemetry(
+        request_started_monotonic_seconds=99.50,
+        request_completed_monotonic_seconds=100.80,
+        processor_started_monotonic_seconds=99.51,
+        processor_completed_monotonic_seconds=99.71,
+        input_materialization_started_monotonic_seconds=99.75,
+        input_materialization_completed_monotonic_seconds=99.78,
+        generation_started_monotonic_seconds=100.0,
+        first_output_token_monotonic_seconds=100.25,
+        generation_completed_monotonic_seconds=100.75,
+        decode_started_monotonic_seconds=100.76,
+        decode_completed_monotonic_seconds=100.80,
+        processor_lock_wait_seconds=0.01,
+        processor_seconds=0.20,
+        generation_lock_wait_seconds=0.02,
+        input_materialization_seconds=0.03,
+        generate_seconds=0.75,
+        decode_seconds=0.04,
+        total_request_seconds=1.30,
+        time_to_first_token_seconds=0.25,
+        output_tokens_per_second=8.0,
+    )
+
+
+def test_jsonl_generation_telemetry_is_versioned_and_does_not_change_v2_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "robata.inference.mage_video_endpoint._server_authored_rfc3339_utc_timestamp",
+        lambda: "2026-08-08T12:34:56.123456Z",
+    )
+    request, durable_root = _request(tmp_path)
+
+    baseline = _service(_FakeRuntime(), tmp_path, durable_root)
+    baseline.start()
+    baseline_response = baseline.infer(request)
+    baseline_response_bytes = canonical_json_bytes(baseline_response.model_dump(mode="json"))
+    baseline_artifact_path = Path(baseline_response.result_artifact.durable_path)
+    baseline_artifact_bytes = baseline_artifact_path.read_bytes()
+    baseline.stop()
+    baseline_artifact_path.unlink()
+
+    telemetry_path = tmp_path / "telemetry" / "generation.jsonl"
+    jsonl_sink = MageVideoGenerationJsonlSink(telemetry_path)
+
+    def persisted_artifact_sink(event: Mapping[str, Any]) -> None:
+        artifact_path = tmp_path / "results" / f"{event['result_artifact_identity']}.json"
+        assert artifact_path.is_file()
+        assert (
+            exact_bytes_sha256(artifact_path.read_bytes())
+            == (event["result_artifact_exact_sha256"])
+        )
+        jsonl_sink(event)
+
+    instrumented = _service(
+        _FakeRuntime(generation_telemetry=_generation_telemetry()),
+        tmp_path,
+        durable_root,
+        generation_telemetry_sink=persisted_artifact_sink,
+    )
+    instrumented.start()
+    instrumented_response = instrumented.infer(request)
+
+    assert canonical_json_bytes(instrumented_response.model_dump(mode="json")) == (
+        baseline_response_bytes
+    )
+    assert Path(instrumented_response.result_artifact.durable_path).read_bytes() == (
+        baseline_artifact_bytes
+    )
+    assert "telemetry" not in MageVideoResultArtifactDocument.model_fields
+    assert "telemetry" not in type(instrumented_response).model_fields
+
+    lines = telemetry_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event_version"] == "mage-video-generation-telemetry-event-v3"
+    assert event["request_id"] == request.request_id
+    assert event["context_id"] == request.context_manifest.context_id
+    assert event["max_new_tokens"] == request.decoder.max_new_tokens
+    assert event["output_tokens"] == 6
+    assert event["output_budget_exhausted"] is False
+    assert event["result_artifact_identity"] == (
+        instrumented_response.result_artifact.artifact_identity
+    )
+    assert event["result_artifact_exact_sha256"] == (
+        instrumented_response.result_artifact.content_sha256
+    )
+    assert event["result_artifact_created_at"] == "2026-08-08T12:34:56.123456Z"
+    assert event["model_load_seconds"] == 1.25
+    assert event["model_load_included_in_run_wall"] is False
+    runtime_telemetry = event["runtime_telemetry"]
+    assert set(runtime_telemetry) == {
+        "telemetry_version",
+        "request_started_monotonic_seconds",
+        "request_completed_monotonic_seconds",
+        "processor_started_monotonic_seconds",
+        "processor_completed_monotonic_seconds",
+        "input_materialization_started_monotonic_seconds",
+        "input_materialization_completed_monotonic_seconds",
+        "generation_started_monotonic_seconds",
+        "first_output_token_monotonic_seconds",
+        "generation_completed_monotonic_seconds",
+        "decode_started_monotonic_seconds",
+        "decode_completed_monotonic_seconds",
+        "processor_lock_wait_seconds",
+        "processor_seconds",
+        "generation_lock_wait_seconds",
+        "input_materialization_seconds",
+        "generate_seconds",
+        "decode_seconds",
+        "total_request_seconds",
+        "time_to_first_token_seconds",
+        "output_tokens_per_second",
+    }
+    assert runtime_telemetry["telemetry_version"] == "mage-video-generation-telemetry-v3"
+    assert runtime_telemetry["request_started_monotonic_seconds"] == 99.50
+    assert runtime_telemetry["request_completed_monotonic_seconds"] == 100.80
+    assert runtime_telemetry["time_to_first_token_seconds"] == 0.25
+    assert runtime_telemetry["output_tokens_per_second"] == 8.0
+    assert runtime_telemetry["generation_started_monotonic_seconds"] == 100.0
+    assert runtime_telemetry["generation_completed_monotonic_seconds"] == 100.75
+
+
+def test_generation_telemetry_sink_failure_does_not_fail_authoritative_result(
+    tmp_path: Path,
+) -> None:
+    request, durable_root = _request(tmp_path)
+
+    def failing_sink(_event: Mapping[str, Any]) -> None:
+        raise OSError("telemetry disk unavailable")
+
+    service = _service(
+        _FakeRuntime(generation_telemetry=_generation_telemetry()),
+        tmp_path,
+        durable_root,
+        generation_telemetry_sink=failing_sink,
+    )
+    service.start()
+
+    response = service.infer(request)
+
+    assert response.contract_version == "mage-video-codec-response-v2"
+    assert Path(response.result_artifact.durable_path).is_file()
 
 
 def test_neural_policy_translates_to_native_codec_parameters(tmp_path: Path) -> None:
@@ -365,6 +520,48 @@ def test_idempotency_replays_durable_artifact_after_restart_and_binds_exact_body
             request_body=body + b"\n",
         )
     assert replay_runtime.generate_calls == 0
+
+
+def test_idempotent_replay_does_not_duplicate_generation_telemetry(
+    tmp_path: Path,
+) -> None:
+    request, durable_root = _request(tmp_path, request_id="telemetry-replay")
+    body = _request_body(request)
+    telemetry_path = tmp_path / "telemetry" / "generation.jsonl"
+    sink = MageVideoGenerationJsonlSink(telemetry_path)
+
+    first_runtime = _FakeRuntime(generation_telemetry=_generation_telemetry())
+    first_service = _service(
+        first_runtime,
+        tmp_path,
+        durable_root,
+        generation_telemetry_sink=sink,
+    )
+    first_service.start()
+    first_service.infer_idempotently(
+        request=request,
+        idempotency_key="telemetry-replay-key",
+        request_body=body,
+    )
+    first_service.stop()
+
+    replay_runtime = _FakeRuntime(generation_telemetry=_generation_telemetry())
+    replay_service = _service(
+        replay_runtime,
+        tmp_path,
+        durable_root,
+        generation_telemetry_sink=sink,
+    )
+    replay_service.start()
+    replay_service.infer_idempotently(
+        request=request,
+        idempotency_key="telemetry-replay-key",
+        request_body=body,
+    )
+
+    assert first_runtime.generate_calls == 1
+    assert replay_runtime.generate_calls == 0
+    assert len(telemetry_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_service_rejects_changed_durable_segment_before_runtime_call(tmp_path: Path) -> None:

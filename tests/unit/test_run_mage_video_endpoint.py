@@ -31,6 +31,33 @@ def test_launcher_defaults_to_explicit_local_nf4_profile() -> None:
     )
 
 
+def test_launcher_generation_telemetry_jsonl_is_opt_in_and_resolved(
+    tmp_path: Path,
+) -> None:
+    module = _script_module()
+    from robata.inference import mage_video_endpoint
+
+    default_arguments = module._parser().parse_args(["--model-dir", "D:/models/mage"])
+    assert default_arguments.generation_telemetry_jsonl is None
+    assert module._generation_telemetry_sink(mage_video_endpoint, default_arguments) == (None, None)
+
+    requested = tmp_path / "telemetry" / "mage-generation.jsonl"
+    arguments = module._parser().parse_args(
+        [
+            "--model-dir",
+            "D:/models/mage",
+            "--generation-telemetry-jsonl",
+            str(requested),
+        ]
+    )
+    sink, resolved = module._generation_telemetry_sink(mage_video_endpoint, arguments)
+
+    assert resolved == requested.resolve()
+    assert sink is not None
+    assert sink.path == requested.resolve()
+    assert requested.parent.is_dir()
+
+
 def test_launcher_builds_and_verifies_checkpoint_manifest(tmp_path: Path) -> None:
     module = _script_module()
     model_directory = tmp_path / "mage"
