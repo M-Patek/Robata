@@ -3,10 +3,11 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from robata.perception.durable_scheduler import (
     DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
+    SQLitePerceptionWorkScheduler,
 )
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "run_local_mage_stream.py"
@@ -128,3 +129,108 @@ def test_execute_uses_in_repository_composition_without_pipeline_runner_hook(
         module._parser().parse_args([str(source), "--start-ns", "0", "--end-ns", "8000000000"]),
         "pipeline_runner",
     )
+
+
+def test_execute_constructs_and_passes_the_default_vnext_scheduler(
+    tmp_path: Path,
+) -> None:
+    module = _script_module()
+    source = tmp_path / "cam_01.mp4"
+    source.write_bytes(b"native-video")
+    arguments = module._parser().parse_args(
+        [
+            str(source),
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "8000000000",
+            "--execute",
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    plan = module.plan_mage_stream(
+        recording=module.MageStreamRecording(
+            recording_key="runner-default-scheduler",
+            recording_exact_sha256=module.exact_file_sha256(source)[0],
+            interval=module.AbsoluteNanosecondInterval(0, 8_000_000_000),
+        ),
+        policy=module.MageStreamPolicy(
+            scan_segment_duration_ns=8_000_000_000,
+            reasoning_horizon_duration_ns=8_000_000_000,
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeModelIdentity:
+        def model_dump(self, *, mode: str) -> dict[str, str]:
+            assert mode == "json"
+            return {"model_identifier": "fake-mage"}
+
+    def fake_execute_local_mage_stream(**kwargs: object) -> object:
+        scheduler = kwargs["durable_scheduler"]
+        assert isinstance(scheduler, SQLitePerceptionWorkScheduler)
+        current_plan = kwargs["plan"]
+        codec_policy_version = kwargs["codec_policy_version"]
+        assert isinstance(current_plan, type(plan))
+        assert isinstance(codec_policy_version, str)
+        run = scheduler.register_plan(current_plan, codec_policy_version=codec_policy_version)
+        captured["scheduler"] = scheduler
+        durable_execution = SimpleNamespace(
+            run=run,
+            snapshot=scheduler.snapshot(run.run_key),
+            finalization_state="PLANNED",
+            fusion_work_item_ids=(),
+            pending_refinement_work_item_ids=(),
+        )
+        return SimpleNamespace(
+            queue_depth=1,
+            durable_execution=durable_execution,
+            run_manifest=None,
+            pipeline_result=SimpleNamespace(
+                normal_model_call_count=0,
+                refinement_model_call_count=0,
+                total_model_call_count=0,
+                stage_measurements=(),
+                event_tracks=(),
+                fusion_decisions=(),
+                refine_requests=(),
+            ),
+            contexts=(),
+        )
+
+    patch_names = (
+        "fetch_mage_video_endpoint_health",
+        "MageVideoObservationAdapter",
+        "MageVideoHttpTransport",
+        "FileMageVideoResultArtifactReader",
+        "StreamPerceptionPipeline",
+        "execute_local_mage_stream",
+    )
+    originals = {name: getattr(module, name) for name in patch_names}
+    replacements = {
+        "fetch_mage_video_endpoint_health": lambda **_kwargs: SimpleNamespace(
+            model_identity=_FakeModelIdentity()
+        ),
+        "MageVideoObservationAdapter": lambda **_kwargs: object(),
+        "MageVideoHttpTransport": lambda **_kwargs: object(),
+        "FileMageVideoResultArtifactReader": lambda: object(),
+        "StreamPerceptionPipeline": lambda **_kwargs: object(),
+        "execute_local_mage_stream": fake_execute_local_mage_stream,
+    }
+    for name, replacement in replacements.items():
+        setattr(module, name, replacement)
+    try:
+        report = module._execute(arguments=arguments, plan=plan, source=source)
+    finally:
+        for name, original in originals.items():
+            setattr(module, name, original)
+
+    scheduler = captured["scheduler"]
+    assert isinstance(scheduler, SQLitePerceptionWorkScheduler)
+    assert (
+        scheduler.database_path == (tmp_path / "artifacts" / "perception-vnext.sqlite3").resolve()
+    )
+    assert scheduler.scheduler_policy_version == DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION
+    assert report["durable_execution"]["run"]["run_key"]
+    assert report["durable_execution"]["stage_counts"]

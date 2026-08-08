@@ -201,6 +201,27 @@ def test_one_observation_per_segment_drives_all_logical_products_and_one_track(t
     assert len(tuple((tmp_path / "perception-cas" / "_logical").rglob("*.ref"))) == 24
 
 
+def test_projection_must_be_temporally_reconciled_before_finalization(tmp_path) -> None:
+    context = make_context(selected_cameras=(CameraId.CAM_01, CameraId.CAM_02))
+    observation = make_observation(context=context)
+    provider = _FakeMageProvider({context.context_manifest_semantic_sha256: observation})
+    session = _pipeline(provider, tmp_path).open_session()
+    health = session.scan_media(lambda: make_media_health(context))
+
+    projected = session.project_precomputed(
+        context=context,
+        media_health=health,
+        observation=observation,
+        observation_elapsed_seconds=0.0,
+    )
+    with pytest.raises(RuntimeError, match="pending temporal reconciliation"):
+        session.finalize()
+
+    outcome = session.reconcile_projected(projected)
+    assert outcome.context.context_manifest_key == context.context_manifest_key
+    assert session.finalize().normal_model_call_count == 1
+
+
 def test_shadow_gate_does_not_suppress_normal_perception(tmp_path) -> None:
     context = make_context(selected_cameras=(CameraId.CAM_01, CameraId.CAM_02))
     observation = make_observation(context=context)
