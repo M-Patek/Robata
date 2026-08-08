@@ -18,7 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
-from typing import Final
+from typing import Final, TypeVar
 
 from robata.application.canonical.mage_stream import (
     FfmpegCommandResult,
@@ -37,9 +37,19 @@ from robata.inference.mage_video_adapter import (
     MageVideoDurableCameraSegment,
     MageVideoDurableSegmentResolver,
 )
+from robata.perception.durable_scheduler import (
+    DurablePerceptionRun,
+    DurablePerceptionRunSnapshot,
+    DurablePerceptionWorkClaim,
+    DurablePerceptionWorkItem,
+    DurablePerceptionWorkState,
+    SQLitePerceptionWorkScheduler,
+)
 from robata.perception.pipeline import (
     LocalPerceptionArtifactReference,
     LocalPerceptionArtifactStore,
+    PerceptionContextOutcome,
+    PerceptionProjectedContext,
     PerceptionStage,
     StreamPerceptionPipeline,
     StreamPerceptionRunResult,
@@ -56,6 +66,8 @@ LOCAL_MAGE_MEDIA_HEALTH_POLICY_VERSION: Final = "local-mage-media-health-v1"
 LOCAL_MAGE_STREAM_CONTEXT_REPORT_NAMESPACE: Final = "local-mage-stream-context-report-v1"
 LOCAL_MAGE_STREAM_RUN_MANIFEST_VERSION: Final = "local-mage-stream-run-manifest-v1"
 LOCAL_MAGE_STREAM_RUN_MANIFEST_NAMESPACE: Final = "local-mage-stream-run-manifest-v1"
+
+_T = TypeVar("_T")
 
 
 class LocalMageStreamExecutionError(RuntimeError):
@@ -99,6 +111,17 @@ class LocalMageStreamContextExecution:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalMageStreamDurableExecution:
+    """Authoritative local scheduler state observed after one stream attempt."""
+
+    run: DurablePerceptionRun
+    snapshot: DurablePerceptionRunSnapshot
+    finalization_state: str
+    fusion_work_item_ids: tuple[str, ...]
+    pending_refinement_work_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalMageStreamExecutionResult:
     """Whole-stream output plus per-context measured execution evidence."""
 
@@ -106,6 +129,331 @@ class LocalMageStreamExecutionResult:
     contexts: tuple[LocalMageStreamContextExecution, ...]
     queue_depth: int
     run_manifest: LocalPerceptionArtifactReference | None = None
+    durable_execution: LocalMageStreamDurableExecution | None = None
+
+
+class _LocalDurableSchedulerBridge:
+    """Execute local work under durable claims without coupling the pipeline to SQLite.
+
+    Normal work is claimed around the operation that actually performs it.  Fusion
+    and refinement are written after the deterministic pipeline has emitted their
+    immutable outputs; refinement remains request-only and is intentionally not
+    marked successful without a real targeted-model result.
+    """
+
+    def __init__(
+        self,
+        *,
+        scheduler: SQLitePerceptionWorkScheduler,
+        plan: MageStreamPlan,
+        codec_policy_version: str,
+        worker_id: str,
+        lease_duration_seconds: int,
+    ) -> None:
+        if not isinstance(scheduler, SQLitePerceptionWorkScheduler):
+            raise TypeError("durable_scheduler must be SQLitePerceptionWorkScheduler")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("durable_worker_id must be a nonempty string")
+        if (
+            isinstance(lease_duration_seconds, bool)
+            or not isinstance(lease_duration_seconds, int)
+            or lease_duration_seconds <= 0
+        ):
+            raise ValueError("durable_lease_duration_seconds must be a positive integer")
+        self._scheduler = scheduler
+        self._worker_id = worker_id
+        self._lease_duration_seconds = lease_duration_seconds
+        self._run = scheduler.register_plan(
+            plan,
+            codec_policy_version=codec_policy_version,
+        )
+
+    @property
+    def run(self) -> DurablePerceptionRun:
+        return self._run
+
+    def run_context_stage(
+        self,
+        *,
+        focus_segment_ordinal: int,
+        stage: PerceptionStage,
+        operation: Callable[[], _T],
+        result_binding: Callable[[_T], tuple[str, str]],
+    ) -> _T:
+        claim = self._claim_context_stage(
+            focus_segment_ordinal=focus_segment_ordinal,
+            stage=stage,
+        )
+        try:
+            value = operation()
+        except BaseException as error:
+            self._fail(claim, stage=stage, error=error)
+            raise
+        result_reference, result_sha256 = result_binding(value)
+        self._succeed(claim, result_reference=result_reference, result_sha256=result_sha256)
+        return value
+
+    def begin_context_stage(
+        self, *, focus_segment_ordinal: int, stage: PerceptionStage
+    ) -> DurablePerceptionWorkClaim:
+        return self._claim_context_stage(
+            focus_segment_ordinal=focus_segment_ordinal,
+            stage=stage,
+        )
+
+    def complete(
+        self,
+        claim: DurablePerceptionWorkClaim,
+        *,
+        result_reference: str,
+        result_sha256: str,
+    ) -> None:
+        self._succeed(claim, result_reference=result_reference, result_sha256=result_sha256)
+
+    def fail(
+        self, claim: DurablePerceptionWorkClaim, *, stage: PerceptionStage, error: BaseException
+    ) -> None:
+        self._fail(claim, stage=stage, error=error)
+
+    def record_terminal_state(
+        self,
+        result: StreamPerceptionRunResult,
+    ) -> LocalMageStreamDurableExecution:
+        """Persist derived deterministic products, then seal/finalize only if complete."""
+
+        observation_ordinals = {
+            outcome.observation.observation_logical_key: outcome.context.focus_segment_ordinal
+            for outcome in result.contexts
+        }
+        tracks_by_key = {track.event_track_key: track for track in result.event_tracks}
+        fusion_by_track_key: dict[str, DurablePerceptionWorkItem] = {}
+        fusion_work_item_ids: list[str] = []
+        for decision in sorted(result.fusion_decisions, key=lambda item: item.fusion_key):
+            track = tracks_by_key.get(decision.source_event_track_key)
+            if track is None:
+                raise LocalMageStreamExecutionError(
+                    "fusion decision references an event track absent from final stream result"
+                )
+            source = track.source_hypotheses[-1]
+            try:
+                ordinal = observation_ordinals[source.source_observation_logical_key]
+            except KeyError as error:
+                raise LocalMageStreamExecutionError(
+                    "fusion track source observation is absent from final stream contexts"
+                ) from error
+            item = self._scheduler.schedule_derived(
+                run_key=self._run.run_key,
+                focus_segment_ordinal=ordinal,
+                stage=PerceptionStage.FUSION,
+                input_sha256=decision.source_event_track_revision_semantic_sha256,
+                config_sha256=semantic_sha256(
+                    {
+                        "durable_run_config_sha256": self._run.config_sha256,
+                        "stage": PerceptionStage.FUSION.value,
+                        "fusion_policy_version": decision.policy_version,
+                    }
+                ),
+            )
+            self._complete_item(
+                item,
+                result_reference=f"fusion:{decision.fusion_key}",
+                result_sha256=decision.fusion_semantic_sha256,
+            )
+            fusion_by_track_key[decision.source_event_track_key] = item
+            fusion_work_item_ids.append(item.work_item_id)
+
+        track_by_latest_hypothesis = {
+            track.source_hypotheses[-1].hypothesis_logical_key: track
+            for track in result.event_tracks
+        }
+        pending_refinement_work_item_ids: list[str] = []
+        for request in sorted(result.refine_requests, key=lambda item: item.refine_request_key):
+            track = track_by_latest_hypothesis.get(request.target_hypothesis_logical_key)
+            if track is None:
+                raise LocalMageStreamExecutionError(
+                    "refine request target hypothesis is absent from final event tracks"
+                )
+            fusion = fusion_by_track_key.get(track.event_track_key)
+            if fusion is None:
+                raise LocalMageStreamExecutionError(
+                    "refine request has no durable upstream FUSION work item"
+                )
+            try:
+                ordinal = observation_ordinals[request.source_observation_logical_key]
+            except KeyError as error:
+                raise LocalMageStreamExecutionError(
+                    "refine request source observation is absent from final stream contexts"
+                ) from error
+            item = self._scheduler.schedule_derived(
+                run_key=self._run.run_key,
+                focus_segment_ordinal=ordinal,
+                stage=PerceptionStage.PERCEPTION_REFINE,
+                input_sha256=request.refine_request_semantic_sha256,
+                config_sha256=semantic_sha256(
+                    {
+                        "durable_run_config_sha256": self._run.config_sha256,
+                        "stage": PerceptionStage.PERCEPTION_REFINE.value,
+                        "refine_policy_version": request.refine_policy_version,
+                        "prompt_version": request.prompt_version,
+                    }
+                ),
+                upstream_work_item_id=fusion.work_item_id,
+            )
+            pending_refinement_work_item_ids.append(item.work_item_id)
+
+        if pending_refinement_work_item_ids:
+            snapshot = self._scheduler.snapshot(self._run.run_key)
+            return LocalMageStreamDurableExecution(
+                run=snapshot.run,
+                snapshot=snapshot,
+                finalization_state="PENDING_REFINEMENT",
+                fusion_work_item_ids=tuple(fusion_work_item_ids),
+                pending_refinement_work_item_ids=tuple(pending_refinement_work_item_ids),
+            )
+
+        sealed = self._scheduler.seal_derived_work(self._run.run_key)
+        finalization = next(
+            item
+            for item in self._scheduler.items_for_run(self._run.run_key)
+            if item.stage is PerceptionStage.FINALIZE
+        )
+        result_reference, result_sha256 = _terminal_result_binding(result, sealed.run_key)
+        self._complete_item(
+            finalization,
+            result_reference=result_reference,
+            result_sha256=result_sha256,
+        )
+        snapshot = self._scheduler.snapshot(self._run.run_key)
+        return LocalMageStreamDurableExecution(
+            run=snapshot.run,
+            snapshot=snapshot,
+            finalization_state="SUCCEEDED",
+            fusion_work_item_ids=tuple(fusion_work_item_ids),
+            pending_refinement_work_item_ids=(),
+        )
+
+    def _claim_context_stage(
+        self, *, focus_segment_ordinal: int, stage: PerceptionStage
+    ) -> DurablePerceptionWorkClaim:
+        item = next(
+            item
+            for item in self._scheduler.context_work(self._run.run_key, focus_segment_ordinal)
+            if item.stage is stage
+        )
+        return self._claim_item(item)
+
+    def _claim_item(self, item: DurablePerceptionWorkItem) -> DurablePerceptionWorkClaim:
+        current = self._scheduler.get(item.work_item_id)
+        if current.state is DurablePerceptionWorkState.SUCCEEDED:
+            raise LocalMageStreamExecutionError(
+                "local Mage executor will not recompute an already-succeeded durable work item"
+            )
+        claim = self._scheduler.claim_and_start(
+            self._worker_id,
+            self._lease_duration_seconds,
+            run_key=self._run.run_key,
+            work_item_id=item.work_item_id,
+        )
+        if claim is None:
+            raise LocalMageStreamExecutionError(
+                f"durable {item.stage.value} work is not ready for claim"
+            )
+        return claim
+
+    def _complete_item(
+        self,
+        item: DurablePerceptionWorkItem,
+        *,
+        result_reference: str,
+        result_sha256: str,
+    ) -> None:
+        claim = self._claim_item(item)
+        self._succeed(claim, result_reference=result_reference, result_sha256=result_sha256)
+
+    def _succeed(
+        self,
+        claim: DurablePerceptionWorkClaim,
+        *,
+        result_reference: str,
+        result_sha256: str,
+    ) -> None:
+        self._scheduler.succeed(
+            claim.lease,
+            result_reference=result_reference,
+            result_sha256=result_sha256,
+        )
+
+    def _fail(
+        self,
+        claim: DurablePerceptionWorkClaim,
+        *,
+        stage: PerceptionStage,
+        error: BaseException,
+    ) -> None:
+        detail = f"{type(error).__name__}: {error}"
+        self._scheduler.fail(
+            claim.lease,
+            error_code=f"{stage.value}_FAILED",
+            retryable=False,
+            error_detail=detail or type(error).__name__,
+        )
+
+
+def _terminal_result_binding(result: StreamPerceptionRunResult, run_key: str) -> tuple[str, str]:
+    terminal_artifacts = result.terminal_artifacts
+    if terminal_artifacts is not None:
+        artifact = terminal_artifacts.terminal_manifest
+        return artifact.logical_key, artifact.exact_sha256
+    return (
+        f"local-stream-finalize:{run_key}",
+        semantic_sha256(
+            {
+                "event_track_revision_sha256_values": [
+                    item.revision_semantic_sha256 for item in result.event_tracks
+                ],
+                "fusion_sha256_values": [
+                    item.fusion_semantic_sha256 for item in result.fusion_decisions
+                ],
+                "refine_request_sha256_values": [
+                    item.refine_request_semantic_sha256 for item in result.refine_requests
+                ],
+            }
+        ),
+    )
+
+
+def _media_health_result_binding(value: MediaHealthReport) -> tuple[str, str]:
+    return value.media_health_key, value.media_health_semantic_sha256
+
+
+def _observation_result_binding(value: MageObservation) -> tuple[str, str]:
+    return value.observation_logical_key, value.observation_semantic_sha256
+
+
+def _projected_result_binding(value: PerceptionProjectedContext) -> tuple[str, str]:
+    return (
+        value.event_projection.event_projection_key,
+        semantic_sha256(
+            {
+                "qa_projection_semantic_sha256": (
+                    value.qa_projection.qa_projection_semantic_sha256
+                ),
+                "event_projection_semantic_sha256": (
+                    value.event_projection.event_projection_semantic_sha256
+                ),
+                "evidence_projection_semantic_sha256": (
+                    value.evidence_projection.evidence_projection_semantic_sha256
+                ),
+            }
+        ),
+    )
+
+
+def _temporal_result_binding(value: PerceptionContextOutcome) -> tuple[str, str]:
+    return (
+        value.temporal_reconcile.reconcile_key,
+        value.temporal_reconcile.reconcile_semantic_sha256,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +690,9 @@ def execute_local_mage_stream(
     media_health_scanner: LocalMediaHealthScanner | None = None,
     materialization_root: Path,
     max_inflight_observations: int = 2,
+    durable_scheduler: SQLitePerceptionWorkScheduler | None = None,
+    durable_worker_id: str = "local-mage-stream",
+    durable_lease_duration_seconds: int = 14_520,
 ) -> LocalMageStreamExecutionResult:
     """Run a bounded producer/consumer stream with ordered deterministic reduction.
 
@@ -363,6 +714,17 @@ def execute_local_mage_stream(
     ):
         raise ValueError("max_inflight_observations must be an integer in [1, 2]")
     scanner = media_health_scanner or LocalMediaHealthScanner()
+    durable_bridge = (
+        None
+        if durable_scheduler is None
+        else _LocalDurableSchedulerBridge(
+            scheduler=durable_scheduler,
+            plan=plan,
+            codec_policy_version=codec_policy_version,
+            worker_id=durable_worker_id,
+            lease_duration_seconds=durable_lease_duration_seconds,
+        )
+    )
     session = pipeline.open_session()
     reports: list[LocalMageStreamContextExecution] = []
     context_iterator = iter(plan.reasoning_contexts)
@@ -398,7 +760,15 @@ def execute_local_mage_stream(
         ) -> MediaHealthReport:
             return scanner.scan(context=context, materialized_context=materialized_context)
 
-        health = session.scan_media(scan_current_context)
+        if durable_bridge is None:
+            health = session.scan_media(scan_current_context)
+        else:
+            health = durable_bridge.run_context_stage(
+                focus_segment_ordinal=stream_context.focus_segment_ordinal,
+                stage=PerceptionStage.MEDIA_SCAN,
+                operation=lambda: session.scan_media(scan_current_context),
+                result_binding=_media_health_result_binding,
+            )
         return _PreparedStreamContext(
             focus_segment_ordinal=stream_context.focus_segment_ordinal,
             context=context,
@@ -448,7 +818,13 @@ def execute_local_mage_stream(
             report = replace(report, persisted_report_exact_sha256=report_digest)
         reports.append(report)
 
-    pending: deque[tuple[_PreparedStreamContext, Future[tuple[MageObservation, float]]]] = deque()
+    pending: deque[
+        tuple[
+            _PreparedStreamContext,
+            Future[tuple[MageObservation, float]],
+            DurablePerceptionWorkClaim | None,
+        ]
+    ] = deque()
     with ThreadPoolExecutor(
         max_workers=max_inflight_observations,
         thread_name_prefix="robata-mage-observe",
@@ -460,27 +836,96 @@ def execute_local_mage_stream(
             except StopIteration:
                 return False
             prepared = prepare(stream_context)
-            pending.append((prepared, executor.submit(pipeline.observe_context, prepared.context)))
+            observation_claim: DurablePerceptionWorkClaim | None = None
+            if durable_bridge is not None:
+                observation_claim = durable_bridge.begin_context_stage(
+                    focus_segment_ordinal=prepared.focus_segment_ordinal,
+                    stage=PerceptionStage.PERCEPTION_OBSERVE,
+                )
+            try:
+                future = executor.submit(pipeline.observe_context, prepared.context)
+            except BaseException as error:
+                if durable_bridge is not None and observation_claim is not None:
+                    durable_bridge.fail(
+                        observation_claim,
+                        stage=PerceptionStage.PERCEPTION_OBSERVE,
+                        error=error,
+                    )
+                raise
+            pending.append((prepared, future, observation_claim))
             return True
 
         while len(pending) < max_inflight_observations and submit_next():
             pass
         while pending:
-            prepared, future = pending.popleft()
-            observation, _provider_elapsed = future.result()
+            prepared, future, observation_claim = pending.popleft()
+            try:
+                observation, _provider_elapsed = future.result()
+            except BaseException as error:
+                if durable_bridge is not None and observation_claim is not None:
+                    durable_bridge.fail(
+                        observation_claim,
+                        stage=PerceptionStage.PERCEPTION_OBSERVE,
+                        error=error,
+                    )
+                raise
+            if durable_bridge is not None and observation_claim is not None:
+                observation_reference, observation_sha256 = _observation_result_binding(observation)
+                durable_bridge.complete(
+                    observation_claim,
+                    result_reference=observation_reference,
+                    result_sha256=observation_sha256,
+                )
             before = _measurement_map(session.stage_measurements())
-            session.consume_precomputed(
-                context=prepared.context,
-                media_health=prepared.media_health,
-                observation=observation,
-                observation_elapsed_seconds=_provider_elapsed,
-            )
+            if durable_bridge is None:
+                session.consume_precomputed(
+                    context=prepared.context,
+                    media_health=prepared.media_health,
+                    observation=observation,
+                    observation_elapsed_seconds=_provider_elapsed,
+                )
+            else:
+
+                def project_current(
+                    context: PerceptionContextManifest = prepared.context,
+                    media_health: MediaHealthReport = prepared.media_health,
+                    current_observation: MageObservation = observation,
+                    elapsed: float = _provider_elapsed,
+                ) -> PerceptionProjectedContext:
+                    return session.project_precomputed(
+                        context=context,
+                        media_health=media_health,
+                        observation=current_observation,
+                        observation_elapsed_seconds=elapsed,
+                    )
+
+                projected = durable_bridge.run_context_stage(
+                    focus_segment_ordinal=prepared.focus_segment_ordinal,
+                    stage=PerceptionStage.OBSERVATION_PROJECT,
+                    operation=project_current,
+                    result_binding=_projected_result_binding,
+                )
+
+                def reconcile_current(
+                    current_projection: PerceptionProjectedContext = projected,
+                ) -> PerceptionContextOutcome:
+                    return session.reconcile_projected(current_projection)
+
+                durable_bridge.run_context_stage(
+                    focus_segment_ordinal=prepared.focus_segment_ordinal,
+                    stage=PerceptionStage.TEMPORAL_RECONCILE,
+                    operation=reconcile_current,
+                    result_binding=_temporal_result_binding,
+                )
             after = _measurement_map(session.stage_measurements())
             append_report(prepared, before, after)
             while len(pending) < max_inflight_observations and submit_next():
                 pass
 
     result = session.finalize()
+    durable_execution = (
+        None if durable_bridge is None else durable_bridge.record_terminal_state(result)
+    )
     context_reports = tuple(reports)
     run_manifest: LocalPerceptionArtifactReference | None = None
     if artifact_store is not None:
@@ -491,6 +936,7 @@ def execute_local_mage_stream(
             queue_depth=max_inflight_observations,
             contexts=context_reports,
             pipeline_result=result,
+            durable_execution=durable_execution,
             artifact_store=artifact_store,
         )
         run_identity = semantic_sha256(run_projection)
@@ -512,6 +958,7 @@ def execute_local_mage_stream(
         contexts=context_reports,
         queue_depth=max_inflight_observations,
         run_manifest=run_manifest,
+        durable_execution=durable_execution,
     )
 
 
@@ -523,6 +970,7 @@ def _build_run_manifest_projection(
     queue_depth: int,
     contexts: tuple[LocalMageStreamContextExecution, ...],
     pipeline_result: StreamPerceptionRunResult,
+    durable_execution: LocalMageStreamDurableExecution | None,
     artifact_store: LocalPerceptionArtifactStore,
 ) -> dict[str, object]:
     """Build a deterministic durable root for one local Mage stream execution.
@@ -582,6 +1030,32 @@ def _build_run_manifest_projection(
         }
         for measurement in pipeline_result.stage_measurements
     ]
+    durable_projection: dict[str, object] | None = None
+    if durable_execution is not None:
+        durable_projection = {
+            "run_key": durable_execution.run.run_key,
+            "scheduler_policy_version": durable_execution.run.scheduler_policy_version,
+            "config_sha256": durable_execution.run.config_sha256,
+            "derived_work_sealed": durable_execution.run.derived_work_sealed,
+            "finalization_state": durable_execution.finalization_state,
+            "fusion_work_item_ids": list(durable_execution.fusion_work_item_ids),
+            "pending_refinement_work_item_ids": list(
+                durable_execution.pending_refinement_work_item_ids
+            ),
+            "stage_counts": [
+                {
+                    "stage": item.stage.value,
+                    "planned": item.planned,
+                    "ready": item.ready,
+                    "leased": item.leased,
+                    "running": item.running,
+                    "retry_wait": item.retry_wait,
+                    "succeeded": item.succeeded,
+                    "failed_permanent": item.failed_permanent,
+                }
+                for item in durable_execution.snapshot.stage_counts
+            ],
+        }
     return {
         "manifest_version": LOCAL_MAGE_STREAM_RUN_MANIFEST_VERSION,
         "plan_key": plan.plan_key,
@@ -595,6 +1069,7 @@ def _build_run_manifest_projection(
         "contexts": context_projection,
         "terminal_artifacts": terminal_projection,
         "accepted_inference_bindings": accepted_bindings,
+        "durable_execution": durable_projection,
         "stage_invocations": stage_projection,
         "normal_model_call_count": pipeline_result.normal_model_call_count,
         "refinement_model_call_count": pipeline_result.refinement_model_call_count,
@@ -680,6 +1155,7 @@ __all__ = [
     "LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION",
     "FfprobeCommandRunner",
     "LocalMageStreamContextExecution",
+    "LocalMageStreamDurableExecution",
     "LocalMageStreamExecutionError",
     "LocalMageStreamExecutionResult",
     "LocalMaterializedSegmentResolver",

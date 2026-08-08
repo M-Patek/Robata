@@ -45,6 +45,9 @@ from robata.application.canonical.mage_stream_execution import (  # noqa: E402
     LocalMediaHealthScanner,
     execute_local_mage_stream,
 )
+from robata.application.canonical.perception_composition import (  # noqa: E402
+    create_default_vnext_perception_scheduler,
+)
 from robata.application.canonical.perception_routing import (  # noqa: E402
     LEGACY_QWEN_WINDOW_PROFILE,
     MAGE_STREAM_VNEXT_PROFILE,
@@ -223,6 +226,12 @@ def _parser() -> argparse.ArgumentParser:
         default=REPOSITORY_ROOT / ".local" / "mage-stream-artifacts",
         help="local exact-byte CAS for observation/projection/report artifacts",
     )
+    parser.add_argument(
+        "--scheduler-db",
+        type=Path,
+        default=None,
+        help="SQLite path for the durable Mage vNext scheduler; defaults inside --artifact-dir",
+    )
     parser.add_argument("--ffmpeg-binary", default="ffmpeg")
     parser.add_argument("--ffprobe-binary", default="ffprobe")
     parser.add_argument(
@@ -395,6 +404,15 @@ def _execute(
     codec_policy = _codec_policy(arguments)
     resolver = LocalMaterializedSegmentResolver()
     artifact_store = LocalPerceptionArtifactStore(arguments.artifact_dir)
+    scheduler_path = (
+        arguments.scheduler_db
+        if arguments.scheduler_db is not None
+        else arguments.artifact_dir / "perception-vnext.sqlite3"
+    )
+    durable_scheduler = create_default_vnext_perception_scheduler(
+        scheduler_path,
+        profile=arguments.profile,
+    )
     adapter = MageVideoObservationAdapter(
         model_identity=endpoint_health.model_identity,
         codec_policy=codec_policy,
@@ -435,11 +453,47 @@ def _execute(
         media_health_scanner=LocalMediaHealthScanner(ffprobe_binary=arguments.ffprobe_binary),
         materialization_root=arguments.materialization_dir,
         max_inflight_observations=arguments.max_inflight_observations,
+        durable_scheduler=durable_scheduler,
     )
+    durable_execution = result.durable_execution
+    if durable_execution is None:
+        raise LocalMageStreamRunnerError(
+            "Mage vNext --execute did not receive durable scheduler execution state"
+        )
     return {
         "performed": True,
         "execution_policy_version": LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION,
         "queue_depth": result.queue_depth,
+        "durable_execution": {
+            "database_path": str(durable_scheduler.database_path),
+            "run": {
+                "run_key": durable_execution.run.run_key,
+                "plan_key": durable_execution.run.plan_key,
+                "plan_semantic_sha256": durable_execution.run.plan_semantic_sha256,
+                "codec_policy_version": durable_execution.run.codec_policy_version,
+                "scheduler_policy_version": durable_execution.run.scheduler_policy_version,
+                "config_sha256": durable_execution.run.config_sha256,
+                "derived_work_sealed": durable_execution.run.derived_work_sealed,
+            },
+            "finalization_state": durable_execution.finalization_state,
+            "fusion_work_item_ids": list(durable_execution.fusion_work_item_ids),
+            "pending_refinement_work_item_ids": list(
+                durable_execution.pending_refinement_work_item_ids
+            ),
+            "stage_counts": [
+                {
+                    "stage": item.stage.value,
+                    "planned": item.planned,
+                    "ready": item.ready,
+                    "leased": item.leased,
+                    "running": item.running,
+                    "retry_wait": item.retry_wait,
+                    "succeeded": item.succeeded,
+                    "failed_permanent": item.failed_permanent,
+                }
+                for item in durable_execution.snapshot.stage_counts
+            ],
+        },
         "run_manifest": (
             None
             if result.run_manifest is None
