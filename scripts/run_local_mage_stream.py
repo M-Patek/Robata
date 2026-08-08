@@ -2,9 +2,10 @@
 
 ``--execute`` is a concrete in-repository single-worker producer/consumer path:
 for each immutable focus segment it stream-copies one native-video file, measures
-local media health, sends one Mage observation request to the declared endpoint,
-and only then prepares the next segment.  No Qwen model is loaded, deleted, or
-selected unless a caller uses the separate explicit legacy route.
+local media health, and sends one Mage observation request to the declared endpoint.
+At most two observations may be in flight so next-segment preparation can overlap
+serialized generation; results are consumed in ordinal order. No Qwen model is
+loaded, deleted, or selected unless a caller uses the explicit legacy route.
 """
 
 from __future__ import annotations

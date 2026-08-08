@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 from types import ModuleType
 
+from robata.perception.durable_scheduler import (
+    DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
+)
+
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "run_local_mage_stream.py"
 
 
@@ -49,7 +53,7 @@ def test_dry_run_defaults_to_mage_and_emits_absolute_nonoverlap_plan(
     assert payload["composition"] == {
         "mode": "MAGE_STREAM",
         "qwen_autoload": False,
-        "scheduler_policy_version": "mage-stream-vnext-v1",
+        "scheduler_policy_version": DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
         "version": "mage-stream-composition-v1",
     }
     assert payload["qwen_weights_preserved"] is True

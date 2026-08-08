@@ -13,6 +13,9 @@ from robata.application.canonical.perception_routing import (
     require_explicit_legacy_window_route,
     resolve_perception_route,
 )
+from robata.perception.durable_scheduler import (
+    DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
+)
 from robata.perception.pipeline import PerceptionStage
 
 
@@ -23,7 +26,7 @@ def test_default_route_is_provider_neutral_mage_native_video() -> None:
     assert decision.profile is PerceptionRouteKind.MAGE_STREAM_VNEXT
     assert decision.execution_mode is PerceptionExecutionMode.MAGE_STREAM
     assert decision.composition_version == MAGE_STREAM_COMPOSITION_VERSION
-    assert decision.scheduler_policy_version == "mage-stream-vnext-v1"
+    assert decision.scheduler_policy_version == DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION
     assert decision.native_media_type == "video/mp4"
     assert decision.normal_model_stage is PerceptionStage.PERCEPTION_OBSERVE
     assert decision.refinement_model_stage is PerceptionStage.PERCEPTION_REFINE

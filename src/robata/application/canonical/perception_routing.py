@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from robata.perception.durable_scheduler import (
+    DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
+)
 from robata.perception.pipeline import PerceptionStage
 
 MAGE_STREAM_VNEXT_PROFILE: Final = "mage_stream_vnext_v1"
@@ -78,7 +81,7 @@ def resolve_perception_route(
         profile=selected,
         execution_mode=PerceptionExecutionMode.MAGE_STREAM,
         composition_version=MAGE_STREAM_COMPOSITION_VERSION,
-        scheduler_policy_version="mage-stream-vnext-v1",
+        scheduler_policy_version=DURABLE_PERCEPTION_SCHEDULER_POLICY_VERSION,
         provider_neutral_stages=stages,
         native_media_type="video/mp4",
         normal_model_stage=PerceptionStage.PERCEPTION_OBSERVE,
