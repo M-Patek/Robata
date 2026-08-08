@@ -1,4 +1,9 @@
-"""Profile one explicitly mapped local MCAP through the canonical composition."""
+"""Profile the retained legacy-window canonical composition for one local MCAP.
+
+Mage stream vNext has a separate native-video composition and must be launched
+through ``scripts/run_local_mage_stream.py``.  This profiler therefore requires
+the explicit legacy profile rather than acting as a default route.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +23,10 @@ from robata.application.canonical.local_composition import (  # noqa: E402
     CanonicalLocalCompositionError,
     CanonicalLocalRunReceipt,
     run_local_canonical_mcap,
+)
+from robata.application.canonical.perception_routing import (  # noqa: E402
+    LEGACY_QWEN_WINDOW_PROFILE,
+    require_explicit_legacy_window_route,
 )
 from robata.contracts.hashing import canonical_json_bytes  # noqa: E402
 from robata.durability import sync_directory  # noqa: E402
@@ -70,6 +79,12 @@ def _parser() -> argparse.ArgumentParser:
         description="Profile the local canonical pipeline from one real six-camera MCAP."
     )
     parser.add_argument("source", metavar="SOURCE", type=Path, help="local MCAP source")
+    parser.add_argument(
+        "--profile",
+        choices=(LEGACY_QWEN_WINDOW_PROFILE,),
+        required=True,
+        help=("explicit compatibility route; Mage vNext uses scripts/run_local_mage_stream.py"),
+    )
     parser.add_argument(
         "--mapping-config",
         type=Path,
@@ -155,6 +170,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    require_explicit_legacy_window_route(args.profile)
     max_duration_ns = args.max_duration_seconds * 1_000_000_000
     output = args.output.resolve()
     comparison_output = None if args.comparison_output is None else args.comparison_output.resolve()

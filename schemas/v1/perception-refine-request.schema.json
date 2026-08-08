@@ -1,0 +1,158 @@
+{
+  "$defs": {
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "RefineReason": {
+      "description": "Narrow reasons that may trigger the exceptional perception path.",
+      "enum": [
+        "BOUNDARY",
+        "LABEL",
+        "CONFLICT",
+        "QA"
+      ],
+      "title": "RefineReason",
+      "type": "string"
+    },
+    "RefineTargetField": {
+      "description": "Fields a refinement call is permitted to author.",
+      "enum": [
+        "START_BOUNDARY",
+        "END_BOUNDARY",
+        "ACTION_LABEL",
+        "CAMERA_RELATION",
+        "SEMANTIC_QA"
+      ],
+      "title": "RefineTargetField",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/perception-refine-request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A bounded, single-purpose request for exceptional Mage refinement.",
+  "properties": {
+    "identity_policy_version": {
+      "const": "perception-refine-request-identity-v1",
+      "default": "perception-refine-request-identity-v1",
+      "title": "Identity Policy Version",
+      "type": "string"
+    },
+    "projection_version": {
+      "const": "perception-refine-request-semantic-v1",
+      "default": "perception-refine-request-semantic-v1",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "prompt_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Prompt Version",
+      "type": "string"
+    },
+    "reason": {
+      "$ref": "#/$defs/RefineReason"
+    },
+    "refine_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "refine_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Refine Policy Version",
+      "type": "string"
+    },
+    "refine_request_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Refine Request Id",
+      "type": "string"
+    },
+    "refine_request_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Refine Request Key",
+      "type": "string"
+    },
+    "refine_request_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Refine Request Semantic Sha256",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_observation_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Source Observation Logical Key",
+      "type": "string"
+    },
+    "source_observation_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Source Observation Semantic Sha256",
+      "type": "string"
+    },
+    "target_fields": {
+      "items": {
+        "$ref": "#/$defs/RefineTargetField"
+      },
+      "title": "Target Fields",
+      "type": "array"
+    },
+    "target_hypothesis_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Target Hypothesis Logical Key",
+      "type": "string"
+    },
+    "target_hypothesis_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Target Hypothesis Semantic Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "projection_version",
+    "identity_policy_version",
+    "refine_request_id",
+    "refine_request_key",
+    "refine_request_semantic_sha256",
+    "source_observation_logical_key",
+    "source_observation_semantic_sha256",
+    "target_hypothesis_logical_key",
+    "target_hypothesis_semantic_sha256",
+    "reason",
+    "target_fields",
+    "refine_interval",
+    "refine_policy_version",
+    "prompt_version"
+  ],
+  "title": "PerceptionRefineRequest",
+  "type": "object"
+}

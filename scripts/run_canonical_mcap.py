@@ -1,4 +1,9 @@
-"""Run the canonical pipeline against one explicitly mapped local MCAP."""
+"""Run the retained legacy window canonical composition against one local MCAP.
+
+New Mage-native stream runs use ``scripts/run_local_mage_stream.py``.  This
+compatibility entry point requires an explicit ``legacy_window_v1`` profile so
+a generic local command cannot silently select the Qwen/window DAG.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,10 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from robata.application.canonical.local_composition import (  # noqa: E402
     CanonicalLocalCompositionError,
     run_local_canonical_mcap,
+)
+from robata.application.canonical.perception_routing import (  # noqa: E402
+    LEGACY_QWEN_WINDOW_PROFILE,
+    require_explicit_legacy_window_route,
 )
 from robata.contracts.hashing import canonical_json_bytes  # noqa: E402
 
@@ -35,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the local canonical pipeline from one real six-camera MCAP."
     )
     parser.add_argument("source", metavar="SOURCE", type=Path, help="local MCAP source")
+    parser.add_argument(
+        "--profile",
+        choices=(LEGACY_QWEN_WINDOW_PROFILE,),
+        required=True,
+        help=("explicit compatibility route; Mage vNext uses scripts/run_local_mage_stream.py"),
+    )
     parser.add_argument(
         "--mapping-config",
         type=Path,
@@ -73,6 +88,7 @@ def _write_json(payload: object, *, stream: TextIO = sys.stdout) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        require_explicit_legacy_window_route(args.profile)
         receipt = run_local_canonical_mcap(
             source_path=args.source,
             mapping_config=args.mapping_config,

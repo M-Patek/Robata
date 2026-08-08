@@ -13,9 +13,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 
 from pydantic import StringConstraints, model_validator
+
+if TYPE_CHECKING:
+    from robata.application.canonical.perception_composition import (
+        PerceptionCompositionDecision,
+    )
+
 
 from robata.adapters.postgres_authority import ConnectionFactory, PostgresCanonicalAuthority
 from robata.adapters.postgres_capture_authority import PostgresCaptureAuthority
@@ -52,6 +58,25 @@ NonEmptyString = Annotated[str, StringConstraints(strict=True, min_length=1, max
 
 _CANONICAL_SCHEMA = "robata_canonical"
 _TENANT_SETTING = "robata.tenant_id"
+
+
+def _resolve_production_perception_composition(
+    profile: str | None,
+) -> PerceptionCompositionDecision:
+    """Choose Mage stream for new production runs unless legacy is explicit.
+
+    The historical window scheduler remains available for replay only through a
+    caller-supplied legacy profile; production bootstraps without a profile do
+    not silently reconstruct ``stream-window-dag-v4``.
+    """
+
+    from robata.application.canonical.perception_composition import (
+        resolve_perception_composition,
+    )
+
+    return resolve_perception_composition(profile, allow_explicit_legacy_qwen=profile is not None)
+
+
 _REQUIRED_CANONICAL_TABLES = (
     "work_items",
     "work_dependencies",

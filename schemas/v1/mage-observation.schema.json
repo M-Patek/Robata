@@ -1,0 +1,861 @@
+{
+  "$defs": {
+    "ActorObservation": {
+      "additionalProperties": false,
+      "description": "Optional actor attributes reported by perception.",
+      "properties": {
+        "actor_type": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actor Type"
+        },
+        "hand": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hand"
+        }
+      },
+      "required": [
+        "hand",
+        "actor_type"
+      ],
+      "title": "ActorObservation",
+      "type": "object"
+    },
+    "BoundaryAssessment": {
+      "additionalProperties": false,
+      "description": "Boundary certainty and continuation state for a clipped context observation.",
+      "properties": {
+        "continues_after_context": {
+          "default": false,
+          "title": "Continues After Context",
+          "type": "boolean"
+        },
+        "end_confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "End Confidence",
+          "type": "number"
+        },
+        "start_confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Start Confidence",
+          "type": "number"
+        },
+        "started_before_context": {
+          "default": false,
+          "title": "Started Before Context",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "start_confidence",
+        "end_confidence",
+        "started_before_context",
+        "continues_after_context"
+      ],
+      "title": "BoundaryAssessment",
+      "type": "object"
+    },
+    "CameraAbsenceReason": {
+      "description": "Why one canonical camera cannot contribute to the context.",
+      "enum": [
+        "MISSING",
+        "LATE",
+        "DECODE_ERROR",
+        "TIMESTAMP_GAP",
+        "CORRUPT",
+        "UNAVAILABLE"
+      ],
+      "title": "CameraAbsenceReason",
+      "type": "string"
+    },
+    "CameraContextBinding": {
+      "additionalProperties": false,
+      "description": "Durable camera input facts; model features and hidden tensors are excluded.",
+      "properties": {
+        "absence_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CameraAbsenceReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "codec_stream_exact_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Codec Stream Exact Sha256"
+        },
+        "segment_semantic_sha256_values": {
+          "default": [],
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "title": "Segment Semantic Sha256 Values",
+          "type": "array"
+        },
+        "selected_for_inference": {
+          "title": "Selected For Inference",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "camera_id",
+        "available",
+        "selected_for_inference",
+        "codec_stream_exact_sha256",
+        "segment_semantic_sha256_values",
+        "absence_reason"
+      ],
+      "title": "CameraContextBinding",
+      "type": "object"
+    },
+    "CameraEvidenceRelation": {
+      "description": "A camera-local relation to an action observation.",
+      "enum": [
+        "SUPPORTS",
+        "CONTRADICTS",
+        "INDETERMINATE",
+        "NOT_OBSERVABLE"
+      ],
+      "title": "CameraEvidenceRelation",
+      "type": "string"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "CameraObservationEvidence": {
+      "additionalProperties": false,
+      "description": "One explicit six-slot camera relation to an action observation.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "evidence_semantic_sha256_values": {
+          "default": [],
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "title": "Evidence Semantic Sha256 Values",
+          "type": "array"
+        },
+        "observed_interval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NanosecondInterval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "relation": {
+          "$ref": "#/$defs/CameraEvidenceRelation"
+        },
+        "visibility": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Visibility"
+        }
+      },
+      "required": [
+        "camera_id",
+        "relation",
+        "visibility",
+        "observed_interval",
+        "evidence_semantic_sha256_values"
+      ],
+      "title": "CameraObservationEvidence",
+      "type": "object"
+    },
+    "CognitionGateSignal": {
+      "additionalProperties": false,
+      "description": "Shadow-only gate evidence; it cannot suppress perception in v1.",
+      "properties": {
+        "gate_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Gate Policy Version",
+          "type": "string"
+        },
+        "mode": {
+          "const": "SHADOW_ONLY",
+          "default": "SHADOW_ONLY",
+          "title": "Mode",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Score"
+        },
+        "threshold": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Threshold",
+          "type": "number"
+        },
+        "would_admit": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Would Admit"
+        }
+      },
+      "required": [
+        "mode",
+        "score",
+        "threshold",
+        "would_admit",
+        "gate_policy_version"
+      ],
+      "title": "CognitionGateSignal",
+      "type": "object"
+    },
+    "MageActionObservation": {
+      "additionalProperties": false,
+      "description": "What Mage observed, before Robata projects any business fact.",
+      "properties": {
+        "action": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+          "title": "Action",
+          "type": "string"
+        },
+        "actor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActorObservation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "boundary": {
+          "$ref": "#/$defs/BoundaryAssessment"
+        },
+        "camera_evidence": {
+          "$ref": "#/$defs/SixCameraMap_CameraObservationEvidence_"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "local_ref": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Local Ref",
+          "type": "string"
+        },
+        "object": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObjectObservation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "local_ref",
+        "action",
+        "interval",
+        "confidence",
+        "actor",
+        "object",
+        "camera_evidence",
+        "boundary"
+      ],
+      "title": "MageActionObservation",
+      "type": "object"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "ObjectObservation": {
+      "additionalProperties": false,
+      "description": "Optional object attributes; identity hints remain hypotheses, not facts.",
+      "properties": {
+        "identity_hint": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Identity Hint"
+        },
+        "object_type": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+          "title": "Object Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_type",
+        "identity_hint"
+      ],
+      "title": "ObjectObservation",
+      "type": "object"
+    },
+    "PerceptionContextManifest": {
+      "additionalProperties": false,
+      "description": "Replayable causal context for one stream-oriented perception call.",
+      "properties": {
+        "cameras": {
+          "$ref": "#/$defs/SixCameraMap_CameraContextBinding_"
+        },
+        "codec_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Codec Policy Version",
+          "type": "string"
+        },
+        "context_interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "context_manifest_key": {
+          "maxLength": 193,
+          "minLength": 66,
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+          "title": "Context Manifest Key",
+          "type": "string"
+        },
+        "context_manifest_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Context Manifest Semantic Sha256",
+          "type": "string"
+        },
+        "context_policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+          "title": "Context Policy Version",
+          "type": "string"
+        },
+        "focus_segment_ordinal": {
+          "minimum": 0,
+          "title": "Focus Segment Ordinal",
+          "type": "integer"
+        },
+        "identity_policy_version": {
+          "const": "perception-context-identity-v1",
+          "default": "perception-context-identity-v1",
+          "title": "Identity Policy Version",
+          "type": "string"
+        },
+        "ordered_segments": {
+          "items": {
+            "$ref": "#/$defs/StorageSegmentReference"
+          },
+          "title": "Ordered Segments",
+          "type": "array"
+        },
+        "projection_version": {
+          "const": "perception-context-semantic-v1",
+          "default": "perception-context-semantic-v1",
+          "title": "Projection Version",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source_recording_exact_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Recording Exact Sha256",
+          "type": "string"
+        },
+        "source_recording_key": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Source Recording Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "projection_version",
+        "identity_policy_version",
+        "source_recording_key",
+        "source_recording_exact_sha256",
+        "context_interval",
+        "ordered_segments",
+        "focus_segment_ordinal",
+        "cameras",
+        "codec_policy_version",
+        "context_policy_version",
+        "context_manifest_key",
+        "context_manifest_semantic_sha256"
+      ],
+      "title": "PerceptionContextManifest",
+      "type": "object"
+    },
+    "SemanticCameraQa": {
+      "additionalProperties": false,
+      "description": "Camera-local semantic QA from the single perception generation.",
+      "properties": {
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "disposition": {
+          "$ref": "#/$defs/SemanticQaDisposition"
+        },
+        "issues": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SemanticQaIssue"
+          },
+          "title": "Issues",
+          "type": "array"
+        }
+      },
+      "required": [
+        "camera_id",
+        "disposition",
+        "issues",
+        "confidence"
+      ],
+      "title": "SemanticCameraQa",
+      "type": "object"
+    },
+    "SemanticQaDisposition": {
+      "description": "Mage semantic assessment, separate from deterministic media health.",
+      "enum": [
+        "USABLE",
+        "DEGRADED",
+        "UNUSABLE",
+        "UNKNOWN"
+      ],
+      "title": "SemanticQaDisposition",
+      "type": "string"
+    },
+    "SemanticQaIssue": {
+      "additionalProperties": false,
+      "description": "One normalized semantic QA issue emitted by Mage.",
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        }
+      },
+      "required": [
+        "code",
+        "detail"
+      ],
+      "title": "SemanticQaIssue",
+      "type": "object"
+    },
+    "SixCameraMap_CameraContextBinding_": {
+      "additionalProperties": false,
+      "properties": {
+        "cam_01": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_02": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_03": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_04": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_05": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_06": {
+          "$ref": "#/$defs/CameraContextBinding"
+        }
+      },
+      "required": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "SixCameraMap[CameraContextBinding]",
+      "type": "object"
+    },
+    "SixCameraMap_CameraObservationEvidence_": {
+      "additionalProperties": false,
+      "properties": {
+        "cam_01": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        },
+        "cam_02": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        },
+        "cam_03": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        },
+        "cam_04": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        },
+        "cam_05": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        },
+        "cam_06": {
+          "$ref": "#/$defs/CameraObservationEvidence"
+        }
+      },
+      "required": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "SixCameraMap[CameraObservationEvidence]",
+      "type": "object"
+    },
+    "SixCameraMap_SemanticCameraQa_": {
+      "additionalProperties": false,
+      "properties": {
+        "cam_01": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        },
+        "cam_02": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        },
+        "cam_03": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        },
+        "cam_04": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        },
+        "cam_05": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        },
+        "cam_06": {
+          "$ref": "#/$defs/SemanticCameraQa"
+        }
+      },
+      "required": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "SixCameraMap[SemanticCameraQa]",
+      "type": "object"
+    },
+    "StorageSegmentReference": {
+      "additionalProperties": false,
+      "description": "Reference to one immutable, non-overlapping storage segment manifest.",
+      "properties": {
+        "interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "segment_key": {
+          "maxLength": 193,
+          "minLength": 66,
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+          "title": "Segment Key",
+          "type": "string"
+        },
+        "segment_ordinal": {
+          "minimum": 0,
+          "title": "Segment Ordinal",
+          "type": "integer"
+        },
+        "segment_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Segment Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segment_ordinal",
+        "segment_key",
+        "segment_semantic_sha256",
+        "interval"
+      ],
+      "title": "StorageSegmentReference",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/mage-observation.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One durable, parsed Mage perception artifact for one causal context.",
+  "properties": {
+    "cognition_gate": {
+      "$ref": "#/$defs/CognitionGateSignal"
+    },
+    "context": {
+      "$ref": "#/$defs/PerceptionContextManifest"
+    },
+    "created_at": {
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Created At",
+      "type": "string"
+    },
+    "identity_policy_version": {
+      "const": "mage-observation-identity-v1",
+      "default": "mage-observation-identity-v1",
+      "title": "Identity Policy Version",
+      "type": "string"
+    },
+    "inference_artifact_exact_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Inference Artifact Exact Sha256",
+      "type": "string"
+    },
+    "model_artifact_manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Artifact Manifest Sha256",
+      "type": "string"
+    },
+    "model_family": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+      "title": "Model Family",
+      "type": "string"
+    },
+    "model_revision": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Model Revision",
+      "type": "string"
+    },
+    "observation_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "title": "Observation Id",
+      "type": "string"
+    },
+    "observation_identity_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Observation Identity Sha256",
+      "type": "string"
+    },
+    "observation_logical_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Observation Logical Key",
+      "type": "string"
+    },
+    "observation_schema_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Observation Schema Version",
+      "type": "string"
+    },
+    "observation_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Observation Semantic Sha256",
+      "type": "string"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/$defs/MageActionObservation"
+      },
+      "title": "Observations",
+      "type": "array"
+    },
+    "projection_version": {
+      "const": "mage-observation-semantic-v1",
+      "default": "mage-observation-semantic-v1",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "prompt_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Prompt Version",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "semantic_qa": {
+      "$ref": "#/$defs/SixCameraMap_SemanticCameraQa_"
+    }
+  },
+  "required": [
+    "schema_version",
+    "projection_version",
+    "identity_policy_version",
+    "observation_schema_version",
+    "observation_id",
+    "observation_logical_key",
+    "observation_identity_sha256",
+    "observation_semantic_sha256",
+    "context",
+    "model_family",
+    "model_revision",
+    "model_artifact_manifest_sha256",
+    "prompt_version",
+    "inference_artifact_exact_sha256",
+    "cognition_gate",
+    "semantic_qa",
+    "observations",
+    "created_at"
+  ],
+  "title": "MageObservation",
+  "type": "object"
+}
