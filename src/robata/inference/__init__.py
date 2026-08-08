@@ -114,6 +114,19 @@ from robata.inference.input_plan import (
     TransformOperation,
     TransformParameter,
 )
+from robata.inference.mage_small_encoder import (
+    MAGE_SMALL_ENCODER_ID,
+    MAGE_SMALL_ENCODER_POLICY_VERSION,
+    MAGE_SMALL_ENCODER_REVISION,
+    MAGE_SMALL_ENCODER_SELECTION_MODE,
+    MageCompatibleSmallEncoder,
+    MageSmallEncoderError,
+    MageSmallEncoderInputs,
+    MageSmallEncoderPolicy,
+    MageSmallEncoderTelemetry,
+    select_mage_visual_token_runs,
+    uniform_temporal_run_indices,
+)
 from robata.inference.models import (
     CapabilitySnapshot,
     ConcurrencyClass,
@@ -194,6 +207,10 @@ from robata.inference.shadow import ShadowRouter, ShadowRoutingError
 __all__ = [
     "ENRICHED_OUTPUT_SCHEMA_ID",
     "ENRICHED_OUTPUT_SCHEMA_VERSION",
+    "MAGE_SMALL_ENCODER_ID",
+    "MAGE_SMALL_ENCODER_POLICY_VERSION",
+    "MAGE_SMALL_ENCODER_REVISION",
+    "MAGE_SMALL_ENCODER_SELECTION_MODE",
     "PROVIDER_CLAIM_SCHEMA_ID",
     "RUNPOD_QUALIFICATION_RUN_NAMESPACE_METADATA_KEY",
     "RUNPOD_QUALIFICATION_SESSION_METADATA_KEY",
@@ -274,6 +291,11 @@ __all__ = [
     "JsonSchemaRef",
     "LimitDecisionStatus",
     "LimitMetric",
+    "MageCompatibleSmallEncoder",
+    "MageSmallEncoderError",
+    "MageSmallEncoderInputs",
+    "MageSmallEncoderPolicy",
+    "MageSmallEncoderTelemetry",
     "MeasuredProviderLimits",
     "ModelCapabilities",
     "ModelDisagreementSample",
@@ -355,4 +377,6 @@ __all__ = [
     "enrichment_logical_digest",
     "inference_attempt_selection_digest",
     "inference_attempt_selection_logical_key",
+    "select_mage_visual_token_runs",
+    "uniform_temporal_run_indices",
 ]
