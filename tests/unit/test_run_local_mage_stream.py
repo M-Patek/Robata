@@ -130,8 +130,8 @@ def test_execute_uses_in_repository_composition_without_pipeline_runner_hook(
         "pipeline_runner",
     )
     parsed = module._parser().parse_args([str(source), "--start-ns", "0", "--end-ns", "8000000000"])
-    assert parsed.max_inflight_observations == 1
-    assert parsed.max_new_tokens == 512
+    assert parsed.max_inflight_observations == 2
+    assert parsed.max_new_tokens == 256
 
 
 def test_execute_constructs_and_passes_the_default_vnext_scheduler(
@@ -187,7 +187,14 @@ def test_execute_constructs_and_passes_the_default_vnext_scheduler(
             pending_refinement_work_item_ids=(),
         )
         return SimpleNamespace(
-            queue_depth=1,
+            queue_depth=2,
+            execution_profile=SimpleNamespace(value="BOUNDED_PREFETCH_NATIVE_V1"),
+            timing=SimpleNamespace(
+                as_projection=lambda: {
+                    "profile": "BOUNDED_PREFETCH_NATIVE_V1",
+                    "run_wall_seconds": 1.0,
+                }
+            ),
             durable_execution=durable_execution,
             run_manifest=None,
             pipeline_result=SimpleNamespace(
@@ -246,9 +253,11 @@ def test_execute_constructs_and_passes_the_default_vnext_scheduler(
         "shadow_encoder_mode": "DISABLED",
         "worker_count": 1,
         "generation_concurrency": 1,
-        "max_inflight_observations": 1,
+        "max_inflight_observations": 2,
         "raw_refine_provider": "MAGE_NATIVE",
     }
-    assert report["decoder"] == {"max_new_tokens": 512}
+    assert report["decoder"] == {"max_new_tokens": 256}
+    assert report["execution_profile"] == "BOUNDED_PREFETCH_NATIVE_V1"
+    assert report["execution_timing"]["run_wall_seconds"] == 1.0
     adapter_config = captured["adapter_config"]
-    assert adapter_config.max_new_tokens == 512
+    assert adapter_config.max_new_tokens == 256

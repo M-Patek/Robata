@@ -22,6 +22,7 @@ from threading import Condition, Lock, RLock
 from typing import Any, Final
 
 MAGE_VIDEO_RUNTIME_IDENTITY_VERSION: Final = "mage-video-runtime-identity-v1"
+MAGE_VIDEO_GENERATION_TELEMETRY_VERSION: Final = "mage-video-generation-telemetry-v3"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -65,8 +66,24 @@ class MageVideoLoadObservation:
 
 @dataclass(frozen=True, slots=True)
 class MageVideoGenerationTelemetry:
-    """Non-wire timing breakdown for one native generation request."""
+    """Versioned, non-wire timing breakdown for one native generation request.
 
+    Monotonic timestamps are process-local observations. They are deliberately
+    excluded from endpoint v2 responses, result artifacts, and inference
+    identity; only the optional operational telemetry sink may retain them.
+    """
+
+    request_started_monotonic_seconds: float
+    request_completed_monotonic_seconds: float
+    processor_started_monotonic_seconds: float
+    processor_completed_monotonic_seconds: float
+    input_materialization_started_monotonic_seconds: float
+    input_materialization_completed_monotonic_seconds: float
+    generation_started_monotonic_seconds: float
+    first_output_token_monotonic_seconds: float | None
+    generation_completed_monotonic_seconds: float
+    decode_started_monotonic_seconds: float
+    decode_completed_monotonic_seconds: float
     processor_lock_wait_seconds: float
     processor_seconds: float
     generation_lock_wait_seconds: float
@@ -74,6 +91,30 @@ class MageVideoGenerationTelemetry:
     generate_seconds: float
     decode_seconds: float
     total_request_seconds: float
+    time_to_first_token_seconds: float | None
+    output_tokens_per_second: float | None
+    telemetry_version: str = field(
+        default=MAGE_VIDEO_GENERATION_TELEMETRY_VERSION,
+        init=False,
+    )
+
+
+class _MageVideoFirstTokenStoppingCriterion:
+    """Observe the first decoded token without copying token tensors to CPU.
+
+    Transformers invokes stopping criteria after appending each generated
+    token. Returning ``False`` preserves generation behavior while the
+    monotonic callback provides low-overhead TTFT instrumentation.
+    """
+
+    def __init__(self, *, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self.first_output_token_monotonic_seconds: float | None = None
+
+    def __call__(self, _input_ids: Any, _scores: Any, **_kwargs: Any) -> bool:
+        if self.first_output_token_monotonic_seconds is None:
+            self.first_output_token_monotonic_seconds = self._clock()
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,7 +397,8 @@ class MageVideoRuntime:
                     return_tensors="pt",
                     padding=True,
                 )
-                processor_seconds += time.perf_counter() - processor_started
+                processor_completed = time.perf_counter()
+                processor_seconds += processor_completed - processor_started
 
             # The model remains single-flight. Input device materialization is
             # intentionally inside this region: it may allocate GPU tensors and
@@ -373,21 +415,55 @@ class MageVideoRuntime:
                     move = getattr(pixel_values, "to", None)
                     if callable(move):
                         materialized_inputs["pixel_values"] = move(model_dtype)
-                input_materialization_seconds = time.perf_counter() - materialization_started
+                materialization_completed = time.perf_counter()
+                input_materialization_seconds = materialization_completed - materialization_started
                 prompt_tokens = _token_count(materialized_inputs.get("input_ids"), "input_ids")
-                started = time.perf_counter()
+                first_token_criterion = _MageVideoFirstTokenStoppingCriterion(
+                    clock=time.perf_counter
+                )
+                generation_started_monotonic_seconds = time.perf_counter()
                 # ``use_cache`` may create attention KV only for this call. It
-                # is not stored on ``self`` or returned to the endpoint.
+                # is not stored on ``self`` or returned to the endpoint. The
+                # stopping criterion observes TTFT without moving token tensors
+                # to CPU and always returns ``False``, so it cannot terminate or
+                # otherwise alter decoding.
                 with resident.torch.inference_mode():
                     generated = resident.model.generate(
                         **materialized_inputs,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
                         use_cache=True,
+                        stopping_criteria=[first_token_criterion],
                     )
-                generation_seconds = float(time.perf_counter() - started)
+                generation_completed_monotonic_seconds = time.perf_counter()
+                generation_seconds = float(
+                    generation_completed_monotonic_seconds - generation_started_monotonic_seconds
+                )
                 generated_only = generated[:, prompt_tokens:]
                 output_tokens = _token_count(generated_only, "generated output")
+                move_generated = getattr(generated_only, "to", None)
+                if callable(move_generated):
+                    generated_only = move_generated("cpu")
+                # Drop request-local GPU references before releasing the single
+                # generation lane. The CUDA allocator remains warm; no cache
+                # flush is performed between segments.
+                del generated
+                del materialized_inputs
+                del inputs
+                first_output_token_monotonic_seconds = (
+                    first_token_criterion.first_output_token_monotonic_seconds
+                )
+                time_to_first_token_seconds = (
+                    None
+                    if first_output_token_monotonic_seconds is None
+                    else max(
+                        0.0,
+                        first_output_token_monotonic_seconds - generation_started_monotonic_seconds,
+                    )
+                )
+                output_tokens_per_second = (
+                    None if generation_seconds <= 0.0 else float(output_tokens) / generation_seconds
+                )
 
             # ``batch_decode`` is also processor state. It must not race a
             # subsequent codec preparation, but it intentionally happens after
@@ -397,7 +473,8 @@ class MageVideoRuntime:
                 processor_lock_wait_seconds += time.perf_counter() - lock_wait_started
                 decode_started = time.perf_counter()
                 output_text = _decode_generated_text(resident.processor, generated_only)
-                decode_seconds = time.perf_counter() - decode_started
+                decode_completed = time.perf_counter()
+                decode_seconds = decode_completed - decode_started
         except MageVideoRuntimeError:
             raise
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as error:
@@ -408,7 +485,8 @@ class MageVideoRuntime:
 
         if not output_text:
             raise MageVideoRuntimeError("Mage video model returned an empty output")
-        total_request_seconds = time.perf_counter() - request_started
+        request_completed = time.perf_counter()
+        total_request_seconds = request_completed - request_started
         return MageVideoGenerationObservation(
             input_video_count=len(paths),
             prompt_tokens=prompt_tokens,
@@ -416,6 +494,17 @@ class MageVideoRuntime:
             generation_seconds=generation_seconds,
             output_text=output_text,
             telemetry=MageVideoGenerationTelemetry(
+                request_started_monotonic_seconds=request_started,
+                request_completed_monotonic_seconds=request_completed,
+                processor_started_monotonic_seconds=processor_started,
+                processor_completed_monotonic_seconds=processor_completed,
+                input_materialization_started_monotonic_seconds=materialization_started,
+                input_materialization_completed_monotonic_seconds=materialization_completed,
+                generation_started_monotonic_seconds=generation_started_monotonic_seconds,
+                first_output_token_monotonic_seconds=first_output_token_monotonic_seconds,
+                generation_completed_monotonic_seconds=generation_completed_monotonic_seconds,
+                decode_started_monotonic_seconds=decode_started,
+                decode_completed_monotonic_seconds=decode_completed,
                 processor_lock_wait_seconds=processor_lock_wait_seconds,
                 processor_seconds=processor_seconds,
                 generation_lock_wait_seconds=generation_lock_wait_seconds,
@@ -423,6 +512,8 @@ class MageVideoRuntime:
                 generate_seconds=generation_seconds,
                 decode_seconds=decode_seconds,
                 total_request_seconds=total_request_seconds,
+                time_to_first_token_seconds=time_to_first_token_seconds,
+                output_tokens_per_second=output_tokens_per_second,
             ),
         )
 
@@ -905,6 +996,7 @@ def _positive_int(value: object, field: str) -> int:
 
 
 __all__ = [
+    "MAGE_VIDEO_GENERATION_TELEMETRY_VERSION",
     "MAGE_VIDEO_LOAD_PROFILE_BITSANDBYTES_4BIT_NF4",
     "MAGE_VIDEO_LOAD_PROFILE_NATIVE_BF16",
     "MAGE_VIDEO_RUNTIME_IDENTITY_VERSION",

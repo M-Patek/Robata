@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
+from threading import Event, Lock
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,6 +40,7 @@ class _FakeProcessor:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] | None = None
         self.call_kwargs: dict[str, object] | None = None
+        self.decoded_tokens: _FakeTensor | None = None
 
     def apply_chat_template(
         self,
@@ -59,8 +62,9 @@ class _FakeProcessor:
             "patch_positions": _FakeTensor(1),
         }
 
-    def batch_decode(self, _tokens: _FakeTensor, *, skip_special_tokens: bool) -> list[str]:
+    def batch_decode(self, tokens: _FakeTensor, *, skip_special_tokens: bool) -> list[str]:
         assert skip_special_tokens is True
+        self.decoded_tokens = tokens
         return ["  codec answer  "]
 
 
@@ -95,6 +99,74 @@ class _FakeModel:
 
     def generate(self, **kwargs: object) -> _FakeTensor:
         self.generate_kwargs = kwargs
+        stopping_criteria = kwargs.get("stopping_criteria")
+        assert isinstance(stopping_criteria, list)
+        for criterion in stopping_criteria:
+            assert callable(criterion)
+            assert criterion(_FakeTensor(6), None) is False
+        return _FakeTensor(8)
+
+
+class _OverlapProcessor(_FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_prepared = Event()
+        self.first_decode_entered = Event()
+        self.release_first_decode = Event()
+        self._call_count = 0
+        self._decode_count = 0
+        self._counter_lock = Lock()
+
+    def __call__(self, **kwargs: object) -> dict[str, _FakeTensor]:
+        result = super().__call__(**kwargs)
+        with self._counter_lock:
+            self._call_count += 1
+            call_count = self._call_count
+        if call_count == 2:
+            self.second_prepared.set()
+        return result
+
+    def batch_decode(self, tokens: _FakeTensor, *, skip_special_tokens: bool) -> list[str]:
+        with self._counter_lock:
+            self._decode_count += 1
+            decode_count = self._decode_count
+        if decode_count == 1:
+            self.first_decode_entered.set()
+            if not self.release_first_decode.wait(timeout=5.0):
+                raise AssertionError("first decode was not released")
+        return super().batch_decode(tokens, skip_special_tokens=skip_special_tokens)
+
+
+class _OverlapModel(_FakeModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_generation_entered = Event()
+        self.release_first_generation = Event()
+        self.second_generation_entered = Event()
+        self.release_second_generation = Event()
+        self._generate_count = 0
+        self._generate_count_lock = Lock()
+
+    def generate(self, **kwargs: object) -> _FakeTensor:
+        self.generate_kwargs = kwargs
+        stopping_criteria = kwargs.get("stopping_criteria")
+        assert isinstance(stopping_criteria, list)
+        for criterion in stopping_criteria:
+            assert callable(criterion)
+            assert criterion(_FakeTensor(6), None) is False
+        with self._generate_count_lock:
+            self._generate_count += 1
+            generation_count = self._generate_count
+        if generation_count == 1:
+            self.first_generation_entered.set()
+            if not self.release_first_generation.wait(timeout=5.0):
+                raise AssertionError("first generation was not released")
+        elif generation_count == 2:
+            self.second_generation_entered.set()
+            if not self.release_second_generation.wait(timeout=5.0):
+                raise AssertionError("second generation was not released")
+        else:
+            raise AssertionError("unexpected extra generation")
         return _FakeTensor(8)
 
 
@@ -239,6 +311,50 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     assert generated.telemetry.total_request_seconds >= generated.generation_seconds
     assert generated.telemetry.processor_seconds >= 0.0
     assert generated.telemetry.input_materialization_seconds >= 0.0
+    assert generated.telemetry.telemetry_version == "mage-video-generation-telemetry-v3"
+    assert (
+        generated.telemetry.generation_started_monotonic_seconds
+        <= generated.telemetry.first_output_token_monotonic_seconds
+        <= generated.telemetry.generation_completed_monotonic_seconds
+    )
+    assert generated.telemetry.time_to_first_token_seconds is not None
+    assert generated.telemetry.time_to_first_token_seconds >= 0.0
+    assert generated.telemetry.output_tokens_per_second is not None
+    assert generated.telemetry.output_tokens_per_second > 0.0
+    assert generated.telemetry.generate_seconds == pytest.approx(
+        generated.telemetry.generation_completed_monotonic_seconds
+        - generated.telemetry.generation_started_monotonic_seconds
+    )
+    assert (
+        generated.telemetry.request_started_monotonic_seconds
+        <= generated.telemetry.processor_started_monotonic_seconds
+        <= generated.telemetry.processor_completed_monotonic_seconds
+        <= generated.telemetry.input_materialization_started_monotonic_seconds
+        <= generated.telemetry.input_materialization_completed_monotonic_seconds
+        <= generated.telemetry.generation_started_monotonic_seconds
+        <= generated.telemetry.generation_completed_monotonic_seconds
+        <= generated.telemetry.decode_started_monotonic_seconds
+        <= generated.telemetry.decode_completed_monotonic_seconds
+        <= generated.telemetry.request_completed_monotonic_seconds
+    )
+    assert generated.telemetry.processor_seconds == pytest.approx(
+        generated.telemetry.processor_completed_monotonic_seconds
+        - generated.telemetry.processor_started_monotonic_seconds
+    )
+    assert generated.telemetry.input_materialization_seconds == pytest.approx(
+        generated.telemetry.input_materialization_completed_monotonic_seconds
+        - generated.telemetry.input_materialization_started_monotonic_seconds
+    )
+    assert generated.telemetry.decode_seconds == pytest.approx(
+        generated.telemetry.decode_completed_monotonic_seconds
+        - generated.telemetry.decode_started_monotonic_seconds
+    )
+    assert generated.telemetry.total_request_seconds == pytest.approx(
+        generated.telemetry.request_completed_monotonic_seconds
+        - generated.telemetry.request_started_monotonic_seconds
+    )
+    assert processor.decoded_tokens is not None
+    assert processor.decoded_tokens.moves == ["cpu"]
     assert processor.messages == [
         {
             "role": "user",
@@ -269,6 +385,73 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     assert model.generate_kwargs["max_new_tokens"] == 32
     assert model.generate_kwargs["use_cache"] is True
     assert model.generate_kwargs["do_sample"] is False
+    assert len(model.generate_kwargs["stopping_criteria"]) == 1
+
+
+def test_runtime_releases_generation_lane_before_cpu_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    video_path = tmp_path / "segments" / "cam-01.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video-segment")
+    codec_binary = tmp_path / "cv-preinfer"
+    codec_binary.write_bytes(b"stub")
+    monkeypatch.setenv("CV_PREINFER_BIN", str(codec_binary))
+
+    processor = _OverlapProcessor()
+    model = _OverlapModel()
+    transformers = _FakeTransformers(processor, model)
+    imported: list[str] = []
+    monkeypatch.setattr(
+        mage_video_runtime,
+        "import_module",
+        _fake_importer(transformers=transformers, imported=imported),
+    )
+    runtime = MageVideoRuntime(model_directory=model_directory)
+    generation_kwargs = {
+        "video_paths": [video_path],
+        "prompt": "Describe the scene.",
+        "max_new_tokens": 32,
+        "codec_config": {
+            "engine": "hevc",
+            "max_pixels": 150_000,
+            "preprocess_device": "cpu",
+        },
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(runtime.generate, **generation_kwargs)
+        assert model.first_generation_entered.wait(timeout=5.0)
+        second_future = executor.submit(runtime.generate, **generation_kwargs)
+        assert processor.second_prepared.wait(timeout=5.0)
+        model.release_first_generation.set()
+        try:
+            assert processor.first_decode_entered.wait(timeout=5.0)
+            assert model.second_generation_entered.wait(timeout=5.0)
+        finally:
+            processor.release_first_decode.set()
+            model.release_second_generation.set()
+        first = first_future.result(timeout=5.0)
+        second = second_future.result(timeout=5.0)
+
+    assert first.telemetry is not None
+    assert second.telemetry is not None
+    assert (
+        first.telemetry.generation_completed_monotonic_seconds
+        <= second.telemetry.generation_started_monotonic_seconds
+    )
+    assert max(
+        first.telemetry.decode_started_monotonic_seconds,
+        second.telemetry.generation_started_monotonic_seconds,
+    ) < min(
+        first.telemetry.decode_completed_monotonic_seconds,
+        second.telemetry.generation_completed_monotonic_seconds,
+    )
+    assert processor.decoded_tokens is not None
+    assert processor.decoded_tokens.moves == ["cpu"]
 
 
 def test_runtime_loads_bitsandbytes_nf4_profile_with_official_transformers_config(

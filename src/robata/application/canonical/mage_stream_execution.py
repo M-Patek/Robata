@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 from typing import Final, TypeVar
@@ -61,11 +62,33 @@ from robata.perception.projectors import (
     create_media_health_report,
 )
 
-LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION: Final = "local-mage-stream-execution-v2"
+LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION: Final = "local-mage-stream-execution-v3"
 LOCAL_MAGE_MEDIA_HEALTH_POLICY_VERSION: Final = "local-mage-media-health-v1"
-LOCAL_MAGE_STREAM_CONTEXT_REPORT_NAMESPACE: Final = "local-mage-stream-context-report-v1"
-LOCAL_MAGE_STREAM_RUN_MANIFEST_VERSION: Final = "local-mage-stream-run-manifest-v1"
-LOCAL_MAGE_STREAM_RUN_MANIFEST_NAMESPACE: Final = "local-mage-stream-run-manifest-v1"
+LOCAL_MAGE_STREAM_CONTEXT_REPORT_NAMESPACE: Final = "local-mage-stream-context-report-v2"
+LOCAL_MAGE_STREAM_RUN_MANIFEST_VERSION: Final = "local-mage-stream-run-manifest-v2"
+LOCAL_MAGE_STREAM_RUN_MANIFEST_NAMESPACE: Final = "local-mage-stream-run-manifest-v2"
+
+
+class LocalMageStreamExecutionProfile(StrEnum):
+    """Versioned scheduling profiles for one resident Mage generation lane."""
+
+    SERIAL_NATIVE_V1 = "SERIAL_NATIVE_V1"
+    BOUNDED_PREFETCH_NATIVE_V1 = "BOUNDED_PREFETCH_NATIVE_V1"
+
+    @property
+    def queue_depth(self) -> int:
+        return 1 if self is LocalMageStreamExecutionProfile.SERIAL_NATIVE_V1 else 2
+
+
+def execution_profile_for_queue_depth(queue_depth: int) -> LocalMageStreamExecutionProfile:
+    """Return the explicit profile bound to a validated local queue depth."""
+
+    if queue_depth == 1:
+        return LocalMageStreamExecutionProfile.SERIAL_NATIVE_V1
+    if queue_depth == 2:
+        return LocalMageStreamExecutionProfile.BOUNDED_PREFETCH_NATIVE_V1
+    raise ValueError("queue_depth must be 1 or 2")
+
 
 _T = TypeVar("_T")
 
@@ -82,6 +105,14 @@ class LocalMageStreamContextExecution:
     context_manifest_key: str
     context_manifest_semantic_sha256: str
     durable_path: Path
+    preparation_started_offset_seconds: float
+    preparation_completed_offset_seconds: float
+    observation_submitted_offset_seconds: float
+    observation_started_offset_seconds: float
+    observation_completed_offset_seconds: float
+    consumption_started_offset_seconds: float
+    consumption_completed_offset_seconds: float
+    future_wait_seconds: float
     materialization_seconds: float
     media_scan_seconds: float
     observation_seconds: float
@@ -99,6 +130,14 @@ class LocalMageStreamContextExecution:
             "context_manifest_key": self.context_manifest_key,
             "context_manifest_semantic_sha256": self.context_manifest_semantic_sha256,
             "durable_path": str(self.durable_path),
+            "preparation_started_offset_seconds": self.preparation_started_offset_seconds,
+            "preparation_completed_offset_seconds": self.preparation_completed_offset_seconds,
+            "observation_submitted_offset_seconds": self.observation_submitted_offset_seconds,
+            "observation_started_offset_seconds": self.observation_started_offset_seconds,
+            "observation_completed_offset_seconds": self.observation_completed_offset_seconds,
+            "consumption_started_offset_seconds": self.consumption_started_offset_seconds,
+            "consumption_completed_offset_seconds": self.consumption_completed_offset_seconds,
+            "future_wait_seconds": self.future_wait_seconds,
             "materialization_seconds": self.materialization_seconds,
             "media_scan_seconds": self.media_scan_seconds,
             "observation_seconds": self.observation_seconds,
@@ -107,6 +146,36 @@ class LocalMageStreamContextExecution:
             "fusion_seconds": self.fusion_seconds,
             "normal_model_call_count": self.normal_model_call_count,
             "refinement_model_call_count": self.refinement_model_call_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LocalMageStreamExecutionTiming:
+    """Whole-run monotonic timing evidence for serial or bounded-prefetch execution."""
+
+    profile: LocalMageStreamExecutionProfile
+    run_wall_seconds: float
+    media_duration_seconds: float
+    end_to_end_realtime_factor: float
+    preparation_interval_union_seconds: float
+    observation_interval_union_seconds: float
+    preparation_observation_overlap_seconds: float
+    observation_worker_sum_seconds: float
+    observation_parallelism_factor: float
+    max_observations_in_flight: int
+
+    def as_projection(self) -> dict[str, object]:
+        return {
+            "profile": self.profile.value,
+            "run_wall_seconds": self.run_wall_seconds,
+            "media_duration_seconds": self.media_duration_seconds,
+            "end_to_end_realtime_factor": self.end_to_end_realtime_factor,
+            "preparation_interval_union_seconds": self.preparation_interval_union_seconds,
+            "observation_interval_union_seconds": self.observation_interval_union_seconds,
+            "preparation_observation_overlap_seconds": self.preparation_observation_overlap_seconds,
+            "observation_worker_sum_seconds": self.observation_worker_sum_seconds,
+            "observation_parallelism_factor": self.observation_parallelism_factor,
+            "max_observations_in_flight": self.max_observations_in_flight,
         }
 
 
@@ -128,6 +197,8 @@ class LocalMageStreamExecutionResult:
     pipeline_result: StreamPerceptionRunResult
     contexts: tuple[LocalMageStreamContextExecution, ...]
     queue_depth: int
+    execution_profile: LocalMageStreamExecutionProfile
+    timing: LocalMageStreamExecutionTiming
     run_manifest: LocalPerceptionArtifactReference | None = None
     durable_execution: LocalMageStreamDurableExecution | None = None
 
@@ -462,8 +533,26 @@ class _PreparedStreamContext:
     context: PerceptionContextManifest
     materialized_context: MageMaterializedReasoningContext
     media_health: MediaHealthReport
+    preparation_started_offset_seconds: float
+    preparation_completed_offset_seconds: float
     materialization_seconds: float
     media_scan_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedStreamContext:
+    observation: MageObservation
+    provider_elapsed_seconds: float
+    started_offset_seconds: float
+    completed_offset_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingStreamContext:
+    prepared: _PreparedStreamContext
+    future: Future[_ObservedStreamContext]
+    observation_claim: DurablePerceptionWorkClaim | None
+    submitted_offset_seconds: float
 
 
 class LocalMaterializedSegmentResolver(MageVideoDurableSegmentResolver):
@@ -694,13 +783,12 @@ def execute_local_mage_stream(
     durable_worker_id: str = "local-mage-stream",
     durable_lease_duration_seconds: int = 14_520,
 ) -> LocalMageStreamExecutionResult:
-    """Run a bounded producer/consumer stream with ordered deterministic reduction.
+    """Run one resident Mage lane with serial or bounded-prefetch preparation.
 
-    At most ``max_inflight_observations`` native-video requests are in flight.
-    Materialization and media health for the next focus segment proceed while the
-    current Mage request is in preprocessing/generation; observations are still
-    consumed strictly by segment ordinal so tracks and durable projections remain
-    deterministic. A value of one restores the serial backpressure profile.
+    The profile never permits concurrent model generation.  A queue depth of two
+    only admits one next context so its native-media preparation and processor work
+    may overlap the current request.  Deterministic projection, tracking, fusion,
+    persistence, and durable completion remain strictly ordinal.
     """
 
     _validate_local_v1_plan(plan)
@@ -713,6 +801,12 @@ def execute_local_mage_stream(
         or max_inflight_observations > 2
     ):
         raise ValueError("max_inflight_observations must be an integer in [1, 2]")
+    execution_profile = execution_profile_for_queue_depth(max_inflight_observations)
+    execution_started = time.perf_counter()
+
+    def offset_seconds() -> float:
+        return time.perf_counter() - execution_started
+
     scanner = media_health_scanner or LocalMediaHealthScanner()
     durable_bridge = (
         None
@@ -730,6 +824,7 @@ def execute_local_mage_stream(
     context_iterator = iter(plan.reasoning_contexts)
 
     def prepare(stream_context: MageReasoningContext) -> _PreparedStreamContext:
+        preparation_started_offset_seconds = offset_seconds()
         focus_segment = stream_context.ordered_segments[-1]
         materialization_started = time.perf_counter()
         materialized_storage = materializer.materialize_storage_segment(
@@ -774,20 +869,46 @@ def execute_local_mage_stream(
             context=context,
             materialized_context=materialized_context,
             media_health=health,
+            preparation_started_offset_seconds=preparation_started_offset_seconds,
+            preparation_completed_offset_seconds=offset_seconds(),
             materialization_seconds=materialization_seconds,
             media_scan_seconds=time.perf_counter() - scan_started,
         )
 
+    def observe(prepared: _PreparedStreamContext) -> _ObservedStreamContext:
+        started_offset_seconds = offset_seconds()
+        observation, provider_elapsed_seconds = pipeline.observe_context(prepared.context)
+        return _ObservedStreamContext(
+            observation=observation,
+            provider_elapsed_seconds=provider_elapsed_seconds,
+            started_offset_seconds=started_offset_seconds,
+            completed_offset_seconds=offset_seconds(),
+        )
+
     def append_report(
-        prepared: _PreparedStreamContext,
+        pending_context: _PendingStreamContext,
+        observed: _ObservedStreamContext,
+        *,
+        future_wait_seconds: float,
+        consumption_started_offset_seconds: float,
+        consumption_completed_offset_seconds: float,
         before: Mapping[PerceptionStage, tuple[int, float]],
         after: Mapping[PerceptionStage, tuple[int, float]],
     ) -> None:
+        prepared = pending_context.prepared
         report = LocalMageStreamContextExecution(
             focus_segment_ordinal=prepared.focus_segment_ordinal,
             context_manifest_key=prepared.context.context_manifest_key,
             context_manifest_semantic_sha256=prepared.context.context_manifest_semantic_sha256,
             durable_path=prepared.materialized_context.durable_path,
+            preparation_started_offset_seconds=prepared.preparation_started_offset_seconds,
+            preparation_completed_offset_seconds=prepared.preparation_completed_offset_seconds,
+            observation_submitted_offset_seconds=pending_context.submitted_offset_seconds,
+            observation_started_offset_seconds=observed.started_offset_seconds,
+            observation_completed_offset_seconds=observed.completed_offset_seconds,
+            consumption_started_offset_seconds=consumption_started_offset_seconds,
+            consumption_completed_offset_seconds=consumption_completed_offset_seconds,
+            future_wait_seconds=future_wait_seconds,
             materialization_seconds=prepared.materialization_seconds,
             media_scan_seconds=prepared.media_scan_seconds,
             observation_seconds=_stage_elapsed_delta(
@@ -818,19 +939,15 @@ def execute_local_mage_stream(
             report = replace(report, persisted_report_exact_sha256=report_digest)
         reports.append(report)
 
-    pending: deque[
-        tuple[
-            _PreparedStreamContext,
-            Future[tuple[MageObservation, float]],
-            DurablePerceptionWorkClaim | None,
-        ]
-    ] = deque()
+    pending: deque[_PendingStreamContext] = deque()
+    maximum_pending = 0
     with ThreadPoolExecutor(
         max_workers=max_inflight_observations,
         thread_name_prefix="robata-mage-observe",
     ) as executor:
 
         def submit_next() -> bool:
+            nonlocal maximum_pending
             try:
                 stream_context = next(context_iterator)
             except StopIteration:
@@ -842,8 +959,9 @@ def execute_local_mage_stream(
                     focus_segment_ordinal=prepared.focus_segment_ordinal,
                     stage=PerceptionStage.PERCEPTION_OBSERVE,
                 )
+            submitted_offset_seconds = offset_seconds()
             try:
-                future = executor.submit(pipeline.observe_context, prepared.context)
+                future = executor.submit(observe, prepared)
             except BaseException as error:
                 if durable_bridge is not None and observation_claim is not None:
                     durable_bridge.fail(
@@ -852,45 +970,59 @@ def execute_local_mage_stream(
                         error=error,
                     )
                 raise
-            pending.append((prepared, future, observation_claim))
+            pending.append(
+                _PendingStreamContext(
+                    prepared=prepared,
+                    future=future,
+                    observation_claim=observation_claim,
+                    submitted_offset_seconds=submitted_offset_seconds,
+                )
+            )
+            maximum_pending = max(maximum_pending, len(pending))
             return True
 
         while len(pending) < max_inflight_observations and submit_next():
             pass
         while pending:
-            prepared, future, observation_claim = pending.popleft()
+            pending_context = pending.popleft()
+            wait_started = time.perf_counter()
             try:
-                observation, _provider_elapsed = future.result()
+                observed = pending_context.future.result()
             except BaseException as error:
-                if durable_bridge is not None and observation_claim is not None:
+                if durable_bridge is not None and pending_context.observation_claim is not None:
                     durable_bridge.fail(
-                        observation_claim,
+                        pending_context.observation_claim,
                         stage=PerceptionStage.PERCEPTION_OBSERVE,
                         error=error,
                     )
                 raise
-            if durable_bridge is not None and observation_claim is not None:
-                observation_reference, observation_sha256 = _observation_result_binding(observation)
+            future_wait_seconds = time.perf_counter() - wait_started
+            consumption_started_offset_seconds = offset_seconds()
+            if durable_bridge is not None and pending_context.observation_claim is not None:
+                observation_reference, observation_sha256 = _observation_result_binding(
+                    observed.observation
+                )
                 durable_bridge.complete(
-                    observation_claim,
+                    pending_context.observation_claim,
                     result_reference=observation_reference,
                     result_sha256=observation_sha256,
                 )
             before = _measurement_map(session.stage_measurements())
+            prepared = pending_context.prepared
             if durable_bridge is None:
                 session.consume_precomputed(
                     context=prepared.context,
                     media_health=prepared.media_health,
-                    observation=observation,
-                    observation_elapsed_seconds=_provider_elapsed,
+                    observation=observed.observation,
+                    observation_elapsed_seconds=observed.provider_elapsed_seconds,
                 )
             else:
 
                 def project_current(
                     context: PerceptionContextManifest = prepared.context,
                     media_health: MediaHealthReport = prepared.media_health,
-                    current_observation: MageObservation = observation,
-                    elapsed: float = _provider_elapsed,
+                    current_observation: MageObservation = observed.observation,
+                    elapsed: float = observed.provider_elapsed_seconds,
                 ) -> PerceptionProjectedContext:
                     return session.project_precomputed(
                         context=context,
@@ -918,7 +1050,15 @@ def execute_local_mage_stream(
                     result_binding=_temporal_result_binding,
                 )
             after = _measurement_map(session.stage_measurements())
-            append_report(prepared, before, after)
+            append_report(
+                pending_context,
+                observed,
+                future_wait_seconds=future_wait_seconds,
+                consumption_started_offset_seconds=consumption_started_offset_seconds,
+                consumption_completed_offset_seconds=offset_seconds(),
+                before=before,
+                after=after,
+            )
             while len(pending) < max_inflight_observations and submit_next():
                 pass
 
@@ -926,7 +1066,45 @@ def execute_local_mage_stream(
     durable_execution = (
         None if durable_bridge is None else durable_bridge.record_terminal_state(result)
     )
+    run_wall_seconds = offset_seconds()
     context_reports = tuple(reports)
+    preparation_intervals = tuple(
+        (
+            item.preparation_started_offset_seconds,
+            item.preparation_completed_offset_seconds,
+        )
+        for item in context_reports
+    )
+    observation_intervals = tuple(
+        (item.observation_started_offset_seconds, item.observation_completed_offset_seconds)
+        for item in context_reports
+    )
+    preparation_union_seconds = _interval_union_seconds(preparation_intervals)
+    observation_union_seconds = _interval_union_seconds(observation_intervals)
+    observation_worker_sum_seconds = sum(
+        end_seconds - start_seconds for start_seconds, end_seconds in observation_intervals
+    )
+    media_duration_seconds = plan.recording.interval.duration_ns / 1_000_000_000
+    timing = LocalMageStreamExecutionTiming(
+        profile=execution_profile,
+        run_wall_seconds=run_wall_seconds,
+        media_duration_seconds=media_duration_seconds,
+        end_to_end_realtime_factor=(
+            media_duration_seconds / run_wall_seconds if run_wall_seconds > 0.0 else 0.0
+        ),
+        preparation_interval_union_seconds=preparation_union_seconds,
+        observation_interval_union_seconds=observation_union_seconds,
+        preparation_observation_overlap_seconds=_interval_overlap_union_seconds(
+            preparation_intervals, observation_intervals
+        ),
+        observation_worker_sum_seconds=observation_worker_sum_seconds,
+        observation_parallelism_factor=(
+            observation_worker_sum_seconds / observation_union_seconds
+            if observation_union_seconds > 0.0
+            else 0.0
+        ),
+        max_observations_in_flight=maximum_pending,
+    )
     run_manifest: LocalPerceptionArtifactReference | None = None
     if artifact_store is not None:
         run_projection = _build_run_manifest_projection(
@@ -934,6 +1112,8 @@ def execute_local_mage_stream(
             selected_camera=selected_camera,
             codec_policy_version=codec_policy_version,
             queue_depth=max_inflight_observations,
+            execution_profile=execution_profile,
+            timing=timing,
             contexts=context_reports,
             pipeline_result=result,
             durable_execution=durable_execution,
@@ -957,6 +1137,8 @@ def execute_local_mage_stream(
         pipeline_result=result,
         contexts=context_reports,
         queue_depth=max_inflight_observations,
+        execution_profile=execution_profile,
+        timing=timing,
         run_manifest=run_manifest,
         durable_execution=durable_execution,
     )
@@ -968,6 +1150,8 @@ def _build_run_manifest_projection(
     selected_camera: CameraId,
     codec_policy_version: str,
     queue_depth: int,
+    execution_profile: LocalMageStreamExecutionProfile,
+    timing: LocalMageStreamExecutionTiming,
     contexts: tuple[LocalMageStreamContextExecution, ...],
     pipeline_result: StreamPerceptionRunResult,
     durable_execution: LocalMageStreamDurableExecution | None,
@@ -1066,6 +1250,8 @@ def _build_run_manifest_projection(
         "codec_policy_version": codec_policy_version,
         "execution_policy_version": LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION,
         "queue_depth": queue_depth,
+        "execution_profile": execution_profile.value,
+        "timing": timing.as_projection(),
         "contexts": context_projection,
         "terminal_artifacts": terminal_projection,
         "accepted_inference_bindings": accepted_bindings,
@@ -1082,6 +1268,42 @@ def _artifact_reference_projection(reference: LocalPerceptionArtifactReference) 
         "logical_key": reference.logical_key,
         "exact_sha256": reference.exact_sha256,
     }
+
+
+def _interval_union_seconds(intervals: tuple[tuple[float, float], ...]) -> float:
+    """Return the union of valid monotonic intervals without double counting."""
+
+    normalized = sorted(
+        (start_seconds, end_seconds)
+        for start_seconds, end_seconds in intervals
+        if end_seconds > start_seconds
+    )
+    if not normalized:
+        return 0.0
+    union_seconds = 0.0
+    current_start, current_end = normalized[0]
+    for start_seconds, end_seconds in normalized[1:]:
+        if start_seconds <= current_end:
+            current_end = max(current_end, end_seconds)
+            continue
+        union_seconds += current_end - current_start
+        current_start, current_end = start_seconds, end_seconds
+    return union_seconds + current_end - current_start
+
+
+def _interval_overlap_union_seconds(
+    left_intervals: tuple[tuple[float, float], ...],
+    right_intervals: tuple[tuple[float, float], ...],
+) -> float:
+    """Return unique wall time covered by at least one interval from each side."""
+
+    intersections = tuple(
+        (max(left_start, right_start), min(left_end, right_end))
+        for left_start, left_end in left_intervals
+        for right_start, right_end in right_intervals
+        if min(left_end, right_end) > max(left_start, right_start)
+    )
+    return _interval_union_seconds(intersections)
 
 
 def _validate_local_v1_plan(plan: MageStreamPlan) -> None:
@@ -1157,8 +1379,11 @@ __all__ = [
     "LocalMageStreamContextExecution",
     "LocalMageStreamDurableExecution",
     "LocalMageStreamExecutionError",
+    "LocalMageStreamExecutionProfile",
     "LocalMageStreamExecutionResult",
+    "LocalMageStreamExecutionTiming",
     "LocalMaterializedSegmentResolver",
     "LocalMediaHealthScanner",
     "execute_local_mage_stream",
+    "execution_profile_for_queue_depth",
 ]

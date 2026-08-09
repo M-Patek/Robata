@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -18,6 +19,7 @@ from robata.application.canonical.mage_stream import (
 )
 from robata.application.canonical.mage_stream_execution import (
     LocalMageStreamExecutionError,
+    LocalMageStreamExecutionProfile,
     LocalMaterializedSegmentResolver,
     LocalMediaHealthScanner,
     execute_local_mage_stream,
@@ -61,6 +63,33 @@ class _RecordingProvider:
             start_confidence=self.start_confidence,
             end_confidence=self.end_confidence,
             inference_artifact_seed=("stream", ordinal),
+        )
+
+
+class _OverlapProvider:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.first_started = Event()
+        self.second_started = Event()
+
+    def observe(self, context):  # type: ignore[no-untyped-def]
+        ordinal = context.focus_segment_ordinal
+        self.events.append(f"observe-{ordinal}")
+        if ordinal == 0:
+            self.first_started.set()
+            if not self.second_started.wait(timeout=5.0):
+                raise RuntimeError("second observation did not overlap the first")
+        elif ordinal == 1:
+            if not self.first_started.is_set():
+                raise RuntimeError("second observation started before the first")
+            self.second_started.set()
+        start_ns = context.context_interval.start_ns + 1
+        return make_observation(
+            context=context,
+            local_ref=f"observation-{ordinal}",
+            action_start_ns=start_ns,
+            action_end_ns=start_ns + 1,
+            inference_artifact_seed=("overlap", ordinal),
         )
 
 
@@ -156,6 +185,10 @@ def test_execution_materializes_scans_and_observes_each_focus_segment_in_order(
         "observe-2",
     ]
     assert result.queue_depth == 1
+    assert result.execution_profile is LocalMageStreamExecutionProfile.SERIAL_NATIVE_V1
+    assert result.timing.profile is LocalMageStreamExecutionProfile.SERIAL_NATIVE_V1
+    assert result.timing.max_observations_in_flight == 1
+    assert result.timing.end_to_end_realtime_factor > 0.0
     assert len(result.contexts) == 3
     assert all(item.normal_model_call_count == 1 for item in result.contexts)
     assert all(item.refinement_model_call_count == 0 for item in result.contexts)
@@ -166,8 +199,10 @@ def test_execution_materializes_scans_and_observes_each_focus_segment_in_order(
             kind=result.run_manifest.kind, logical_key=result.run_manifest.logical_key
         )
     )
-    assert run_manifest["manifest_version"] == "local-mage-stream-run-manifest-v1"
+    assert run_manifest["manifest_version"] == "local-mage-stream-run-manifest-v2"
     assert run_manifest["plan_semantic_sha256"] == plan.plan_semantic_sha256
+    assert run_manifest["execution_profile"] == "SERIAL_NATIVE_V1"
+    assert run_manifest["timing"]["max_observations_in_flight"] == 1
     assert result.pipeline_result.terminal_artifacts is not None
     assert [item["persisted_report_exact_sha256"] for item in run_manifest["contexts"]] == [
         item.persisted_report_exact_sha256 for item in result.contexts
@@ -392,12 +427,20 @@ def test_execution_supports_two_inflight_observations_with_ordered_consumption(
         materializer=_RecordingMaterializer(events=events),
         codec_policy_version="mage-video-codec-policy-v1",
         resolver=LocalMaterializedSegmentResolver(),
-        pipeline=_pipeline(_RecordingProvider(events), tmp_path),
+        pipeline=_pipeline(_OverlapProvider(events), tmp_path),
         media_health_scanner=LocalMediaHealthScanner(command_runner=_ffprobe_success),
         materialization_root=tmp_path / "materialized",
         max_inflight_observations=2,
     )
 
     assert result.queue_depth == 2
+    assert result.execution_profile is LocalMageStreamExecutionProfile.BOUNDED_PREFETCH_NATIVE_V1
+    assert result.timing.profile is LocalMageStreamExecutionProfile.BOUNDED_PREFETCH_NATIVE_V1
+    assert result.timing.max_observations_in_flight == 2
+    assert result.timing.preparation_observation_overlap_seconds > 0.0
+    assert result.timing.observation_parallelism_factor > 1.0
     assert [item.focus_segment_ordinal for item in result.contexts] == [0, 1, 2]
+    assert result.contexts[1].observation_started_offset_seconds < (
+        result.contexts[0].observation_completed_offset_seconds
+    )
     assert result.pipeline_result.normal_model_call_count == 3

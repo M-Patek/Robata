@@ -119,6 +119,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--idempotency-state-path", type=Path, default=None)
     parser.add_argument("--result-artifact-dir", type=Path, default=None)
     parser.add_argument(
+        "--generation-telemetry-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "optional non-wire JSONL sink for versioned generation timing, TTFT, token "
+            "throughput, and monotonic generation intervals"
+        ),
+    )
+    parser.add_argument(
         "--durable-input-root",
         type=Path,
         action="append",
@@ -264,6 +273,22 @@ def _codec_policy(endpoint_module: Any, arguments: argparse.Namespace) -> Any:
     )
 
 
+def _generation_telemetry_sink(
+    endpoint_module: Any,
+    arguments: argparse.Namespace,
+) -> tuple[Any | None, Path | None]:
+    requested_path = arguments.generation_telemetry_jsonl
+    if requested_path is None:
+        return None, None
+    sink_type = getattr(endpoint_module, "MageVideoGenerationJsonlSink", None)
+    if sink_type is None:
+        raise MageVideoEndpointLaunchError(
+            "Mage endpoint does not expose the generation telemetry JSONL sink"
+        )
+    resolved_path = requested_path.expanduser().resolve()
+    return sink_type(resolved_path), resolved_path
+
+
 def _state_paths(arguments: argparse.Namespace) -> tuple[Path, Path, Path, tuple[Path, ...]]:
     state_root = arguments.state_dir.expanduser().resolve()
     try:
@@ -312,6 +337,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         checkpoint_sha256 = checkpoint_manifest.manifest_sha256
         policy = _codec_policy(endpoint_module, arguments)
+        generation_telemetry_sink, generation_telemetry_path = _generation_telemetry_sink(
+            endpoint_module,
+            arguments,
+        )
         codec_checker = getattr(runtime_module, "require_mage_video_codec_dependencies", None)
         if not callable(codec_checker):
             raise MageVideoEndpointLaunchError(
@@ -339,6 +368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             idempotency_state_path=idempotency_path,
             result_artifact_directory=result_root,
             durable_input_roots=input_roots,
+            generation_telemetry_sink=generation_telemetry_sink,
         )
         service.start()
         health = service.health()
@@ -364,6 +394,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "state_dir": str(state_root),
                 "idempotency_state_path": str(idempotency_path),
                 "result_artifact_dir": str(result_root),
+                "generation_telemetry_jsonl": (
+                    str(generation_telemetry_path)
+                    if generation_telemetry_path is not None
+                    else None
+                ),
                 "durable_input_roots": [str(item) for item in input_roots],
                 "limitation": "v2 accepts one native video input and one decoder only",
             }

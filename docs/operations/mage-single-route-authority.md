@@ -1,65 +1,66 @@
-﻿# Mage Single-Route Authority Profile
+# Mage Single-Route Authority Profile
 
 ## Decision
 
-The current qualification profile uses **Mage native codec/video as the only
-publication authority**. The lightweight-encoder seam is disabled by default. When an implementation is configured, it is an additive,
-`SHADOW_ONLY` candidate and cannot publish facts, suppress Mage inference, or
-replace a native Mage artifact until it passes a paired qualification.
+The active local qualification route uses **Mage native codec/video as the only
+perception authority**. The small-encoder seam is not executed by this profile and
+cannot publish facts, suppress Mage inference, or replace a Mage artifact. It remains
+an offline/shadow research boundary only; it is not part of the sustained runtime.
 
 ## Current execution profile
 
 - one selected camera (`cam_01` by default);
 - one resident Mage runtime;
-- one generation worker (`generation_concurrency=1`);
-- one observation in flight by default;
-- small-encoder execution disabled until an implementation is explicitly configured;
-- optional second preparation slot only for a controlled prefetch experiment;
-- native Mage raw-video remains the normal and refinement provider;
-- raw media and exact segment lineage remain durable for replay and targeted refine.
+- one worker and exactly one `model.generate` call in flight;
+- bounded queue depth `2` by default: one active request plus one preparation slot;
+- queue depth `1` remains the explicit serial control profile;
+- native Mage codec/video is used for both normal observation and any future targeted
+  refinement;
+- raw media, segment manifests, inference identities, result artifacts, and downstream
+  projections remain durable and replayable;
+- no Qwen model or lightweight encoder is selected by the default route.
 
-The single-route restriction is deliberate. It makes the trust boundary and the
-performance baseline unambiguous before multi-camera or high-concurrency work is
-introduced.
+Queue depth `2` is **not model concurrency**. The runtime keeps generation serialized,
+but permits segment `N+1` processor/codec preparation to overlap segment `N` generation.
+Generated token IDs are moved to CPU before the generation lane is released, so CPU
+decode can overlap the next GPU generation without retaining request-local GPU tensors.
+No per-segment CUDA cache flush is performed.
 
-## Small-encoder shadow seam
+## Compact decoder contract
 
-`robata.perception.single_route` defines a provider-neutral `SmallCameraEncoder`
-protocol and bounded `SmallEncoderObservation`. These observations include camera
-identity, interval, quality, confidence, candidate actions, feature lineage, and
-source-frame references. They are explicitly `shadow_only` and are compared to
-the native Mage observation by lineage, not promoted automatically.
+`run_local_mage_stream.py --max-new-tokens` is identity-bound. The sustained profile
+default is `256` tokens. Qualification fails if any output reaches that ceiling; this
+prevents a shorter budget from being reported as a performance win when it truncates the
+observation.
 
-A small encoder must not be treated as trusted merely because it is faster. Before
-promotion, paired runs on the same segments must measure event recall, boundary
-error, false silence, confidence calibration, output token reduction, latency,
-VRAM, and replay lineage. A text-only summary is not a sufficient replacement for
-visual evidence; a final implementation must retain structured semantics and a
-compatible compact visual representation or use native Mage refinement.
+## Operational telemetry
 
-## Decoder budget and telemetry
+The authoritative v2 response and result artifact bytes remain unchanged. Optional
+non-wire sidecars record:
 
-`run_local_mage_stream.py --max-new-tokens` exposes the decoder budget for an
-identity-bound A/B test. The default remains 512 until a versioned compact prompt
-contract is qualified.
+- endpoint generation event v3: request, processor, input materialization, generation,
+  first token, decode, lock waits, TTFT, output tokens/s, result artifact lineage, model
+  load time, and token-budget exhaustion;
+- full-wall `nvidia-smi` samples: utilization, VRAM, power, and temperature;
+- run timing: wall time, media duration, RTF, preparation/generation overlap, bounded
+  in-flight count, and execution profile;
+- comparison evidence: freshness, artifact replay isolation, single-generation proof,
+  exact output-text hash parity, duty cycle, idle gaps, and qualification gates.
 
-The runtime now records a non-wire timing sidecar for local diagnostics:
-processor-lock wait, processor preparation, generation-lock wait, input
-materialization, `model.generate`, decode, and total request time. The published
-endpoint response remains unchanged; endpoint logs carry the timing breakdown.
+These sidecars are local diagnostic evidence. They are not published schemas, do not
+participate in inference identity, and cannot make a run production-eligible.
 
-## Future migration
+## Cache conditioning
 
-On a high-memory GPU, the same contracts can be reused with:
+Native neural-codec preparation has a large cold-cache cost on the RTX 4060 test host.
+Performance reports must therefore label whether codec assets were absent or already
+populated. A cold serial arm must not be compared with a warm prefetch arm. The retained
+August 8, 2026 qualification records both a warm steady-state pair and a cold-path pair;
+see `mage-native-sustained-qualification.md`.
 
-```text
-camera_01 ... camera_06
-        -> bounded encoder micro-batch
-        -> SceneObservation
-        -> one Mage reasoning request
-```
+## Future scaling
 
-That future expansion changes runtime composition and capacity settings, not the
-authority boundary or published evidence lineage. The native Mage path remains a
-reference and targeted-refine route until the small encoder demonstrates no
-unacceptable semantic regression.
+The current route intentionally stays single-camera and single-generation. Moving to a
+high-memory GPU may add native multi-camera encoding or provider-internal feature reuse,
+but that is a separate qualification. It must not silently turn the disabled small
+encoder into the authority or change the published evidence lineage.
