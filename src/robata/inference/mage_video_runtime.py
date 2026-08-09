@@ -12,7 +12,8 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from importlib import import_module
@@ -21,9 +22,18 @@ from pathlib import Path
 from threading import Condition, Lock, RLock
 from typing import Any, Final
 
+from robata.inference.device_execution_guard import (
+    DeviceExecutionGuard,
+    DeviceExecutionGuardBusy,
+    DeviceExecutionGuardError,
+    ExclusiveFileDeviceGuard,
+)
+
 MAGE_VIDEO_RUNTIME_IDENTITY_VERSION: Final = "mage-video-runtime-identity-v1"
 MAGE_VIDEO_GENERATION_TELEMETRY_VERSION: Final = "mage-video-generation-telemetry-v3"
+MAGE_VIDEO_CODEC_CACHE_BINDING_VERSION: Final = "mage-video-codec-cache-binding-v1"
 _LOGGER = logging.getLogger(__name__)
+_PROVIDER_CACHE_BINDING_LOCK = RLock()
 
 
 class MageVideoLoadProfile(StrEnum):
@@ -53,6 +63,40 @@ class MageVideoRuntimeError(RuntimeError):
 
 class MageVideoCodecDependencyError(MageVideoRuntimeError):
     """A selected codec preprocessing engine is unavailable on this host."""
+
+
+@dataclass(frozen=True, slots=True)
+class MageVideoCodecCacheBinding:
+    """Internal binding to one already verified native-codec cache directory.
+
+    This object is an endpoint/runtime hand-off, not a published wire contract and
+    not an authoritative replay artifact. Its only purpose is to make the exact
+    cache directory selected by strict admission explicit to the resident runtime.
+    """
+
+    source_path: Path
+    provider_cache_directory: Path
+    binding_version: str = field(default=MAGE_VIDEO_CODEC_CACHE_BINDING_VERSION, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_path, Path):
+            raise TypeError("source_path must be pathlib.Path")
+        if not isinstance(self.provider_cache_directory, Path):
+            raise TypeError("provider_cache_directory must be pathlib.Path")
+        source = self.source_path.expanduser().resolve()
+        directory = self.provider_cache_directory.expanduser().resolve()
+        if not source.is_file():
+            raise ValueError(f"codec cache binding source is not a file: {source}")
+        if not directory.is_dir():
+            raise ValueError(f"codec cache binding directory is not a directory: {directory}")
+        for relative_name in ("meta.json", "src_patch_position.npy"):
+            if not (directory / relative_name).is_file():
+                raise ValueError(
+                    "codec cache binding directory lacks a required provider asset: "
+                    f"{relative_name}"
+                )
+        object.__setattr__(self, "source_path", source)
+        object.__setattr__(self, "provider_cache_directory", directory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,9 +212,11 @@ class MageVideoRuntime:
         *,
         model_directory: Path,
         offload_directory: Path | None = None,
+        codec_cache_root: Path | None = None,
         load_profile: MageVideoLoadProfile | str | None = None,
         runtime_identity: MageVideoRuntimeIdentity | None = None,
         codec_dependency_checker: CodecDependencyChecker | None = None,
+        shared_device_guard_file: Path | None = None,
     ) -> None:
         self._model_directory = Path(model_directory).expanduser().resolve()
         if not self._model_directory.is_dir():
@@ -182,6 +228,13 @@ class MageVideoRuntime:
             if offload_directory is not None
             else None
         )
+        self._codec_cache_root = (
+            Path(codec_cache_root).expanduser().resolve() if codec_cache_root is not None else None
+        )
+        if self._codec_cache_root is not None and not self._codec_cache_root.is_dir():
+            raise MageVideoRuntimeError(
+                f"codec_cache_root is not an existing directory: {self._codec_cache_root}"
+            )
         self._codec_dependency_checker = (
             codec_dependency_checker or require_mage_video_codec_dependencies
         )
@@ -189,8 +242,21 @@ class MageVideoRuntime:
             load_profile=load_profile,
             declared_identity=runtime_identity,
         )
+        try:
+            self._shared_device_guard: DeviceExecutionGuard | None = (
+                ExclusiveFileDeviceGuard(shared_device_guard_file)
+                if shared_device_guard_file is not None
+                else None
+            )
+        except DeviceExecutionGuardError as error:
+            raise MageVideoRuntimeError("shared device guard configuration is invalid") from error
+        self._shared_device_guard_file = (
+            self._shared_device_guard.path
+            if isinstance(self._shared_device_guard, ExclusiveFileDeviceGuard)
+            else None
+        )
 
-        # Do not use a single lock across codec preparation and GPU generation.
+        # Do not use a single in-process lock across codec preparation and GPU generation.
         # The condition protects resident lifetime only; the other two locks
         # independently bound the unsafe mutable provider surfaces.
         self._state_condition = Condition(RLock())
@@ -227,6 +293,16 @@ class MageVideoRuntime:
         """Return the explicit profile that controls model-loading semantics."""
 
         return self._runtime_identity.load_profile
+
+    @property
+    def shared_device_guard_file(self) -> Path | None:
+        """Return the operational cross-process guard path, if configured.
+
+        The path is scheduling state only and deliberately does not alter
+        :attr:`runtime_identity` or any durable inference identity.
+        """
+
+        return self._shared_device_guard_file
 
     @property
     def load_observation(self) -> MageVideoLoadObservation:
@@ -335,6 +411,7 @@ class MageVideoRuntime:
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
+        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
     ) -> MageVideoGenerationObservation:
         """Generate from durable video paths through ``video_backend='codec'``.
 
@@ -358,10 +435,20 @@ class MageVideoRuntime:
             if not path.is_file():
                 raise MageVideoRuntimeError(f"video path is not a file: {path}")
 
-        native_codec_config = _normalise_native_codec_config(codec_config, self._model_directory)
+        native_codec_config = _normalise_native_codec_config(
+            codec_config,
+            self._model_directory,
+            codec_cache_root=self._codec_cache_root,
+        )
         # Validate host requirements before a costly model load. The actual
         # codec implementation still owns per-video cache and decoding errors.
         self._codec_dependency_checker(native_codec_config, self._model_directory)
+        exact_cache_binding = _validate_codec_cache_binding(
+            binding=codec_cache_binding,
+            paths=paths,
+            native_codec_config=native_codec_config,
+            configured_cache_root=self._codec_cache_root,
+        )
         resident = self._acquire_resident_lease()
         request_started = time.perf_counter()
         processor_lock_wait_seconds = 0.0
@@ -388,15 +475,19 @@ class MageVideoRuntime:
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                inputs = resident.processor(
-                    text=[text],
-                    videos=[str(path) for path in paths],
-                    video_backend="codec",
-                    codec_config=native_codec_config,
-                    max_pixels=int(native_codec_config["max_pixels"]),
-                    return_tensors="pt",
-                    padding=True,
-                )
+                with _bind_exact_provider_cache_entry(
+                    processor=resident.processor,
+                    binding=exact_cache_binding,
+                ):
+                    inputs = resident.processor(
+                        text=[text],
+                        videos=[str(path) for path in paths],
+                        video_backend="codec",
+                        codec_config=native_codec_config,
+                        max_pixels=int(native_codec_config["max_pixels"]),
+                        return_tensors="pt",
+                        padding=True,
+                    )
                 processor_completed = time.perf_counter()
                 processor_seconds += processor_completed - processor_started
 
@@ -406,64 +497,85 @@ class MageVideoRuntime:
             lock_wait_started = time.perf_counter()
             with self._generation_lock:
                 generation_lock_wait_seconds += time.perf_counter() - lock_wait_started
-                materialization_started = time.perf_counter()
-                device = _model_device(resident.model)
-                materialized_inputs = _move_inputs_to_device(inputs, device)
-                pixel_values = materialized_inputs.get("pixel_values")
-                model_dtype = getattr(resident.model, "dtype", None)
-                if pixel_values is not None and model_dtype is not None:
-                    move = getattr(pixel_values, "to", None)
-                    if callable(move):
-                        materialized_inputs["pixel_values"] = move(model_dtype)
-                materialization_completed = time.perf_counter()
-                input_materialization_seconds = materialization_completed - materialization_started
-                prompt_tokens = _token_count(materialized_inputs.get("input_ids"), "input_ids")
-                first_token_criterion = _MageVideoFirstTokenStoppingCriterion(
-                    clock=time.perf_counter
-                )
-                generation_started_monotonic_seconds = time.perf_counter()
-                # ``use_cache`` may create attention KV only for this call. It
-                # is not stored on ``self`` or returned to the endpoint. The
-                # stopping criterion observes TTFT without moving token tensors
-                # to CPU and always returns ``False``, so it cannot terminate or
-                # otherwise alter decoding.
-                with resident.torch.inference_mode():
-                    generated = resident.model.generate(
-                        **materialized_inputs,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        use_cache=True,
-                        stopping_criteria=[first_token_criterion],
-                    )
-                generation_completed_monotonic_seconds = time.perf_counter()
-                generation_seconds = float(
-                    generation_completed_monotonic_seconds - generation_started_monotonic_seconds
-                )
-                generated_only = generated[:, prompt_tokens:]
-                output_tokens = _token_count(generated_only, "generated output")
-                move_generated = getattr(generated_only, "to", None)
-                if callable(move_generated):
-                    generated_only = move_generated("cpu")
-                # Drop request-local GPU references before releasing the single
-                # generation lane. The CUDA allocator remains warm; no cache
-                # flush is performed between segments.
-                del generated
-                del materialized_inputs
-                del inputs
-                first_output_token_monotonic_seconds = (
-                    first_token_criterion.first_output_token_monotonic_seconds
-                )
-                time_to_first_token_seconds = (
-                    None
-                    if first_output_token_monotonic_seconds is None
-                    else max(
-                        0.0,
-                        first_output_token_monotonic_seconds - generation_started_monotonic_seconds,
-                    )
-                )
-                output_tokens_per_second = (
-                    None if generation_seconds <= 0.0 else float(output_tokens) / generation_seconds
-                )
+                device_guard = self._shared_device_guard
+                guard = device_guard.hold() if device_guard is not None else _null_device_guard()
+                try:
+                    # Input materialization can allocate accelerator memory, so it
+                    # shares the same cross-process exclusion interval as generate.
+                    # CPU decode remains outside both generation guards.
+                    with guard:
+                        materialization_started = time.perf_counter()
+                        device = _model_device(resident.model)
+                        materialized_inputs = _move_inputs_to_device(inputs, device)
+                        pixel_values = materialized_inputs.get("pixel_values")
+                        model_dtype = getattr(resident.model, "dtype", None)
+                        if pixel_values is not None and model_dtype is not None:
+                            move = getattr(pixel_values, "to", None)
+                            if callable(move):
+                                materialized_inputs["pixel_values"] = move(model_dtype)
+                        materialization_completed = time.perf_counter()
+                        input_materialization_seconds = (
+                            materialization_completed - materialization_started
+                        )
+                        prompt_tokens = _token_count(
+                            materialized_inputs.get("input_ids"), "input_ids"
+                        )
+                        first_token_criterion = _MageVideoFirstTokenStoppingCriterion(
+                            clock=time.perf_counter
+                        )
+                        generation_started_monotonic_seconds = time.perf_counter()
+                        # ``use_cache`` may create attention KV only for this call. It
+                        # is not stored on ``self`` or returned to the endpoint. The
+                        # stopping criterion observes TTFT without moving token tensors
+                        # to CPU and always returns ``False``, so it cannot terminate or
+                        # otherwise alter decoding.
+                        with resident.torch.inference_mode():
+                            generated = resident.model.generate(
+                                **materialized_inputs,
+                                max_new_tokens=max_new_tokens,
+                                do_sample=False,
+                                use_cache=True,
+                                stopping_criteria=[first_token_criterion],
+                            )
+                        generation_completed_monotonic_seconds = time.perf_counter()
+                        generation_seconds = float(
+                            generation_completed_monotonic_seconds
+                            - generation_started_monotonic_seconds
+                        )
+                        generated_only = generated[:, prompt_tokens:]
+                        output_tokens = _token_count(generated_only, "generated output")
+                        move_generated = getattr(generated_only, "to", None)
+                        if callable(move_generated):
+                            generated_only = move_generated("cpu")
+                        # Drop request-local GPU references before releasing the shared
+                        # accelerator lane. The allocator remains warm; no cache flush
+                        # is performed between segments.
+                        del generated
+                        del materialized_inputs
+                        del inputs
+                        first_output_token_monotonic_seconds = (
+                            first_token_criterion.first_output_token_monotonic_seconds
+                        )
+                        time_to_first_token_seconds = (
+                            None
+                            if first_output_token_monotonic_seconds is None
+                            else max(
+                                0.0,
+                                first_output_token_monotonic_seconds
+                                - generation_started_monotonic_seconds,
+                            )
+                        )
+                        output_tokens_per_second = (
+                            None
+                            if generation_seconds <= 0.0
+                            else float(output_tokens) / generation_seconds
+                        )
+                except DeviceExecutionGuardBusy as error:
+                    raise MageVideoRuntimeError(
+                        "shared accelerator is busy with DCVC preparation"
+                    ) from error
+                except DeviceExecutionGuardError as error:
+                    raise MageVideoRuntimeError("shared device guard failed") from error
 
             # ``batch_decode`` is also processor state. It must not race a
             # subsequent codec preparation, but it intentionally happens after
@@ -578,6 +690,125 @@ class MageVideoRuntime:
                 raise MageVideoRuntimeError("Mage runtime resident lease underflow")
             self._active_operations -= 1
             self._state_condition.notify_all()
+
+
+def _validate_codec_cache_binding(
+    *,
+    binding: MageVideoCodecCacheBinding | None,
+    paths: Sequence[Path],
+    native_codec_config: Mapping[str, Any],
+    configured_cache_root: Path | None,
+) -> MageVideoCodecCacheBinding | None:
+    if binding is None:
+        return None
+    if not isinstance(binding, MageVideoCodecCacheBinding):
+        raise MageVideoRuntimeError("codec_cache_binding must be MageVideoCodecCacheBinding")
+    if len(paths) != 1 or binding.source_path != paths[0]:
+        raise MageVideoRuntimeError(
+            "codec cache binding source does not match the generation input"
+        )
+    if native_codec_config.get("engine") != "dcvc-rt":
+        raise MageVideoRuntimeError(
+            "an exact provider cache binding is valid only for engine='dcvc-rt'"
+        )
+    if configured_cache_root is None:
+        raise MageVideoRuntimeError(
+            "an exact provider cache binding requires a configured codec cache root"
+        )
+    if binding.provider_cache_directory.parent != configured_cache_root:
+        raise MageVideoRuntimeError(
+            "provider cache binding is outside the configured qualified cache root"
+        )
+    return binding
+
+
+@contextmanager
+def _bind_exact_provider_cache_entry(
+    *,
+    processor: Any,
+    binding: MageVideoCodecCacheBinding | None,
+) -> Iterator[None]:
+    """Route one processor call directly to a strictly admitted cache entry.
+
+    Mage's remote-code processor computes its cache key inside a dynamically copied
+    module. That copy does not include `preprocessor_config.json`, so recomputing
+    the upstream locator can disagree with the externally qualified Provider V2
+    locator. The checkpoint does not expose a cache-entry argument, therefore this
+    adapter replaces only `process_codec_video` for the bounded processor call and
+    invokes the checkpoint's own result loader on the exact admitted directory.
+    There is no fallback to codec preparation on a bound request.
+    """
+
+    if binding is None:
+        with _PROVIDER_CACHE_BINDING_LOCK:
+            yield
+        return
+
+    codec_module = _mage_codec_processing_module(processor)
+    original_process = getattr(codec_module, "process_codec_video", None)
+    load_codec_result = getattr(codec_module, "_load_codec_result", None)
+    if not callable(original_process) or not callable(load_codec_result):
+        raise MageVideoRuntimeError(
+            "qualified Mage codec module lacks the exact-cache consumption surface"
+        )
+
+    def consume_bound_entry(video_url: str, config: Any) -> Any:
+        try:
+            source = Path(video_url).expanduser().resolve()
+        except (OSError, TypeError, ValueError) as error:
+            raise MageVideoRuntimeError(
+                "native processor supplied an invalid bound-cache source"
+            ) from error
+        if source != binding.source_path:
+            raise MageVideoRuntimeError(
+                "native processor requested a source other than the admitted cache binding"
+            )
+        if getattr(config, "engine", None) != "dcvc-rt":
+            raise MageVideoRuntimeError(
+                "native processor changed engine for the admitted Provider V2 cache"
+            )
+        return load_codec_result(binding.provider_cache_directory)
+
+    # `process_codec_video` is a module-level function imported inside the
+    # checkpoint processor's call. Keep the replacement process-global but narrow,
+    # and serialize it across any accidental second runtime in this interpreter.
+    with _PROVIDER_CACHE_BINDING_LOCK:
+        codec_module.process_codec_video = consume_bound_entry
+        try:
+            yield
+        finally:
+            codec_module.process_codec_video = original_process
+
+
+def _mage_codec_processing_module(processor: Any) -> Any:
+    module_name = type(processor).__module__
+    package_name, separator, _leaf = module_name.rpartition(".")
+    candidates = (
+        (f"{package_name}.codec_video_processing_mage_vl", "codec_video_processing_mage_vl")
+        if separator
+        else ("codec_video_processing_mage_vl",)
+    )
+    last_error: ImportError | None = None
+    for candidate in candidates:
+        try:
+            return import_module(candidate)
+        except ImportError as error:
+            last_error = error
+    raise MageVideoRuntimeError(
+        "could not import the qualified Mage codec processing module"
+    ) from last_error
+
+
+class _NullDeviceGuard:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        return None
+
+
+def _null_device_guard() -> _NullDeviceGuard:
+    return _NullDeviceGuard()
 
 
 def _resolve_runtime_identity(
@@ -887,6 +1118,8 @@ def _normalise_video_paths(video_paths: Sequence[Path | str]) -> tuple[Path, ...
 def _normalise_native_codec_config(
     codec_config: Mapping[str, Any],
     model_directory: Path,
+    *,
+    codec_cache_root: Path | None = None,
 ) -> dict[str, Any]:
     """Validate an identity-bound native codec configuration.
 
@@ -932,6 +1165,8 @@ def _normalise_native_codec_config(
         dcvc["device"] = preprocess_device
         dcvc.setdefault("pkg_dir", str(model_directory / "neural_codec"))
         native["dcvc"] = dcvc
+    if codec_cache_root is not None:
+        native["cache_root"] = codec_cache_root
     return native
 
 
@@ -996,10 +1231,12 @@ def _positive_int(value: object, field: str) -> int:
 
 
 __all__ = [
+    "MAGE_VIDEO_CODEC_CACHE_BINDING_VERSION",
     "MAGE_VIDEO_GENERATION_TELEMETRY_VERSION",
     "MAGE_VIDEO_LOAD_PROFILE_BITSANDBYTES_4BIT_NF4",
     "MAGE_VIDEO_LOAD_PROFILE_NATIVE_BF16",
     "MAGE_VIDEO_RUNTIME_IDENTITY_VERSION",
+    "MageVideoCodecCacheBinding",
     "MageVideoCodecDependencyError",
     "MageVideoGenerationObservation",
     "MageVideoGenerationTelemetry",

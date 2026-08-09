@@ -31,6 +31,7 @@ from robata.inference.mage_video_endpoint import (
     create_mage_video_endpoint_app,
 )
 from robata.inference.mage_video_runtime import (
+    MageVideoCodecCacheBinding,
     MageVideoGenerationObservation,
     MageVideoGenerationTelemetry,
     MageVideoLoadObservation,
@@ -57,6 +58,7 @@ class _FakeRuntime:
         self.last_prompt: str | None = None
         self.last_max_new_tokens: int | None = None
         self.last_codec_config: dict[str, Any] | None = None
+        self.last_codec_cache_binding: MageVideoCodecCacheBinding | None = None
         self.load_observation = MageVideoLoadObservation(
             load_seconds=1.25,
             execution_device="cuda:0",
@@ -80,6 +82,7 @@ class _FakeRuntime:
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
+        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
     ) -> MageVideoGenerationObservation:
         assert self.loaded is True
         self.generate_calls += 1
@@ -87,6 +90,7 @@ class _FakeRuntime:
         self.last_prompt = prompt
         self.last_max_new_tokens = max_new_tokens
         self.last_codec_config = dict(codec_config)
+        self.last_codec_cache_binding = codec_cache_binding
         return MageVideoGenerationObservation(
             input_video_count=len(video_paths),
             prompt_tokens=18,
@@ -115,6 +119,7 @@ class _BlockingRuntime(_FakeRuntime):
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
+        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
     ) -> MageVideoGenerationObservation:
         with self._entry_lock:
             self._entry_count += 1
@@ -128,6 +133,7 @@ class _BlockingRuntime(_FakeRuntime):
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             codec_config=codec_config,
+            codec_cache_binding=codec_cache_binding,
         )
 
 
@@ -200,6 +206,7 @@ def _service(
     *,
     model_identity: MageVideoModelIdentity | None = None,
     generation_telemetry_sink: Any | None = None,
+    codec_cache_admission: Any | None = None,
 ) -> MageVideoEndpointService:
     return MageVideoEndpointService(
         runtime=runtime,
@@ -208,11 +215,74 @@ def _service(
         result_artifact_directory=tmp_path / "results",
         durable_input_roots=[durable_root],
         generation_telemetry_sink=generation_telemetry_sink,
+        codec_cache_admission=codec_cache_admission,
     )
 
 
 def _request_body(request: MageVideoEndpointRequest) -> bytes:
     return canonical_json_bytes(request.model_dump(mode="json"))
+
+
+def test_service_applies_codec_cache_admission_before_generation(tmp_path: Path) -> None:
+    request, durable_root = _request(tmp_path, request_id="cache-admitted")
+    runtime = _FakeRuntime()
+    admitted: list[tuple[MageVideoEndpointRequest, list[Path]]] = []
+    provider_cache = tmp_path / "provider-cache"
+    provider_cache.mkdir()
+    (provider_cache / "meta.json").write_text("{}", encoding="utf-8")
+    (provider_cache / "src_patch_position.npy").write_bytes(b"positions")
+    binding = MageVideoCodecCacheBinding(
+        source_path=Path(request.camera_encodings[0].segment_manifest.durable_path),
+        provider_cache_directory=provider_cache,
+    )
+
+    def admission(
+        candidate: MageVideoEndpointRequest,
+        paths: Sequence[Path],
+    ) -> MageVideoCodecCacheBinding:
+        assert runtime.generate_calls == 0
+        admitted.append((candidate, list(paths)))
+        return binding
+
+    service = _service(
+        runtime,
+        tmp_path,
+        durable_root,
+        codec_cache_admission=admission,
+    )
+    service.start()
+    service.infer(request)
+
+    assert admitted == [
+        (
+            request,
+            [Path(request.camera_encodings[0].segment_manifest.durable_path)],
+        )
+    ]
+    assert runtime.generate_calls == 1
+    assert runtime.last_codec_cache_binding == binding
+
+
+def test_codec_cache_admission_rejection_prevents_generation(tmp_path: Path) -> None:
+    request, durable_root = _request(tmp_path, request_id="cache-rejected")
+    runtime = _FakeRuntime()
+
+    def reject(_request: MageVideoEndpointRequest, _paths: Sequence[Path]) -> None:
+        raise RuntimeError("verified Provider V2 cache admission rejected")
+
+    service = _service(
+        runtime,
+        tmp_path,
+        durable_root,
+        codec_cache_admission=reject,
+    )
+    service.start()
+
+    with pytest.raises(RuntimeError, match="cache admission rejected"):
+        service.infer(request)
+
+    assert runtime.generate_calls == 0
+    assert not list((tmp_path / "results").glob("*.json"))
 
 
 def test_service_uses_durable_video_manifest_and_persists_explicit_result_artifact(

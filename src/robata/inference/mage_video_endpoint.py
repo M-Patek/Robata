@@ -30,6 +30,7 @@ from robata.contracts.common import Sha256Digest, StrictModel
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.inference.mage_video_runtime import (
     MAGE_VIDEO_RUNTIME_IDENTITY_VERSION,
+    MageVideoCodecCacheBinding,
     MageVideoLoadProfile,
     MageVideoRuntimeError,
     MageVideoRuntimeIdentity,
@@ -459,7 +460,19 @@ class MageVideoInferenceRuntime(Protocol):
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
+        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
     ) -> Any: ...
+
+
+class MageVideoCodecCacheAdmission(Protocol):
+    """Operational pre-inference guard and exact-cache binding factory."""
+
+    def __call__(
+        self,
+        request: MageVideoEndpointRequest,
+        paths: Sequence[Path],
+        /,
+    ) -> MageVideoCodecCacheBinding | None: ...
 
 
 class MageVideoGenerationTelemetrySink(Protocol):
@@ -532,6 +545,7 @@ class MageVideoEndpointService:
         result_artifact_directory: Path,
         durable_input_roots: Sequence[Path],
         generation_telemetry_sink: MageVideoGenerationTelemetrySink | None = None,
+        codec_cache_admission: MageVideoCodecCacheAdmission | None = None,
     ) -> None:
         if not isinstance(model_identity, MageVideoModelIdentity):
             raise TypeError("model_identity must be MageVideoModelIdentity")
@@ -552,6 +566,8 @@ class MageVideoEndpointService:
             raise ValueError("every durable_input_root must be an existing directory")
         if generation_telemetry_sink is not None and not callable(generation_telemetry_sink):
             raise TypeError("generation_telemetry_sink must be callable")
+        if codec_cache_admission is not None and not callable(codec_cache_admission):
+            raise TypeError("codec_cache_admission must be callable")
 
         self._runtime = runtime
         self._model_identity = model_identity
@@ -559,6 +575,7 @@ class MageVideoEndpointService:
         self._result_artifact_directory = Path(result_artifact_directory).expanduser().resolve()
         self._durable_input_roots = roots
         self._generation_telemetry_sink = generation_telemetry_sink
+        self._codec_cache_admission = codec_cache_admission
         self._initialize_storage()
 
     def _open_idempotency_connection(self) -> sqlite3.Connection:
@@ -915,13 +932,24 @@ class MageVideoEndpointService:
             self._verify_durable_segment(encoding.segment_manifest)
             for encoding in request.camera_encodings
         ]
+        codec_cache_binding = None
+        if self._codec_cache_admission is not None:
+            codec_cache_binding = self._codec_cache_admission(request, paths)
+            if codec_cache_binding is not None and not isinstance(
+                codec_cache_binding, MageVideoCodecCacheBinding
+            ):
+                raise MageVideoRuntimeError(
+                    "codec cache admission returned an invalid runtime binding"
+                )
         inference_identity = build_mage_video_inference_identity(request)
         generated = self._runtime.generate(
             video_paths=paths,
             prompt=request.decoder.prompt,
             max_new_tokens=request.decoder.max_new_tokens,
             codec_config=request.codec_policy.native_codec_config(),
+            codec_cache_binding=codec_cache_binding,
         )
+
         telemetry = getattr(generated, "telemetry", None)
         if telemetry is not None:
             _LOGGER.info(
@@ -1543,6 +1571,8 @@ __all__ = [
     "MAGE_VIDEO_RESULT_ARTIFACT_VERSION",
     "MAGE_VIDEO_SEGMENT_MANIFEST_VERSION",
     "MageVideoCameraEncoding",
+    "MageVideoCodecCacheAdmission",
+    "MageVideoCodecCacheBinding",
     "MageVideoCodecPolicy",
     "MageVideoCodecPolicyIdentity",
     "MageVideoContextManifest",
