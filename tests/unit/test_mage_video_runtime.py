@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -10,13 +11,22 @@ from typing import Any
 import pytest
 
 import robata.inference.mage_video_runtime as mage_video_runtime
+from robata.inference.device_execution_guard import ExclusiveFileDeviceGuard
 from robata.inference.mage_video_runtime import (
+    MageVideoCodecCacheBinding,
     MageVideoCodecDependencyError,
     MageVideoLoadProfile,
     MageVideoRuntime,
     MageVideoRuntimeError,
     MageVideoRuntimeIdentity,
 )
+
+
+def _hold_shared_device_guard(path: str, ready: Any, release: Any) -> None:
+    with ExclusiveFileDeviceGuard(Path(path)).hold():
+        ready.set()
+        if not release.wait(timeout=10.0):
+            raise RuntimeError("test guard holder timed out")
 
 
 class _FakeTensor:
@@ -386,6 +396,173 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     assert model.generate_kwargs["use_cache"] is True
     assert model.generate_kwargs["do_sample"] is False
     assert len(model.generate_kwargs["stopping_criteria"]) == 1
+
+
+def test_runtime_consumes_exact_admitted_provider_cache_without_running_dcvc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    video_path = tmp_path / "segments" / "cam-01.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video-segment")
+    cache_root = tmp_path / "qualified-cache"
+    provider_cache = cache_root / "provider-entry-from-manifest"
+    provider_cache.mkdir(parents=True)
+    (provider_cache / "meta.json").write_text("{}", encoding="utf-8")
+    (provider_cache / "src_patch_position.npy").write_bytes(b"positions")
+
+    calls: dict[str, object] = {"dcvc": 0, "loads": []}
+
+    def run_dcvc(_video_url: str, _out_dir: Path, _config: object) -> object:
+        calls["dcvc"] = int(calls["dcvc"]) + 1
+        raise AssertionError("bound request must not invoke _run_dcvc_rt")
+
+    def upstream_process(video_url: str, config: object) -> object:
+        return run_dcvc(video_url, cache_root / "wrong-runtime-key", config)
+
+    def load_codec_result(directory: Path) -> dict[str, object]:
+        loads = calls["loads"]
+        assert isinstance(loads, list)
+        loads.append(directory)
+        return {"out_dir": str(directory)}
+
+    codec_module = SimpleNamespace(
+        process_codec_video=upstream_process,
+        _load_codec_result=load_codec_result,
+        _run_dcvc_rt=run_dcvc,
+    )
+
+    class BoundCacheProcessor(_FakeProcessor):
+        def __call__(self, **kwargs: object) -> dict[str, _FakeTensor]:
+            videos = kwargs["videos"]
+            codec_config = kwargs["codec_config"]
+            assert isinstance(videos, list)
+            assert isinstance(codec_config, dict)
+            codec_module.process_codec_video(
+                str(videos[0]),
+                SimpleNamespace(engine=codec_config["engine"]),
+            )
+            return super().__call__(**kwargs)
+
+    BoundCacheProcessor.__module__ = "qualified_mage.processing_mage_vl"
+    processor = BoundCacheProcessor()
+    model = _FakeModel()
+    transformers = _FakeTransformers(processor, model)
+    imported: list[str] = []
+    base_importer = _fake_importer(transformers=transformers, imported=imported)
+
+    def importer(name: str) -> object:
+        if name == "qualified_mage.codec_video_processing_mage_vl":
+            imported.append(name)
+            return codec_module
+        return base_importer(name)
+
+    monkeypatch.setattr(mage_video_runtime, "import_module", importer)
+    runtime = MageVideoRuntime(
+        model_directory=model_directory,
+        codec_cache_root=cache_root,
+        codec_dependency_checker=lambda _config, _model_directory: None,
+    )
+    binding = MageVideoCodecCacheBinding(
+        source_path=video_path,
+        provider_cache_directory=provider_cache,
+    )
+
+    generated = runtime.generate(
+        video_paths=[video_path],
+        prompt="Describe the scene.",
+        max_new_tokens=32,
+        codec_config={
+            "engine": "dcvc-rt",
+            "max_pixels": 150_000,
+            "preprocess_device": "cuda",
+            "dcvc": {},
+        },
+        codec_cache_binding=binding,
+    )
+
+    assert generated.output_text == "codec answer"
+    assert calls == {"dcvc": 0, "loads": [provider_cache.resolve()]}
+    assert codec_module.process_codec_video is upstream_process
+    assert "qualified_mage.codec_video_processing_mage_vl" in imported
+
+
+def test_runtime_generation_uses_cross_process_shared_device_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    video_path = tmp_path / "segments" / "cam-01.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video-segment")
+    codec_binary = tmp_path / "cv-preinfer"
+    codec_binary.write_bytes(b"stub")
+    monkeypatch.setenv("CV_PREINFER_BIN", str(codec_binary))
+
+    processor = _FakeProcessor()
+    model = _FakeModel()
+    transformers = _FakeTransformers(processor, model)
+    imported: list[str] = []
+    monkeypatch.setattr(
+        mage_video_runtime,
+        "import_module",
+        _fake_importer(transformers=transformers, imported=imported),
+    )
+    guard_path = tmp_path / "device-guards" / "cuda-0.lock"
+    runtime = MageVideoRuntime(
+        model_directory=model_directory,
+        shared_device_guard_file=guard_path,
+    )
+    assert runtime.shared_device_guard_file == guard_path.resolve()
+    assert runtime.runtime_identity == MageVideoRuntimeIdentity(
+        load_profile=MageVideoLoadProfile.NATIVE_BF16
+    )
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_shared_device_guard,
+        args=(str(guard_path), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=10.0)
+        with pytest.raises(MageVideoRuntimeError, match="busy with DCVC preparation"):
+            runtime.generate(
+                video_paths=[video_path],
+                prompt="Describe the scene.",
+                max_new_tokens=32,
+                codec_config={
+                    "engine": "hevc",
+                    "max_pixels": 150_000,
+                    "preprocess_device": "cpu",
+                },
+            )
+        assert model.generate_kwargs is None
+    finally:
+        release.set()
+        holder.join(timeout=10.0)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=5.0)
+    assert holder.exitcode == 0
+
+    generated = runtime.generate(
+        video_paths=[video_path],
+        prompt="Describe the scene.",
+        max_new_tokens=32,
+        codec_config={
+            "engine": "hevc",
+            "max_pixels": 150_000,
+            "preprocess_device": "cpu",
+        },
+    )
+    assert generated.output_text == "codec answer"
+    assert model.generate_kwargs is not None
 
 
 def test_runtime_releases_generation_lane_before_cpu_decode(
