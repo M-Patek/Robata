@@ -10,6 +10,9 @@ __pycache__/
 /pytest-cache-files-*/
 /GithubRobatatmppytest-audit/
 /.test-tmp-*/
+/.pytest-tmp/
+/.test-temp/
+/GithubRobata.worktrees*.pytest-tmp*/
 .mypy_cache/
 .ruff_cache/
 **/.schema-registration.lock

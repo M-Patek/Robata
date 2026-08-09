@@ -783,3 +783,135 @@ Report: changed files, command results, schema/identity decision, normal/refine 
 when applicable, measured result, and real external blockers. Do not touch web/ and do not
 physically delete model checkpoints.
 ```
+
+---
+
+# 2026-08-09 DCVC Provider V2 Cold-Path Qualification Addendum
+
+## Product Outcome
+
+**Outcome:** Robata prepares Mage native-DCVC assets through one explicit, identity-bound
+Provider V2 configuration, proves that `max_side` reaches the DCVC process, reuses one
+resident DCVC engine across a sequence of single-camera segments, and admits only exact,
+receipt-backed cache assets to the existing Mage endpoint.
+
+**Why now:** the observed upstream path accepts `max_side` in Robata's policy but the child
+readiness process reads the checkpoint's static `preprocessor_config.json`. A requested
+`max_side=448` can therefore be recorded in parent-authored metadata while the child actually
+runs full resolution. The current child-per-segment topology also reloads the DCVC networks.
+
+**Success measures:**
+
+- Provider V2 full-resolution (`max_side=0`) is exact-byte equivalent to the observed-v1
+  reference for provider payload assets before any bounded-resolution default is considered.
+- Every V2 cache entry binds provider implementation, canonical effective configuration,
+  child/worker receipt, and exact output assets in a new recipe/cache namespace.
+- One persistent worker handles the five non-overlapping segments serially and proves one
+  DCVC engine load, one sequence reset per segment, no cross-camera or cross-segment DPB reuse,
+  atomic publication, restart cleanup, and fail-closed admission.
+- The same 40-second/five-segment sample reports cold wall time, RTF, provider startup/load,
+  per-segment preparation, GPU/VRAM/temperature, asset identities, Mage output, and downstream
+  QA/event/evidence/track/fusion deltas for observed-v1, V2 full-resolution, and bounded
+  `max_side` candidates.
+- A bounded-resolution default changes only after identity, recovery, exact-asset validation,
+  and quality gates pass. H100 topology remains target configuration until externally run.
+
+**Non-goals:** multi-camera fan-in, high request concurrency, cross-camera latent reuse,
+cross-segment DPB reuse, or treating `sequence_length_frames` as a DCVC compute limit.
+
+## Contract and Identity Decision
+
+These are internal operational contracts, not published wire schemas. No file in `schemas/`
+is changed in this phase.
+
+| Contract | Decision | Compatibility rule |
+| --- | --- | --- |
+| `mage-dcvc-provider-job-v2` | New canonical internal job | Binds immutable source bytes, checkpoint, provider implementation, explicit effective config, sampling semantics, and output intent. Unknown or missing fields fail. |
+| `mage-dcvc-provider-receipt-v2` | New canonical internal receipt | Worker-authored proof of the configuration actually used, engine-load generation, processed frame extent, timing, and exact payload asset set. Parent-authored claims are not accepted as proof. |
+| `mage-dcvc-readiness-explicit-v2` | New effective recipe | Replaces `mage-dcvc-readiness-observed-v1` only for V2 builds; both remain readable and never share a namespace. |
+| cache entry/manifest/namespace v2 | New internal families | Add provider/config/receipt identities. Existing v1 artifacts remain read-only rollback evidence and are never rewritten or admitted as V2. |
+| qualified Mage checkpoint | New model revision and checkpoint manifest | Provider implementation used for preparation must be copied into a separate qualified model tree and included in its checkpoint manifest. The original `D:\HuggingFace\Mage-VL` stays unchanged. This makes the existing endpoint v2 model+policy inference identity sufficient for this cycle. |
+
+Provider V2 initially requires `sequence_length_frames=0` and
+`canvas_token_side=null`. Uniform sampling may select fewer output frames, but DCVC still
+advances its recurrent chain from frame zero through the largest sampled frame. Reports must
+not describe a sampled-frame count as a temporal compute cap.
+
+The persistent worker is fixed to one implementation/config/device tuple. `reset_interval`
+and `intra_period` are process identity fields because the DCVC engine binds them at load.
+Each job calls `reset_sequence`; QP may be applied at reset. A different fixed tuple requires
+a separate worker and recipe identity.
+
+On the local RTX 4060 profile, CUDA codec preparation and Mage generation are mutually
+exclusive GPU phases. The worker may persist between phases, but the scheduler must not run
+both simultaneously. The two-H100 target may place one serial codec worker and one serial
+Mage decoder on different GPUs, but this remains `NOT_LOCALLY_VALIDATED`.
+
+## Roadmap
+
+| Phase | Outcome | Modules | Local proof | External follow-up |
+| --- | --- | --- | --- | --- |
+| P11 | Canonical Provider V2 job/receipt, qualified checkpoint, v2 cache identity | `contract-governance`, `inference-evidence` | identity/parity/tamper tests; no schema diff | none |
+| P12 | Explicit fixed-config provider and persistent one-job worker | `inference-evidence`, `stream-control` | protocol, one-load/multi-reset, crash cleanup, stale-result rejection | none |
+| P13 | Strict cache pre-admission and local serialization guard | `canonical-integration`, `identity-delivery` | endpoint rejects v1/wrong recipe/receipt/config; GPU phase overlap rejected | none |
+| P14 | Same-sample A/B and quality qualification | `qualification-ops`, `event-semantics` | observed-v1 vs V2 full-res vs bounded max-side report | repeat on H100 |
+| P15 | Target deployment profile and adoption decision | `qualification-ops` | rendered config and report explicitly mark unmeasured claims | RunPod/H100 soak |
+
+## P11-P15 Implementation Boundaries
+
+1. Build the qualified model tree reproducibly with a pinned source-manifest precondition;
+   copy/link unchanged bytes, copy the exact Provider V2 implementation into the qualified
+   tree, assign a new model revision, and generate a new checkpoint manifest. Never patch the
+   source checkpoint in place.
+2. Pass the effective configuration to the provider before readiness/DCVC modules import.
+   The provider may use a versioned configuration-module overlay, but may not mutate an
+   already-imported unknown Mage object or depend on hidden checkpoint defaults.
+3. Generate into a same-filesystem temporary directory, validate receipt and payload hashes,
+   then atomically publish. On restart, delete only verified stale temp children under the
+   qualified cache root; never recursively delete a computed external path.
+4. Establish observed-v1 -> V2 `max_side=0` payload parity first. Then vary only `max_side`.
+   Do not mix `sequence_length_frames`, `canvas_token_side`, cross-segment state, or camera
+   selection into the same experiment.
+5. Keep one camera, one provider worker, and one Mage generation in flight. Higher-performance
+   hardware changes placement, not the logical contract.
+
+## Measured Qualification Result ? August 9, 2026
+
+The controlled local A/B used the same 40-second recording, five non-overlapping segments, one
+camera, one preparation worker, one NF4 Mage generation lane, and zero executed refinement calls.
+The retained evidence shows:
+
+- observed-v1 cold preparation: 178.146 seconds;
+- Provider V2 `max_side=0`: 144.383 seconds;
+- Provider V2 `max_side=448`: 50.512 seconds, a 3.527x speedup and 71.65% wall reduction;
+- all nine non-metadata provider assets for all five segments are exact-equal across the three
+  variants;
+- all five Mage outputs and all downstream QA/event/evidence/track/fusion comparison projections
+  are equal;
+- exact Provider V2 cache consumption performs zero new `_run_dcvc_rt` calls.
+
+Decision: Provider V2 `max_side=448` is the local/pre-production candidate default. The Provider
+V2 prewarm CLI therefore defaults to 448; `--max-side 0` remains the explicit full-resolution
+control. observed-v1 remains an explicit non-destructive rollback composition. The decision is
+not production eligibility evidence and does not qualify Linux/H100, multiple cameras, or target
+capacity.
+
+## Acceptance and Rollback
+
+- [x] Original Mage directory and observed-v1 cache remain unchanged and readable.
+- [x] V2 job/config/implementation changes produce different recipe, namespace, and qualified
+      checkpoint identities.
+- [x] Missing/mismatched receipt, config, implementation, source, or asset hashes fail closed.
+- [x] Full-resolution V2 payload parity passes before persistent execution is called equivalent.
+- [x] A one-shot Provider V2 execution topology is not admitted. If one is introduced later, it
+      requires exact parity or a successor recipe rather than silent substitution.
+- [x] Bounded `max_side` adoption passed explicit asset, Mage-output, and downstream semantic
+      quality gates; speed alone did not change the default.
+- [x] RTX 4060 evidence never claims simultaneous codec+decoder GPU execution.
+- [x] H100 topology is documented as target-only until measured on the target hardware.
+- [x] No `web/` or published-schema changes are included.
+
+Rollback stops new V2 cache admission and restarts the endpoint with the original model
+revision, checkpoint manifest, codec policy, and observed-v1 manifest. It does not delete or
+rehash either cache family. Strict Provider V2 admission never silently falls back to dynamic
+DCVC recomputation.
