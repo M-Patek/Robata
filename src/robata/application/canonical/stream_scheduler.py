@@ -10,10 +10,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Self
+from typing import TYPE_CHECKING, Final, Self
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+if TYPE_CHECKING:
+    from robata.application.canonical.perception_composition import (
+        PerceptionCompositionDecision,
+    )
+
 
 from robata.adapters.sqlite_stream_work_ledger import (
     NewStreamWindow,
@@ -162,6 +168,26 @@ _NONTERMINAL_STREAM_STATE: Final = {
 
 class StreamSchedulerCompositionError(RuntimeError):
     """The stream graph conflicts with its exact replay or execution state."""
+
+
+def require_legacy_window_scheduler_profile(profile: str | None) -> PerceptionCompositionDecision:
+    """Admit the historical window scheduler only through an explicit profile.
+
+    This preserves old scheduler/replay entry points while preventing a new
+    composition root from selecting ``stream-window-dag-v4`` implicitly.  The
+    import is intentionally local so the legacy scheduler remains usable
+    without coupling its module import to the vNext composition root.
+    """
+
+    from robata.application.canonical.perception_composition import (
+        PerceptionCompositionSelectionError,
+        require_legacy_window_composition,
+    )
+
+    try:
+        return require_legacy_window_composition(profile)
+    except PerceptionCompositionSelectionError as error:
+        raise StreamSchedulerCompositionError(str(error)) from error
 
 
 class StreamBackpressureThrottle(StreamSchedulerCompositionError):
@@ -2631,4 +2657,5 @@ __all__ = [
     "StreamExportBarrierSnapshot",
     "StreamSchedulerCompositionError",
     "StreamSchedulerSchemaRefs",
+    "require_legacy_window_scheduler_profile",
 ]

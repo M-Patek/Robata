@@ -1554,6 +1554,69 @@
         "max_exclusive": "0.2.0"
       },
       "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/perception-refine-request",
+        "version": "1.0.0",
+        "artifact_id": "841007f6-0b7f-2488-6f85-4ade12738549",
+        "sha256": "b4f1a71d5d62c03ac8e8c3697a144ecafc10fed8b2f412cad8e32217f73ee2f0"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/perception-refine-request.schema.json",
+      "artifact_path": "v1/perception-refine-request.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "perception-refine-request-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/perception-context-manifest",
+        "version": "1.0.0",
+        "artifact_id": "7b47ea44-25e1-52bb-a9a2-2c969295a602",
+        "sha256": "9f68542d42ef3383284ce9ef2ebf797adc7d884ee72f7392b20215d632e49c7b"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/perception-context-manifest.schema.json",
+      "artifact_path": "v1/perception-context-manifest.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "perception-context-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
+    },
+    {
+      "ref": {
+        "schema_id": "https://schemas.robata.dev/mage-observation",
+        "version": "1.0.0",
+        "artifact_id": "0a877693-e6da-8163-ae69-f99d4b076ae3",
+        "sha256": "af48ed154084029d59a39d00504624a317bda1e66239559bf91f4ed507e0492a"
+      },
+      "wire_version": "1.0",
+      "document_id": "https://schemas.robata.dev/v1/mage-observation.schema.json",
+      "artifact_path": "v1/mage-observation.schema.json",
+      "owner": "robata-contracts",
+      "canonicalization_version": "rfc8785-v1",
+      "projection_version": "mage-observation-semantic-v1",
+      "compatibility_mode": "NONE",
+      "lifecycle": "ACTIVE",
+      "supported_software": {
+        "min_inclusive": "0.1.0",
+        "max_exclusive": "0.2.0"
+      },
+      "supported_predecessors": []
     }
   ],
   "upcasters": []

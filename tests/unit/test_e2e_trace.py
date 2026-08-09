@@ -129,3 +129,28 @@ def test_local_canonical_operation_names_are_classified_by_semantic_stage() -> N
     assert by_stage[E2ETraceStage.EVIDENCE].observed_span_count == 1
     assert by_stage[E2ETraceStage.PUBLICATION].observed_span_count == 1
     assert unclassified == 0
+
+
+def test_perception_vnext_spans_are_classified_by_physical_capability() -> None:
+    recorder = RuntimeProfileRecorder(resource_sampler=_resource_sample)
+    names = (
+        "perception.media_scan",
+        "perception.observe",
+        "perception.project",
+        "perception.temporal_reconcile",
+        "perception.fusion",
+        "perception.refine",
+        "perception.finalize",
+    )
+    for name in names:
+        with runtime_span(recorder, name):
+            pass
+
+    summaries, unclassified = summarize_e2e_trace_stages(recorder.snapshot())
+    by_stage = {item.stage: item for item in summaries}
+
+    assert by_stage[E2ETraceStage.SOURCE].observed_span_count == 1
+    assert by_stage[E2ETraceStage.INFERENCE].observed_span_count == 2
+    assert by_stage[E2ETraceStage.EVIDENCE].observed_span_count == 1
+    assert by_stage[E2ETraceStage.REDUCTION].observed_span_count == 3
+    assert unclassified == 0

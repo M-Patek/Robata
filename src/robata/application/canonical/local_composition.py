@@ -1,4 +1,9 @@
-"""Concrete, restartable LOCAL_CONFORMANCE composition for the canonical path."""
+"""Retained restartable LOCAL_CONFORMANCE composition for the legacy window path.
+
+New Mage codec/video work is composed through ``mage_stream_execution`` and
+``perception_routing``; this module remains for legacy replay, fixtures,
+and explicit compatibility runs without changing published window contracts.
+"""
 
 from __future__ import annotations
 

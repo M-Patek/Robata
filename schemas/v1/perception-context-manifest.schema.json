@@ -1,0 +1,272 @@
+{
+  "$defs": {
+    "CameraAbsenceReason": {
+      "description": "Why one canonical camera cannot contribute to the context.",
+      "enum": [
+        "MISSING",
+        "LATE",
+        "DECODE_ERROR",
+        "TIMESTAMP_GAP",
+        "CORRUPT",
+        "UNAVAILABLE"
+      ],
+      "title": "CameraAbsenceReason",
+      "type": "string"
+    },
+    "CameraContextBinding": {
+      "additionalProperties": false,
+      "description": "Durable camera input facts; model features and hidden tensors are excluded.",
+      "properties": {
+        "absence_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CameraAbsenceReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "camera_id": {
+          "$ref": "#/$defs/CameraId"
+        },
+        "codec_stream_exact_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Codec Stream Exact Sha256"
+        },
+        "segment_semantic_sha256_values": {
+          "default": [],
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "title": "Segment Semantic Sha256 Values",
+          "type": "array"
+        },
+        "selected_for_inference": {
+          "title": "Selected For Inference",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "camera_id",
+        "available",
+        "selected_for_inference",
+        "codec_stream_exact_sha256",
+        "segment_semantic_sha256_values",
+        "absence_reason"
+      ],
+      "title": "CameraContextBinding",
+      "type": "object"
+    },
+    "CameraId": {
+      "enum": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "CameraId",
+      "type": "string"
+    },
+    "NanosecondInterval": {
+      "additionalProperties": false,
+      "description": "A nonempty half-open interval ``[start_ns, end_ns)``.",
+      "properties": {
+        "end_ns": {
+          "title": "End Ns",
+          "type": "string"
+        },
+        "start_ns": {
+          "title": "Start Ns",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_ns",
+        "end_ns"
+      ],
+      "title": "NanosecondInterval",
+      "type": "object"
+    },
+    "SixCameraMap_CameraContextBinding_": {
+      "additionalProperties": false,
+      "properties": {
+        "cam_01": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_02": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_03": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_04": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_05": {
+          "$ref": "#/$defs/CameraContextBinding"
+        },
+        "cam_06": {
+          "$ref": "#/$defs/CameraContextBinding"
+        }
+      },
+      "required": [
+        "cam_01",
+        "cam_02",
+        "cam_03",
+        "cam_04",
+        "cam_05",
+        "cam_06"
+      ],
+      "title": "SixCameraMap[CameraContextBinding]",
+      "type": "object"
+    },
+    "StorageSegmentReference": {
+      "additionalProperties": false,
+      "description": "Reference to one immutable, non-overlapping storage segment manifest.",
+      "properties": {
+        "interval": {
+          "$ref": "#/$defs/NanosecondInterval"
+        },
+        "segment_key": {
+          "maxLength": 193,
+          "minLength": 66,
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+          "title": "Segment Key",
+          "type": "string"
+        },
+        "segment_ordinal": {
+          "minimum": 0,
+          "title": "Segment Ordinal",
+          "type": "integer"
+        },
+        "segment_semantic_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Segment Semantic Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segment_ordinal",
+        "segment_key",
+        "segment_semantic_sha256",
+        "interval"
+      ],
+      "title": "StorageSegmentReference",
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.robata.dev/v1/perception-context-manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Replayable causal context for one stream-oriented perception call.",
+  "properties": {
+    "cameras": {
+      "$ref": "#/$defs/SixCameraMap_CameraContextBinding_"
+    },
+    "codec_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Codec Policy Version",
+      "type": "string"
+    },
+    "context_interval": {
+      "$ref": "#/$defs/NanosecondInterval"
+    },
+    "context_manifest_key": {
+      "maxLength": 193,
+      "minLength": 66,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?::[a-z0-9][a-z0-9-]*)*:[0-9a-f]{64}$",
+      "title": "Context Manifest Key",
+      "type": "string"
+    },
+    "context_manifest_semantic_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Context Manifest Semantic Sha256",
+      "type": "string"
+    },
+    "context_policy_version": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+-]*[A-Za-z0-9])?$",
+      "title": "Context Policy Version",
+      "type": "string"
+    },
+    "focus_segment_ordinal": {
+      "minimum": 0,
+      "title": "Focus Segment Ordinal",
+      "type": "integer"
+    },
+    "identity_policy_version": {
+      "const": "perception-context-identity-v1",
+      "default": "perception-context-identity-v1",
+      "title": "Identity Policy Version",
+      "type": "string"
+    },
+    "ordered_segments": {
+      "items": {
+        "$ref": "#/$defs/StorageSegmentReference"
+      },
+      "title": "Ordered Segments",
+      "type": "array"
+    },
+    "projection_version": {
+      "const": "perception-context-semantic-v1",
+      "default": "perception-context-semantic-v1",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_recording_exact_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Source Recording Exact Sha256",
+      "type": "string"
+    },
+    "source_recording_key": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Source Recording Key",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "projection_version",
+    "identity_policy_version",
+    "source_recording_key",
+    "source_recording_exact_sha256",
+    "context_interval",
+    "ordered_segments",
+    "focus_segment_ordinal",
+    "cameras",
+    "codec_policy_version",
+    "context_policy_version",
+    "context_manifest_key",
+    "context_manifest_semantic_sha256"
+  ],
+  "title": "PerceptionContextManifest",
+  "type": "object"
+}
