@@ -211,6 +211,12 @@ def traditional_generation(
         results[hashlib.sha256(raw).hexdigest()] = (path, raw, item)
     if len(results) != 5:
         raise EvidenceError("traditional result set must contain five artifacts")
+    observations_dir = bindings_dir.parent / "observation"
+    observations: dict[int, tuple[Path, bytes, dict[str, Any]]] = {}
+    for path in observations_dir.rglob("*.json"):
+        raw, item = load(path)
+        ordinal = item["context"]["focus_segment_ordinal"]
+        observations[ordinal] = (path, raw, item)
     rows: dict[int, dict[str, Any]] = {}
     binding_sources = []
     load_seconds = set()
@@ -226,6 +232,9 @@ def traditional_generation(
         if result["request_id"] != response["request_id"]:
             raise EvidenceError("binding/result request differs")
         output = json.loads(response["output_text"])
+        observation_path, observation_raw, observation = observations[ordinal]
+        normalized = observation["observations"]
+        normalized_actions = [item["action"] for item in normalized]
         interval = segments[ordinal]["interval"]
         duration = (interval["end_ns"] - interval["start_ns"]) / 1e9
         rows[ordinal] = {
@@ -239,10 +248,17 @@ def traditional_generation(
             >= stream["decoder"]["max_new_tokens"],
             "strict_json": True,
             "observation_count": len(output["observations"]),
+            "raw_observation_action": output["observations"][0]["action"],
             "output_text_sha256": hashlib.sha256(response["output_text"].encode()).hexdigest(),
             "request_id": response["request_id"],
             "binding_exact_sha256": digest,
             "result_artifact": source(result_path, result_raw),
+            "normalized_observation_action_count": len(normalized_actions),
+            "normalized_observation_actions": normalized_actions,
+            "normalized_observation_action": (
+                normalized_actions[0] if len(normalized_actions) == 1 else None
+            ),
+            "normalized_observation_artifact": source(observation_path, observation_raw),
             "model_identity_sha256": response["inference_identity"]["model_identity_sha256"],
             "checkpoint_manifest_sha256": response["inference_identity"]["model_identity"][
                 "checkpoint_manifest_sha256"
@@ -297,6 +313,32 @@ def traditional_generation(
         "run_manifest": stream["execution"]["run_manifest"],
     }
     return projection, stream
+
+
+def _contains_book_claim(action: str) -> bool:
+    lowered = action.lower()
+    return "book" in lowered
+
+
+def spatial_segment4_follow_up(path: Path) -> dict[str, Any]:
+    raw, report = load(path)
+    if report.get("report_version") != "mage-spatial-sampling-qualification-v1":
+        raise EvidenceError("spatial report version differs")
+    profiles = report["profiles"]
+    run_98k = profiles["traditional_8x98k"]["run"]["generation"]["per_segment"][4]
+    run_131k = profiles["traditional_8x131k"]["fresh_recomputations"][0]["generation"][
+        "per_segment"
+    ][4]
+    action_98k = json.loads(run_98k["output_text"])["observations"][0]["action"]
+    action_131k = json.loads(run_131k["output_text"])["observations"][0]["action"]
+    if _contains_book_claim(action_98k) or _contains_book_claim(action_131k):
+        raise EvidenceError("spatial follow-up must remove the unsupported book claim")
+    return {
+        "source_report": {**source(path, raw), "semantic_sha256": report["semantic_sha256"]},
+        "traditional_8x98k_segment_4_action": action_98k,
+        "traditional_8x131k_segment_4_action": action_131k,
+        "book_claim_present_only_at_8x65k": True,
+    }
 
 
 def quality16(
@@ -371,6 +413,57 @@ def inspection(directory: Path) -> dict[str, Any]:
     }
 
 
+def hallucination_analysis(
+    *,
+    traditional: dict[str, Any],
+    inspection_finding: dict[str, Any],
+    spatial_follow_up: dict[str, Any],
+) -> dict[str, Any]:
+    segment = traditional["per_segment"][4]
+    raw_action = segment["raw_observation_action"]
+    normalized_action = segment["normalized_observation_action"]
+    if not _contains_book_claim(raw_action) or not _contains_book_claim(normalized_action):
+        raise EvidenceError(
+            "segment 4 book claim must remain visible before and after normalization"
+        )
+    if (
+        inspection_finding["visual_observation"]
+        != "handling/folding green fabric; no book is visible"
+    ):
+        raise EvidenceError("inspection finding for segment 4 differs")
+    return {
+        "admission_reason_code": "UNSUPPORTED_OBJECT_CLASS_CLAIM",
+        "determination": "MODEL_OUTPUT_HALLUCINATION_SUPPORTED_BY_LOW_RESOLUTION_INPUT_DEGRADATION",
+        "primary_surface": "RAW_MODEL_OUTPUT",
+        "segment_4_control": {
+            "raw_observation_action": raw_action,
+            "normalized_observation_action": normalized_action,
+            "normalized_observation_preserved_object_class": True,
+            "source_binding_exact_sha256": segment["binding_exact_sha256"],
+            "source_observation_artifact": segment["normalized_observation_artifact"],
+        },
+        "input_degradation_assessment": {
+            "state": "SUPPORTED_CONTRIBUTING_FACTOR",
+            "basis": (
+                "The same segment stops claiming a book in the tracked 98K and 131K "
+                "traditional spatial follow-ups."
+            ),
+            "follow_up": spatial_follow_up,
+        },
+        "normalization_assessment": {
+            "state": "NOT_CAUSAL",
+            "basis": "The normalized observation preserves the green-book object class.",
+        },
+        "evaluation_policy_assessment": {
+            "state": "NOT_CAUSAL_HOLD_REQUIRED",
+            "basis": (
+                "Manual retained-frame inspection shows green fabric, so the route must remain "
+                "held rather than promoted."
+            ),
+        },
+    }
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
     dcvc, baseline = dcvc_control(args.baseline)
     traditional, stream = traditional_generation(
@@ -378,6 +471,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         args.traditional_gpu_telemetry,
         args.traditional_bindings,
         args.traditional_results,
+    )
+    inspection_report = inspection(args.inspection)
+    hallucination = hallucination_analysis(
+        traditional=traditional,
+        inspection_finding=inspection_report["finding"],
+        spatial_follow_up=spatial_segment4_follow_up(args.spatial_sampling_report),
     )
     media = traditional["media_seconds"]
     prep8 = preparation(
@@ -456,8 +555,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "generation": traditional,
             "quality": {
                 "decision": "HOLD",
+                "admission_reason_code": hallucination["admission_reason_code"],
                 "strict_json_segments": 5,
-                "inspection": inspection(args.inspection),
+                "inspection": inspection_report,
+                "issue_analysis": hallucination,
                 "reason": (
                     "All calls completed and the hot route exceeded realtime locally, but "
                     "segment 4 asserted a green book where retained frames show green fabric."
@@ -550,6 +651,38 @@ def validate(report: dict[str, Any]) -> None:
         raise EvidenceError("recording-hour lane formula differs")
     if report["decision"]["state"] != "HOLD_TRADITIONAL":
         raise EvidenceError("eight-canvas decision must remain HOLD")
+    quality = report["traditional_target_canvas_8"]["quality"]
+    issue = quality["issue_analysis"]
+    if quality.get("admission_reason_code") != "UNSUPPORTED_OBJECT_CLASS_CLAIM":
+        raise EvidenceError("eight-canvas admission reason must remain explicit")
+    if (
+        issue.get("determination")
+        != "MODEL_OUTPUT_HALLUCINATION_SUPPORTED_BY_LOW_RESOLUTION_INPUT_DEGRADATION"
+        or issue.get("primary_surface") != "RAW_MODEL_OUTPUT"
+    ):
+        raise EvidenceError("hallucination classification differs")
+    control = issue["segment_4_control"]
+    if "green book" not in control["raw_observation_action"]:
+        raise EvidenceError("segment 4 raw output must retain the green-book claim")
+    if "green_book" not in control["normalized_observation_action"]:
+        raise EvidenceError("segment 4 normalized action must retain the green-book claim")
+    if control.get("normalized_observation_preserved_object_class") is not True:
+        raise EvidenceError("normalization must remain non-causal")
+    input_assessment = issue["input_degradation_assessment"]
+    if input_assessment.get("state") != "SUPPORTED_CONTRIBUTING_FACTOR":
+        raise EvidenceError("input degradation assessment differs")
+    follow_up = input_assessment["follow_up"]
+    if follow_up.get("book_claim_present_only_at_8x65k") is not True:
+        raise EvidenceError("follow-up comparison must keep the 65K-only book claim")
+    if (
+        "book" in follow_up["traditional_8x98k_segment_4_action"].lower()
+        or "book" in follow_up["traditional_8x131k_segment_4_action"].lower()
+    ):
+        raise EvidenceError("higher-resolution follow-ups must keep the book claim removed")
+    if issue["normalization_assessment"].get("state") != "NOT_CAUSAL":
+        raise EvidenceError("normalization assessment differs")
+    if issue["evaluation_policy_assessment"].get("state") != "NOT_CAUSAL_HOLD_REQUIRED":
+        raise EvidenceError("evaluation policy assessment differs")
     candidate = report["traditional_target_canvas_16"]
     if candidate["decision"] != "STOP" or candidate["generation"]["strict_json"] is not False:
         raise EvidenceError("sixteen-canvas decision must remain STOP")
@@ -601,6 +734,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--inspection", type=Path, default=ROOT / ".tmp/traditional-generation-r3/inspection"
+    )
+    result.add_argument(
+        "--spatial-sampling-report",
+        type=Path,
+        default=ROOT / "docs/mage-spatial-sampling-qualification-2026-08-09.json",
     )
     result.add_argument(
         "--quality16-preparation-receipt",

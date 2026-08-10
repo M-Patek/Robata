@@ -403,6 +403,61 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     assert len(model.generate_kwargs["stopping_criteria"]) == 1
 
 
+def test_runtime_calls_fixed_frame_processor_without_codec_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    processor = _FakeProcessor()
+    model = _FakeModel()
+    transformers = _FakeTransformers(processor, model)
+    imported: list[str] = []
+    monkeypatch.setattr(
+        mage_video_runtime,
+        "import_module",
+        _fake_importer(transformers=transformers, imported=imported),
+    )
+    dependency_checks: list[object] = []
+    runtime = MageVideoRuntime(
+        model_directory=model_directory,
+        codec_dependency_checker=lambda *args: dependency_checks.append(args),
+    )
+    frames = (object(), object(), object())
+
+    generated = runtime.generate_fixed_frames(
+        frames=frames,
+        prompt="Describe only visible actions.",
+        max_new_tokens=48,
+    )
+
+    assert generated.output_text == "codec answer"
+    assert generated.input_video_count == 1
+    assert dependency_checks == []
+    assert processor.call_kwargs is not None
+    assert processor.call_kwargs["video_backend"] == "frames"
+    assert processor.call_kwargs["num_frames"] == 3
+    assert processor.call_kwargs["max_frames"] == 3
+    assert processor.call_kwargs["videos"] == [list(frames)]
+    assert "codec_config" not in processor.call_kwargs
+    assert model.generate_kwargs is not None
+    assert model.generate_kwargs["do_sample"] is False
+    assert model.generate_kwargs["use_cache"] is True
+
+
+def test_runtime_rejects_empty_fixed_frame_sequence(tmp_path: Path) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    runtime = MageVideoRuntime(model_directory=model_directory)
+
+    with pytest.raises(MageVideoRuntimeError, match="at least one frame"):
+        runtime.generate_fixed_frames(
+            frames=(),
+            prompt="Describe only visible actions.",
+            max_new_tokens=48,
+        )
+
+
 def test_runtime_consumes_exact_admitted_provider_cache_without_running_dcvc(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

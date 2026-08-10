@@ -22,7 +22,7 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path, PurePosixPath
 from threading import Condition, Lock, RLock
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from robata.contracts.hashing import semantic_sha256
 from robata.inference.device_execution_guard import (
@@ -571,6 +571,86 @@ class MageVideoRuntime:
         # V2 binding retain their original dependency diagnostics unchanged.
         if not isinstance(exact_cache_binding, MageVideoTraditionalCodecCacheBinding):
             self._codec_dependency_checker(native_codec_config, self._model_directory)
+
+        def prepare_inputs(processor: Any, text: str) -> Mapping[str, Any]:
+            with _bind_exact_provider_cache_entry(
+                processor=processor,
+                binding=exact_cache_binding,
+            ):
+                return cast(
+                    Mapping[str, Any],
+                    processor(
+                        text=[text],
+                        videos=[str(path) for path in paths],
+                        video_backend="codec",
+                        codec_config=native_codec_config,
+                        max_pixels=int(native_codec_config["max_pixels"]),
+                        return_tensors="pt",
+                        padding=True,
+                    ),
+                )
+
+        return self._generate_with_processor(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            input_video_count=len(paths),
+            prepare_inputs=prepare_inputs,
+        )
+
+    def generate_fixed_frames(
+        self,
+        *,
+        frames: Sequence[Any],
+        prompt: str,
+        max_new_tokens: int,
+    ) -> MageVideoGenerationObservation:
+        """Generate from one already decoded, fixed ordered frame sequence.
+
+        This is an explicit diagnostic/control path. It invokes Mage's native
+        ``video_backend='frames'`` processor without codec preparation, hidden
+        resampling, recurrent state, or fallback to the codec path. Durable frame
+        identity and timestamps remain the caller's responsibility; the runtime
+        only consumes the verified in-memory images for one generation call.
+        """
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise MageVideoRuntimeError("prompt must be nonempty")
+        _positive_int(max_new_tokens, "max_new_tokens")
+        ordered_frames = tuple(frames)
+        if not ordered_frames:
+            raise MageVideoRuntimeError("fixed-frame generation requires at least one frame")
+        if any(frame is None for frame in ordered_frames):
+            raise MageVideoRuntimeError("fixed-frame generation received a null frame")
+
+        def prepare_inputs(processor: Any, text: str) -> Mapping[str, Any]:
+            return cast(
+                Mapping[str, Any],
+                processor(
+                    text=[text],
+                    videos=[list(ordered_frames)],
+                    video_backend="frames",
+                    num_frames=len(ordered_frames),
+                    max_frames=len(ordered_frames),
+                    return_tensors="pt",
+                    padding=True,
+                ),
+            )
+
+        return self._generate_with_processor(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            input_video_count=1,
+            prepare_inputs=prepare_inputs,
+        )
+
+    def _generate_with_processor(
+        self,
+        *,
+        prompt: str,
+        max_new_tokens: int,
+        input_video_count: int,
+        prepare_inputs: Callable[[Any, str], Mapping[str, Any]],
+    ) -> MageVideoGenerationObservation:
         resident = self._acquire_resident_lease()
         request_started = time.perf_counter()
         processor_lock_wait_seconds = 0.0
@@ -581,35 +661,28 @@ class MageVideoRuntime:
         decode_seconds = 0.0
 
         try:
-            # The processor owns native codec invocation and mutable prompt
-            # templating state. Keep this region narrow so the next CPU
-            # preparation can overlap an earlier GPU generation, but not another
-            # processor call.
+            # Prompt templating and visual preprocessing share processor state.
+            # Keep this region narrow so the next preparation can overlap an
+            # earlier GPU generation, but never another processor call.
             lock_wait_started = time.perf_counter()
             with self._processor_lock:
                 processor_lock_wait_seconds += time.perf_counter() - lock_wait_started
                 processor_started = time.perf_counter()
-                content: list[dict[str, str]] = [{"type": "video"} for _ in paths]
-                content.append({"type": "text", "text": prompt})
-                messages = [{"role": "user", "content": content}]
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video"},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ]
                 text = resident.processor.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                with _bind_exact_provider_cache_entry(
-                    processor=resident.processor,
-                    binding=exact_cache_binding,
-                ):
-                    inputs = resident.processor(
-                        text=[text],
-                        videos=[str(path) for path in paths],
-                        video_backend="codec",
-                        codec_config=native_codec_config,
-                        max_pixels=int(native_codec_config["max_pixels"]),
-                        return_tensors="pt",
-                        padding=True,
-                    )
+                inputs = prepare_inputs(resident.processor, text)
                 processor_completed = time.perf_counter()
                 processor_seconds += processor_completed - processor_started
 
@@ -622,9 +695,6 @@ class MageVideoRuntime:
                 device_guard = self._shared_device_guard
                 guard = device_guard.hold() if device_guard is not None else _null_device_guard()
                 try:
-                    # Input materialization can allocate accelerator memory, so it
-                    # shares the same cross-process exclusion interval as generate.
-                    # CPU decode remains outside both generation guards.
                     with guard:
                         materialization_started = time.perf_counter()
                         device = _model_device(resident.model)
@@ -646,11 +716,6 @@ class MageVideoRuntime:
                             clock=time.perf_counter
                         )
                         generation_started_monotonic_seconds = time.perf_counter()
-                        # ``use_cache`` may create attention KV only for this call. It
-                        # is not stored on ``self`` or returned to the endpoint. The
-                        # stopping criterion observes TTFT without moving token tensors
-                        # to CPU and always returns ``False``, so it cannot terminate or
-                        # otherwise alter decoding.
                         with resident.torch.inference_mode():
                             generated = resident.model.generate(
                                 **materialized_inputs,
@@ -669,9 +734,6 @@ class MageVideoRuntime:
                         move_generated = getattr(generated_only, "to", None)
                         if callable(move_generated):
                             generated_only = move_generated("cpu")
-                        # Drop request-local GPU references before releasing the shared
-                        # accelerator lane. The allocator remains warm; no cache flush
-                        # is performed between segments.
                         del generated
                         del materialized_inputs
                         del inputs
@@ -699,9 +761,9 @@ class MageVideoRuntime:
                 except DeviceExecutionGuardError as error:
                     raise MageVideoRuntimeError("shared device guard failed") from error
 
-            # ``batch_decode`` is also processor state. It must not race a
-            # subsequent codec preparation, but it intentionally happens after
-            # the GPU generation lock has been released.
+            # ``batch_decode`` is processor state. It must not race a subsequent
+            # visual preparation, but intentionally happens after the GPU lane
+            # has been released.
             lock_wait_started = time.perf_counter()
             with self._processor_lock:
                 processor_lock_wait_seconds += time.perf_counter() - lock_wait_started
@@ -722,7 +784,7 @@ class MageVideoRuntime:
         request_completed = time.perf_counter()
         total_request_seconds = request_completed - request_started
         return MageVideoGenerationObservation(
-            input_video_count=len(paths),
+            input_video_count=input_video_count,
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             generation_seconds=generation_seconds,
