@@ -875,7 +875,7 @@ Mage decoder on different GPUs, but this remains `NOT_LOCALLY_VALIDATED`.
 5. Keep one camera, one provider worker, and one Mage generation in flight. Higher-performance
    hardware changes placement, not the logical contract.
 
-## Measured Qualification Result ? August 9, 2026
+## Measured Qualification Result — August 9, 2026
 
 The controlled local A/B used the same 40-second recording, five non-overlapping segments, one
 camera, one preparation worker, one NF4 Mage generation lane, and zero executed refinement calls.

@@ -53,6 +53,13 @@ tmp/
 .claude/
 
 # Temporary patches, test artifacts, and scratch directories
+/.agent-tasks/
+/.tmp/
+/.test-basetemp-*/
+/.test-temp-*/
+/.test-tmp/
+/test-run-*/
+/tmp_*/
 .patch*.txt
 .tmp-*/
 .pytest-basetemp-*/

@@ -1,10 +1,10 @@
-# Robata 25? Route Decision ? 2026-08-09
+# Robata 25× Route Decision — 2026-08-09
 
 > **Authority:** local, non-production evidence on one RTX 4060 Laptop GPU. This document does not claim H100 capacity or production readiness.
 
 ## Executive decision
 
-- **Mage vNext:** retain as the architectural default and continue to hold/qualify it; do not promote it to a 25? production route from the current local evidence.
+- **Mage vNext:** retain as the architectural default and continue to hold/qualify it; do not promote it to a 25× production route from the current local evidence.
 - **Qwen Batch4 hybrid:** activate as the versioned local hedge and integration candidate:
   - one-claim groups use one native `generate_batch` call;
   - multi-claim groups remain explicitly serial;
@@ -22,18 +22,18 @@ The long-running PowerShell incident was an **outer orchestration failure**, not
 | Common comparison | `cam_01`, five non-overlapping segments |
 | Hardware | RTX 4060 Laptop, 8,188 MiB |
 | Worker / generation lanes | 1 / 1 |
-| Target | 25? sustained aggregate real-time factor (500 camera-hours/day + 20% margin) |
+| Target | 25× sustained aggregate real-time factor (500 camera-hours/day + 20% margin) |
 
 ## Measured route evidence
 
-| Route | Recurring wall | RTF | Local lanes for 25? | Quality / admission |
+| Route | Recurring wall | RTF | Local lanes for 25× | Quality / admission |
 |---|---:|---:|---:|---|
-| Mage native DCVC v2 | 21.962 s stream wall | 1.821? | 14 | codec variant locally qualified; production hold |
-| Mage traditional H.264/HEVC + 8?131K | 24.263 s hot wall | 1.248? | 21 | HOLD: green-book object hallucination |
-| Mage temporal memory | 21.112 s | 1.895? | 14 | REJECT: repeated-action semantic collapse |
-| Qwen v2 serial common | 31.070 s | 1.287? | 20 | 5/5 strict parse and downstream pass |
-| Qwen v2 Batch4 common | 19.068 s | 2.098? | 12 | 5/5 strict parse and downstream pass; 4/5 semantic exact to serial |
-| Qwen r12 Batch4 hybrid (QA-only) | 65.588 s median full control | 3.728? conservative | 7 | 51/51 normalized exact to serial; not full-pipeline qualification |
+| Mage native DCVC v2 | 21.962 s stream wall | 1.821× | 14 | codec variant locally qualified; production hold |
+| Mage traditional H.264/HEVC + 8×131K | 24.263 s hot wall | 1.248× | 21 | HOLD: green-book object hallucination |
+| Mage temporal memory | 21.112 s | 1.895× | 14 | REJECT: repeated-action semantic collapse |
+| Qwen v2 serial common | 31.070 s | 1.287× | 20 | 5/5 strict parse and downstream pass |
+| Qwen v2 Batch4 common | 19.068 s | 2.098× | 12 | 5/5 strict parse and downstream pass; 4/5 semantic exact to serial |
+| Qwen r12 Batch4 hybrid (QA-only) | 65.588 s median full control | 3.728× conservative | 7 | 51/51 normalized exact to serial; not full-pipeline qualification |
 
 ### Mage bottleneck conclusion
 
@@ -47,8 +47,8 @@ The fresh common v2 comparison passed the structural quality gate in both modes:
 
 - serial: 5/5 strict parse, downstream recomputation enabled;
 - Batch4: 5/5 strict parse, downstream recomputation enabled;
-- recurring speedup: `1.629?`;
-- physical generation speedup: `1.647?`;
+- recurring speedup: `1.629×`;
+- physical generation speedup: `1.647×`;
 - raw and semantic exactness versus the serial run: `4/5`.
 
 The real endpoint smoke used four frozen single-claim QA requests:
@@ -89,7 +89,7 @@ Select the unchanged serial Qwen binding. Do not rewrite existing artifacts, cac
 
 1. Representative labeled semantic quality passes for Mage and Qwen on the real task distribution.
 2. Linux H100 BF16/NF4 sustained capacity and thermal measurements.
-3. Full QA ? event ? evidence ? track ? fusion ? publication path, not QA-only.
+3. Full QA → event → evidence → track → fusion → publication path, not QA-only.
 4. Canary and shadow traffic with bounded backpressure and restart/replay proof.
 5. RunPod/Supabase/R2 production adapters participate in the trace and are independently verified.
 

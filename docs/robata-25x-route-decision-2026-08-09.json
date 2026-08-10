@@ -52,16 +52,34 @@
       "scope": "Common cam_01 five-segment Qwen-specific v2 prompt serial run"
     },
     {
+      "id": "qwen_common_serial_v2_lifecycle",
+      "path": "docs/qwen-mage-common-serial-v2-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, exit status, and child reaping for the common serial control",
+      "exact_sha256": "0f5df35a5f75ef68216bbc0aa9ddeb1976a7687d323bd703e3d520012ed43884"
+    },
+    {
       "id": "qwen_common_batch4_v2",
       "path": "docs/qwen-mage-common-batch4-v2-qualification-2026-08-09.json",
       "exact_sha256": "62b6734627d91f838b496d8135e59998d92e581a214524311f1d8b29d3d83d0c",
       "scope": "Common cam_01 five-segment Qwen-specific v2 prompt Batch4 run"
     },
     {
+      "id": "qwen_common_batch4_v2_lifecycle",
+      "path": "docs/qwen-mage-common-batch4-v2-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, exit status, and child reaping for the common Batch4 run",
+      "exact_sha256": "7430598917b515393cb0f708a9d99ebcbae9fe8a2b4d9d0b4002715e14d7057d"
+    },
+    {
       "id": "qwen_endpoint_smoke_r6",
       "path": "docs/qwen-batch4-endpoint-smoke-qualification-2026-08-09.json",
       "exact_sha256": "ab853843af79bbac141b65921bae17a424a0da3ada37dff87e3c25014f8ca19d",
       "scope": "Real in-process ASGI Batch4 endpoint/adapter first pass plus durable replay (raw-parity-gated)"
+    },
+    {
+      "id": "qwen_endpoint_smoke_r6_lifecycle",
+      "path": "docs/qwen-batch4-endpoint-smoke-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, hard deadlines, and child reaping for the real endpoint smoke",
+      "exact_sha256": "f9551e9009911228c0fde354a6398fb48da35cfffee5653512f4a8a1b46015d6"
     }
   ],
   "mage_route": {
@@ -209,5 +227,5 @@
     "rollback": "Switch canonical binding to unchanged serial Qwen; preserve batch artifacts and idempotency namespaces.",
     "next_gate": "Run representative labeled end-to-end samples on Linux/H100, then canary before production admission."
   },
-  "semantic_sha256": "d39e32525d21479d209338e9950f9de79d04f2a1ab1a0a1bef25affb1943dcdf"
+  "semantic_sha256": "fb40201a8b91802d1b9f8238d3d8a913e2687fdb53fb4e8a8a6ab3e06d8fbf7f"
 }

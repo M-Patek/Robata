@@ -11,7 +11,7 @@ from types import ModuleType
 import pytest
 
 np = pytest.importorskip("numpy")
-from PIL import Image
+Image = pytest.importorskip("PIL.Image")
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 RUNNER_PATH = REPOSITORY_ROOT / "docker" / "mage-traditional-codec" / "run_cv_preinfer.py"
