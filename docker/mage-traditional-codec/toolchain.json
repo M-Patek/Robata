@@ -1,0 +1,47 @@
+{
+  "schema_name": "robata-mage-traditional-codec-toolchain",
+  "schema_version": 1,
+  "platform": "linux/amd64",
+  "base_image": {
+    "reference": "python:3.12-slim",
+    "digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+    "python_version": "3.12.13",
+    "distribution": "Debian GNU/Linux 13 (trixie)"
+  },
+  "static_ffmpeg_image": {
+    "reference": "mwader/static-ffmpeg:7.1.1",
+    "digest": "sha256:11a44711684c0b9f754c047dcd64235b8b52deab251bd0e0a86f22faa160749c",
+    "version": "7.1.1"
+  },
+  "python_distributions": [
+    {
+      "name": "codec-video-prep",
+      "version": "0.2.5",
+      "wheel_sha256": "1fdf52a26a3499b915a3921926391ab78afe0bc703697eacf7da187c43bfbab6"
+    },
+    {
+      "name": "numpy",
+      "version": "1.26.4",
+      "wheel_sha256": "675d61ffbfa78604709862923189bad94014bef562cc35cf61d3a07bba02a7ed"
+    },
+    {
+      "name": "opencv-python-headless",
+      "version": "4.11.0.86",
+      "wheel_sha256": "0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b"
+    },
+    {
+      "name": "Pillow",
+      "version": "12.3.0",
+      "wheel_sha256": "78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91"
+    }
+  ],
+  "mage_loader_contract": {
+    "source": "D:/HuggingFace/Mage-VL/codec_video_processing_mage_vl.py",
+    "entrypoint": "_load_codec_result",
+    "required_assets": [
+      "meta.json",
+      "src_patch_position.npy",
+      "canvas_files"
+    ]
+  }
+}

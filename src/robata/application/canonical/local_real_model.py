@@ -16,6 +16,7 @@ from robata.adapters.sqlite_inference_evidence import SQLiteInferenceEvidenceLed
 from robata.application.canonical.local_composition import (
     CanonicalLocalRunReceipt,
     LocalCanonicalModelBinding,
+    LocalCanonicalNativeBatchAdmission,
     run_local_canonical_mcap,
 )
 from robata.application.canonical.runner import NormalizedOutputLineagePolicy
@@ -67,6 +68,14 @@ LOCAL_QWEN_NORMALIZATION_CONTRACT_SHA256: Final = (
 LOCAL_QWEN_NORMALIZED_LINEAGE_PARSER_VERSION: Final = (
     f"local-hf-compact-provider-claim-v1-{LOCAL_QWEN_NORMALIZATION_CONTRACT_SHA256[:12]}"
 )
+# Native batching is an explicit local candidate, not a mutation of the serial
+# control.  The policy contains the qualified multi-claim serial guard observed
+# in the frozen r12 A/B evidence; endpoint failures are never downgraded to serial.
+LOCAL_QWEN_NATIVE_BATCH_POLICY_VERSION: Final = "local-qwen-task-claim-group-hybrid-batch-v1"
+LOCAL_QWEN_NATIVE_BATCH_CAPACITY_PROJECTION_VERSION: Final = "local-qwen-batch4-local-capacity-v1"
+LOCAL_QWEN_MULTI_CLAIM_SERIAL_GUARD_POLICY_VERSION: Final = "local-qwen-multi-claim-serial-guard-v1"
+LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE: Final = 4
+LOCAL_QWEN_NATIVE_BATCH_MAX_CONCURRENT_CALL_PARTS: Final = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +356,70 @@ def build_local_qwen_model_binding(
     )
 
 
+def build_local_qwen_batch_model_binding(
+    *,
+    transport: LocalHfTransport | None = None,
+    observed_at: str = LOCAL_QWEN_OBSERVED_AT,
+    checkpoint_manifest_sha256: str | None = None,
+    max_inference_batch_size: int = LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE,
+    max_concurrent_call_parts: int = LOCAL_QWEN_NATIVE_BATCH_MAX_CONCURRENT_CALL_PARTS,
+) -> LocalCanonicalModelBinding:
+    """Build the qualified Batch4 hybrid candidate as an explicit local route.
+
+    Per-request capabilities and policies intentionally match the serial control.
+    Only the internal runtime/capacity identity changes.  Selecting
+    :func:`build_local_qwen_model_binding` is therefore the complete rollback.
+    """
+
+    if max_inference_batch_size != LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE:
+        raise ValueError(
+            "max_inference_batch_size must equal the qualified local Qwen native batch size "
+            f"{LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE}"
+        )
+    capabilities = build_local_qwen_capabilities(
+        observed_at=observed_at,
+        checkpoint_manifest_sha256=checkpoint_manifest_sha256,
+    )
+    policies = build_local_qwen_policies()
+    adapter_config = LocalHfLoopbackAdapterConfig(
+        provider=LOCAL_QWEN_PROVIDER,
+        default_max_new_tokens=LOCAL_QWEN_MAX_NEW_TOKENS,
+        request_timeout_cap_ms=LOCAL_QWEN_TIMEOUT_MS,
+    )
+
+    def adapter_factory(
+        evidence_ledger: SQLiteInferenceEvidenceLedger,
+        parser: StrictProviderClaimParser,
+    ) -> VisionModelAdapter:
+        return LocalHfLoopbackVisionAdapter(
+            capabilities=capabilities,
+            parser=parser,
+            evidence_ledger=evidence_ledger,
+            config=adapter_config,
+            transport=transport,
+        )
+
+    return LocalCanonicalModelBinding(
+        capabilities=capabilities,
+        coarse_qa_policy=policies[0],
+        dense_qa_policy=policies[1],
+        event_proposal_policy=policies[2],
+        action_evidence_policy=policies[3],
+        boundary_refinement_policy=policies[4],
+        inference_policy=policies[5],
+        adapter_factory=adapter_factory,
+        normalized_output_lineage_policy=build_local_qwen_normalized_lineage_policy(),
+        native_batch_admission=LocalCanonicalNativeBatchAdmission(
+            policy_version=LOCAL_QWEN_NATIVE_BATCH_POLICY_VERSION,
+            max_batch_size=LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE,
+            capacity_projection_version=(LOCAL_QWEN_NATIVE_BATCH_CAPACITY_PROJECTION_VERSION),
+            serial_guard_policy_version=(LOCAL_QWEN_MULTI_CLAIM_SERIAL_GUARD_POLICY_VERSION),
+        ),
+        max_concurrent_call_parts=max_concurrent_call_parts,
+        max_inference_batch_size=max_inference_batch_size,
+    )
+
+
 def run_local_qwen_canonical_mcap(
     *,
     source_path: Path,
@@ -380,6 +453,7 @@ def run_local_qwen_canonical_mcap(
 # Short aliases make the reusable wiring convenient for callers that use the
 # Qwen name rather than the longer local-hugging-face provider name.
 build_qwen_capabilities = build_local_qwen_capabilities
+build_qwen_batch_model_binding = build_local_qwen_batch_model_binding
 build_qwen_model_binding = build_local_qwen_model_binding
 build_qwen_policies = build_local_qwen_policies
 run_local_qwen_canonical = run_local_qwen_canonical_mcap
@@ -396,6 +470,11 @@ __all__ = [
     "LOCAL_QWEN_MAX_PIXELS_PER_IMAGE",
     "LOCAL_QWEN_MODEL_NAME",
     "LOCAL_QWEN_MODEL_VERSION",
+    "LOCAL_QWEN_MULTI_CLAIM_SERIAL_GUARD_POLICY_VERSION",
+    "LOCAL_QWEN_NATIVE_BATCH_CAPACITY_PROJECTION_VERSION",
+    "LOCAL_QWEN_NATIVE_BATCH_MAX_CONCURRENT_CALL_PARTS",
+    "LOCAL_QWEN_NATIVE_BATCH_MAX_SIZE",
+    "LOCAL_QWEN_NATIVE_BATCH_POLICY_VERSION",
     "LOCAL_QWEN_NORMALIZATION_CONTRACT_SHA256",
     "LOCAL_QWEN_NORMALIZED_LINEAGE_PARSER_VERSION",
     "LOCAL_QWEN_NORMALIZED_LINEAGE_POLICY_VERSION",
@@ -404,10 +483,12 @@ __all__ = [
     "LOCAL_QWEN_PROVIDER",
     "LOCAL_QWEN_TIMEOUT_MS",
     "LocalQwenCanonicalRunOptions",
+    "build_local_qwen_batch_model_binding",
     "build_local_qwen_capabilities",
     "build_local_qwen_model_binding",
     "build_local_qwen_normalized_lineage_policy",
     "build_local_qwen_policies",
+    "build_qwen_batch_model_binding",
     "build_qwen_capabilities",
     "build_qwen_model_binding",
     "build_qwen_policies",

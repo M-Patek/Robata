@@ -1,0 +1,1 @@
+{"docker_run_rc":0,"host_wall_seconds":7.074725,"image":"robata/mage-traditional-codec:20260809","image_id":"sha256:857ad103f01c1594500f6b6ba300c084d891f9ec6106f7f25de583403ec86cbf","measurement_note":"PowerShell Stopwatch around docker run; six-decimal value retained from command output.","network":"none","platform":"linux/amd64"}

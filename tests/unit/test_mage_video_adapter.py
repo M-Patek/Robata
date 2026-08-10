@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -9,6 +10,11 @@ from robata.contracts.cameras import CAMERA_IDS, CameraId
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.contracts.perception_stream import MageObservation, PerceptionContextManifest
 from robata.inference.mage_video_adapter import (
+    MAGE_VIDEO_COMPACT_DECODER_ID,
+    MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS,
+    MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS,
+    MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION,
+    MAGE_VIDEO_COMPACT_OUTPUT_POLICY_VERSION,
     MAGE_VIDEO_INFER_PATH,
     MAGE_VIDEO_OBSERVATION_IDEMPOTENCY_NAMESPACE,
     MAGE_VIDEO_OBSERVATION_REQUEST_IDENTITY_VERSION,
@@ -22,6 +28,7 @@ from robata.inference.mage_video_adapter import (
     MageVideoObservationDiagnosticSink,
     MageVideoObservationTransportRequest,
     MageVideoPreparedObservationRequest,
+    build_mage_video_unified_observation_prompt,
 )
 from robata.inference.mage_video_endpoint import (
     MAGE_VIDEO_ENDPOINT_RESPONSE_VERSION,
@@ -897,3 +904,140 @@ def test_v6_parses_persisted_v4b_artifact_without_rewriting_its_authority() -> N
     assert first.boundary.end_confidence == 0.0
     assert first.boundary.started_before_context is False
     assert first.boundary.continues_after_context is False
+
+
+def test_compact_v1_profile_is_versioned_and_shortens_the_instruction() -> None:
+    context = _single_camera_context()
+    segment = _durable_segment(context)
+    default_config = MageVideoObservationAdapterConfig()
+    compact_config = MageVideoObservationAdapterConfig.compact_v1()
+
+    default_prompt = build_mage_video_unified_observation_prompt(
+        context=context,
+        segment=segment,
+        config=default_config,
+    )
+    compact_prompt = build_mage_video_unified_observation_prompt(
+        context=context,
+        segment=segment,
+        config=compact_config,
+    )
+    projection = json.loads(compact_prompt)
+
+    assert compact_config.output_profile == "COMPACT_V1"
+    assert compact_config.prompt_version == MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION
+    assert compact_config.decoder_id == MAGE_VIDEO_COMPACT_DECODER_ID
+    assert compact_config.max_new_tokens == MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS
+    assert projection["output_policy"] == {
+        "item_keys": ["action", "interval"],
+        "max_observations": MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS,
+        "profile": "COMPACT_V1",
+        "version": MAGE_VIDEO_COMPACT_OUTPUT_POLICY_VERSION,
+    }
+    assert projection["response_contract"]["observations"]["item_keys"] == [
+        "action",
+        "interval",
+    ]
+    assert projection["output_policy"]["max_observations"] == MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS
+    assert len(compact_prompt) < len(default_prompt)
+    assert "one JSON object only" in compact_prompt
+
+
+def test_compact_v1_reserved_identities_cannot_be_mixed_with_full_profile() -> None:
+    with pytest.raises(ValueError, match="COMPACT_V1 requires"):
+        MageVideoObservationAdapterConfig(output_profile="COMPACT_V1")
+    with pytest.raises(ValueError, match="requires COMPACT_V1"):
+        MageVideoObservationAdapterConfig(
+            prompt_version=MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION,
+        )
+
+
+def test_compact_v1_request_identity_and_replay_are_separate_from_full_control() -> None:
+    context = _single_camera_context()
+    default_adapter = _adapter(
+        resolver=_Resolver((_durable_segment(context),)),
+        transport=_Transport(),
+        artifact_reader=_ArtifactReader(),
+    )
+    compact_adapter = _adapter(
+        resolver=_Resolver((_durable_segment(context),)),
+        transport=_Transport(),
+        artifact_reader=_ArtifactReader(),
+        config=MageVideoObservationAdapterConfig.compact_v1(),
+    )
+
+    default_prepared = default_adapter.prepare_request(context)
+    compact_prepared = compact_adapter.prepare_request(context)
+
+    assert (
+        default_prepared.request_identity_sha256
+        == "2700708813ae4e8a886e1129f8f60b59adab6dcce4026d8ef9d62c893a76b9ae"
+    )
+    assert (
+        default_prepared.inference_identity.inference_identity
+        == "287655ae47bf83b4326b48672e8d28ceb2210a221cd8ad556e424a0b9c7be88d"
+    )
+    assert (
+        exact_bytes_sha256(default_prepared.request_body)
+        == "fce52dc9af9e4eb7227a72ea3acb9e35071549f4fcaa70fd1d778aa753026185"
+    )
+    assert (
+        exact_bytes_sha256(default_prepared.prompt.encode("utf-8"))
+        == "7ec247fc6672d9d0b60d82fbb482be715f3448852a5121312adb7164b4fdd779"
+    )
+    assert (
+        compact_prepared.request_identity_sha256
+        == "b4dcddc1862b702607b541638c0f98712e3e3f10716d42c44526459c6fdcd192"
+    )
+    assert (
+        compact_prepared.inference_identity.inference_identity
+        == "ded31de1fb34a11f875ec19d31440ff98841c2e5a215cf1ec30da04d36d1874d"
+    )
+    assert (
+        exact_bytes_sha256(compact_prepared.request_body)
+        == "dfb6b87a60cd010c243d1e27894a9a6837a261d257af05bfe0fce3c75ba6ff58"
+    )
+    assert (
+        exact_bytes_sha256(compact_prepared.prompt.encode("utf-8"))
+        == "9abb4348ffdbd60ea04896d2eb14403b580fa4fb81249f78072f7e833c93ee00"
+    )
+    assert compact_prepared.request_identity_sha256 != default_prepared.request_identity_sha256
+    assert compact_prepared.inference_identity != default_prepared.inference_identity
+    assert compact_prepared.endpoint_request.decoder.decoder_id == MAGE_VIDEO_COMPACT_DECODER_ID
+    assert (
+        compact_prepared.endpoint_request.decoder.max_new_tokens
+        == MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS
+    )
+    assert compact_prepared.endpoint_request.decoder.prompt != (
+        default_prepared.endpoint_request.decoder.prompt
+    )
+
+    compact_payload = {
+        "observations": [
+            {
+                "action": "pick up cup",
+                "interval": {
+                    "start_offset_seconds": "1.0",
+                    "end_offset_seconds": "2.0",
+                },
+            }
+        ]
+    }
+    response, artifact_bytes = _response_with_artifact(
+        compact_prepared,
+        canonical_json_bytes(compact_payload).decode("utf-8"),
+    )
+    observation = compact_adapter.replay_prepared_artifact(
+        prepared=compact_prepared,
+        response=response,
+        artifact_bytes=artifact_bytes,
+    )
+    assert observation.prompt_version == (
+        f"{MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION}+reject_action_v1"
+    )
+    assert len(observation.observations) == 1
+    assert observation.observations[0].action == "pick_up_cup"
+    assert observation.observations[0].interval.start_ns == 1_000_000_000
+    assert observation.observations[0].interval.end_ns == 2_000_000_000
+    assert observation.observations[0].confidence is None
+    assert observation.observations[0].camera_evidence[CameraId.CAM_01].visibility is None

@@ -393,3 +393,117 @@ def test_v2_manifest_rebuild_accepts_only_verified_existing_entry(tmp_path: Path
     assert replay.built_count == 0
     assert replay.verified_hit_count == 1
     assert replay.entries[0].entry_semantic_sha256 == manifest.entries[0].entry_semantic_sha256
+
+
+def _rebuild_verified_hit(
+    *,
+    tmp_path: Path,
+    manifest: Any,
+    source: Path,
+    output: Path,
+) -> Any:
+    model_root = tmp_path / "Mage-VL-Robata-DCVC-V2"
+    checkpoint = build_mage_checkpoint_manifest(
+        model_directory=model_root,
+        model_identifier="Mage-VL-Robata-DCVC-V2",
+        model_revision="test+robata-dcvc-provider-v2",
+    )
+    return build_mage_codec_cache_manifest_v2(
+        checkpoint_manifest=checkpoint,
+        codec_policy=_policy(),
+        effective_config=manifest.effective_config,
+        cache_base_root=Path(manifest.cache_base_root),
+        model_directory=model_root,
+        observations=[(source, output, "VERIFIED_HIT", 0.001)],
+        prewarm_wall_seconds=0.001,
+    )
+
+
+def test_v2_verified_hit_republishes_missing_entry_sidecar_exactly(tmp_path: Path) -> None:
+    manifest, source, output = _build(tmp_path)
+    sidecar = output / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    expected_bytes = sidecar.read_bytes()
+    sidecar.unlink()
+
+    replay = _rebuild_verified_hit(
+        tmp_path=tmp_path,
+        manifest=manifest,
+        source=source,
+        output=output,
+    )
+
+    assert sidecar.read_bytes() == expected_bytes
+    assert replay.built_count == 0
+    assert replay.verified_hit_count == 1
+    assert replay.entries[0].entry_semantic_sha256 == manifest.entries[0].entry_semantic_sha256
+    assert verify_mage_codec_cache_manifest_v2(manifest=replay)
+    assert not tuple(output.glob(f".{sidecar.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("corruption", ["source", "artifact", "asset"])
+def test_v2_missing_sidecar_is_not_published_for_tampered_backing(
+    tmp_path: Path, corruption: str
+) -> None:
+    manifest, source, output = _build(tmp_path)
+    sidecar = output / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    sidecar.unlink()
+    if corruption == "source":
+        source.write_bytes(b"tampered-source")
+        match = "does not match source/config"
+    elif corruption == "artifact":
+        preparation = output / MAGE_DCVC_PREPARATION_SIDECAR_NAME
+        preparation.write_bytes(preparation.read_bytes() + b"\n")
+        match = "canonical JSON"
+    else:
+        (output / "canvas_000.jpg").write_bytes(b"tampered-asset")
+        match = "asset bytes"
+
+    with pytest.raises(MageCodecCacheV2Error, match=match):
+        _rebuild_verified_hit(
+            tmp_path=tmp_path,
+            manifest=manifest,
+            source=source,
+            output=output,
+        )
+
+    assert not sidecar.exists()
+    assert not tuple(output.glob(f".{sidecar.name}.*.tmp"))
+
+
+def test_v2_truncated_existing_sidecar_fails_closed_without_overwrite(tmp_path: Path) -> None:
+    manifest, source, output = _build(tmp_path)
+    sidecar = output / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    truncated = b'{"entry_version":"mage-codec-cache-entry-v2"'
+    sidecar.write_bytes(truncated)
+
+    with pytest.raises(MageCodecCacheV2Error, match="differs from expected entry"):
+        _rebuild_verified_hit(
+            tmp_path=tmp_path,
+            manifest=manifest,
+            source=source,
+            output=output,
+        )
+
+    assert sidecar.read_bytes() == truncated
+    assert not tuple(output.glob(f".{sidecar.name}.*.tmp"))
+
+
+def test_v2_mismatched_valid_sidecar_fails_closed_without_overwrite(tmp_path: Path) -> None:
+    manifest, source, output = _build(tmp_path)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    _other_manifest, _other_source, other_output = _build(other_root)
+    mismatched = (other_output / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME).read_bytes()
+    sidecar = output / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    sidecar.write_bytes(mismatched)
+
+    with pytest.raises(MageCodecCacheV2Error, match="differs from expected entry"):
+        _rebuild_verified_hit(
+            tmp_path=tmp_path,
+            manifest=manifest,
+            source=source,
+            output=output,
+        )
+
+    assert sidecar.read_bytes() == mismatched
+    assert not tuple(output.glob(f".{sidecar.name}.*.tmp"))

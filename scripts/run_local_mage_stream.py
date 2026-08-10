@@ -269,8 +269,17 @@ def _parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=256,
         help=(
-            "compact Mage decoder output budget for sustained native execution; "
-            "identity-bound and qualification-gated"
+            "identity-bound Mage decoder output budget for sustained native execution; "
+            "compact-v1 A/B should use 224 unless a larger safety budget is intentional"
+        ),
+    )
+    parser.add_argument(
+        "--decoder-output-profile",
+        choices=("full-v1", "compact-v1"),
+        default="full-v1",
+        help=(
+            "versioned prompt/output policy; full-v1 preserves the existing control "
+            "and compact-v1 is the bounded-output A/B"
         ),
     )
     parser.add_argument(
@@ -420,6 +429,18 @@ def _codec_policy(arguments: argparse.Namespace) -> MageVideoCodecPolicy:
     )
 
 
+def _observation_adapter_config(
+    arguments: argparse.Namespace,
+) -> MageVideoObservationAdapterConfig:
+    """Resolve the explicit decoder A/B profile without changing the default route."""
+
+    if arguments.decoder_output_profile == "compact-v1":
+        return MageVideoObservationAdapterConfig.compact_v1(
+            max_new_tokens=arguments.max_new_tokens,
+        )
+    return MageVideoObservationAdapterConfig(max_new_tokens=arguments.max_new_tokens)
+
+
 def _single_route_authority(arguments: argparse.Namespace) -> SingleCameraAuthority:
     return SingleCameraAuthority(
         SingleCameraAuthorityPolicy(
@@ -436,6 +457,7 @@ def _execute(
     source: Path,
 ) -> dict[str, object]:
     _validate_v1_execution_policy(plan)
+    adapter_config = _observation_adapter_config(arguments)
     endpoint_health = fetch_mage_video_endpoint_health(
         endpoint_url=arguments.endpoint_url,
         timeout_seconds=arguments.endpoint_timeout_seconds,
@@ -462,7 +484,7 @@ def _execute(
             timeout_seconds=arguments.endpoint_timeout_seconds,
         ),
         artifact_reader=FileMageVideoResultArtifactReader(),
-        config=MageVideoObservationAdapterConfig(max_new_tokens=arguments.max_new_tokens),
+        config=adapter_config,
         accepted_binding_sink=artifact_store,
     )
     pipeline = StreamPerceptionPipeline(
@@ -517,6 +539,7 @@ def _execute(
         "execution_policy_version": LOCAL_MAGE_STREAM_EXECUTION_POLICY_VERSION,
         "single_route": authority.as_projection(),
         "decoder": {"max_new_tokens": arguments.max_new_tokens},
+        "decoder_output_profile": arguments.decoder_output_profile,
         "queue_depth": result.queue_depth,
         "execution_profile": result.execution_profile.value,
         "execution_timing": result.timing.as_projection(),
@@ -709,6 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "selected_camera": arguments.camera,
             "single_route": _single_route_authority(arguments).as_projection(),
             "decoder": {"max_new_tokens": arguments.max_new_tokens},
+            "decoder_output_profile": arguments.decoder_output_profile,
             "segment_boundary_mode": plan.policy.segmentation_mode.value,
             "source_path": str(source),
             "source_byte_count": source_byte_count,

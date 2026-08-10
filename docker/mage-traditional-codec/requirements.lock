@@ -1,0 +1,10 @@
+# Linux x86_64 / CPython 3.12 wheels. Hashes are the exact PyPI artifacts used
+# by this toolchain; wheels remain external build inputs and are not committed.
+numpy==1.26.4 \
+    --hash=sha256:675d61ffbfa78604709862923189bad94014bef562cc35cf61d3a07bba02a7ed
+opencv-python-headless==4.11.0.86 \
+    --hash=sha256:0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b
+Pillow==12.3.0 \
+    --hash=sha256:78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91
+codec-video-prep==0.2.5 \
+    --hash=sha256:1fdf52a26a3499b915a3921926391ab78afe0bc703697eacf7da187c43bfbab6

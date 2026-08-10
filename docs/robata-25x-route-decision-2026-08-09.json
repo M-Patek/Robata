@@ -1,0 +1,231 @@
+{
+  "report_version": "robata-25x-route-decision-v1",
+  "authority": "LOCAL_NONPRODUCTION_ONLY",
+  "report_date": "2026-08-09",
+  "production_eligible": false,
+  "objective": {
+    "daily_camera_hours": 500,
+    "margin_fraction": 0.2,
+    "sustained_aggregate_realtime_factor_target": 25.0,
+    "fixed_local_fixture_seconds": 40.0,
+    "fixed_local_camera": "cam_01",
+    "fixed_local_segments": 5,
+    "hardware": "NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB",
+    "worker_count": 1,
+    "generation_lanes": 1
+  },
+  "evidence": [
+    {
+      "id": "mage_capacity_baseline",
+      "path": "docs/mage-25x-local-capacity-baseline-2026-08-09.json",
+      "exact_sha256": "1a6ff7cd3fc56f582027ac950e2dc0419eb5963a2d4836bbe0cfa8ae35e6d7b7",
+      "scope": "Mage provider-v2 DCVC 40s cam_01 five-segment baseline"
+    },
+    {
+      "id": "mage_traditional_generation",
+      "path": "docs/mage-traditional-codec-generation-qualification-2026-08-09.json",
+      "exact_sha256": "f1b5db9d838152f8ebd775e5d68c62139421556456e60f91caa1686e061cd910",
+      "scope": "Traditional H.264/HEVC preparation plus real Mage generation qualification"
+    },
+    {
+      "id": "mage_spatial_sampling",
+      "path": "docs/mage-spatial-sampling-qualification-2026-08-09.json",
+      "exact_sha256": "5975e82ea9b445bb435c0f3994b56d1d0212bb81518ff68c93768a4f2d95820a",
+      "scope": "8x131K spatial sampling quality/capacity candidate"
+    },
+    {
+      "id": "mage_temporal_memory",
+      "path": "docs/mage-temporal-memory-qualification-2026-08-09.json",
+      "exact_sha256": "9e06dba340f3b51fcf385811cd4b10cb0442a4680d97570a284576bf0c1be6dd",
+      "scope": "Temporal-memory A/B and semantic non-inferiority gate"
+    },
+    {
+      "id": "qwen_full_r12_batch",
+      "path": "docs/qwen-native-batch-qualification-2026-08-09.json",
+      "exact_sha256": "0844c9b7c43bf1db7396977c91eb8575755a971ebf2c1d5b28310fff641084fc",
+      "scope": "Qwen r12 51-request serial/control and Batch4 hybrid qualification"
+    },
+    {
+      "id": "qwen_common_serial_v2",
+      "path": "docs/qwen-mage-common-serial-v2-qualification-2026-08-09.json",
+      "exact_sha256": "66b6ac49f886a2dcf2b20089541e5124a4735363c16f6c54491aa01a202c2ff4",
+      "scope": "Common cam_01 five-segment Qwen-specific v2 prompt serial run"
+    },
+    {
+      "id": "qwen_common_serial_v2_lifecycle",
+      "path": "docs/qwen-mage-common-serial-v2-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, exit status, and child reaping for the common serial control",
+      "exact_sha256": "0f5df35a5f75ef68216bbc0aa9ddeb1976a7687d323bd703e3d520012ed43884"
+    },
+    {
+      "id": "qwen_common_batch4_v2",
+      "path": "docs/qwen-mage-common-batch4-v2-qualification-2026-08-09.json",
+      "exact_sha256": "62b6734627d91f838b496d8135e59998d92e581a214524311f1d8b29d3d83d0c",
+      "scope": "Common cam_01 five-segment Qwen-specific v2 prompt Batch4 run"
+    },
+    {
+      "id": "qwen_common_batch4_v2_lifecycle",
+      "path": "docs/qwen-mage-common-batch4-v2-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, exit status, and child reaping for the common Batch4 run",
+      "exact_sha256": "7430598917b515393cb0f708a9d99ebcbae9fe8a2b4d9d0b4002715e14d7057d"
+    },
+    {
+      "id": "qwen_endpoint_smoke_r6",
+      "path": "docs/qwen-batch4-endpoint-smoke-qualification-2026-08-09.json",
+      "exact_sha256": "ab853843af79bbac141b65921bae17a424a0da3ada37dff87e3c25014f8ca19d",
+      "scope": "Real in-process ASGI Batch4 endpoint/adapter first pass plus durable replay (raw-parity-gated)"
+    },
+    {
+      "id": "qwen_endpoint_smoke_r6_lifecycle",
+      "path": "docs/qwen-batch4-endpoint-smoke-lifecycle-2026-08-09.json",
+      "scope": "Bounded process lifecycle, hard deadlines, and child reaping for the real endpoint smoke",
+      "exact_sha256": "f9551e9009911228c0fde354a6398fb48da35cfffee5653512f4a8a1b46015d6"
+    }
+  ],
+  "mage_route": {
+    "state": "HOLD",
+    "default_route": "mage_stream_vnext_v1",
+    "small_encoder": "REMOVED; pure Mage authority retained",
+    "native_dcvc_provider_v2": {
+      "preparation_full_wall_seconds": 50.31025060000138,
+      "preparation_worker_job_sum_seconds": 37.407738199999585,
+      "stream_run_wall_seconds": 21.96186850000049,
+      "generation_sum_seconds": 19.957743899998604,
+      "first_generation_seconds": 7.67130520000137,
+      "warm_generation_mean_seconds": 3.0716096749993085,
+      "stream_realtime_factor": 1.8213386534027878,
+      "generation_sum_realtime_factor": 2.0042345567929045,
+      "local_lanes_for_25x": 14,
+      "quality_status": "LOCAL_QUALIFIED_CODEC_VARIANT_ONLY"
+    },
+    "traditional_h264_hevc": {
+      "preparation_workload_wall_seconds": 6.278373299000123,
+      "generation_stream_wall_seconds": 24.262979400000404,
+      "generation_sum_seconds": 22.617738799999643,
+      "warm_generation_mean_seconds": 3.554213549999986,
+      "hot_end_to_end_realtime_factor": 1.2482115702634684,
+      "local_lanes_for_25x": 21,
+      "quality_status": "HOLD_OBJECT_CLASS_HALLUCINATION",
+      "sixteen_canvas_status": "STOP_OUTPUT_BUDGET_AND_STRICT_JSON_FAILURE"
+    },
+    "temporal_memory": {
+      "candidate_stream_wall_seconds": 21.111573099999987,
+      "candidate_realtime_factor": 1.894695379189911,
+      "status": "REJECT_SEMANTIC_COLLAPSE",
+      "reason": "All five segments collapsed to one repeated action; speed gain is not semantically non-inferior."
+    },
+    "spatial_sampling": {
+      "selected_profile": "traditional_8x131k",
+      "local_lanes_for_25x": 16,
+      "status": "HOLD_REPRESENTATIVE_LABELED_QUALITY",
+      "reason": "Higher resolution is not itself a promotion; garment taxonomy drift remains."
+    },
+    "structural_bottlenecks": [
+      "DCVC preparation remains CPU/GPU serialized and dominates the native cold/recurring path.",
+      "Autoregressive decoder output length dominates hot generation after traditional preparation.",
+      "First generation is a cold/long-output outlier; model load is measured separately from recurring stream wall.",
+      "Temporal-memory speedup is not admissible when it changes the action sequence."
+    ]
+  },
+  "qwen_route": {
+    "state": "HOLD_FULL_PRODUCTION_QUALIFICATION",
+    "selected_policy": {
+      "policy_version": "local-qwen-task-claim-group-hybrid-batch-v1",
+      "batch_size": 4,
+      "single_claim_route": "NATIVE_BATCH_GENERATE_V1",
+      "multi_claim_route": "SERIAL_GENERATE_V1",
+      "hidden_serial_fallback": false,
+      "rollback": "build_local_qwen_model_binding (unchanged serial control)"
+    },
+    "common_v2_serial": {
+      "status": "SUCCEEDED",
+      "strict_parse": "5/5",
+      "downstream_recomputed": true,
+      "recurring_wall_seconds": 31.07019119999859,
+      "generation_seconds": 30.78875649999827,
+      "model_load_seconds": 15.210879600001135,
+      "realtime_factor": 1.287407590848743,
+      "local_lanes_for_25x": 20
+    },
+    "common_v2_batch4": {
+      "status": "SUCCEEDED",
+      "strict_parse": "5/5",
+      "downstream_recomputed": true,
+      "recurring_wall_seconds": 19.067635299999893,
+      "generation_seconds": 18.690954800002146,
+      "model_load_seconds": 16.42244220000066,
+      "realtime_factor": 2.0977955247549875,
+      "local_lanes_for_25x": 12,
+      "speedup_vs_common_serial": 1.6294727013159709,
+      "generation_speedup_vs_common_serial": 1.6472543446520311,
+      "raw_exact_vs_serial": "4/5",
+      "semantic_exact_vs_serial": "4/5"
+    },
+    "real_endpoint_smoke": {
+      "status": "SUCCEEDED",
+      "selected_cases": 4,
+      "first_pass_wall_seconds": 5.6066861000017525,
+      "physical_generation_seconds": 5.102308899999116,
+      "replay_wall_seconds": 0.142485399999714,
+      "native_batch_calls_first_pass": 1,
+      "native_batch_calls_after_replay": 1,
+      "serial_calls_first_pass": 0,
+      "raw_exact_parity": "4/4",
+      "normalized_parity": "4/4",
+      "replay_raw_evidence_identity": "EXACT",
+      "endpoint_batch_rows": 4,
+      "evidence_intents": 4,
+      "raw_provider_responses": 4,
+      "child_reaped": true,
+      "quality_gate": "RAW_AND_NORMALIZED_PARITY_PASS"
+    },
+    "full_r12_control_scope": {
+      "scope": "QA_ONLY_NOT_FULL_PIPELINE",
+      "batch4_hybrid_speedup_median": 3.7810767980162585,
+      "conservative_camera_realtime_factor": 3.7280937756078103,
+      "local_lanes_for_25x": 7,
+      "normalized_exact_match": "51/51",
+      "production_eligible": false,
+      "reason": "Exact QA replay/throughput evidence; not full production event/evidence qualification."
+    },
+    "remaining_gates": [
+      "Representative labeled semantic quality and task-level acceptance.",
+      "Full production pipeline qualification beyond QA-only workload.",
+      "Linux H100 BF16 sustained multi-worker capacity measurement.",
+      "Canary/shadow comparison under production traffic and backpressure."
+    ]
+  },
+  "capacity_model": {
+    "target_realtime_factor": 25.0,
+    "daily_target_hours_with_margin": 600.0,
+    "lanes_for_500_camera_hours_per_day": {
+      "mage_native_dcvc_stream_wall": 13,
+      "mage_traditional_hot_end_to_end": 21,
+      "qwen_common_batch4": 10,
+      "qwen_full_r12_batch4_hybrid_qa_only": 7
+    },
+    "formula": "ceil(500 / (24 * measured_realtime_factor)); 25x is ceil(25 / measured_realtime_factor).",
+    "interpretation": "These are local equivalent lanes, not H100 worker counts or production capacity claims."
+  },
+  "orchestration_safety": {
+    "bounded_runner": "run_bounded_qwen_batch_benchmark.py",
+    "process_containment": "windows-job-kill-on-close-v1",
+    "hard_deadlines": {
+      "benchmark_seconds": 180,
+      "overall_seconds": 220,
+      "shutdown_seconds": 20
+    },
+    "stale_shell_disposition": "OUTER_ORCHESTRATION_FAILURE_NOT_MODEL_RUNTIME",
+    "post_run_gpu_idle_mib_observed": 614,
+    "residual_model_processes": false
+  },
+  "decision": {
+    "selected_local_route": "QWEN_BATCH4_HYBRID_AS_VERSIONED_HEDGE; MAGE_STREAM_VNEXT_RETAINED_AS_HOLD",
+    "mage_go": false,
+    "qwen_batch_go_for_local_integration": true,
+    "production_go": false,
+    "rollback": "Switch canonical binding to unchanged serial Qwen; preserve batch artifacts and idempotency namespaces.",
+    "next_gate": "Run representative labeled end-to-end samples on Linux/H100, then canary before production admission."
+  },
+  "semantic_sha256": "fb40201a8b91802d1b9f8238d3d8a913e2687fdb53fb4e8a8a6ab3e06d8fbf7f"
+}

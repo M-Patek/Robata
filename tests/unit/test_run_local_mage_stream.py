@@ -261,3 +261,29 @@ def test_execute_constructs_and_passes_the_default_vnext_scheduler(
     assert report["execution_timing"]["run_wall_seconds"] == 1.0
     adapter_config = captured["adapter_config"]
     assert adapter_config.max_new_tokens == 256
+
+
+def test_compact_decoder_output_profile_is_explicit_and_identity_bound() -> None:
+    module = _script_module()
+    arguments = module._parser().parse_args(
+        [
+            "cam_01.mp4",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "8000000000",
+            "--execute",
+            "--decoder-output-profile",
+            "compact-v1",
+            "--max-new-tokens",
+            "160",
+        ]
+    )
+
+    assert arguments.decoder_output_profile == "compact-v1"
+    assert arguments.max_new_tokens == 160
+    config = module._observation_adapter_config(arguments)
+    assert config.output_profile == "COMPACT_V1"
+    assert config.prompt_version == "mage-unified-observation-prompt-v7-compact"
+    assert config.decoder_id == "mage-observation-decoder-v3-compact"
+    assert config.max_new_tokens == 160

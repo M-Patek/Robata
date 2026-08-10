@@ -31,9 +31,11 @@ from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, s
 from robata.inference.mage_video_runtime import (
     MAGE_VIDEO_RUNTIME_IDENTITY_VERSION,
     MageVideoCodecCacheBinding,
+    MageVideoExactCodecCacheBinding,
     MageVideoLoadProfile,
     MageVideoRuntimeError,
     MageVideoRuntimeIdentity,
+    MageVideoTraditionalCodecCacheBinding,
 )
 
 MAGE_VIDEO_ENDPOINT_REQUEST_VERSION: Literal["mage-video-codec-request-v2"] = (
@@ -460,7 +462,7 @@ class MageVideoInferenceRuntime(Protocol):
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
-        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
+        codec_cache_binding: MageVideoExactCodecCacheBinding | None = None,
     ) -> Any: ...
 
 
@@ -472,7 +474,7 @@ class MageVideoCodecCacheAdmission(Protocol):
         request: MageVideoEndpointRequest,
         paths: Sequence[Path],
         /,
-    ) -> MageVideoCodecCacheBinding | None: ...
+    ) -> MageVideoExactCodecCacheBinding | None: ...
 
 
 class MageVideoGenerationTelemetrySink(Protocol):
@@ -936,7 +938,8 @@ class MageVideoEndpointService:
         if self._codec_cache_admission is not None:
             codec_cache_binding = self._codec_cache_admission(request, paths)
             if codec_cache_binding is not None and not isinstance(
-                codec_cache_binding, MageVideoCodecCacheBinding
+                codec_cache_binding,
+                (MageVideoCodecCacheBinding, MageVideoTraditionalCodecCacheBinding),
             ):
                 raise MageVideoRuntimeError(
                     "codec cache admission returned an invalid runtime binding"
@@ -1581,6 +1584,7 @@ __all__ = [
     "MageVideoEndpointRequest",
     "MageVideoEndpointResponse",
     "MageVideoEndpointService",
+    "MageVideoExactCodecCacheBinding",
     "MageVideoGenerationJsonlSink",
     "MageVideoGenerationTelemetrySink",
     "MageVideoHealthResponse",
@@ -1592,6 +1596,7 @@ __all__ = [
     "MageVideoResultArtifactReference",
     "MageVideoRuntimeIdentityBinding",
     "MageVideoSegmentManifest",
+    "MageVideoTraditionalCodecCacheBinding",
     "build_mage_video_codec_policy_identity",
     "build_mage_video_context_manifest",
     "build_mage_video_inference_identity",

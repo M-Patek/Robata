@@ -9,7 +9,21 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
-from robata.inference.mage_video_runtime import MageVideoCodecCacheBinding
+from robata.inference import mage_traditional_codec_cache, mage_video_endpoint
+from robata.inference.mage_traditional_codec_cache import (
+    MageTraditionalCodecCacheAdmission,
+    build_mage_traditional_codec_cache_manifest,
+    build_mage_traditional_codec_effective_config,
+    build_mage_traditional_codec_toolchain_identity,
+    mage_traditional_codec_provider_identity,
+    write_mage_traditional_codec_cache_manifest,
+)
+from robata.inference.mage_video_endpoint import MageVideoCodecPolicy
+from robata.inference.mage_video_runtime import (
+    MageVideoCodecCacheBinding,
+    MageVideoExactCodecCacheAsset,
+    MageVideoTraditionalCodecCacheBinding,
+)
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "run_mage_video_endpoint.py"
 
@@ -1147,3 +1161,414 @@ def test_launcher_provider_v2_rejects_current_identity_drift(
 
     with pytest.raises(module.MageVideoEndpointLaunchError, match=expected):
         _provider_v2_cache_configuration(module, tmp_path, **kwargs)
+
+
+_TRADITIONAL_CHECKPOINT_SHA256 = "a" * 64
+_TRADITIONAL_PROVIDER_IMPLEMENTATION_SHA256 = "b" * 64
+_TRADITIONAL_PACKAGE_SHA256 = "c" * 64
+_TRADITIONAL_EXECUTABLE_SHA256 = "d" * 64
+_TRADITIONAL_COMMAND_SHA256 = "e" * 64
+_TRADITIONAL_IMAGE_DIGEST = "f" * 64
+
+
+def _traditional_launcher_configuration(
+    module: ModuleType,
+    tmp_path: Path,
+    *,
+    extra_arguments: tuple[str, ...] = (),
+    omitted_pin: str | None = None,
+) -> tuple[object, object, Path, Path, MageVideoCodecPolicy, object]:
+    policy = MageVideoCodecPolicy(
+        codec_mode="traditional",
+        preprocess_device="cpu",
+        target_canvas=8,
+        group_size=8,
+        images_per_group=4,
+        patch_size=16,
+        max_pixels=65_536,
+        min_group_frames=8,
+        max_group_frames=128,
+    )
+    toolchain = build_mage_traditional_codec_toolchain_identity(
+        package_version="0.2.5",
+        package_artifact_sha256=_TRADITIONAL_PACKAGE_SHA256,
+        executable_sha256=_TRADITIONAL_EXECUTABLE_SHA256,
+        provider_command_contract_sha256=_TRADITIONAL_COMMAND_SHA256,
+        container_image_reference=(
+            "robata/mage-traditional-codec@sha256:" + _TRADITIONAL_IMAGE_DIGEST
+        ),
+        container_image_digest=_TRADITIONAL_IMAGE_DIGEST,
+        container_platform="linux/amd64",
+    )
+    effective_config = build_mage_traditional_codec_effective_config(
+        codec_policy=policy,
+        provider_options={
+            "decode_backend": "cv_reader_pixels",
+            "grouping_mode": "readiness",
+            "parallel_decode_cv_reader": False,
+        },
+    )
+    provider_identity = mage_traditional_codec_provider_identity(
+        provider_implementation_sha256=_TRADITIONAL_PROVIDER_IMPLEMENTATION_SHA256,
+        toolchain_identity_sha256=toolchain.toolchain_identity_sha256,
+        effective_config_sha256=effective_config.effective_config_sha256,
+    )
+    source = (tmp_path / "durable" / "segment-000000.mp4").resolve()
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"exact-h264-segment")
+    cache_base = (tmp_path / "traditional-cache").resolve()
+    # The manifest builder requires the directory under its derived namespace;
+    # derive that locator with a provisional empty directory name after the
+    # source/policy/provider identities are known.
+    policy_sha = mage_video_endpoint.build_mage_video_codec_policy_identity(policy).policy_sha256
+    codec_config_sha = mage_traditional_codec_cache.mage_video_codec_config_sha256(
+        policy.native_codec_config()
+    )
+    namespace = mage_traditional_codec_cache.mage_traditional_codec_namespace_identity(
+        checkpoint_manifest_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+        codec_policy_sha256=policy_sha,
+        codec_config_sha256=codec_config_sha,
+        provider_identity_sha256=provider_identity,
+    )
+    provider_directory = cache_base / namespace / "segment-000000"
+    provider_directory.mkdir(parents=True)
+    (provider_directory / "canvas_000.jpg").write_bytes(b"jpeg")
+    (provider_directory / "meta.json").write_bytes(b'{"canvas_files":["canvas_000.jpg"],"fps":30}')
+    (provider_directory / "src_patch_position.npy").write_bytes(b"positions")
+    manifest = build_mage_traditional_codec_cache_manifest(
+        checkpoint_manifest_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+        codec_policy=policy,
+        provider_implementation_sha256=_TRADITIONAL_PROVIDER_IMPLEMENTATION_SHA256,
+        toolchain=toolchain,
+        effective_config=effective_config,
+        cache_base_root=cache_base,
+        observations=[(source, provider_directory)],
+    )
+    manifest_path = (tmp_path / "traditional-cache-manifest.json").resolve()
+    write_mage_traditional_codec_cache_manifest(manifest=manifest, path=manifest_path)
+    pin_arguments = {
+        "provider": (
+            "--traditional-provider-identity-sha256",
+            provider_identity,
+        ),
+        "toolchain": (
+            "--traditional-toolchain-identity-sha256",
+            toolchain.toolchain_identity_sha256,
+        ),
+        "image": (
+            "--traditional-container-image-digest",
+            _TRADITIONAL_IMAGE_DIGEST,
+        ),
+    }
+    argv = [
+        "--model-dir",
+        str(tmp_path / "model"),
+        "--codec-mode",
+        "traditional",
+        "--preprocess-device",
+        "cpu",
+        "--codec-target-canvas",
+        "8",
+        "--codec-group-size",
+        "8",
+        "--codec-images-per-group",
+        "4",
+        "--codec-patch-size",
+        "16",
+        "--codec-max-pixels",
+        "65536",
+        "--codec-min-group-frames",
+        "8",
+        "--codec-max-group-frames",
+        "128",
+        "--codec-cache-manifest",
+        str(manifest_path),
+        "--require-traditional-codec-cache",
+    ]
+    for name, pair in pin_arguments.items():
+        if name != omitted_pin:
+            argv.extend(pair)
+    argv.extend(extra_arguments)
+    arguments = module._parser().parse_args(argv)
+    configuration = module._codec_cache_configuration(
+        cache_module=object(),
+        endpoint_module=mage_video_endpoint,
+        traditional_cache_module=mage_traditional_codec_cache,
+        arguments=arguments,
+        checkpoint_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+        codec_policy=policy,
+    )
+    return configuration, arguments, source, provider_directory, policy, manifest
+
+
+def test_launcher_cache_family_gates_are_mutually_exclusive() -> None:
+    module = _script_module()
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args(
+            [
+                "--model-dir",
+                "D:/models/mage",
+                "--require-provider-v2-cache",
+                "--require-traditional-codec-cache",
+            ]
+        )
+
+
+def test_launcher_traditional_cache_admission_and_startup_identity(tmp_path: Path) -> None:
+    module = _script_module()
+    configuration, arguments, source, provider_directory, policy, manifest = (
+        _traditional_launcher_configuration(module, tmp_path)
+    )
+
+    assert configuration.cache_family == module.TRADITIONAL_V1_CACHE_FAMILY
+    assert configuration.cache_root == Path(manifest.qualified_cache_root).resolve()
+    assert isinstance(configuration.admission, MageTraditionalCodecCacheAdmission)
+    request = SimpleNamespace(
+        codec_policy=policy,
+        model_identity=SimpleNamespace(checkpoint_manifest_sha256=_TRADITIONAL_CHECKPOINT_SHA256),
+        camera_encodings=(
+            SimpleNamespace(
+                segment_manifest=SimpleNamespace(
+                    content_sha256=exact_bytes_sha256(source.read_bytes()),
+                    byte_count=source.stat().st_size,
+                    durable_path=str(source),
+                )
+            ),
+        ),
+    )
+    binding = configuration.admission(request, [source])
+    assert isinstance(binding, MageVideoTraditionalCodecCacheBinding)
+    assert binding.provider_cache_directory == provider_directory.resolve()
+    assert binding.provider_identity_sha256 == manifest.provider_identity_sha256
+    assert binding.toolchain_identity_sha256 == manifest.toolchain.toolchain_identity_sha256
+
+    report = module._codec_cache_startup_report(configuration, arguments=arguments)
+    assert report is not None
+    assert report["cache_family"] == module.TRADITIONAL_V1_CACHE_FAMILY
+    assert report["traditional_required"] is True
+    assert report["provider_v2_required"] is False
+    assert report["manifest_exact_sha256"] == exact_bytes_sha256(
+        configuration.manifest_path.read_bytes()
+    )
+    assert report["provider_identity"] == {
+        "provider_version": manifest.provider_version,
+        "provider_implementation_sha256": manifest.provider_implementation_sha256,
+        "provider_identity_sha256": manifest.provider_identity_sha256,
+    }
+    assert report["toolchain_identity"]["toolchain_identity_sha256"] == (
+        manifest.toolchain.toolchain_identity_sha256
+    )
+    assert report["container_image_identity"] == {
+        "reference": manifest.toolchain.container_image_reference,
+        "digest": _TRADITIONAL_IMAGE_DIGEST,
+    }
+    assert report["shared_device_guard"] == {
+        "required": False,
+        "path": None,
+        "identity_authoritative": False,
+    }
+
+
+@pytest.mark.parametrize("omitted_pin", ["provider", "toolchain", "image"])
+def test_launcher_traditional_cache_requires_all_deployment_pins(
+    tmp_path: Path,
+    omitted_pin: str,
+) -> None:
+    module = _script_module()
+
+    with pytest.raises(module.MageVideoEndpointLaunchError, match="identity pins"):
+        _traditional_launcher_configuration(module, tmp_path, omitted_pin=omitted_pin)
+
+
+@pytest.mark.parametrize(
+    ("extra_arguments", "match"),
+    [
+        (("--qualified-provider-manifest", "qualified.json"), "Provider V2"),
+        (("--shared-device-guard-file", "guard.lock"), "DCVC Provider V2 control"),
+    ],
+)
+def test_launcher_traditional_cache_rejects_dcvc_only_controls(
+    tmp_path: Path,
+    extra_arguments: tuple[str, ...],
+    match: str,
+) -> None:
+    module = _script_module()
+
+    with pytest.raises(module.MageVideoEndpointLaunchError, match=match):
+        _traditional_launcher_configuration(
+            module,
+            tmp_path,
+            extra_arguments=extra_arguments,
+        )
+
+
+def test_launcher_traditional_cache_rejects_non_cpu_or_neural_policy(tmp_path: Path) -> None:
+    module = _script_module()
+    configuration, arguments, _source, _directory, policy, _manifest = (
+        _traditional_launcher_configuration(module, tmp_path)
+    )
+    assert configuration.cache_family == module.TRADITIONAL_V1_CACHE_FAMILY
+
+    arguments.preprocess_device = "cuda"
+    with pytest.raises(module.MageVideoEndpointLaunchError, match="preprocess-device cpu"):
+        module._codec_cache_configuration(
+            cache_module=object(),
+            endpoint_module=mage_video_endpoint,
+            traditional_cache_module=mage_traditional_codec_cache,
+            arguments=arguments,
+            checkpoint_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+            codec_policy=policy,
+        )
+    arguments.preprocess_device = "cpu"
+    arguments.codec_mode = "neural"
+    with pytest.raises(module.MageVideoEndpointLaunchError, match="codec-mode traditional"):
+        module._codec_cache_configuration(
+            cache_module=object(),
+            endpoint_module=mage_video_endpoint,
+            traditional_cache_module=mage_traditional_codec_cache,
+            arguments=arguments,
+            checkpoint_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+            codec_policy=policy,
+        )
+
+
+def test_launcher_traditional_cache_revalidates_assets(tmp_path: Path) -> None:
+    module = _script_module()
+    configuration, arguments, _source, provider_directory, policy, _manifest = (
+        _traditional_launcher_configuration(module, tmp_path)
+    )
+    assert configuration.cache_family == module.TRADITIONAL_V1_CACHE_FAMILY
+    (provider_directory / "meta.json").write_bytes(b"tampered")
+
+    with pytest.raises(module.MageVideoEndpointLaunchError, match="provider assets changed"):
+        module._codec_cache_configuration(
+            cache_module=object(),
+            endpoint_module=mage_video_endpoint,
+            traditional_cache_module=mage_traditional_codec_cache,
+            arguments=arguments,
+            checkpoint_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+            codec_policy=policy,
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "match"),
+    [
+        ("traditional_provider_identity_sha256", "provider identity mismatch"),
+        ("traditional_toolchain_identity_sha256", "toolchain identity mismatch"),
+        ("traditional_container_image_digest", "container image identity mismatch"),
+    ],
+)
+def test_launcher_traditional_cache_revalidates_every_deployment_pin(
+    tmp_path: Path,
+    attribute: str,
+    match: str,
+) -> None:
+    module = _script_module()
+    _configuration, arguments, _source, _directory, policy, _manifest = (
+        _traditional_launcher_configuration(module, tmp_path)
+    )
+    setattr(arguments, attribute, "0" * 64)
+
+    with pytest.raises(module.MageVideoEndpointLaunchError, match=match):
+        module._codec_cache_configuration(
+            cache_module=object(),
+            endpoint_module=mage_video_endpoint,
+            traditional_cache_module=mage_traditional_codec_cache,
+            arguments=arguments,
+            checkpoint_sha256=_TRADITIONAL_CHECKPOINT_SHA256,
+            codec_policy=policy,
+        )
+
+
+def test_launcher_exact_traditional_replay_does_not_require_cv_preinfer() -> None:
+    module = _script_module()
+    calls: list[tuple[object, object]] = []
+    runtime_module = SimpleNamespace(
+        require_mage_video_codec_dependencies=lambda config, model: calls.append((config, model))
+    )
+    policy = SimpleNamespace(native_codec_config=lambda: {"engine": "hevc"})
+
+    module._require_launch_codec_dependencies(
+        runtime_module=runtime_module,
+        codec_policy=policy,
+        model_directory=Path("D:/models/mage"),
+        cache_family=module.TRADITIONAL_V1_CACHE_FAMILY,
+    )
+    assert calls == []
+    module._require_launch_codec_dependencies(
+        runtime_module=runtime_module,
+        codec_policy=policy,
+        model_directory=Path("D:/models/mage"),
+        cache_family=None,
+    )
+    assert len(calls) == 1
+
+
+def test_launcher_traditional_warmup_uses_full_exact_binding(tmp_path: Path) -> None:
+    module = _script_module()
+    _configuration, arguments, source, provider_directory, policy, manifest = (
+        _traditional_launcher_configuration(module, tmp_path)
+    )
+    prompt = tmp_path / "warmup-prompt.txt"
+    prompt.write_text("observe", encoding="utf-8")
+    report_path = tmp_path / "traditional-warmup.json"
+    arguments.warmup_video = source
+    arguments.warmup_video_sha256 = exact_bytes_sha256(source.read_bytes())
+    arguments.warmup_prompt_file = prompt
+    arguments.warmup_report_json = report_path
+    runtime = _WarmupRuntime()
+
+    module._run_non_authoritative_warmup(
+        runtime=runtime,
+        model_identity=_WarmupModelIdentity(),
+        codec_policy=policy,
+        arguments=arguments,
+        durable_input_roots=(source.parent,),
+        codec_cache_manifest=manifest,
+        traditional_codec_cache_binding_type=MageVideoTraditionalCodecCacheBinding,
+        exact_codec_cache_asset_type=MageVideoExactCodecCacheAsset,
+    )
+
+    assert len(runtime.generate_calls) == 1
+    binding = runtime.generate_calls[0]["codec_cache_binding"]
+    assert isinstance(binding, MageVideoTraditionalCodecCacheBinding)
+    assert binding.provider_cache_directory == provider_directory.resolve()
+    assert binding.asset_set_sha256 == manifest.entries[0].entry.asset_set_sha256
+    report = json.loads(report_path.read_bytes())
+    assert report["codec_cache_family"] == module.TRADITIONAL_V1_CACHE_FAMILY
+
+
+def test_launcher_provider_v2_manifest_rejects_traditional_identity_flags(
+    tmp_path: Path,
+) -> None:
+    module = _script_module()
+    manifest_path = tmp_path / "provider-v2.json"
+    manifest_path.write_text(
+        json.dumps({"manifest_version": module.PROVIDER_V2_CACHE_MANIFEST_VERSION}),
+        encoding="utf-8",
+    )
+    arguments = module._parser().parse_args(
+        [
+            "--model-dir",
+            "D:/models/mage",
+            "--codec-cache-manifest",
+            str(manifest_path),
+            "--traditional-provider-identity-sha256",
+            "0" * 64,
+        ]
+    )
+
+    with pytest.raises(module.MageVideoEndpointLaunchError, match="invalid for Provider V2"):
+        module._codec_cache_configuration(
+            cache_module=object(),
+            cache_v2_module=object(),
+            qualified_provider_module=object(),
+            preparation_worker_module=object(),
+            endpoint_module=object(),
+            arguments=arguments,
+            checkpoint_sha256="a" * 64,
+            checkpoint_manifest=object(),
+            codec_policy=object(),
+        )

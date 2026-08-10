@@ -45,12 +45,21 @@ from robata.inference.enrichment import (
 )
 from robata.inference.input_plan import RenderedProviderItem
 from robata.inference.local_hf_endpoint import (
+    LOCAL_HF_BATCH_ENDPOINT_REQUEST_VERSION,
+    LOCAL_HF_BATCH_ENDPOINT_RESPONSE_VERSION,
+    LOCAL_HF_BATCH_INFER_PATH,
+    LOCAL_HF_BATCH_POLICY_VERSION,
     LOCAL_HF_ENDPOINT_IDEMPOTENCY_HEADER,
     LOCAL_HF_ENDPOINT_IDEMPOTENCY_POLICY_VERSION,
     LOCAL_HF_ENDPOINT_RESPONSE_VERSION,
+    LocalHfBatchEndpointMemberRequest,
+    LocalHfBatchEndpointMemberResponse,
+    LocalHfBatchEndpointRequest,
+    LocalHfBatchEndpointResponse,
     LocalHfEncodedImage,
     LocalHfEndpointRequest,
     LocalHfEndpointResponse,
+    build_local_hf_batch_request_sha256,
 )
 from robata.inference.models import (
     InferenceFailure,
@@ -70,7 +79,15 @@ LOCAL_HF_LOOPBACK_INFER_PATH: Final = "/v1/local-vision/infer"
 LOCAL_HF_LOOPBACK_ENDPOINT_URL: Final = (
     f"{LOCAL_HF_LOOPBACK_BASE_URL}{LOCAL_HF_LOOPBACK_INFER_PATH}"
 )
+LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL: Final = (
+    f"{LOCAL_HF_LOOPBACK_BASE_URL}{LOCAL_HF_BATCH_INFER_PATH}"
+)
 LOCAL_HF_LOOPBACK_ADAPTER_VERSION: Final = "local-hf-loopback-adapter-v1"
+LOCAL_HF_HYBRID_BATCH_POLICY_VERSION: Literal["local-qwen-task-claim-group-hybrid-batch-v1"] = (
+    "local-qwen-task-claim-group-hybrid-batch-v1"
+)
+LOCAL_HF_HYBRID_BATCH_MAX_SIZE: Literal[4] = 4
+LOCAL_HF_HYBRID_BATCH_INPUT_MAX_SIZE: Literal[8] = 8
 LOCAL_HF_LOOPBACK_TOKEN_POLICY_VERSION: Final = "provider-token-v1"
 LOCAL_HF_COMPACT_BROADCAST_POLICY_VERSION: Final = "single-observation-broadcast-v1"
 LOCAL_HF_COMPACT_CAMERA_GROUP_POLICY_VERSION: Final = "package-camera-unanimous-collapse-v1"
@@ -126,6 +143,29 @@ class LocalHfLoopbackAdapterConfig(StrictModel):
         return self
 
 
+class LocalHfNativeBatchCapability(StrictModel):
+    """Versioned proof consumed by canonical composition before enabling Batch4."""
+
+    supported: Literal[True] = True
+    adapter_policy_version: Literal["local-qwen-task-claim-group-hybrid-batch-v1"] = (
+        LOCAL_HF_HYBRID_BATCH_POLICY_VERSION
+    )
+    endpoint_request_version: Literal["local-hf-vision-batch-request-v1"] = (
+        LOCAL_HF_BATCH_ENDPOINT_REQUEST_VERSION
+    )
+    endpoint_response_version: Literal["local-hf-vision-batch-response-v1"] = (
+        LOCAL_HF_BATCH_ENDPOINT_RESPONSE_VERSION
+    )
+    endpoint_policy_version: Literal["local-hf-native-batch-policy-v1"] = (
+        LOCAL_HF_BATCH_POLICY_VERSION
+    )
+    max_batch_size: Literal[4] = LOCAL_HF_HYBRID_BATCH_MAX_SIZE
+    max_dispatch_size: Literal[8] = LOCAL_HF_HYBRID_BATCH_INPUT_MAX_SIZE
+    native_admission: Literal["EXACTLY_ONE_CLAIM_GROUP"] = "EXACTLY_ONE_CLAIM_GROUP"
+    multi_claim_route: Literal["SERIAL_V1"] = "SERIAL_V1"
+    hidden_error_fallback: Literal[False] = False
+
+
 @dataclass(frozen=True, slots=True)
 class LocalHfHttpRequest:
     """One exact HTTP dispatch handed to a local transport."""
@@ -137,8 +177,11 @@ class LocalHfHttpRequest:
     idempotency_key: str
 
     def __post_init__(self) -> None:
-        if self.url != LOCAL_HF_LOOPBACK_ENDPOINT_URL:
-            raise ValueError("local HF request URL is not the pinned loopback infer path")
+        if self.url not in {
+            LOCAL_HF_LOOPBACK_ENDPOINT_URL,
+            LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL,
+        }:
+            raise ValueError("local HF request URL is not a pinned loopback infer path")
         if not isinstance(self.body, bytes) or not self.body:
             raise ValueError("local HF request body must be nonempty bytes")
         if (
@@ -275,6 +318,18 @@ class _DuplicateJsonKeyError(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedLocalHfBatchMember:
+    index: int
+    request: VisionInferenceRequest
+    started: float
+    selected_items: tuple[RenderedProviderItem, ...]
+    endpoint_request: LocalHfEndpointRequest
+    endpoint_request_body: bytes
+    claim_group_count: int
+    member_idempotency_key: str
+
+
 class LocalHfLoopbackVisionAdapter:
     """Local Qwen adapter with fail-closed evidence and parsing boundaries.
 
@@ -339,6 +394,26 @@ class LocalHfLoopbackVisionAdapter:
         return LOCAL_HF_LOOPBACK_ENDPOINT_URL
 
     @property
+    def batch_endpoint_url(self) -> str:
+        return LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL
+
+    @property
+    def native_batch_capability(self) -> LocalHfNativeBatchCapability:
+        """Return the immutable local Batch4 admission proof."""
+
+        return LocalHfNativeBatchCapability()
+
+    @property
+    def native_batch_policy_version(
+        self,
+    ) -> Literal["local-qwen-task-claim-group-hybrid-batch-v1"]:
+        return LOCAL_HF_HYBRID_BATCH_POLICY_VERSION
+
+    @property
+    def native_batch_max_size(self) -> Literal[4]:
+        return LOCAL_HF_HYBRID_BATCH_MAX_SIZE
+
+    @property
     def parser(self) -> StrictProviderClaimParser:
         return self._parser
 
@@ -382,6 +457,37 @@ class LocalHfLoopbackVisionAdapter:
             raise ValueError("local HF capability request does not match the pinned model")
         return self._capabilities
 
+    def _prepare_endpoint_request(
+        self,
+        request: VisionInferenceRequest,
+    ) -> tuple[tuple[RenderedProviderItem, ...], LocalHfEndpointRequest, bytes]:
+        """Build the exact existing serial request bytes after fail-closed validation."""
+
+        selected_items = self._validate_request(request)
+        image_payloads = self._read_selected_files(selected_items)
+        prompt = self._canonical_claim_prompt(request, selected_items)
+        endpoint_request = LocalHfEndpointRequest(
+            request_id=request.request_id,
+            images=[
+                LocalHfEncodedImage(
+                    camera_id=item.camera_id.value,
+                    sha256=item.artifact.sha256,
+                    base64_data=base64.b64encode(payload).decode("ascii"),
+                )
+                for item, payload in zip(selected_items, image_payloads, strict=True)
+            ],
+            prompt=prompt,
+            max_new_tokens=self._max_new_tokens(request),
+        )
+        body = canonical_json_bytes(endpoint_request.model_dump(mode="json"))
+        max_payload_bytes = self._capabilities.max_payload_bytes
+        if max_payload_bytes is not None and len(body) > max_payload_bytes:
+            raise _LocalHfAdapterError(
+                "LOCAL_HF_REQUEST_TOO_LARGE",
+                "local HF request exceeds the pinned payload byte limit",
+            )
+        return selected_items, endpoint_request, body
+
     async def infer(
         self,
         request: VisionInferenceRequest,
@@ -392,29 +498,7 @@ class LocalHfLoopbackVisionAdapter:
             raise TypeError("request must be VisionInferenceRequest")
         started = self._monotonic()
         try:
-            selected_items = self._validate_request(request)
-            image_payloads = self._read_selected_files(selected_items)
-            prompt = self._canonical_claim_prompt(request, selected_items)
-            endpoint_request = LocalHfEndpointRequest(
-                request_id=request.request_id,
-                images=[
-                    LocalHfEncodedImage(
-                        camera_id=item.camera_id.value,
-                        sha256=item.artifact.sha256,
-                        base64_data=base64.b64encode(payload).decode("ascii"),
-                    )
-                    for item, payload in zip(selected_items, image_payloads, strict=True)
-                ],
-                prompt=prompt,
-                max_new_tokens=self._max_new_tokens(request),
-            )
-            body = canonical_json_bytes(endpoint_request.model_dump(mode="json"))
-            max_payload_bytes = self._capabilities.max_payload_bytes
-            if max_payload_bytes is not None and len(body) > max_payload_bytes:
-                raise _LocalHfAdapterError(
-                    "LOCAL_HF_REQUEST_TOO_LARGE",
-                    "local HF request exceeds the pinned payload byte limit",
-                )
+            selected_items, _endpoint_request, body = self._prepare_endpoint_request(request)
         except _LocalHfAdapterError as error:
             return self._failure(
                 request,
@@ -617,6 +701,431 @@ class LocalHfLoopbackVisionAdapter:
             schema_valid=True,
             usage=self._usage(request, endpoint_response),
             latency_ms=_elapsed_ms(started, self._monotonic()),
+        )
+
+    async def infer_batch(
+        self,
+        requests: tuple[VisionInferenceRequest, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        """Execute the qualified Batch4 hybrid policy without hidden fallback.
+
+        Exactly-one-claim-group requests are partitioned by their deterministic
+        compatibility key and sent through the native batch endpoint in chunks of
+        at most four. Every other request deliberately uses the unchanged serial
+        ``infer`` route; a native-batch error is never retried through that route.
+        """
+
+        if not isinstance(requests, tuple):
+            raise TypeError("requests must be a tuple")
+        if any(not isinstance(request, VisionInferenceRequest) for request in requests):
+            raise TypeError("requests must contain only VisionInferenceRequest values")
+        if not 1 <= len(requests) <= LOCAL_HF_HYBRID_BATCH_INPUT_MAX_SIZE:
+            raise ValueError("local HF hybrid dispatch must contain between one and eight requests")
+
+        outcomes: list[VisionInferenceSuccess | VisionInferenceFailure | None] = [None] * len(
+            requests
+        )
+        prepared_members: list[_PreparedLocalHfBatchMember] = []
+        for index, request in enumerate(requests):
+            started = self._monotonic()
+            try:
+                selected_items, endpoint_request, endpoint_request_body = (
+                    self._prepare_endpoint_request(request)
+                )
+                claim_group_count = _claim_group_count(endpoint_request.prompt)
+                member_idempotency_key = _batch_member_idempotency_key(
+                    provider_idempotency_key=request.provider_idempotency_key,
+                    endpoint_request_body=endpoint_request_body,
+                )
+            except _LocalHfAdapterError as error:
+                outcomes[index] = self._failure(
+                    request,
+                    started=started,
+                    status=InferenceStatus.FAILED,
+                    code=error.code,
+                    detail=error.detail,
+                    retryability=Retryability.PERMANENT,
+                )
+                continue
+            except (TypeError, ValueError, OSError):
+                outcomes[index] = self._failure(
+                    request,
+                    started=started,
+                    status=InferenceStatus.FAILED,
+                    code="LOCAL_HF_REQUEST_REJECTED",
+                    detail="local HF request could not be prepared",
+                    retryability=Retryability.PERMANENT,
+                )
+                continue
+            prepared_members.append(
+                _PreparedLocalHfBatchMember(
+                    index=index,
+                    request=request,
+                    started=started,
+                    selected_items=selected_items,
+                    endpoint_request=endpoint_request,
+                    endpoint_request_body=endpoint_request_body,
+                    claim_group_count=claim_group_count,
+                    member_idempotency_key=member_idempotency_key,
+                )
+            )
+
+        native_groups: dict[tuple[object, ...], list[_PreparedLocalHfBatchMember]] = {}
+        serial_members: list[_PreparedLocalHfBatchMember] = []
+        for member in prepared_members:
+            if member.claim_group_count != 1:
+                serial_members.append(member)
+                continue
+            key = self._native_batch_compatibility_key(member)
+            native_groups.setdefault(key, []).append(member)
+
+        for compatible_members in native_groups.values():
+            for chunk in self._native_batch_chunks(tuple(compatible_members)):
+                chunk_outcomes = await self._infer_native_batch_chunk(chunk)
+                if len(chunk_outcomes) != len(chunk):
+                    raise AssertionError("local HF native batch returned an invalid cardinality")
+                for member, outcome in zip(chunk, chunk_outcomes, strict=True):
+                    outcomes[member.index] = outcome
+
+        for member in serial_members:
+            # This is the explicit multi-/zero-claim quality guard, not a response
+            # error fallback. Calling infer preserves the exact serial wire identity.
+            outcomes[member.index] = await self.infer(member.request)
+
+        if any(outcome is None for outcome in outcomes):
+            raise AssertionError("local HF hybrid batch did not resolve every request")
+        return tuple(outcome for outcome in outcomes if outcome is not None)
+
+    @staticmethod
+    def _native_batch_compatibility_key(
+        member: _PreparedLocalHfBatchMember,
+    ) -> tuple[object, ...]:
+        request = member.request
+        schema = request.output_schema
+        return (
+            request.task.value,
+            member.claim_group_count,
+            member.endpoint_request.max_new_tokens,
+            request.model_name,
+            request.model_version,
+            request.prompt_version,
+            request.prompt_sha256,
+            schema.schema_id,
+            schema.version,
+            schema.sha256,
+        )
+
+    @staticmethod
+    def _native_batch_chunks(
+        members: tuple[_PreparedLocalHfBatchMember, ...],
+    ) -> tuple[tuple[_PreparedLocalHfBatchMember, ...], ...]:
+        """Chunk stably while keeping endpoint member idempotency keys unique."""
+
+        chunks: list[tuple[_PreparedLocalHfBatchMember, ...]] = []
+        current: list[_PreparedLocalHfBatchMember] = []
+        current_keys: set[str] = set()
+        for member in members:
+            if (
+                len(current) == LOCAL_HF_HYBRID_BATCH_MAX_SIZE
+                or member.member_idempotency_key in current_keys
+            ):
+                chunks.append(tuple(current))
+                current = []
+                current_keys = set()
+            current.append(member)
+            current_keys.add(member.member_idempotency_key)
+        if current:
+            chunks.append(tuple(current))
+        return tuple(chunks)
+
+    async def _infer_native_batch_chunk(
+        self,
+        members: tuple[_PreparedLocalHfBatchMember, ...],
+    ) -> tuple[VisionInferenceSuccess | VisionInferenceFailure, ...]:
+        if not 1 <= len(members) <= LOCAL_HF_HYBRID_BATCH_MAX_SIZE:
+            raise ValueError(
+                "native local HF batch chunk must contain between one and four members"
+            )
+        try:
+            endpoint_members = tuple(
+                LocalHfBatchEndpointMemberRequest(
+                    idempotency_key=member.member_idempotency_key,
+                    request=member.endpoint_request,
+                )
+                for member in members
+            )
+            batch_request_sha256 = build_local_hf_batch_request_sha256(
+                members=endpoint_members,
+                batch_policy_version=LOCAL_HF_BATCH_POLICY_VERSION,
+            )
+            endpoint_request = LocalHfBatchEndpointRequest(
+                batch_policy_version=LOCAL_HF_BATCH_POLICY_VERSION,
+                batch_request_sha256=batch_request_sha256,
+                members=list(endpoint_members),
+            )
+            body = canonical_json_bytes(endpoint_request.model_dump(mode="json"))
+            http_request = LocalHfHttpRequest(
+                url=LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL,
+                body=body,
+                timeout_seconds=(
+                    min(
+                        min(member.request.timeout_ms for member in members),
+                        self._config.request_timeout_cap_ms,
+                    )
+                    / 1_000
+                ),
+                max_response_bytes=self._config.max_response_bytes,
+                idempotency_key=(f"{LOCAL_HF_HYBRID_BATCH_POLICY_VERSION}:{batch_request_sha256}"),
+            )
+        except (TypeError, ValueError):
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.FAILED,
+                code="LOCAL_HF_BATCH_REQUEST_REJECTED",
+                detail="local HF native-batch request could not be prepared",
+                retryability=Retryability.PERMANENT,
+            )
+
+        try:
+            async with asyncio.timeout(http_request.timeout_seconds):
+                response = await self._transport.post(http_request)
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, LocalHfTransportError):
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.TIMEOUT,
+                code="LOCAL_HF_BATCH_TRANSPORT_TIMEOUT",
+                detail="local HF native-batch transport timed out or was unavailable",
+                retryability=Retryability.RETRYABLE,
+            )
+        except Exception:
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.FAILED,
+                code="LOCAL_HF_BATCH_TRANSPORT_EXCEPTION",
+                detail="local HF native-batch transport raised an unexpected exception",
+                retryability=Retryability.PERMANENT,
+            )
+
+        if not isinstance(response, LocalHfHttpResponse):
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code="LOCAL_HF_BATCH_TRANSPORT_CONTRACT_VIOLATION",
+                detail="local HF native-batch transport returned an unsupported response",
+                retryability=Retryability.PERMANENT,
+            )
+        if response.status_code != 200:
+            retryability = (
+                Retryability.RATE_LIMITED
+                if response.status_code == 429
+                else Retryability.RETRYABLE
+                if response.status_code == 408 or response.status_code >= 500
+                else Retryability.PERMANENT
+            )
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.FAILED,
+                code="LOCAL_HF_BATCH_HTTP_REJECTED",
+                detail=f"local HF batch endpoint returned HTTP status {response.status_code}",
+                retryability=retryability,
+            )
+        if len(response.body) > self._config.max_response_bytes:
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code="LOCAL_HF_BATCH_RESPONSE_TOO_LARGE",
+                detail="local HF native-batch response exceeds the configured byte limit",
+                retryability=Retryability.PERMANENT,
+            )
+        try:
+            endpoint_response = _decode_batch_endpoint_response(response.body)
+        except _LocalHfEnvelopeError as error:
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code=error.code,
+                detail=error.detail,
+                retryability=Retryability.PERMANENT,
+            )
+
+        binding_error = self._batch_binding_error(
+            members=members,
+            request=endpoint_request,
+            response=endpoint_response,
+        )
+        if binding_error is not None:
+            return self._batch_failures(
+                members,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code="LOCAL_HF_BATCH_RESPONSE_BINDING_MISMATCH",
+                detail=binding_error,
+                retryability=Retryability.PERMANENT,
+            )
+        return tuple(
+            self._batch_member_outcome(member=member, response=member_response)
+            for member, member_response in zip(
+                members,
+                endpoint_response.members,
+                strict=True,
+            )
+        )
+
+    def _batch_failures(
+        self,
+        members: tuple[_PreparedLocalHfBatchMember, ...],
+        *,
+        status: FailureStatus,
+        code: str,
+        detail: str,
+        retryability: Retryability,
+    ) -> tuple[VisionInferenceFailure, ...]:
+        return tuple(
+            self._failure(
+                member.request,
+                started=member.started,
+                status=status,
+                code=code,
+                detail=detail,
+                retryability=retryability,
+            )
+            for member in members
+        )
+
+    def _batch_binding_error(
+        self,
+        *,
+        members: tuple[_PreparedLocalHfBatchMember, ...],
+        request: LocalHfBatchEndpointRequest,
+        response: LocalHfBatchEndpointResponse,
+    ) -> str | None:
+        if response.contract_version != LOCAL_HF_BATCH_ENDPOINT_RESPONSE_VERSION:
+            return "local HF batch response contract version is not pinned"
+        if response.batch_policy_version != LOCAL_HF_BATCH_POLICY_VERSION:
+            return "local HF batch response policy version is not pinned"
+        if response.batch_request_sha256 != request.batch_request_sha256:
+            return "local HF batch response identity differs from the request"
+        if response.model_identifier != self._capabilities.model_name:
+            return "local HF batch response model identifier differs from the request"
+        if response.model_version != self._capabilities.model_version:
+            return "local HF batch response model version differs from the request"
+        if len(response.members) != len(members):
+            return "local HF batch response member count differs from the request"
+        if response.generated_member_count + response.replay_member_count != len(members):
+            return "local HF batch response disposition counts differ from the request"
+        for prepared, resolved in zip(members, response.members, strict=True):
+            if resolved.idempotency_key != prepared.member_idempotency_key:
+                return "local HF batch response member idempotency order differs from the request"
+            if resolved.request_id != prepared.request.request_id:
+                return "local HF batch response member request_id order differs from the request"
+            expected_images = len(prepared.selected_items)
+            if resolved.input_image_count != expected_images:
+                return "local HF batch response member image count differs from the request"
+            if len(resolved.rendered_image_sizes) != expected_images:
+                return "local HF batch response member image-size count differs from the request"
+        return None
+
+    def _batch_member_outcome(
+        self,
+        *,
+        member: _PreparedLocalHfBatchMember,
+        response: LocalHfBatchEndpointMemberResponse,
+    ) -> VisionInferenceSuccess | VisionInferenceFailure:
+        request = member.request
+        usage = VisionUsage(
+            input_frames=len(member.selected_items),
+            input_images=len(member.selected_items),
+            input_tokens=response.prompt_tokens,
+            output_tokens=response.output_tokens,
+            cost=0.0,
+            currency="USD",
+        )
+        raw_bytes = response.output_text.encode("utf-8")
+        try:
+            stored = self._evidence_ledger.append(
+                request_id=request.request_id,
+                provider_request_id=response.request_id,
+                data=raw_bytes,
+                media_type="application/json",
+            )
+        except Exception:
+            return self._failure(
+                request,
+                started=member.started,
+                status=InferenceStatus.FAILED,
+                code="LOCAL_HF_EVIDENCE_PERSIST_FAILED",
+                detail="local HF raw provider bytes could not be persisted",
+                retryability=Retryability.PERMANENT,
+                provider_request_id=response.request_id,
+                usage=usage,
+            )
+
+        try:
+            try:
+                payload = self._parser.decode_payload(
+                    data=stored.data,
+                    provider_claim_schema=request.output_schema,
+                )
+            except StrictProviderClaimParseError as direct_error:
+                try:
+                    payload = self._decode_compact_payload(
+                        data=stored.data,
+                        request=request,
+                        items=member.selected_items,
+                    )
+                except (TypeError, ValueError, ValidationError):
+                    raise direct_error from None
+        except StrictProviderClaimParseError as error:
+            return self._failure(
+                request,
+                started=member.started,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code=error.code.value,
+                detail=error.detail,
+                retryability=Retryability.PERMANENT,
+                provider_request_id=response.request_id,
+                raw_output_artifact_id=stored.artifact_id,
+                usage=usage,
+            )
+
+        allowed_tokens = self._allowed_reference_tokens(request, member.selected_items)
+        if any(
+            token not in allowed_tokens
+            for claim in payload.claims
+            for token in claim.evidence_tokens
+        ):
+            return self._failure(
+                request,
+                started=member.started,
+                status=InferenceStatus.INVALID_OUTPUT,
+                code="LOCAL_HF_REFERENCE_TOKEN_OUT_OF_SCOPE",
+                detail="provider claim cites an evidence token outside the selected call part",
+                retryability=Retryability.PERMANENT,
+                provider_request_id=response.request_id,
+                raw_output_artifact_id=stored.artifact_id,
+                usage=usage,
+            )
+
+        return VisionInferenceSuccess(
+            status=InferenceStatus.SUCCEEDED,
+            provider_request_id=response.request_id,
+            provider=request.provider,
+            model_name=request.model_name,
+            model_version=request.model_version,
+            normalized_output=NormalizedOutputEnvelope(
+                task=request.task,
+                output_schema=request.output_schema,
+                package_input_set_sha256=request.package_input_set_sha256,
+                input_plan_semantic_sha256=request.input_plan_semantic_sha256,
+                input_plan_part_ordinal=request.input_plan_part_ordinal,
+                input_plan_part_semantic_sha256=request.input_plan_part_semantic_sha256,
+                payload=payload.model_dump(mode="json"),
+            ),
+            raw_output_artifact_id=stored.artifact_id,
+            schema_valid=True,
+            usage=usage,
+            latency_ms=_elapsed_ms(member.started, self._monotonic()),
         )
 
     def _validate_request(
@@ -1314,6 +1823,65 @@ def _selected_items(request: VisionInferenceRequest) -> tuple[RenderedProviderIt
     return tuple(plan.rendered_items[part.start_item_ordinal : part.end_item_ordinal_exclusive])
 
 
+def _claim_group_count(prompt: str) -> int:
+    """Read the admission count from the exact canonical prompt contract."""
+
+    try:
+        document: object = json.loads(prompt)
+    except json.JSONDecodeError as error:
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_PROMPT_CONTRACT_INVALID",
+            "local HF compact prompt does not expose a claim-group count",
+        ) from error
+    if not isinstance(document, dict):
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_PROMPT_CONTRACT_INVALID",
+            "local HF compact prompt does not expose a claim-group count",
+        )
+    compact_contract = document.get("compact_output_contract")
+    if not isinstance(compact_contract, dict):
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_PROMPT_CONTRACT_INVALID",
+            "local HF compact prompt does not expose a claim-group count",
+        )
+    value: object = compact_contract.get("claim_group_count")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_PROMPT_CONTRACT_INVALID",
+            "local HF compact prompt claim-group count is invalid",
+        )
+    return value
+
+
+def _batch_member_idempotency_key(
+    *,
+    provider_idempotency_key: str,
+    endpoint_request_body: bytes,
+) -> str:
+    """Namespace exact member bytes away from both serial and future policies."""
+
+    if not isinstance(provider_idempotency_key, str) or not provider_idempotency_key:
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_IDEMPOTENCY_INVALID",
+            "local HF provider idempotency key must be nonempty",
+        )
+    if not isinstance(endpoint_request_body, bytes) or not endpoint_request_body:
+        raise _LocalHfAdapterError(
+            "LOCAL_HF_BATCH_IDEMPOTENCY_INVALID",
+            "local HF endpoint member request bytes must be nonempty",
+        )
+    binding_sha256 = exact_bytes_sha256(
+        canonical_json_bytes(
+            {
+                "adapter_batch_policy_version": LOCAL_HF_HYBRID_BATCH_POLICY_VERSION,
+                "endpoint_request_exact_sha256": exact_bytes_sha256(endpoint_request_body),
+                "provider_idempotency_key": provider_idempotency_key,
+            }
+        )
+    )
+    return f"{LOCAL_HF_HYBRID_BATCH_POLICY_VERSION}:{binding_sha256}"
+
+
 def _file_uri_path(uri: str) -> Path:
     try:
         parsed = urlsplit(uri)
@@ -1440,6 +2008,70 @@ def _decode_endpoint_response(data: bytes) -> LocalHfEndpointResponse:
     return response
 
 
+def _decode_batch_endpoint_response(data: bytes) -> LocalHfBatchEndpointResponse:
+    if not isinstance(data, bytes) or not data:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_JSON",
+            "local HF batch response must be nonempty JSON bytes",
+        )
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_UTF8",
+            "local HF batch response must not contain a UTF-8 BOM",
+        )
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_UTF8",
+            "local HF batch response is not strict UTF-8",
+        ) from error
+    try:
+        document = json.loads(
+            text,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_nonfinite,
+        )
+    except _DuplicateJsonKeyError as error:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_DUPLICATE_JSON_KEY",
+            "local HF batch response contains a duplicate JSON object key",
+        ) from error
+    except (json.JSONDecodeError, ValueError) as error:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_JSON",
+            "local HF batch response is not strict JSON",
+        ) from error
+    if not isinstance(document, dict):
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_JSON",
+            "local HF batch response root must be a JSON object",
+        )
+    try:
+        response = LocalHfBatchEndpointResponse.model_validate_json(
+            canonical_json_bytes(document),
+            strict=True,
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_CONTRACT",
+            "local HF batch response does not satisfy the pinned endpoint contract",
+        ) from error
+    try:
+        normalized = canonical_json_bytes(response.model_dump(mode="json"))
+    except (TypeError, ValueError) as error:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_CONTRACT",
+            "local HF batch response could not be canonically normalized",
+        ) from error
+    if canonical_json_bytes(document) != normalized:
+        raise _LocalHfEnvelopeError(
+            "LOCAL_HF_BATCH_RESPONSE_NORMALIZATION_MISMATCH",
+            "local HF batch response would change under typed normalization",
+        )
+    return response
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1473,8 +2105,12 @@ __all__ = [
     "LOCAL_HF_COMPACT_SINGLE_DECISION_POLICY_VERSION",
     "LOCAL_HF_COMPACT_TOKEN_ORDER_POLICY_VERSION",
     "LOCAL_HF_DENSE_COORDINATE_REDUCTION_POLICY_VERSION",
+    "LOCAL_HF_HYBRID_BATCH_INPUT_MAX_SIZE",
+    "LOCAL_HF_HYBRID_BATCH_MAX_SIZE",
+    "LOCAL_HF_HYBRID_BATCH_POLICY_VERSION",
     "LOCAL_HF_LOOPBACK_ADAPTER_VERSION",
     "LOCAL_HF_LOOPBACK_BASE_URL",
+    "LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL",
     "LOCAL_HF_LOOPBACK_DEFAULT_NEW_TOKENS",
     "LOCAL_HF_LOOPBACK_ENDPOINT_URL",
     "LOCAL_HF_LOOPBACK_INFER_PATH",
@@ -1484,6 +2120,7 @@ __all__ = [
     "LocalHfHttpResponse",
     "LocalHfLoopbackAdapterConfig",
     "LocalHfLoopbackVisionAdapter",
+    "LocalHfNativeBatchCapability",
     "LocalHfTransport",
     "LocalHfTransportError",
     "LocalHfVisionAdapter",
