@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -11,14 +12,18 @@ from typing import Any
 import pytest
 
 import robata.inference.mage_video_runtime as mage_video_runtime
+from robata.contracts.hashing import semantic_sha256
 from robata.inference.device_execution_guard import ExclusiveFileDeviceGuard
 from robata.inference.mage_video_runtime import (
     MageVideoCodecCacheBinding,
     MageVideoCodecDependencyError,
+    MageVideoExactCodecCacheAsset,
     MageVideoLoadProfile,
     MageVideoRuntime,
     MageVideoRuntimeError,
     MageVideoRuntimeIdentity,
+    MageVideoTraditionalCodecCacheBinding,
+    mage_video_codec_config_sha256,
 )
 
 
@@ -814,4 +819,194 @@ def test_runtime_reserves_sequence_interface_but_rejects_multi_video_v1(tmp_path
             prompt="Describe the scene.",
             max_new_tokens=8,
             codec_config={"engine": "hevc", "max_pixels": 150_000},
+        )
+
+
+def _traditional_runtime_binding(
+    *,
+    source_path: Path,
+    provider_cache_directory: Path,
+    codec_config: dict[str, object],
+) -> MageVideoTraditionalCodecCacheBinding:
+    assets = tuple(
+        MageVideoExactCodecCacheAsset(
+            relative_path=path.relative_to(provider_cache_directory).as_posix(),
+            byte_count=path.stat().st_size,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(provider_cache_directory.rglob("*"), key=lambda item: item.as_posix())
+        if path.is_file()
+    )
+    asset_set_sha256 = semantic_sha256(
+        [
+            {
+                "relative_path": asset.relative_path,
+                "byte_count": asset.byte_count,
+                "sha256": asset.sha256,
+            }
+            for asset in assets
+        ]
+    )
+    return MageVideoTraditionalCodecCacheBinding(
+        source_path=source_path,
+        provider_cache_directory=provider_cache_directory,
+        codec_engine="hevc",
+        codec_config_sha256=mage_video_codec_config_sha256(codec_config),
+        checkpoint_manifest_sha256="1" * 64,
+        codec_policy_sha256="2" * 64,
+        provider_identity_sha256="3" * 64,
+        toolchain_identity_sha256="4" * 64,
+        effective_config_sha256="5" * 64,
+        entry_semantic_sha256="6" * 64,
+        asset_set_sha256=asset_set_sha256,
+        assets=assets,
+    )
+
+
+def test_runtime_replays_exact_traditional_cache_without_cv_preinfer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    video_path = tmp_path / "segments" / "cam-01.mp4"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"h264-video-segment")
+    cache_root = tmp_path / "traditional-cache"
+    provider_cache = cache_root / "manifest-entry"
+    provider_cache.mkdir(parents=True)
+    (provider_cache / "canvas_000.jpg").write_bytes(b"canvas")
+    (provider_cache / "meta.json").write_bytes(b'{"canvas_files":["canvas_000.jpg"]}')
+    (provider_cache / "src_patch_position.npy").write_bytes(b"positions")
+    codec_config: dict[str, object] = {
+        "engine": "hevc",
+        "max_pixels": 150_000,
+        "target_canvas": 8,
+        "preprocess_device": "cpu",
+    }
+
+    calls: dict[str, object] = {"external": 0, "loads": [], "dependency": 0}
+
+    def run_external(_video_url: str, _out_dir: Path, _config: object) -> object:
+        calls["external"] = int(calls["external"]) + 1
+        raise AssertionError("bound replay must not execute cv-preinfer")
+
+    def upstream_process(video_url: str, config: object) -> object:
+        return run_external(video_url, cache_root / "wrong-key", config)
+
+    def load_codec_result(directory: Path) -> dict[str, object]:
+        loads = calls["loads"]
+        assert isinstance(loads, list)
+        loads.append(directory)
+        return {"out_dir": str(directory)}
+
+    codec_module = SimpleNamespace(
+        process_codec_video=upstream_process,
+        _load_codec_result=load_codec_result,
+        _run_cv_preinfer=run_external,
+    )
+
+    class TraditionalCacheProcessor(_FakeProcessor):
+        def __call__(self, **kwargs: object) -> dict[str, _FakeTensor]:
+            videos = kwargs["videos"]
+            native_config = kwargs["codec_config"]
+            assert isinstance(videos, list)
+            assert isinstance(native_config, dict)
+            codec_module.process_codec_video(
+                str(videos[0]),
+                SimpleNamespace(engine=native_config["engine"]),
+            )
+            return super().__call__(**kwargs)
+
+    TraditionalCacheProcessor.__module__ = "qualified_mage.processing_mage_vl"
+    processor = TraditionalCacheProcessor()
+    model = _FakeModel()
+    transformers = _FakeTransformers(processor, model)
+    imported: list[str] = []
+    base_importer = _fake_importer(transformers=transformers, imported=imported)
+
+    def importer(name: str) -> object:
+        if name == "qualified_mage.codec_video_processing_mage_vl":
+            imported.append(name)
+            return codec_module
+        return base_importer(name)
+
+    def dependency_checker(_config: object, _model_directory: Path) -> None:
+        calls["dependency"] = int(calls["dependency"]) + 1
+        raise AssertionError("exact traditional replay must not require cv-preinfer")
+
+    monkeypatch.setattr(mage_video_runtime, "import_module", importer)
+    runtime = MageVideoRuntime(
+        model_directory=model_directory,
+        codec_cache_root=cache_root,
+        codec_dependency_checker=dependency_checker,
+    )
+    binding = _traditional_runtime_binding(
+        source_path=video_path,
+        provider_cache_directory=provider_cache,
+        codec_config=codec_config,
+    )
+
+    generated = runtime.generate(
+        video_paths=[video_path],
+        prompt="Describe the scene.",
+        max_new_tokens=32,
+        codec_config=codec_config,
+        codec_cache_binding=binding,
+    )
+
+    assert generated.output_text == "codec answer"
+    assert calls == {
+        "external": 0,
+        "loads": [provider_cache.resolve()],
+        "dependency": 0,
+    }
+    assert codec_module.process_codec_video is upstream_process
+
+
+def test_runtime_traditional_binding_fails_closed_for_config_or_asset_change(
+    tmp_path: Path,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    video_path = tmp_path / "cam-01.mp4"
+    video_path.write_bytes(b"h264-video-segment")
+    cache_root = tmp_path / "traditional-cache"
+    provider_cache = cache_root / "manifest-entry"
+    provider_cache.mkdir(parents=True)
+    (provider_cache / "meta.json").write_bytes(b"{}")
+    (provider_cache / "src_patch_position.npy").write_bytes(b"positions")
+    codec_config: dict[str, object] = {
+        "engine": "hevc",
+        "max_pixels": 150_000,
+        "preprocess_device": "cpu",
+    }
+    binding = _traditional_runtime_binding(
+        source_path=video_path,
+        provider_cache_directory=provider_cache,
+        codec_config=codec_config,
+    )
+    runtime = MageVideoRuntime(
+        model_directory=model_directory,
+        codec_cache_root=cache_root,
+        codec_dependency_checker=lambda _config, _model_directory: None,
+    )
+
+    with pytest.raises(MageVideoRuntimeError, match="configuration does not match"):
+        runtime.generate(
+            video_paths=[video_path],
+            prompt="Describe the scene.",
+            max_new_tokens=32,
+            codec_config={**codec_config, "max_pixels": 200_000},
+            codec_cache_binding=binding,
+        )
+
+    (provider_cache / "src_patch_position.npy").write_bytes(b"tampered")
+    with pytest.raises(MageVideoRuntimeError, match="assets changed before replay"):
+        runtime.generate(
+            video_paths=[video_path],
+            prompt="Describe the scene.",
+            max_new_tokens=32,
+            codec_config=codec_config,
+            codec_cache_binding=binding,
         )

@@ -74,6 +74,11 @@ MAGE_VIDEO_OBSERVATION_IDEMPOTENCY_NAMESPACE: Final = "mage-video-observation-id
 MAGE_VIDEO_UNIFIED_OBSERVATION_PROMPT_CONTRACT_VERSION: Final = (
     "mage-video-unified-observation-prompt-contract-v6"
 )
+MAGE_VIDEO_COMPACT_OUTPUT_POLICY_VERSION: Final = "mage-video-compact-output-policy-v1"
+MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION: Final = "mage-unified-observation-prompt-v7-compact"
+MAGE_VIDEO_COMPACT_DECODER_ID: Final = "mage-observation-decoder-v3-compact"
+MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS: Final = 224
+MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS: Final = 6
 MAGE_VIDEO_ACCEPTED_BINDING_VERSION: Final = "mage-video-accepted-binding-v1"
 MAGE_VIDEO_ACCEPTED_BINDING_KEY_NAMESPACE: Final = "mage-video-accepted-binding-v1"
 
@@ -305,18 +310,61 @@ class MageVideoObservationPayload(StrictModel):
 
 
 class MageVideoObservationAdapterConfig(StrictModel):
-    """Versioned provider-neutral policy for one native-video observation call."""
+    """Versioned provider-neutral policy for one native-video observation call.
+
+    ``output_profile`` is adapter policy rather than a wire-contract field.  A compact
+    profile still binds itself to the request through its versioned prompt, decoder id,
+    and output budget; the endpoint therefore keeps exact identity/replay semantics.
+    The default remains the v6 profile so existing accepted artifacts and callers are
+    not silently reinterpreted.
+    """
 
     model_family: CanonicalToken = "mage_video"
     observation_schema_version: SchemaVersion = "mage-observation-v1"
     prompt_version: SchemaVersion = "mage-unified-observation-prompt-v6"
     decoder_id: NonEmptyString = "mage-observation-decoder-v2"
+    output_profile: Literal["FULL_V1", "COMPACT_V1"] = "FULL_V1"
     out_of_context_action_policy: Literal["REJECT_ACTION_V1", "CLIP_INTERSECTION_V1"] = (
         "REJECT_ACTION_V1"
     )
     max_new_tokens: PositiveInt = 512
     cognition_gate_policy_version: SchemaVersion = "mage-gate-shadow-v1"
     cognition_gate_threshold: UnitInterval = 0.5
+
+    @model_validator(mode="after")
+    def validate_output_profile_binding(self) -> MageVideoObservationAdapterConfig:
+        """Prevent a compact grammar from masquerading as the full decoder policy."""
+
+        compact_identifiers = (
+            self.prompt_version == MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION,
+            self.decoder_id == MAGE_VIDEO_COMPACT_DECODER_ID,
+        )
+        if self.output_profile == "COMPACT_V1" and not all(compact_identifiers):
+            raise ValueError("COMPACT_V1 requires its reserved prompt and decoder identities")
+        if self.output_profile != "COMPACT_V1" and any(compact_identifiers):
+            raise ValueError("compact prompt or decoder identity requires COMPACT_V1")
+        return self
+
+    @classmethod
+    def compact_v1(
+        cls,
+        *,
+        max_new_tokens: int = MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS,
+    ) -> MageVideoObservationAdapterConfig:
+        """Return the additive, identity-bound compact decoder candidate.
+
+        The candidate changes only the prompt/decoder policy and leaves the
+        ``MageObservation`` schema and deterministic projection untouched.  Callers
+        may pass a larger budget for an A/B, but production admission must record the
+        selected budget in the endpoint request identity.
+        """
+
+        return cls(
+            prompt_version=MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION,
+            decoder_id=MAGE_VIDEO_COMPACT_DECODER_ID,
+            output_profile="COMPACT_V1",
+            max_new_tokens=max_new_tokens,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,11 +477,21 @@ def build_mage_video_unified_observation_prompt(
     segment: MageVideoDurableCameraSegment,
     config: MageVideoObservationAdapterConfig,
 ) -> str:
-    """Build a small, unbiased output contract for one native-video pass."""
+    """Build a versioned output contract for one native-video pass.
+
+    The compact candidate deliberately shortens the *instruction* as well as the
+    generated response.  It is selected only through ``compact_v1`` (or an explicit
+    equivalent config), and its exact bytes remain part of request identity.
+    """
 
     if segment.camera_id not in CAMERA_IDS:
         raise MageVideoObservationAdapterError("selected durable segment has an unknown camera")
     duration_seconds = _exact_seconds_text(context.context_interval.duration_ns)
+    if config.output_profile == "COMPACT_V1":
+        return _build_compact_observation_prompt(
+            duration_seconds=duration_seconds,
+            config=config,
+        )
     prompt_projection = {
         "prompt_contract_version": MAGE_VIDEO_UNIFIED_OBSERVATION_PROMPT_CONTRACT_VERSION,
         "prompt_version": config.prompt_version,
@@ -475,6 +533,57 @@ def build_mage_video_unified_observation_prompt(
             ),
             "Omit an action whose full interval cannot be placed inside the supplied video.",
             "Do not wrap the JSON in markdown or prose.",
+        ],
+    }
+    return canonical_json_bytes(prompt_projection).decode("utf-8")
+
+
+def _build_compact_observation_prompt(
+    *,
+    duration_seconds: str,
+    config: MageVideoObservationAdapterConfig,
+) -> str:
+    """Build the compact v1 grammar used by the decoder A/B candidate.
+
+    The compact profile keeps the already-working long field names and removes only
+    optional confidence/visibility narration.  Action and interval are the semantic
+    minimum required by the existing deterministic ``MageObservation`` projection;
+    no published schema or downstream projector changes.
+    """
+
+    prompt_projection = {
+        "prompt_contract_version": MAGE_VIDEO_UNIFIED_OBSERVATION_PROMPT_CONTRACT_VERSION,
+        "prompt_version": config.prompt_version,
+        "output_policy": {
+            "version": MAGE_VIDEO_COMPACT_OUTPUT_POLICY_VERSION,
+            "profile": config.output_profile,
+            "max_observations": MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS,
+            "item_keys": ["action", "interval"],
+        },
+        "task": (
+            "Analyze the supplied native video once and return one JSON object only. "
+            "Report every distinct visible physical action in temporal order."
+        ),
+        "video_duration_seconds": duration_seconds,
+        "response_contract": {
+            "root_keys": ["observations"],
+            "observations": {
+                "type": "array",
+                "max_items": MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS,
+                "item_keys": ["action", "interval"],
+                "action": "short observed verb-object phrase, at most 6 words",
+                "interval": {
+                    "start_offset_seconds": f"JSON number from 0 to < {duration_seconds}",
+                    "end_offset_seconds": f"JSON number after start and <= {duration_seconds}",
+                },
+            },
+        },
+        "rules": [
+            "Output one JSON object only; no markdown, prose, or code fences.",
+            "Use seconds relative to the video start and keep intervals inside the video.",
+            "Merge only adjacent repeats of the same action; preserve distinct actions.",
+            "Return no more than 6 observations and use no keys outside the contract.",
+            "Do not output confidence, visibility, QA, camera IDs, hashes, or timestamps.",
         ],
     }
     return canonical_json_bytes(prompt_projection).decode("utf-8")
@@ -602,22 +711,26 @@ class MageVideoObservationAdapter(MageObservationProvider):
             context_payload_sha256=context.context_manifest_semantic_sha256,
             segment_manifest_identities=[endpoint_segment.manifest_identity],
         )
-        request_identity = semantic_sha256(
-            {
-                "request_identity_version": MAGE_VIDEO_OBSERVATION_REQUEST_IDENTITY_VERSION,
-                "endpoint_path": MAGE_VIDEO_INFER_PATH,
-                "context_manifest_semantic_sha256": context.context_manifest_semantic_sha256,
-                "segment_manifest_identity": endpoint_segment.manifest_identity,
-                "model_identity": self._model_identity.model_dump(mode="json"),
-                "codec_policy": self._codec_policy.model_dump(mode="json"),
-                "prompt_exact_sha256": exact_bytes_sha256(prompt.encode("utf-8")),
-                "decoder_id": self._config.decoder_id,
-                "max_new_tokens": self._config.max_new_tokens,
-                "observation_schema_version": self._config.observation_schema_version,
-                "prompt_version": _effective_observation_prompt_version(self._config),
-                "out_of_context_action_policy": self._config.out_of_context_action_policy,
-            }
-        )
+        request_identity_projection: dict[str, object] = {
+            "request_identity_version": MAGE_VIDEO_OBSERVATION_REQUEST_IDENTITY_VERSION,
+            "endpoint_path": MAGE_VIDEO_INFER_PATH,
+            "context_manifest_semantic_sha256": context.context_manifest_semantic_sha256,
+            "segment_manifest_identity": endpoint_segment.manifest_identity,
+            "model_identity": self._model_identity.model_dump(mode="json"),
+            "codec_policy": self._codec_policy.model_dump(mode="json"),
+            "prompt_exact_sha256": exact_bytes_sha256(prompt.encode("utf-8")),
+            "decoder_id": self._config.decoder_id,
+            "max_new_tokens": self._config.max_new_tokens,
+            "observation_schema_version": self._config.observation_schema_version,
+            "prompt_version": _effective_observation_prompt_version(self._config),
+            "out_of_context_action_policy": self._config.out_of_context_action_policy,
+        }
+        # Preserve existing FULL_V1 request identities. The additive compact profile
+        # gets an explicit discriminator in addition to its distinct prompt/decoder
+        # bytes, making policy intent visible in request identity projections.
+        if self._config.output_profile != "FULL_V1":
+            request_identity_projection["output_profile"] = self._config.output_profile
+        request_identity = semantic_sha256(request_identity_projection)
         endpoint_request = MageVideoEndpointRequest(
             request_id=f"mage-video-observation-request-v6:{request_identity}",
             model_identity=self._model_identity,
@@ -646,7 +759,10 @@ class MageVideoObservationAdapter(MageObservationProvider):
             inference_identity=build_mage_video_inference_identity(endpoint_request),
         )
 
-    def observe(self, context: PerceptionContextManifest) -> MageObservation:
+    def observe(
+        self,
+        context: PerceptionContextManifest,
+    ) -> MageObservation:
         """Invoke exactly one normal observation request; no shadow signal can suppress it."""
 
         prepared = self.prepare_request(context)
@@ -1706,6 +1822,11 @@ def _reject_nonfinite_json_number(value: str) -> NoReturn:
 __all__ = [
     "MAGE_VIDEO_ACCEPTED_BINDING_KEY_NAMESPACE",
     "MAGE_VIDEO_ACCEPTED_BINDING_VERSION",
+    "MAGE_VIDEO_COMPACT_DECODER_ID",
+    "MAGE_VIDEO_COMPACT_DEFAULT_MAX_NEW_TOKENS",
+    "MAGE_VIDEO_COMPACT_MAX_OBSERVATIONS",
+    "MAGE_VIDEO_COMPACT_OBSERVATION_PROMPT_VERSION",
+    "MAGE_VIDEO_COMPACT_OUTPUT_POLICY_VERSION",
     "MAGE_VIDEO_INFER_PATH",
     "MAGE_VIDEO_OBSERVATION_IDEMPOTENCY_NAMESPACE",
     "MAGE_VIDEO_OBSERVATION_REQUEST_IDENTITY_VERSION",

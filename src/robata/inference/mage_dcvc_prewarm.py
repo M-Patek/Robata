@@ -15,8 +15,9 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
-from threading import Thread
+from threading import Lock, Thread
 from typing import Annotated, Any, Final, Literal, Protocol, Self, cast
 
 from pydantic import Field, StringConstraints, ValidationError, model_validator
@@ -162,67 +163,115 @@ class MageDcvcWorkerProcessRunner(Protocol):
     ) -> tuple[tuple[MageDcvcPreparationResponse, ...], MageDcvcWorkerProcessTelemetryV2]: ...
 
 
-def run_mage_dcvc_preparation_process(
-    *,
-    command: Sequence[str],
-    requests: Sequence[MageDcvcPreparationRequest],
-    environment: Mapping[str, str],
-    working_directory: Path,
-    response_timeout_seconds: float,
-) -> tuple[tuple[MageDcvcPreparationResponse, ...], MageDcvcWorkerProcessTelemetryV2]:
-    """Run one binary-safe JSONL subprocess for all requests and require a clean exit."""
+class MageDcvcPreparationProcessSession:
+    """One resident binary-safe JSONL worker with request-at-a-time delivery.
 
-    if not command or not requests:
-        raise MageDcvcPrewarmError("worker command and requests must be nonempty")
-    if response_timeout_seconds <= 0.0:
-        raise MageDcvcPrewarmError("worker response timeout must be positive")
-    started = time.perf_counter()
-    try:
-        process = subprocess.Popen(
-            tuple(str(part) for part in command),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(Path(working_directory).expanduser().resolve()),
-            env=dict(environment),
-            shell=False,
-        )
-    except OSError as error:
-        raise MageDcvcPrewarmError("could not start the resident DCVC worker") from error
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        _terminate_process(process)
-        raise MageDcvcPrewarmError("resident DCVC worker pipes were not created")
-    process_stdin = process.stdin
-    process_stdout = process.stdout
-    process_stderr = process.stderr
+    The session deliberately permits only one outstanding request. A response is
+    validated and returned before the caller may submit the next request, allowing
+    downstream work to begin without waiting for a whole prewarm batch.
+    """
 
-    stdout_queue: queue.Queue[bytes | None] = queue.Queue()
-    stderr_digest = hashlib.sha256()
-    stderr_byte_count = [0]
+    def __init__(
+        self,
+        *,
+        command: Sequence[str],
+        environment: Mapping[str, str],
+        working_directory: Path,
+        response_timeout_seconds: float,
+    ) -> None:
+        if not command:
+            raise MageDcvcPrewarmError("worker command must be nonempty")
+        if response_timeout_seconds <= 0.0:
+            raise MageDcvcPrewarmError("worker response timeout must be positive")
 
-    def read_stdout() -> None:
+        self._started = time.perf_counter()
+        self._response_timeout_seconds = response_timeout_seconds
+        self._stdout_queue: queue.Queue[bytes | None] = queue.Queue()
+        self._stderr_digest = hashlib.sha256()
+        self._stderr_byte_count = 0
+        self._response_count = 0
+        self._request_lock = Lock()
+        self._closed = False
+        self._telemetry: MageDcvcWorkerProcessTelemetryV2 | None = None
+
         try:
-            while line := process_stdout.readline():
-                stdout_queue.put(line)
-        finally:
-            stdout_queue.put(None)
+            process = subprocess.Popen(
+                tuple(str(part) for part in command),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(Path(working_directory).expanduser().resolve()),
+                env=dict(environment),
+                shell=False,
+            )
+        except OSError as error:
+            raise MageDcvcPrewarmError("could not start the resident DCVC worker") from error
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            _terminate_process(process)
+            raise MageDcvcPrewarmError("resident DCVC worker pipes were not created")
 
-    def read_stderr() -> None:
-        while chunk := process_stderr.read(64 * 1024):
-            stderr_digest.update(chunk)
-            stderr_byte_count[0] += len(chunk)
+        self._process = process
+        self._process_stdin = process.stdin
+        process_stdout = process.stdout
+        process_stderr = process.stderr
 
-    stdout_thread = Thread(target=read_stdout, name="mage-dcvc-v2-stdout", daemon=True)
-    stderr_thread = Thread(target=read_stderr, name="mage-dcvc-v2-stderr", daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-    responses: list[MageDcvcPreparationResponse] = []
-    try:
-        for request in requests:
-            process_stdin.write(canonical_json_bytes(request.model_dump(mode="json")) + b"\n")
-            process_stdin.flush()
+        def read_stdout() -> None:
             try:
-                line = stdout_queue.get(timeout=response_timeout_seconds)
+                while line := process_stdout.readline():
+                    self._stdout_queue.put(line)
+            finally:
+                self._stdout_queue.put(None)
+
+        def read_stderr() -> None:
+            while chunk := process_stderr.read(64 * 1024):
+                self._stderr_digest.update(chunk)
+                self._stderr_byte_count += len(chunk)
+
+        self._stdout_thread = Thread(
+            target=read_stdout,
+            name="mage-dcvc-v2-stdout",
+            daemon=True,
+        )
+        self._stderr_thread = Thread(
+            target=read_stderr,
+            name="mage-dcvc-v2-stderr",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise MageDcvcPrewarmError("resident DCVC worker session is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object | None,
+    ) -> Literal[False]:
+        del exc_value, traceback
+        if exc_type is None:
+            self.close()
+        else:
+            self._abort()
+        return False
+
+    def prepare_one(self, request: MageDcvcPreparationRequest) -> MageDcvcPreparationResponse:
+        """Submit one canonical request and return its fully validated response."""
+
+        if self._closed:
+            raise MageDcvcPrewarmError("resident DCVC worker session is closed")
+        if not self._request_lock.acquire(blocking=False):
+            raise MageDcvcPrewarmError("resident DCVC worker already has an outstanding request")
+        try:
+            if self._closed:
+                raise MageDcvcPrewarmError("resident DCVC worker session is closed")
+            self._process_stdin.write(canonical_json_bytes(request.model_dump(mode="json")) + b"\n")
+            self._process_stdin.flush()
+            try:
+                line = self._stdout_queue.get(timeout=self._response_timeout_seconds)
             except queue.Empty as error:
                 raise MageDcvcPrewarmError("resident DCVC worker response timed out") from error
             if line is None:
@@ -238,45 +287,98 @@ def run_mage_dcvc_preparation_process(
                 raise MageDcvcPrewarmError("resident DCVC worker response is not canonical JSON")
             if response.request_id != request.request_id:
                 raise MageDcvcPrewarmError("resident DCVC worker response request_id differs")
-            responses.append(response)
-        process_stdin.close()
-        try:
-            exit_code = process.wait(timeout=response_timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            raise MageDcvcPrewarmError("resident DCVC worker did not exit after EOF") from error
-        stdout_thread.join(timeout=5.0)
-        stderr_thread.join(timeout=5.0)
-        if stdout_thread.is_alive() or stderr_thread.is_alive():
-            raise MageDcvcPrewarmError("resident DCVC worker output drains did not finish")
-        trailing = []
-        while not stdout_queue.empty():
-            item = stdout_queue.get_nowait()
-            if item not in {None, b"", b"\n", b"\r\n"}:
-                trailing.append(item)
-        if trailing:
-            raise MageDcvcPrewarmError("resident DCVC worker emitted unexpected extra output")
-        if exit_code != 0:
-            raise MageDcvcPrewarmError(f"resident DCVC worker exited with code {exit_code}")
-    except (BrokenPipeError, OSError) as error:
-        _terminate_process(process)
-        raise MageDcvcPrewarmError("resident DCVC worker transport failed") from error
-    except Exception:
-        _terminate_process(process)
-        raise
-    finally:
-        if process.stdin is not None and not process.stdin.closed:
-            process_stdin.close()
-        if process.poll() is None:
-            _terminate_process(process)
-        stdout_thread.join(timeout=5.0)
-        stderr_thread.join(timeout=5.0)
+            self._response_count += 1
+            return response
+        except (BrokenPipeError, OSError) as error:
+            self._abort()
+            raise MageDcvcPrewarmError("resident DCVC worker transport failed") from error
+        except Exception:
+            self._abort()
+            raise
+        finally:
+            self._request_lock.release()
 
-    telemetry = MageDcvcWorkerProcessTelemetryV2(
-        response_count=len(responses),
-        wall_seconds=max(0.0, time.perf_counter() - started),
-        stderr_byte_count=stderr_byte_count[0],
-        stderr_sha256=stderr_digest.hexdigest(),
+    def close(self) -> MageDcvcWorkerProcessTelemetryV2:
+        """Close stdin, require clean EOF/exit, and return process telemetry."""
+
+        if self._telemetry is not None:
+            return self._telemetry
+        if self._closed:
+            raise MageDcvcPrewarmError("resident DCVC worker session did not close cleanly")
+        if not self._request_lock.acquire(blocking=False):
+            raise MageDcvcPrewarmError(
+                "resident DCVC worker cannot close with an outstanding request"
+            )
+        try:
+            self._closed = True
+            self._process_stdin.close()
+            try:
+                exit_code = self._process.wait(timeout=self._response_timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                raise MageDcvcPrewarmError("resident DCVC worker did not exit after EOF") from error
+            self._join_output_drains()
+            trailing = []
+            while not self._stdout_queue.empty():
+                item = self._stdout_queue.get_nowait()
+                if item not in {None, b"", b"\n", b"\r\n"}:
+                    trailing.append(item)
+            if trailing:
+                raise MageDcvcPrewarmError("resident DCVC worker emitted unexpected extra output")
+            if exit_code != 0:
+                raise MageDcvcPrewarmError(f"resident DCVC worker exited with code {exit_code}")
+            self._telemetry = MageDcvcWorkerProcessTelemetryV2(
+                response_count=self._response_count,
+                wall_seconds=max(0.0, time.perf_counter() - self._started),
+                stderr_byte_count=self._stderr_byte_count,
+                stderr_sha256=self._stderr_digest.hexdigest(),
+            )
+            return self._telemetry
+        except Exception:
+            self._abort()
+            raise
+        finally:
+            self._request_lock.release()
+
+    def _join_output_drains(self) -> None:
+        self._stdout_thread.join(timeout=5.0)
+        self._stderr_thread.join(timeout=5.0)
+        if self._stdout_thread.is_alive() or self._stderr_thread.is_alive():
+            raise MageDcvcPrewarmError("resident DCVC worker output drains did not finish")
+
+    def _abort(self) -> None:
+        self._closed = True
+        if not self._process_stdin.closed:
+            with suppress(OSError):
+                self._process_stdin.close()
+        if self._process.poll() is None:
+            _terminate_process(self._process)
+        self._stdout_thread.join(timeout=5.0)
+        self._stderr_thread.join(timeout=5.0)
+
+
+def run_mage_dcvc_preparation_process(
+    *,
+    command: Sequence[str],
+    requests: Sequence[MageDcvcPreparationRequest],
+    environment: Mapping[str, str],
+    working_directory: Path,
+    response_timeout_seconds: float,
+) -> tuple[tuple[MageDcvcPreparationResponse, ...], MageDcvcWorkerProcessTelemetryV2]:
+    """Run one binary-safe JSONL subprocess for all requests and require a clean exit."""
+
+    if not command or not requests:
+        raise MageDcvcPrewarmError("worker command and requests must be nonempty")
+    responses: list[MageDcvcPreparationResponse] = []
+    session = MageDcvcPreparationProcessSession(
+        command=command,
+        environment=environment,
+        working_directory=working_directory,
+        response_timeout_seconds=response_timeout_seconds,
     )
+    with session:
+        for request in requests:
+            responses.append(session.prepare_one(request))
+    telemetry = session.close()
     return tuple(responses), telemetry
 
 
@@ -827,6 +929,7 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
 
 __all__ = [
     "MAGE_DCVC_PREWARM_REPORT_V2_VERSION",
+    "MageDcvcPreparationProcessSession",
     "MageDcvcPrewarmError",
     "MageDcvcPrewarmJobTelemetryV2",
     "MageDcvcPrewarmReportV2",

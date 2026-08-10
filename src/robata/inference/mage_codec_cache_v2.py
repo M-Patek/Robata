@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import uuid
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -361,11 +362,9 @@ def build_mage_codec_cache_manifest_v2(
             provider_cache_directory=output,
             namespace_identity=namespace,
         )
-        if admission == "BUILT":
-            _write_entry_sidecar(directory=output, entry=entry)
-        verified = verify_mage_codec_cache_entry_v2(
+        verified = _publish_or_verify_mage_codec_cache_entry_v2(
             cache_directory=output,
-            expected_entry=entry,
+            entry=entry,
             effective_config=effective_config,
         )
         entries.append(
@@ -474,6 +473,8 @@ def verify_mage_codec_cache_entry_v2(
 ) -> MageCodecCacheEntryV2:
     directory = Path(cache_directory).expanduser().resolve()
     sidecar = directory / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    if sidecar.is_symlink():
+        raise MageCodecCacheV2Error("Provider V2 cache entry sidecar must not be a symlink")
     try:
         raw = sidecar.read_bytes()
         entry = MageCodecCacheEntryV2.model_validate_json(raw, strict=True)
@@ -483,21 +484,11 @@ def verify_mage_codec_cache_entry_v2(
         raise MageCodecCacheV2Error("Provider V2 cache entry sidecar must be canonical JSON")
     if expected_entry is not None and entry != expected_entry:
         raise MageCodecCacheV2Error("Provider V2 cache entry differs from expected entry")
-    source_sha, source_bytes = _file_sha256(Path(entry.source_path))
-    if source_sha != entry.source_content_sha256 or source_bytes != entry.source_byte_count:
-        raise MageCodecCacheV2Error("Provider V2 source content changed")
-    artifact, artifact_exact_sha = _load_preparation_artifact(directory)
-    if effective_config is not None:
-        _validate_provider_metadata(artifact=artifact, effective_config=effective_config)
-    if (
-        artifact.artifact_semantic_sha256 != entry.preparation_artifact_semantic_sha256
-        or artifact_exact_sha != entry.preparation_artifact_exact_sha256
-        or artifact.preparation_identity != entry.preparation_identity
-        or artifact.assets != entry.assets
-        or artifact.provider_metadata != entry.provider_metadata
-    ):
-        raise MageCodecCacheV2Error("Provider V2 preparation artifact differs from cache entry")
-    _verify_assets(directory=directory, assets=entry.assets)
+    _verify_entry_backing_material(
+        directory=directory,
+        entry=entry,
+        effective_config=effective_config,
+    )
     return entry
 
 
@@ -658,11 +649,111 @@ def _verify_assets(*, directory: Path, assets: Sequence[MageDcvcPreparedAsset]) 
             raise MageCodecCacheV2Error("Provider V2 asset bytes changed")
 
 
-def _write_entry_sidecar(*, directory: Path, entry: MageCodecCacheEntryV2) -> None:
-    path = directory / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
-    if path.exists():
-        raise MageCodecCacheV2Error("Provider V2 cache entry sidecar already exists")
-    path.write_bytes(canonical_json_bytes(entry.model_dump(mode="json")))
+def _verify_entry_backing_material(
+    *,
+    directory: Path,
+    entry: MageCodecCacheEntryV2,
+    effective_config: MageDcvcEffectiveConfig | None,
+) -> None:
+    if directory.name != entry.provider_cache_directory_name:
+        raise MageCodecCacheV2Error("Provider V2 cache directory name differs from cache entry")
+    source_sha, source_bytes = _file_sha256(Path(entry.source_path))
+    if source_sha != entry.source_content_sha256 or source_bytes != entry.source_byte_count:
+        raise MageCodecCacheV2Error("Provider V2 source content changed")
+    artifact, artifact_exact_sha = _load_preparation_artifact(directory)
+    if effective_config is not None:
+        _validate_provider_metadata(artifact=artifact, effective_config=effective_config)
+    if (
+        artifact.artifact_semantic_sha256 != entry.preparation_artifact_semantic_sha256
+        or artifact_exact_sha != entry.preparation_artifact_exact_sha256
+        or artifact.preparation_identity != entry.preparation_identity
+        or artifact.assets != entry.assets
+        or artifact.provider_metadata != entry.provider_metadata
+    ):
+        raise MageCodecCacheV2Error("Provider V2 preparation artifact differs from cache entry")
+    _verify_assets(directory=directory, assets=entry.assets)
+
+
+def _publish_or_verify_mage_codec_cache_entry_v2(
+    *,
+    cache_directory: Path,
+    entry: MageCodecCacheEntryV2,
+    effective_config: MageDcvcEffectiveConfig,
+) -> MageCodecCacheEntryV2:
+    """Atomically publish one exact entry, or verify the exact entry already published."""
+
+    directory = Path(cache_directory).expanduser().resolve()
+    _verify_entry_backing_material(
+        directory=directory,
+        entry=entry,
+        effective_config=effective_config,
+    )
+    sidecar = directory / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    expected_bytes = canonical_json_bytes(entry.model_dump(mode="json"))
+
+    if os.path.lexists(sidecar):
+        return _verify_exact_existing_entry_sidecar(
+            directory=directory,
+            entry=entry,
+            effective_config=effective_config,
+            expected_bytes=expected_bytes,
+        )
+
+    temporary = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(expected_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # A hard-link publishes the fully written same-directory inode atomically and,
+            # unlike os.replace(), can never overwrite an entry won by another publisher.
+            os.link(temporary, sidecar)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise MageCodecCacheV2Error(
+                "could not atomically publish Provider V2 cache entry sidecar"
+            ) from error
+    except OSError as error:
+        raise MageCodecCacheV2Error("could not stage Provider V2 cache entry sidecar") from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as error:
+            raise MageCodecCacheV2Error(
+                "could not remove staged Provider V2 cache entry sidecar"
+            ) from error
+
+    return _verify_exact_existing_entry_sidecar(
+        directory=directory,
+        entry=entry,
+        effective_config=effective_config,
+        expected_bytes=expected_bytes,
+    )
+
+
+def _verify_exact_existing_entry_sidecar(
+    *,
+    directory: Path,
+    entry: MageCodecCacheEntryV2,
+    effective_config: MageDcvcEffectiveConfig,
+    expected_bytes: bytes,
+) -> MageCodecCacheEntryV2:
+    sidecar = directory / MAGE_CODEC_CACHE_ENTRY_V2_SIDECAR_NAME
+    if sidecar.is_symlink():
+        raise MageCodecCacheV2Error("Provider V2 cache entry sidecar must not be a symlink")
+    try:
+        actual_bytes = sidecar.read_bytes()
+    except OSError as error:
+        raise MageCodecCacheV2Error("Provider V2 cache entry sidecar is invalid") from error
+    if actual_bytes != expected_bytes:
+        raise MageCodecCacheV2Error("Provider V2 cache entry differs from expected entry")
+    return verify_mage_codec_cache_entry_v2(
+        cache_directory=directory,
+        expected_entry=entry,
+        effective_config=effective_config,
+    )
 
 
 def _file_sha256(path: Path) -> tuple[Sha256Digest, int]:

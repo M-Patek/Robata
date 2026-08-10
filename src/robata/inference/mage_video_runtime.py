@@ -8,8 +8,10 @@ inside one ``model.generate`` call.  Durable input and result handling lives in
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -18,10 +20,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Condition, Lock, RLock
 from typing import Any, Final
 
+from robata.contracts.hashing import semantic_sha256
 from robata.inference.device_execution_guard import (
     DeviceExecutionGuard,
     DeviceExecutionGuardBusy,
@@ -32,8 +35,12 @@ from robata.inference.device_execution_guard import (
 MAGE_VIDEO_RUNTIME_IDENTITY_VERSION: Final = "mage-video-runtime-identity-v1"
 MAGE_VIDEO_GENERATION_TELEMETRY_VERSION: Final = "mage-video-generation-telemetry-v3"
 MAGE_VIDEO_CODEC_CACHE_BINDING_VERSION: Final = "mage-video-codec-cache-binding-v1"
+MAGE_VIDEO_TRADITIONAL_CODEC_CACHE_BINDING_VERSION: Final = (
+    "mage-video-traditional-codec-cache-binding-v1"
+)
 _LOGGER = logging.getLogger(__name__)
 _PROVIDER_CACHE_BINDING_LOCK = RLock()
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class MageVideoLoadProfile(StrEnum):
@@ -97,6 +104,117 @@ class MageVideoCodecCacheBinding:
                 )
         object.__setattr__(self, "source_path", source)
         object.__setattr__(self, "provider_cache_directory", directory)
+
+
+@dataclass(frozen=True, slots=True)
+class MageVideoExactCodecCacheAsset:
+    """One exact provider output file carried into runtime admission."""
+
+    relative_path: str
+    byte_count: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.relative_path, str):
+            raise TypeError("relative_path must be a string")
+        relative = PurePosixPath(self.relative_path)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("relative_path must be a safe relative POSIX path")
+        if not isinstance(self.byte_count, int) or isinstance(self.byte_count, bool):
+            raise TypeError("byte_count must be an integer")
+        if self.byte_count <= 0:
+            raise ValueError("byte_count must be positive")
+        _require_sha256_digest(self.sha256, "asset sha256")
+
+
+@dataclass(frozen=True, slots=True)
+class MageVideoTraditionalCodecCacheBinding:
+    """Exact traditional-codec replay binding admitted by a verified manifest.
+
+    Unlike :class:`MageVideoCodecCacheBinding`, which remains the DCVC Provider V2
+    hand-off, this additive binding carries the exact traditional provider,
+    toolchain, configuration, source, and output-asset identities. The resident
+    runtime re-verifies every asset and calls only Mage's result loader; it never
+    invokes ``cv-preinfer`` for a bound replay.
+    """
+
+    source_path: Path
+    provider_cache_directory: Path
+    codec_engine: str
+    codec_config_sha256: str
+    checkpoint_manifest_sha256: str
+    codec_policy_sha256: str
+    provider_identity_sha256: str
+    toolchain_identity_sha256: str
+    effective_config_sha256: str
+    entry_semantic_sha256: str
+    asset_set_sha256: str
+    assets: tuple[MageVideoExactCodecCacheAsset, ...]
+    binding_version: str = field(
+        default=MAGE_VIDEO_TRADITIONAL_CODEC_CACHE_BINDING_VERSION,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_path, Path):
+            raise TypeError("source_path must be pathlib.Path")
+        if not isinstance(self.provider_cache_directory, Path):
+            raise TypeError("provider_cache_directory must be pathlib.Path")
+        if self.codec_engine not in {"hevc", "cv-preinfer"}:
+            raise ValueError("traditional codec binding engine must be 'hevc' or 'cv-preinfer'")
+        for field_name in (
+            "codec_config_sha256",
+            "checkpoint_manifest_sha256",
+            "codec_policy_sha256",
+            "provider_identity_sha256",
+            "toolchain_identity_sha256",
+            "effective_config_sha256",
+            "entry_semantic_sha256",
+            "asset_set_sha256",
+        ):
+            _require_sha256_digest(getattr(self, field_name), field_name)
+        if not isinstance(self.assets, tuple) or not self.assets:
+            raise ValueError("traditional codec binding assets must be a nonempty tuple")
+        if not all(isinstance(asset, MageVideoExactCodecCacheAsset) for asset in self.assets):
+            raise TypeError("traditional codec binding assets have an invalid item")
+        paths = tuple(asset.relative_path for asset in self.assets)
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("traditional codec binding assets must be unique and sorted")
+        if not {"meta.json", "src_patch_position.npy"}.issubset(paths):
+            raise ValueError("traditional codec binding lacks required Mage provider assets")
+
+        unresolved_source = self.source_path.expanduser()
+        unresolved_directory = self.provider_cache_directory.expanduser()
+        if unresolved_source.is_symlink():
+            raise ValueError("traditional codec binding source must not be a symlink")
+        if unresolved_directory.is_symlink():
+            raise ValueError("traditional codec binding directory must not be a symlink")
+        source = unresolved_source.resolve()
+        directory = unresolved_directory.resolve()
+        if not source.is_file():
+            raise ValueError(f"traditional codec binding source is not a file: {source}")
+        if not directory.is_dir():
+            raise ValueError(f"traditional codec binding directory is not a directory: {directory}")
+        object.__setattr__(self, "source_path", source)
+        object.__setattr__(self, "provider_cache_directory", directory)
+
+    def verify_exact_assets(self) -> None:
+        """Fail closed if the provider directory no longer matches its asset manifest."""
+
+        _verify_traditional_codec_cache_assets(
+            directory=self.provider_cache_directory,
+            expected_assets=self.assets,
+            expected_asset_set_sha256=self.asset_set_sha256,
+        )
+
+
+type MageVideoExactCodecCacheBinding = (
+    MageVideoCodecCacheBinding | MageVideoTraditionalCodecCacheBinding
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,7 +529,7 @@ class MageVideoRuntime:
         prompt: str,
         max_new_tokens: int,
         codec_config: Mapping[str, Any],
-        codec_cache_binding: MageVideoCodecCacheBinding | None = None,
+        codec_cache_binding: MageVideoExactCodecCacheBinding | None = None,
     ) -> MageVideoGenerationObservation:
         """Generate from durable video paths through ``video_backend='codec'``.
 
@@ -440,15 +558,19 @@ class MageVideoRuntime:
             self._model_directory,
             codec_cache_root=self._codec_cache_root,
         )
-        # Validate host requirements before a costly model load. The actual
-        # codec implementation still owns per-video cache and decoding errors.
-        self._codec_dependency_checker(native_codec_config, self._model_directory)
         exact_cache_binding = _validate_codec_cache_binding(
             binding=codec_cache_binding,
             paths=paths,
+            requested_codec_config=codec_config,
             native_codec_config=native_codec_config,
             configured_cache_root=self._codec_cache_root,
         )
+        # A verified traditional binding replays provider output through Mage's
+        # own loader and therefore must not require or execute the external
+        # ``cv-preinfer`` tool. Unbound requests and the existing DCVC Provider
+        # V2 binding retain their original dependency diagnostics unchanged.
+        if not isinstance(exact_cache_binding, MageVideoTraditionalCodecCacheBinding):
+            self._codec_dependency_checker(native_codec_config, self._model_directory)
         resident = self._acquire_resident_lease()
         request_started = time.perf_counter()
         processor_lock_wait_seconds = 0.0
@@ -694,22 +816,17 @@ class MageVideoRuntime:
 
 def _validate_codec_cache_binding(
     *,
-    binding: MageVideoCodecCacheBinding | None,
+    binding: MageVideoExactCodecCacheBinding | None,
     paths: Sequence[Path],
+    requested_codec_config: Mapping[str, Any],
     native_codec_config: Mapping[str, Any],
     configured_cache_root: Path | None,
-) -> MageVideoCodecCacheBinding | None:
+) -> MageVideoExactCodecCacheBinding | None:
     if binding is None:
         return None
-    if not isinstance(binding, MageVideoCodecCacheBinding):
-        raise MageVideoRuntimeError("codec_cache_binding must be MageVideoCodecCacheBinding")
     if len(paths) != 1 or binding.source_path != paths[0]:
         raise MageVideoRuntimeError(
             "codec cache binding source does not match the generation input"
-        )
-    if native_codec_config.get("engine") != "dcvc-rt":
-        raise MageVideoRuntimeError(
-            "an exact provider cache binding is valid only for engine='dcvc-rt'"
         )
     if configured_cache_root is None:
         raise MageVideoRuntimeError(
@@ -719,6 +836,30 @@ def _validate_codec_cache_binding(
         raise MageVideoRuntimeError(
             "provider cache binding is outside the configured qualified cache root"
         )
+
+    if isinstance(binding, MageVideoCodecCacheBinding):
+        if native_codec_config.get("engine") != "dcvc-rt":
+            raise MageVideoRuntimeError(
+                "a DCVC Provider V2 cache binding is valid only for engine='dcvc-rt'"
+            )
+        return binding
+
+    if not isinstance(binding, MageVideoTraditionalCodecCacheBinding):
+        raise MageVideoRuntimeError("codec_cache_binding has an unsupported binding family")
+    if native_codec_config.get("engine") != binding.codec_engine:
+        raise MageVideoRuntimeError(
+            "traditional codec cache binding engine does not match the generation policy"
+        )
+    if mage_video_codec_config_sha256(requested_codec_config) != binding.codec_config_sha256:
+        raise MageVideoRuntimeError(
+            "traditional codec cache binding configuration does not match the generation policy"
+        )
+    try:
+        binding.verify_exact_assets()
+    except (OSError, TypeError, ValueError) as error:
+        raise MageVideoRuntimeError(
+            "traditional codec cache assets changed before replay"
+        ) from error
     return binding
 
 
@@ -726,7 +867,7 @@ def _validate_codec_cache_binding(
 def _bind_exact_provider_cache_entry(
     *,
     processor: Any,
-    binding: MageVideoCodecCacheBinding | None,
+    binding: MageVideoExactCodecCacheBinding | None,
 ) -> Iterator[None]:
     """Route one processor call directly to a strictly admitted cache entry.
 
@@ -763,9 +904,12 @@ def _bind_exact_provider_cache_entry(
             raise MageVideoRuntimeError(
                 "native processor requested a source other than the admitted cache binding"
             )
-        if getattr(config, "engine", None) != "dcvc-rt":
+        expected_engine = (
+            "dcvc-rt" if isinstance(binding, MageVideoCodecCacheBinding) else binding.codec_engine
+        )
+        if getattr(config, "engine", None) != expected_engine:
             raise MageVideoRuntimeError(
-                "native processor changed engine for the admitted Provider V2 cache"
+                "native processor changed engine for the admitted exact codec cache"
             )
         return load_codec_result(binding.provider_cache_directory)
 
@@ -1048,6 +1192,79 @@ def _profile_mismatch(profile: MageVideoLoadProfile, detail: str) -> MageVideoRu
     )
 
 
+def mage_video_codec_config_sha256(codec_config: Mapping[str, Any]) -> str:
+    """Hash the exact request-side codec configuration without operational cache paths."""
+
+    if not isinstance(codec_config, Mapping):
+        raise MageVideoRuntimeError("codec_config must be a mapping")
+    if "cache_root" in codec_config:
+        raise MageVideoRuntimeError(
+            "codec_config identity must not include an operational cache_root"
+        )
+    try:
+        return semantic_sha256(dict(codec_config))
+    except (TypeError, ValueError) as error:
+        raise MageVideoRuntimeError("codec_config is not canonical JSON compatible") from error
+
+
+def _require_sha256_digest(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+
+
+def _verify_traditional_codec_cache_assets(
+    *,
+    directory: Path,
+    expected_assets: tuple[MageVideoExactCodecCacheAsset, ...],
+    expected_asset_set_sha256: str,
+) -> None:
+    observed_paths: list[str] = []
+    observed_directories: list[str] = []
+    for candidate in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
+        if candidate.is_symlink():
+            raise ValueError("traditional codec cache assets must not contain symlinks")
+        relative = candidate.relative_to(directory).as_posix()
+        if candidate.is_dir():
+            observed_directories.append(relative)
+        elif candidate.is_file():
+            observed_paths.append(relative)
+    expected_paths = [asset.relative_path for asset in expected_assets]
+    expected_directories = sorted(
+        {
+            parent.as_posix()
+            for asset in expected_assets
+            for parent in PurePosixPath(asset.relative_path).parents
+            if parent.as_posix() != "."
+        }
+    )
+    if observed_paths != expected_paths or observed_directories != expected_directories:
+        raise ValueError("traditional codec cache asset set changed")
+
+    for asset in expected_assets:
+        path = directory / Path(PurePosixPath(asset.relative_path))
+        digest = hashlib.sha256()
+        byte_count = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                byte_count += len(chunk)
+        if byte_count != asset.byte_count or digest.hexdigest() != asset.sha256:
+            raise ValueError(f"traditional codec cache asset bytes changed: {asset.relative_path}")
+
+    observed_asset_set_sha256 = semantic_sha256(
+        [
+            {
+                "relative_path": asset.relative_path,
+                "byte_count": asset.byte_count,
+                "sha256": asset.sha256,
+            }
+            for asset in expected_assets
+        ]
+    )
+    if observed_asset_set_sha256 != expected_asset_set_sha256:
+        raise ValueError("traditional codec cache asset-set identity changed")
+
+
 def require_mage_video_codec_dependencies(
     codec_config: Mapping[str, Any],
     model_directory: Path,
@@ -1236,8 +1453,11 @@ __all__ = [
     "MAGE_VIDEO_LOAD_PROFILE_BITSANDBYTES_4BIT_NF4",
     "MAGE_VIDEO_LOAD_PROFILE_NATIVE_BF16",
     "MAGE_VIDEO_RUNTIME_IDENTITY_VERSION",
+    "MAGE_VIDEO_TRADITIONAL_CODEC_CACHE_BINDING_VERSION",
     "MageVideoCodecCacheBinding",
     "MageVideoCodecDependencyError",
+    "MageVideoExactCodecCacheAsset",
+    "MageVideoExactCodecCacheBinding",
     "MageVideoGenerationObservation",
     "MageVideoGenerationTelemetry",
     "MageVideoLoadObservation",
@@ -1245,5 +1465,7 @@ __all__ = [
     "MageVideoRuntime",
     "MageVideoRuntimeError",
     "MageVideoRuntimeIdentity",
+    "MageVideoTraditionalCodecCacheBinding",
+    "mage_video_codec_config_sha256",
     "require_mage_video_codec_dependencies",
 ]

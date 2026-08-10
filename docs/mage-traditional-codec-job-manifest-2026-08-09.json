@@ -1,0 +1,50 @@
+{
+    "schema_name":  "robata-mage-traditional-codec-jobs",
+    "schema_version":  1,
+    "run_id":  "mage-traditional-h264-cam01-five-segment-r1-20260809",
+    "policy":  {
+                   "engine":  "hevc",
+                   "target_canvas":  8,
+                   "group_size":  8,
+                   "images_per_group":  1,
+                   "patch":  16,
+                   "max_pixels":  65536,
+                   "min_group_frames":  8,
+                   "max_group_frames":  128,
+                   "canvas_format":  "jpg",
+                   "readiness_sum_threshold":  0,
+                   "avoid_keyframes":  true
+               },
+    "jobs":  [
+                 {
+                     "job_id":  "segment-000000",
+                     "video":  "/input/000000-5bad9161537292b8f75d791a91963c44a8e5fd7c6857b1cf05afcc6d8b2b1a46.mp4",
+                     "out_dir":  "/output/segment-000000",
+                     "source_content_sha256":  "24eef9695323820f199d96b2b0ca5f04664136214cd64513fbb8938250c67bae"
+                 },
+                 {
+                     "job_id":  "segment-000001",
+                     "video":  "/input/000001-f9b5e2780e1bc1fb702ff7b7635c3ecf9bb356d6cca7d45f9ae41d1ae68e0b24.mp4",
+                     "out_dir":  "/output/segment-000001",
+                     "source_content_sha256":  "714cb75e555b9a9b98ccfcab6c6341598ed169366bf2e7e2f77855e9efdbdc4e"
+                 },
+                 {
+                     "job_id":  "segment-000002",
+                     "video":  "/input/000002-53d0500518d5d63ad784a69fe98e8aff55df6ed65a3da2d24c7dc849c81378d1.mp4",
+                     "out_dir":  "/output/segment-000002",
+                     "source_content_sha256":  "f0913ae126f9d582302e2fabaa77806b61a76c49dab83014979804cd309cd88f"
+                 },
+                 {
+                     "job_id":  "segment-000003",
+                     "video":  "/input/000003-acb0d98b4dbae201fc8e9f8035bc082dc4745e32e14f94b10a9750bdc7654b77.mp4",
+                     "out_dir":  "/output/segment-000003",
+                     "source_content_sha256":  "61fcc57e98a7dbb1f75881c5f77c24c9213b95dcc9f3696364253d4bafc002af"
+                 },
+                 {
+                     "job_id":  "segment-000004",
+                     "video":  "/input/000004-bdbb9b8e4c90d9bfbe3c196d8acefe429f2bea285cfda05c02ded18b39ed2b32.mp4",
+                     "out_dir":  "/output/segment-000004",
+                     "source_content_sha256":  "9af846236badd6053a0be7f55bf7a4b92dcb059b6b32818b280bcd9f690cea91"
+                 }
+             ]
+}

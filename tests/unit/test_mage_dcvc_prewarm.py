@@ -14,6 +14,7 @@ from robata.inference.mage_checkpoint_identity import build_mage_checkpoint_mani
 from robata.inference.mage_dcvc_preparation_protocol import (
     MAGE_DCVC_PREPARATION_SIDECAR_NAME,
     MageDcvcPreparationArtifact,
+    MageDcvcPreparationRequest,
     MageDcvcPreparationResponse,
     MageDcvcPreparedAsset,
     mage_dcvc_artifact_semantic_sha256,
@@ -21,6 +22,7 @@ from robata.inference.mage_dcvc_preparation_protocol import (
 )
 from robata.inference.mage_dcvc_preparation_worker import build_mage_dcvc_effective_config
 from robata.inference.mage_dcvc_prewarm import (
+    MageDcvcPreparationProcessSession,
     MageDcvcPrewarmError,
     MageDcvcWorkerProcessTelemetryV2,
     _bounded_worker_error_detail,
@@ -38,6 +40,30 @@ from robata.inference.mage_video_endpoint import (
 
 def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _session_request(tmp_path: Path, index: int = 0) -> MageDcvcPreparationRequest:
+    source_sha = str(index + 1) * 64
+    identity = mage_dcvc_preparation_identity(
+        source_content_sha256=source_sha,
+        source_byte_count=1,
+        effective_config_sha256="a" * 64,
+    )
+    return MageDcvcPreparationRequest(
+        request_id=f"r{index}",
+        source_path=str(tmp_path / f"s{index}.mp4"),
+        source_content_sha256=source_sha,
+        source_byte_count=1,
+        output_relative_path=f"cache/{index}",
+        effective_config_sha256="a" * 64,
+        preparation_identity=identity,
+    )
+
+
+def _session_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+    return environment
 
 
 def _source_model(tmp_path: Path) -> tuple[Path, Any]:
@@ -356,8 +382,6 @@ def test_worker_rejection_never_publishes_manifest_or_report(tmp_path: Path) -> 
 
 
 def test_binary_jsonl_runner_services_multiple_requests_in_one_process(tmp_path: Path) -> None:
-    from robata.inference.mage_dcvc_preparation_protocol import MageDcvcPreparationRequest
-
     request_values = []
     for index in range(2):
         source_sha = str(index + 1) * 64
@@ -406,6 +430,131 @@ def test_binary_jsonl_runner_services_multiple_requests_in_one_process(tmp_path:
     assert telemetry.process_start_count == 1
     assert telemetry.response_count == 2
     assert telemetry.exit_code == 0
+
+
+def test_process_session_returns_first_response_before_second_request(
+    tmp_path: Path,
+) -> None:
+    seen_path = tmp_path / "seen.txt"
+    requests = (_session_request(tmp_path, 0), _session_request(tmp_path, 1))
+    program = (
+        "import os,sys;"
+        "from robata.contracts.hashing import canonical_json_bytes;"
+        "from robata.inference.mage_dcvc_preparation_protocol import "
+        "MageDcvcPreparationRequest as Q,MageDcvcPreparationResponse as R;"
+        f"seen=open({str(seen_path)!r},'a',encoding='utf-8',buffering=1);"
+        "\nfor line in sys.stdin.buffer:\n"
+        " q=Q.model_validate_json(line,strict=True);"
+        " seen.write(str(os.getpid())+':'+q.request_id+'\\n');seen.flush();"
+        " r=R(request_id=q.request_id,status='BUILT',preparation_identity=q.preparation_identity,"
+        "artifact_semantic_sha256='b'*64,output_directory='fake-output',wall_seconds=0.0);"
+        " sys.stdout.buffer.write(canonical_json_bytes(r.model_dump(mode='json'))+b'\\n');"
+        " sys.stdout.buffer.flush()\n"
+    )
+    session = MageDcvcPreparationProcessSession(
+        command=(sys.executable, "-u", "-c", program),
+        environment=_session_environment(),
+        working_directory=tmp_path,
+        response_timeout_seconds=10.0,
+    )
+
+    first = session.prepare_one(requests[0])
+    first_seen = seen_path.read_text(encoding="utf-8").splitlines()
+    assert first.request_id == "r0"
+    assert [line.split(":", maxsplit=1)[1] for line in first_seen] == ["r0"]
+
+    second = session.prepare_one(requests[1])
+    all_seen = seen_path.read_text(encoding="utf-8").splitlines()
+    telemetry = session.close()
+
+    assert second.request_id == "r1"
+    assert [line.split(":", maxsplit=1)[1] for line in all_seen] == ["r0", "r1"]
+    assert len({line.split(":", maxsplit=1)[0] for line in all_seen}) == 1
+    assert telemetry.process_start_count == 1
+    assert telemetry.response_count == 2
+    assert session.close() == telemetry
+    with pytest.raises(MageDcvcPrewarmError, match="session is closed"):
+        session.prepare_one(requests[0])
+
+
+def test_process_session_rejects_early_eof(tmp_path: Path) -> None:
+    session = MageDcvcPreparationProcessSession(
+        command=(sys.executable, "-u", "-c", "import sys;sys.stdin.buffer.readline()"),
+        environment=_session_environment(),
+        working_directory=tmp_path,
+        response_timeout_seconds=10.0,
+    )
+
+    with pytest.raises(MageDcvcPrewarmError, match="exited before responding"):
+        session.prepare_one(_session_request(tmp_path))
+    with pytest.raises(MageDcvcPrewarmError, match="session is closed"):
+        session.prepare_one(_session_request(tmp_path))
+
+
+def test_process_session_rejects_response_timeout(tmp_path: Path) -> None:
+    session = MageDcvcPreparationProcessSession(
+        command=(
+            sys.executable,
+            "-u",
+            "-c",
+            "import sys,time;sys.stdin.buffer.readline();time.sleep(10)",
+        ),
+        environment=_session_environment(),
+        working_directory=tmp_path,
+        response_timeout_seconds=0.25,
+    )
+
+    with pytest.raises(MageDcvcPrewarmError, match="response timed out"):
+        session.prepare_one(_session_request(tmp_path))
+
+
+def test_process_session_rejects_mismatched_request_id(tmp_path: Path) -> None:
+    program = (
+        "import sys;"
+        "from robata.contracts.hashing import canonical_json_bytes;"
+        "from robata.inference.mage_dcvc_preparation_protocol import "
+        "MageDcvcPreparationRequest as Q,MageDcvcPreparationResponse as R;"
+        "q=Q.model_validate_json(sys.stdin.buffer.readline(),strict=True);"
+        "r=R(request_id='wrong',status='BUILT',preparation_identity=q.preparation_identity,"
+        "artifact_semantic_sha256='b'*64,output_directory='fake-output',wall_seconds=0.0);"
+        "sys.stdout.buffer.write(canonical_json_bytes(r.model_dump(mode='json'))+b'\\n');"
+        "sys.stdout.buffer.flush()"
+    )
+    session = MageDcvcPreparationProcessSession(
+        command=(sys.executable, "-u", "-c", program),
+        environment=_session_environment(),
+        working_directory=tmp_path,
+        response_timeout_seconds=10.0,
+    )
+
+    with pytest.raises(MageDcvcPrewarmError, match="request_id differs"):
+        session.prepare_one(_session_request(tmp_path))
+
+
+def test_process_session_rejects_extra_output_on_close(tmp_path: Path) -> None:
+    program = (
+        "import sys;"
+        "from robata.contracts.hashing import canonical_json_bytes;"
+        "from robata.inference.mage_dcvc_preparation_protocol import "
+        "MageDcvcPreparationRequest as Q,MageDcvcPreparationResponse as R;"
+        "q=Q.model_validate_json(sys.stdin.buffer.readline(),strict=True);"
+        "r=R(request_id=q.request_id,status='BUILT',preparation_identity=q.preparation_identity,"
+        "artifact_semantic_sha256='b'*64,output_directory='fake-output',wall_seconds=0.0);"
+        "sys.stdout.buffer.write(canonical_json_bytes(r.model_dump(mode='json'))+b'\\n');"
+        "sys.stdout.buffer.flush();sys.stdin.buffer.read();"
+        "sys.stdout.buffer.write(b'extra\\n');sys.stdout.buffer.flush()"
+    )
+    session = MageDcvcPreparationProcessSession(
+        command=(sys.executable, "-u", "-c", program),
+        environment=_session_environment(),
+        working_directory=tmp_path,
+        response_timeout_seconds=10.0,
+    )
+
+    response = session.prepare_one(_session_request(tmp_path))
+    assert response.request_id == "r0"
+    with pytest.raises(MageDcvcPrewarmError, match="unexpected extra output"):
+        session.close()
 
 
 def test_same_device_run_requires_guard_before_worker_start(tmp_path: Path) -> None:

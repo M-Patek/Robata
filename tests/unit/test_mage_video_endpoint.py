@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256
+from robata.contracts.hashing import canonical_json_bytes, exact_bytes_sha256, semantic_sha256
 from robata.inference.mage_video_endpoint import (
     MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_HEADER,
     MAGE_VIDEO_ENDPOINT_IDEMPOTENCY_POLICY_VERSION,
@@ -32,12 +32,15 @@ from robata.inference.mage_video_endpoint import (
 )
 from robata.inference.mage_video_runtime import (
     MageVideoCodecCacheBinding,
+    MageVideoExactCodecCacheAsset,
     MageVideoGenerationObservation,
     MageVideoGenerationTelemetry,
     MageVideoLoadObservation,
     MageVideoLoadProfile,
     MageVideoRuntimeError,
     MageVideoRuntimeIdentity,
+    MageVideoTraditionalCodecCacheBinding,
+    mage_video_codec_config_sha256,
 )
 
 
@@ -804,3 +807,57 @@ def test_fastapi_v2_route_replays_native_video_request(tmp_path: Path) -> None:
     assert first.json() == second.json()
     assert first.json()["camera_encoding_count"] == 1
     assert runtime.generate_calls == 1
+
+
+def test_service_accepts_additive_traditional_exact_cache_binding(tmp_path: Path) -> None:
+    request, durable_root = _request(tmp_path, request_id="traditional-exact-cache")
+    runtime = _FakeRuntime()
+    provider_cache = tmp_path / "traditional-provider-cache"
+    provider_cache.mkdir()
+    (provider_cache / "meta.json").write_bytes(b"{}")
+    (provider_cache / "src_patch_position.npy").write_bytes(b"positions")
+    assets = tuple(
+        MageVideoExactCodecCacheAsset(
+            relative_path=path.name,
+            byte_count=path.stat().st_size,
+            sha256=exact_bytes_sha256(path.read_bytes()),
+        )
+        for path in sorted(provider_cache.iterdir(), key=lambda item: item.name)
+    )
+    asset_set_sha256 = semantic_sha256(
+        [
+            {
+                "relative_path": asset.relative_path,
+                "byte_count": asset.byte_count,
+                "sha256": asset.sha256,
+            }
+            for asset in assets
+        ]
+    )
+    binding = MageVideoTraditionalCodecCacheBinding(
+        source_path=Path(request.camera_encodings[0].segment_manifest.durable_path),
+        provider_cache_directory=provider_cache,
+        codec_engine="hevc",
+        codec_config_sha256=mage_video_codec_config_sha256(
+            request.codec_policy.native_codec_config()
+        ),
+        checkpoint_manifest_sha256=request.model_identity.checkpoint_manifest_sha256,
+        codec_policy_sha256="1" * 64,
+        provider_identity_sha256="2" * 64,
+        toolchain_identity_sha256="3" * 64,
+        effective_config_sha256="4" * 64,
+        entry_semantic_sha256="5" * 64,
+        asset_set_sha256=asset_set_sha256,
+        assets=assets,
+    )
+
+    service = _service(
+        runtime,
+        tmp_path,
+        durable_root,
+        codec_cache_admission=lambda _request, _paths: binding,
+    )
+    service.start()
+    service.infer(request)
+
+    assert runtime.last_codec_cache_binding == binding

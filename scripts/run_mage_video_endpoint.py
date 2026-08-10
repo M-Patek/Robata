@@ -42,8 +42,10 @@ LOCAL_4BIT_PROFILE = "local-4bit-nf4"
 PRODUCTION_NATIVE_PROFILE = "production-native-bf16"
 OBSERVED_V1_CACHE_FAMILY = "observed-v1"
 PROVIDER_V2_CACHE_FAMILY = "provider-v2"
+TRADITIONAL_V1_CACHE_FAMILY = "traditional-v1"
 OBSERVED_V1_CACHE_MANIFEST_VERSION = "mage-codec-cache-manifest-v1"
 PROVIDER_V2_CACHE_MANIFEST_VERSION = "mage-codec-cache-manifest-v2"
+TRADITIONAL_V1_CACHE_MANIFEST_VERSION = "mage-traditional-codec-cache-manifest-v1"
 CONTROLLED_PRIVATE_NETWORK = "controlled-private-network"
 AUTHENTICATED_REVERSE_PROXY = "authenticated-reverse-proxy"
 _DECLARED_NETWORK_BOUNDARIES = (
@@ -195,8 +197,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "verified observed-v1 or explicit Provider V2 cache manifest used as the only "
-            "codec cache root"
+            "verified observed-v1, explicit Provider V2, or deployment-pinned traditional "
+            "H.264/HEVC cache manifest used as the only codec cache root"
         ),
     )
     parser.add_argument(
@@ -222,13 +224,40 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reject any request whose exact source/policy/checkpoint is absent from the manifest",
     )
-    parser.add_argument(
+    cache_family_gate = parser.add_mutually_exclusive_group()
+    cache_family_gate.add_argument(
         "--require-provider-v2-cache",
         action="store_true",
         help=(
             "fail closed unless --codec-cache-manifest is the explicit Provider V2 family; "
             "observed-v1 remains available only as an intentional rollback path"
         ),
+    )
+    cache_family_gate.add_argument(
+        "--require-traditional-codec-cache",
+        action="store_true",
+        help=(
+            "fail closed unless --codec-cache-manifest is the additive, deployment-pinned "
+            "traditional H.264/HEVC cache family"
+        ),
+    )
+    parser.add_argument(
+        "--traditional-provider-identity-sha256",
+        type=_sha256,
+        default=None,
+        help="required deployment pin for a traditional codec cache manifest",
+    )
+    parser.add_argument(
+        "--traditional-toolchain-identity-sha256",
+        type=_sha256,
+        default=None,
+        help="required codec-video-prep/toolchain identity pin for traditional cache replay",
+    )
+    parser.add_argument(
+        "--traditional-container-image-digest",
+        type=_sha256,
+        default=None,
+        help="required lowercase SHA-256 digest of the qualified traditional codec image",
     )
     parser.add_argument("--warmup-video", type=Path, default=None)
     parser.add_argument("--warmup-video-sha256", type=_sha256, default=None)
@@ -488,6 +517,24 @@ def _generation_telemetry_sink(
     return sink_type(resolved_path), resolved_path
 
 
+def _require_launch_codec_dependencies(
+    *,
+    runtime_module: Any,
+    codec_policy: Any,
+    model_directory: Path,
+    cache_family: str | None,
+) -> None:
+    # Exact traditional replay loads already-qualified assets through Mage's own
+    # result loader. Requiring cv-preinfer here would make the replay endpoint
+    # depend on a tool it is specifically forbidden to execute.
+    if cache_family == TRADITIONAL_V1_CACHE_FAMILY:
+        return
+    codec_checker = getattr(runtime_module, "require_mage_video_codec_dependencies", None)
+    if not callable(codec_checker):
+        raise MageVideoEndpointLaunchError("Mage runtime does not expose native codec diagnostics")
+    codec_checker(codec_policy.native_codec_config(), model_directory)
+
+
 def _codec_cache_manifest_version(path: Path) -> str:
     resolved = Path(path).expanduser().resolve()
     try:
@@ -502,6 +549,38 @@ def _codec_cache_manifest_version(path: Path) -> str:
     return version
 
 
+def _traditional_identity_pins(arguments: argparse.Namespace) -> tuple[str, str, str]:
+    pins = {
+        "--traditional-provider-identity-sha256": (arguments.traditional_provider_identity_sha256),
+        "--traditional-toolchain-identity-sha256": (
+            arguments.traditional_toolchain_identity_sha256
+        ),
+        "--traditional-container-image-digest": arguments.traditional_container_image_digest,
+    }
+    missing = [name for name, value in pins.items() if value is None]
+    if missing:
+        raise MageVideoEndpointLaunchError(
+            "traditional codec cache launch requires deployment identity pins: "
+            + ", ".join(missing)
+        )
+    provider, toolchain, image = pins.values()
+    assert isinstance(provider, str)
+    assert isinstance(toolchain, str)
+    assert isinstance(image, str)
+    return provider, toolchain, image
+
+
+def _traditional_identity_flags_present(arguments: argparse.Namespace) -> bool:
+    return any(
+        value is not None
+        for value in (
+            arguments.traditional_provider_identity_sha256,
+            arguments.traditional_toolchain_identity_sha256,
+            arguments.traditional_container_image_digest,
+        )
+    )
+
+
 def _codec_cache_configuration(
     *,
     cache_module: Any,
@@ -513,19 +592,33 @@ def _codec_cache_configuration(
     cache_v2_module: Any | None = None,
     qualified_provider_module: Any | None = None,
     preparation_worker_module: Any | None = None,
+    traditional_cache_module: Any | None = None,
 ) -> MageCodecCacheLaunchConfiguration:
     requested = arguments.codec_cache_manifest
     if requested is None:
-        if arguments.require_verified_codec_cache or arguments.require_provider_v2_cache:
-            gate = (
-                "--require-provider-v2-cache"
-                if arguments.require_provider_v2_cache
-                else "--require-verified-codec-cache"
+        required_gates = [
+            name
+            for name, enabled in (
+                ("--require-verified-codec-cache", arguments.require_verified_codec_cache),
+                ("--require-provider-v2-cache", arguments.require_provider_v2_cache),
+                (
+                    "--require-traditional-codec-cache",
+                    arguments.require_traditional_codec_cache,
+                ),
             )
-            raise MageVideoEndpointLaunchError(f"{gate} requires --codec-cache-manifest")
+            if enabled
+        ]
+        if required_gates:
+            raise MageVideoEndpointLaunchError(
+                f"{required_gates[0]} requires --codec-cache-manifest"
+            )
         if arguments.qualified_provider_manifest is not None:
             raise MageVideoEndpointLaunchError(
                 "--qualified-provider-manifest requires a Provider V2 cache manifest"
+            )
+        if _traditional_identity_flags_present(arguments):
+            raise MageVideoEndpointLaunchError(
+                "traditional deployment identity pins require a traditional codec cache manifest"
             )
         return MageCodecCacheLaunchConfiguration(
             cache_root=None,
@@ -558,6 +651,14 @@ def _codec_cache_configuration(
             checkpoint_manifest=checkpoint_manifest,
             codec_policy=codec_policy,
         )
+    if version == TRADITIONAL_V1_CACHE_MANIFEST_VERSION:
+        return _traditional_v1_cache_configuration(
+            traditional_cache_module=traditional_cache_module,
+            arguments=arguments,
+            manifest_path=manifest_path,
+            checkpoint_sha256=checkpoint_sha256,
+            codec_policy=codec_policy,
+        )
     raise MageVideoEndpointLaunchError(f"unsupported codec cache manifest_version: {version}")
 
 
@@ -573,6 +674,14 @@ def _observed_v1_cache_configuration(
     if arguments.require_provider_v2_cache:
         raise MageVideoEndpointLaunchError(
             "--require-provider-v2-cache rejects the observed-v1 rollback cache family"
+        )
+    if arguments.require_traditional_codec_cache:
+        raise MageVideoEndpointLaunchError(
+            "--require-traditional-codec-cache rejects the observed-v1 rollback cache family"
+        )
+    if _traditional_identity_flags_present(arguments):
+        raise MageVideoEndpointLaunchError(
+            "traditional deployment identity pins are invalid for observed-v1"
         )
     if arguments.qualified_provider_manifest is not None:
         raise MageVideoEndpointLaunchError(
@@ -639,6 +748,14 @@ def _provider_v2_cache_configuration(
     checkpoint_manifest: Any | None,
     codec_policy: Any,
 ) -> MageCodecCacheLaunchConfiguration:
+    if arguments.require_traditional_codec_cache:
+        raise MageVideoEndpointLaunchError(
+            "--require-traditional-codec-cache rejects the Provider V2 cache family"
+        )
+    if _traditional_identity_flags_present(arguments):
+        raise MageVideoEndpointLaunchError(
+            "traditional deployment identity pins are invalid for Provider V2"
+        )
     if (
         cache_v2_module is None
         or qualified_provider_module is None
@@ -735,6 +852,81 @@ def _provider_v2_cache_configuration(
         cache_family=PROVIDER_V2_CACHE_FAMILY,
         qualified_provider_manifest=qualified_manifest,
         qualified_provider_manifest_path=qualified_path,
+    )
+
+
+def _traditional_v1_cache_configuration(
+    *,
+    traditional_cache_module: Any | None,
+    arguments: argparse.Namespace,
+    manifest_path: Path,
+    checkpoint_sha256: str,
+    codec_policy: Any,
+) -> MageCodecCacheLaunchConfiguration:
+    if arguments.require_provider_v2_cache:
+        raise MageVideoEndpointLaunchError(
+            "--require-provider-v2-cache rejects the traditional cache family"
+        )
+    if arguments.qualified_provider_manifest is not None:
+        raise MageVideoEndpointLaunchError(
+            "--qualified-provider-manifest is valid only with a Provider V2 cache manifest"
+        )
+    if arguments.shared_device_guard_file is not None:
+        raise MageVideoEndpointLaunchError(
+            "--shared-device-guard-file is a DCVC Provider V2 control and is invalid for "
+            "traditional cache replay"
+        )
+    if arguments.codec_mode != "traditional" or getattr(codec_policy, "codec_mode", None) != (
+        "traditional"
+    ):
+        raise MageVideoEndpointLaunchError(
+            "traditional cache launch requires --codec-mode traditional"
+        )
+    if (
+        arguments.preprocess_device != "cpu"
+        or getattr(codec_policy, "preprocess_device", None) != "cpu"
+    ):
+        raise MageVideoEndpointLaunchError(
+            "traditional cache launch requires --preprocess-device cpu"
+        )
+    if traditional_cache_module is None:
+        raise MageVideoEndpointLaunchError("traditional codec cache support module is unavailable")
+    admission_type = getattr(traditional_cache_module, "MageTraditionalCodecCacheAdmission", None)
+    if admission_type is None or not callable(getattr(admission_type, "from_manifest_path", None)):
+        raise MageVideoEndpointLaunchError(
+            "traditional codec cache module lacks strict admission support"
+        )
+    provider_pin, toolchain_pin, image_pin = _traditional_identity_pins(arguments)
+    try:
+        admission = admission_type.from_manifest_path(
+            manifest_path=manifest_path,
+            expected_checkpoint_manifest_sha256=checkpoint_sha256,
+            expected_codec_policy=codec_policy,
+            expected_provider_identity_sha256=provider_pin,
+            expected_toolchain_identity_sha256=toolchain_pin,
+            expected_container_image_digest=image_pin,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise MageVideoEndpointLaunchError(
+            f"traditional codec cache admission failed: {error}"
+        ) from error
+    manifest = admission.manifest
+    if manifest.manifest_version != TRADITIONAL_V1_CACHE_MANIFEST_VERSION:
+        raise MageVideoEndpointLaunchError("traditional cache loader returned another cache family")
+    if manifest.effective_config.engine not in {"hevc", "cv-preinfer"}:
+        raise MageVideoEndpointLaunchError(
+            "traditional cache manifest selected a non-traditional engine"
+        )
+    if manifest.effective_config.native_codec_config.get("preprocess_device") != "cpu":
+        raise MageVideoEndpointLaunchError(
+            "traditional cache manifest was not qualified with CPU preprocessing"
+        )
+    return MageCodecCacheLaunchConfiguration(
+        cache_root=admission.cache_root,
+        admission=admission,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        cache_family=TRADITIONAL_V1_CACHE_FAMILY,
     )
 
 
@@ -950,16 +1142,22 @@ def _codec_cache_startup_report(
     manifest_path = configuration.manifest_path
     if manifest is None or manifest_path is None:
         return None
+    manifest_exact_sha256, manifest_byte_count = _exact_file_sha256(
+        manifest_path, description="verified codec cache manifest"
+    )
     common: dict[str, object] = {
         "cache_family": configuration.cache_family,
         "manifest_path": str(manifest_path),
         "manifest_version": manifest.manifest_version,
+        "manifest_exact_sha256": manifest_exact_sha256,
+        "manifest_byte_count": manifest_byte_count,
         "manifest_semantic_sha256": manifest.manifest_semantic_sha256,
         "namespace_identity": manifest.namespace_identity,
         "qualified_cache_root": manifest.qualified_cache_root,
-        "entry_count": manifest.entry_count,
+        "entry_count": getattr(manifest, "entry_count", len(manifest.entries)),
         "required": arguments.require_verified_codec_cache,
         "provider_v2_required": arguments.require_provider_v2_cache,
+        "traditional_required": arguments.require_traditional_codec_cache,
         "shared_device_guard": {
             "required": (
                 configuration.cache_family == PROVIDER_V2_CACHE_FAMILY
@@ -984,6 +1182,47 @@ def _codec_cache_startup_report(
                     "recipe_semantic_sha256": manifest.recipe.semantic_sha256,
                 },
                 "qualified_provider_identity": None,
+            }
+        )
+        return common
+
+    if configuration.cache_family == TRADITIONAL_V1_CACHE_FAMILY:
+        effective_config = manifest.effective_config
+        toolchain = manifest.toolchain
+        common.update(
+            {
+                "provider_identity": {
+                    "provider_version": manifest.provider_version,
+                    "provider_implementation_sha256": manifest.provider_implementation_sha256,
+                    "provider_identity_sha256": manifest.provider_identity_sha256,
+                },
+                "effective_config_identity": {
+                    "effective_config_version": effective_config.effective_config_version,
+                    "effective_config_sha256": effective_config.effective_config_sha256,
+                    "codec_config_sha256": effective_config.codec_config_sha256,
+                    "engine": effective_config.engine,
+                    "preprocess_device": effective_config.native_codec_config.get(
+                        "preprocess_device"
+                    ),
+                },
+                "recipe_identity": None,
+                "qualified_provider_identity": None,
+                "toolchain_identity": {
+                    "toolchain_version": toolchain.toolchain_version,
+                    "toolchain_identity_sha256": toolchain.toolchain_identity_sha256,
+                    "package_name": toolchain.package_name,
+                    "package_version": toolchain.package_version,
+                    "package_artifact_sha256": toolchain.package_artifact_sha256,
+                    "executable_sha256": toolchain.executable_sha256,
+                    "provider_command_contract_sha256": (
+                        toolchain.provider_command_contract_sha256
+                    ),
+                    "container_platform": toolchain.container_platform,
+                },
+                "container_image_identity": {
+                    "reference": toolchain.container_image_reference,
+                    "digest": toolchain.container_image_digest,
+                },
             }
         )
         return common
@@ -1076,6 +1315,8 @@ def _run_non_authoritative_warmup(
     durable_input_roots: Sequence[Path],
     codec_cache_manifest: Any | None,
     codec_cache_binding_type: Any | None = None,
+    traditional_codec_cache_binding_type: Any | None = None,
+    exact_codec_cache_asset_type: Any | None = None,
 ) -> dict[str, object] | None:
     values = (
         arguments.warmup_video,
@@ -1106,12 +1347,22 @@ def _run_non_authoritative_warmup(
         raise MageVideoEndpointLaunchError("warm-up prompt must be nonempty")
     codec_cache_binding = None
     if codec_cache_manifest is not None:
-        matching = [item for item in codec_cache_manifest.entries if item.source_path == str(video)]
+        manifest_version = codec_cache_manifest.manifest_version
+        if manifest_version == TRADITIONAL_V1_CACHE_MANIFEST_VERSION:
+            matching = [
+                item
+                for item in codec_cache_manifest.entries
+                if item.entry.source_path == str(video)
+            ]
+        else:
+            matching = [
+                item for item in codec_cache_manifest.entries if item.source_path == str(video)
+            ]
         if len(matching) != 1:
             raise MageVideoEndpointLaunchError(
                 "warm-up video is absent from the verified codec cache manifest"
             )
-        if codec_cache_manifest.manifest_version == PROVIDER_V2_CACHE_MANIFEST_VERSION:
+        if manifest_version == PROVIDER_V2_CACHE_MANIFEST_VERSION:
             if codec_cache_binding_type is None:
                 raise MageVideoEndpointLaunchError(
                     "Provider V2 warm-up requires the internal exact cache binding"
@@ -1119,6 +1370,42 @@ def _run_non_authoritative_warmup(
             codec_cache_binding = codec_cache_binding_type(
                 source_path=video,
                 provider_cache_directory=Path(matching[0].provider_cache_directory),
+            )
+        elif manifest_version == TRADITIONAL_V1_CACHE_MANIFEST_VERSION:
+            if traditional_codec_cache_binding_type is None or exact_codec_cache_asset_type is None:
+                raise MageVideoEndpointLaunchError(
+                    "traditional warm-up requires the internal exact cache binding types"
+                )
+            item = matching[0]
+            entry = item.entry
+            if (
+                video_sha256 != entry.source_content_sha256
+                or video_byte_count != entry.source_byte_count
+            ):
+                raise MageVideoEndpointLaunchError(
+                    "warm-up source bytes changed after traditional cache admission"
+                )
+            assets = tuple(
+                exact_codec_cache_asset_type(
+                    relative_path=asset.relative_path,
+                    byte_count=asset.byte_count,
+                    sha256=asset.sha256,
+                )
+                for asset in entry.assets
+            )
+            codec_cache_binding = traditional_codec_cache_binding_type(
+                source_path=video,
+                provider_cache_directory=Path(item.provider_cache_directory),
+                codec_engine=codec_cache_manifest.effective_config.engine,
+                codec_config_sha256=entry.codec_config_sha256,
+                checkpoint_manifest_sha256=entry.checkpoint_manifest_sha256,
+                codec_policy_sha256=entry.codec_policy_sha256,
+                provider_identity_sha256=entry.provider_identity_sha256,
+                toolchain_identity_sha256=entry.toolchain_identity_sha256,
+                effective_config_sha256=entry.effective_config_sha256,
+                entry_semantic_sha256=entry.entry_semantic_sha256,
+                asset_set_sha256=entry.asset_set_sha256,
+                assets=assets,
             )
     identity_before = runtime.runtime_identity
     load_observation = runtime.load_observation
@@ -1169,6 +1456,15 @@ def _run_non_authoritative_warmup(
         "runtime_telemetry": runtime_telemetry,
         "codec_cache_manifest_semantic_sha256": (
             None if codec_cache_manifest is None else codec_cache_manifest.manifest_semantic_sha256
+        ),
+        "codec_cache_family": (
+            None
+            if codec_cache_manifest is None
+            else {
+                OBSERVED_V1_CACHE_MANIFEST_VERSION: OBSERVED_V1_CACHE_FAMILY,
+                PROVIDER_V2_CACHE_MANIFEST_VERSION: PROVIDER_V2_CACHE_FAMILY,
+                TRADITIONAL_V1_CACHE_MANIFEST_VERSION: TRADITIONAL_V1_CACHE_FAMILY,
+            }.get(codec_cache_manifest.manifest_version)
         ),
     }
     report_path = arguments.warmup_report_json.expanduser().resolve()
@@ -1228,6 +1524,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         endpoint_module = importlib.import_module("robata.inference.mage_video_endpoint")
         cache_module = importlib.import_module("robata.inference.mage_codec_cache")
         cache_v2_module = importlib.import_module("robata.inference.mage_codec_cache_v2")
+        traditional_cache_module = importlib.import_module(
+            "robata.inference.mage_traditional_codec_cache"
+        )
         qualified_provider_module = importlib.import_module(
             "robata.inference.mage_dcvc_qualified_provider"
         )
@@ -1252,6 +1551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_v2_module=cache_v2_module,
             qualified_provider_module=qualified_provider_module,
             preparation_worker_module=preparation_worker_module,
+            traditional_cache_module=traditional_cache_module,
             endpoint_module=endpoint_module,
             arguments=arguments,
             checkpoint_sha256=checkpoint_sha256,
@@ -1261,12 +1561,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         codec_cache_root = codec_cache_configuration.cache_root
         codec_cache_admission = codec_cache_configuration.admission
         codec_cache_manifest = codec_cache_configuration.manifest
-        codec_checker = getattr(runtime_module, "require_mage_video_codec_dependencies", None)
-        if not callable(codec_checker):
-            raise MageVideoEndpointLaunchError(
-                "Mage runtime does not expose native codec diagnostics"
-            )
-        codec_checker(policy.native_codec_config(), arguments.model_dir.expanduser().resolve())
+        _require_launch_codec_dependencies(
+            runtime_module=runtime_module,
+            codec_policy=policy,
+            model_directory=arguments.model_dir.expanduser().resolve(),
+            cache_family=codec_cache_configuration.cache_family,
+        )
         runtime, canonical_profile = _create_runtime(
             runtime_module=runtime_module,
             model_directory=arguments.model_dir.expanduser().resolve(),
@@ -1306,6 +1606,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             durable_input_roots=input_roots,
             codec_cache_manifest=codec_cache_manifest,
             codec_cache_binding_type=getattr(endpoint_module, "MageVideoCodecCacheBinding", None),
+            traditional_codec_cache_binding_type=getattr(
+                runtime_module, "MageVideoTraditionalCodecCacheBinding", None
+            ),
+            exact_codec_cache_asset_type=getattr(
+                runtime_module, "MageVideoExactCodecCacheAsset", None
+            ),
         )
         health = service.health()
         _print_json(
