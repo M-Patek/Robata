@@ -123,6 +123,39 @@ def test_capacity_uses_recurring_wall_and_ceiling_lane_count() -> None:
     assert projection["production_qualification"] == "NOT_CLAIMED"
 
 
+def test_unlabeled_common_agreement_is_not_decision_eligible() -> None:
+    module = _module()
+
+    gate = module._semantic_quality_gate(
+        {
+            "authority": "UNLABELED_MODEL_AGREEMENT_ONLY",
+            "is_ground_truth_accuracy": False,
+        }
+    )
+
+    assert gate == {
+        "authority": "UNLABELED_MODEL_AGREEMENT_ONLY",
+        "is_ground_truth_accuracy": False,
+        "quality_qualified": False,
+        "decision_eligible": False,
+        "hold_reason": "HOLD_UNLABELED_MODEL_AGREEMENT_ONLY_V1",
+    }
+
+
+def test_missing_common_projection_is_rejected_before_decision() -> None:
+    module = _module()
+
+    gate = module._semantic_quality_gate(None)
+
+    assert gate == {
+        "authority": None,
+        "is_ground_truth_accuracy": False,
+        "quality_qualified": False,
+        "decision_eligible": False,
+        "hold_reason": "REJECT_CANDIDATE_OUTPUT_BEFORE_DOWNSTREAM_V1",
+    }
+
+
 def test_downstream_action_matching_records_unmatched_candidate() -> None:
     module = _module()
     mage = [{"action": "fold green shirt", "start_ns": "0", "end_ns": "10"}]

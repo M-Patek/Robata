@@ -338,6 +338,33 @@ def _capacity_projection(
     }
 
 
+def _semantic_quality_gate(agreement: dict[str, object] | None) -> dict[str, object]:
+    if agreement is None:
+        return {
+            "authority": None,
+            "is_ground_truth_accuracy": False,
+            "quality_qualified": False,
+            "decision_eligible": False,
+            "hold_reason": "REJECT_CANDIDATE_OUTPUT_BEFORE_DOWNSTREAM_V1",
+        }
+    authority = agreement.get("authority")
+    if authority != "UNLABELED_MODEL_AGREEMENT_ONLY":
+        raise CommonProjectionBenchmarkError(
+            f"unsupported common semantic agreement authority: {authority!r}"
+        )
+    if agreement.get("is_ground_truth_accuracy") is not False:
+        raise CommonProjectionBenchmarkError(
+            "common semantic agreement must remain explicitly non-ground-truth"
+        )
+    return {
+        "authority": authority,
+        "is_ground_truth_accuracy": False,
+        "quality_qualified": False,
+        "decision_eligible": False,
+        "hold_reason": "HOLD_UNLABELED_MODEL_AGREEMENT_ONLY_V1",
+    }
+
+
 def _load_frozen_mage_receipt(mage_root: Path) -> dict[str, object] | None:
     path = mage_root.expanduser().resolve().parent / "stream-report.json"
     if not path.is_file():
@@ -511,7 +538,9 @@ def _run_candidate(
             "strict_compact_observation_expansion_required": True,
             "passed": len(parsed_tuple) == len(fixture.cases),
             "downstream_recomputed": downstream is not None,
-            "capacity_decision_eligible": downstream is not None,
+            # Structural parse/downstream replay is necessary but not sufficient for
+            # admission: this report still carries only unlabeled model-agreement evidence.
+            "capacity_decision_eligible": False,
             "failure_disposition": (
                 None if downstream is not None else "REJECT_CANDIDATE_OUTPUT_BEFORE_DOWNSTREAM_V1"
             ),
@@ -677,8 +706,18 @@ def run(arguments: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 duration_seconds=fixture.duration_seconds,
                 recurring_wall_seconds=recurring,
             )
-            capacity["quality_qualified"] = projections is not None
-            capacity["decision_eligible"] = projections is not None
+            semantic_gate = _semantic_quality_gate(agreement)
+            quality_gate = qwen["quality_gate"]
+            if not isinstance(quality_gate, dict):
+                raise CommonProjectionBenchmarkError("Qwen quality gate is missing")
+            quality_gate["semantic_quality_authority"] = semantic_gate["authority"]
+            quality_gate["semantic_quality_qualified"] = semantic_gate["quality_qualified"]
+            quality_gate["capacity_decision_eligible"] = semantic_gate["decision_eligible"]
+            if quality_gate.get("failure_disposition") is None:
+                quality_gate["failure_disposition"] = semantic_gate["hold_reason"]
+            capacity["quality_qualified"] = semantic_gate["quality_qualified"]
+            capacity["decision_eligible"] = semantic_gate["decision_eligible"]
+            capacity["decision_hold_reason"] = semantic_gate["hold_reason"]
             qwen["capacity"] = capacity
             qwen["model_family"] = COMMON_QWEN_MODEL_FAMILY
             qwen["load"] = {

@@ -217,7 +217,9 @@ def test_benchmark_timeout_reaps_both_children(tmp_path: Path) -> None:
         benchmark_args=["--sleep-seconds", "60"],
         port=port,
         benchmark_timeout=0.25,
-        overall_timeout=3.0,
+        # The intended assertion is the benchmark deadline, not a hosted-Windows
+        # process-startup race against the hard lifecycle deadline.
+        overall_timeout=10.0,
     )
 
     assert module.main(argv) == module.EXIT_TIMEOUT

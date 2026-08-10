@@ -15,8 +15,8 @@ from scripts.build_mage_traditional_generation_qualification import (
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORT = ROOT / "docs" / "mage-traditional-codec-generation-qualification-2026-08-09.json"
-REPORT_EXACT_SHA256 = "f1b5db9d838152f8ebd775e5d68c62139421556456e60f91caa1686e061cd910"
-REPORT_SEMANTIC_SHA256 = "3d2bc915a5cb7247193f6503a5148f2bb4d6ec8ef29bbbaad846e76f76d8972e"
+REPORT_EXACT_SHA256 = "a433b55188eea810aab09c33986bdbcb56b987cf46d2d24a8bdf53e5d1acfa7b"
+REPORT_SEMANTIC_SHA256 = "bd0063b3d7ba406a15f913f9271e1d313fb277f0099aa79957b6d0bda1354cb6"
 
 
 def _report() -> dict[str, object]:
@@ -46,6 +46,26 @@ def test_tracked_report_is_canonical_and_preserves_local_decisions() -> None:
         "next_gate": "P20_COMPACT_DECODER_BUDGET_AND_QUALITY_AB",
         "reasons": report["decision"]["reasons"],
     }
+
+    quality = report["traditional_target_canvas_8"]["quality"]
+    assert quality["admission_reason_code"] == "UNSUPPORTED_OBJECT_CLASS_CLAIM"
+    issue = quality["issue_analysis"]
+    assert issue["determination"] == (
+        "MODEL_OUTPUT_HALLUCINATION_SUPPORTED_BY_LOW_RESOLUTION_INPUT_DEGRADATION"
+    )
+    assert issue["primary_surface"] == "RAW_MODEL_OUTPUT"
+    assert issue["segment_4_control"]["raw_observation_action"] == (
+        "a person in a white shirt is sitting at a desk and flipping through a green book"
+    )
+    assert issue["segment_4_control"]["normalized_observation_action"] == (
+        "a_person_in_a_white_shirt_is_sitting_at_a_desk_and_flipping_through_a_green_book"
+    )
+    follow_up = issue["input_degradation_assessment"]["follow_up"]
+    assert follow_up["book_claim_present_only_at_8x65k"] is True
+    assert follow_up["traditional_8x98k_segment_4_action"] == (
+        "a person in a white shirt is folding a green cloth"
+    )
+    assert follow_up["traditional_8x131k_segment_4_action"] == "a person folds a green cloth"
 
     traditional = report["traditional_target_canvas_8"]["generation"]
     assert traditional["lifecycle"]["model_load_seconds"] == pytest.approx(36.03563010000107)
@@ -92,6 +112,17 @@ def test_validator_rejects_capacity_formula_tamper() -> None:
     _rehash(report)
 
     with pytest.raises(EvidenceError, match="camera-hour lane formula"):
+        validate(report)
+
+
+def test_validator_rejects_hallucination_classification_tamper() -> None:
+    report = deepcopy(_report())
+    report["traditional_target_canvas_8"]["quality"]["issue_analysis"]["primary_surface"] = (
+        "EVALUATION_POLICY"
+    )
+    _rehash(report)
+
+    with pytest.raises(EvidenceError, match="hallucination classification"):
         validate(report)
 
 

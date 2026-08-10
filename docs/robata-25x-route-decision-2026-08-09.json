@@ -24,7 +24,7 @@
     {
       "id": "mage_traditional_generation",
       "path": "docs/mage-traditional-codec-generation-qualification-2026-08-09.json",
-      "exact_sha256": "f1b5db9d838152f8ebd775e5d68c62139421556456e60f91caa1686e061cd910",
+      "exact_sha256": "a433b55188eea810aab09c33986bdbcb56b987cf46d2d24a8bdf53e5d1acfa7b",
       "scope": "Traditional H.264/HEVC preparation plus real Mage generation qualification"
     },
     {
@@ -227,5 +227,5 @@
     "rollback": "Switch canonical binding to unchanged serial Qwen; preserve batch artifacts and idempotency namespaces.",
     "next_gate": "Run representative labeled end-to-end samples on Linux/H100, then canary before production admission."
   },
-  "semantic_sha256": "fb40201a8b91802d1b9f8238d3d8a913e2687fdb53fb4e8a8a6ab3e06d8fbf7f"
+  "semantic_sha256": "14312f62381802fc12d65eceabfd12be1bbf140e826c74b7057a5d40f1529fab"
 }
