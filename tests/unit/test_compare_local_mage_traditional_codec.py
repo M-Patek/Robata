@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import robata.benchmark.mage_traditional_codec as mage_traditional_codec
 from robata.benchmark.mage_25x import load_provider_v2_local_baseline
 from robata.benchmark.mage_traditional_codec import (
     MageTraditionalEvidenceError,
     build_traditional_local_qualification_report,
     load_host_measurement,
     load_traditional_receipt,
+    verify_receipt_sources,
 )
 from robata.contracts.hashing import canonical_json_bytes
 
@@ -26,6 +28,17 @@ BASELINE_SEMANTIC = "ea659e3e78243e43e4c1f921ff0898c64f18c4e68993c9c219d2425c8a2
 IMAGE_DIGEST = "857ad103f01c1594500f6b6ba300c084d891f9ec6106f7f25de583403ec86cbf"
 REPORT_EXACT = "bb28cf36a8eeef442c7f248b96a8b26de3839d5b484c16e555fdeb0f651053df"
 REPORT_SEMANTIC = "2210ed4977d4f750c5faa8c0072cd942f7f93e7aabe36b369befbf661090f57e"
+
+
+def _tracked_control_source_verifier(path: Path) -> tuple[str, int]:
+    document = json.loads(BASELINE.read_text(encoding="utf-8"))
+    variants = document["variants"]["provider_v2_bounded"]
+    selected = [item for item in variants if item["variant_id"] == "provider-v2-max-side-448"]
+    assert len(selected) == 1
+    jobs = selected[0]["preparation"]["per_segment"]
+    matches = [item for item in jobs if item["source_path"] == str(path)]
+    assert len(matches) == 1
+    return matches[0]["source_content_sha256"], matches[0]["source_byte_count"]
 
 
 def _inputs():
@@ -59,6 +72,7 @@ def test_tracked_traditional_qualification_report_is_reproducible() -> None:
         receipt=receipt,
         single_receipt=single,
         host_measurement=host,
+        control_source_verifier=_tracked_control_source_verifier,
     )
 
     assert REPORT.read_bytes() == canonical_json_bytes(report) + b"\n"
@@ -115,4 +129,36 @@ def test_report_rejects_single_probe_payload_drift() -> None:
             receipt=receipt,
             single_receipt=changed_single,
             host_measurement=host,
+            control_source_verifier=_tracked_control_source_verifier,
         )
+
+
+def test_report_rejects_control_source_attestation_mismatch() -> None:
+    baseline, receipt, single, host = _inputs()
+
+    with pytest.raises(MageTraditionalEvidenceError, match="source bytes differ"):
+        build_traditional_local_qualification_report(
+            baseline=baseline,
+            baseline_report_path=BASELINE,
+            receipt=receipt,
+            single_receipt=single,
+            host_measurement=host,
+            control_source_verifier=lambda _path: ("0" * 64, 1),
+        )
+
+
+def test_source_verifier_defaults_to_live_exact_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, receipt, _, _ = _inputs()
+    observed: list[Path] = []
+
+    def mismatched_exact_file(path: Path) -> tuple[str, int]:
+        observed.append(path)
+        return "0" * 64, 1
+
+    monkeypatch.setattr(mage_traditional_codec, "_exact_file", mismatched_exact_file)
+    with pytest.raises(MageTraditionalEvidenceError, match="source bytes differ"):
+        verify_receipt_sources(receipt=receipt, baseline_report_path=BASELINE)
+
+    assert len(observed) == 1

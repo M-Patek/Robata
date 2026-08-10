@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -297,8 +297,17 @@ def load_host_measurement(
 
 
 def verify_receipt_sources(
-    *, receipt: TraditionalReceiptEvidence, baseline_report_path: Path
+    *,
+    receipt: TraditionalReceiptEvidence,
+    baseline_report_path: Path,
+    control_source_verifier: Callable[[Path], tuple[str, int]] | None = None,
 ) -> tuple[dict[str, object], ...]:
+    """Cross-check source identities, re-reading live bytes unless explicitly overridden.
+
+    The injectable verifier is an internal artifact-replay/test seam. Production callers
+    omit it and therefore retain fail-closed exact-file verification.
+    """
+
     raw = _read_bytes(Path(baseline_report_path).expanduser().resolve(), "baseline report")
     document = _json_object(raw, "baseline report")
     variants = _mapping(document.get("variants"), "baseline.variants")
@@ -314,6 +323,9 @@ def verify_receipt_sources(
     baseline_jobs = _sequence(preparation.get("per_segment"), "baseline.preparation.per_segment")
     if len(baseline_jobs) != len(receipt.jobs):
         raise MageTraditionalEvidenceError("traditional and DCVC segment counts differ")
+    verify_control_source = (
+        _exact_file if control_source_verifier is None else control_source_verifier
+    )
     verified: list[dict[str, object]] = []
     for ordinal, (traditional, raw_control) in enumerate(
         zip(receipt.jobs, baseline_jobs, strict=True)
@@ -324,7 +336,7 @@ def verify_receipt_sources(
         control_path = Path(_nonempty_string(control.get("source_path"), "baseline.source_path"))
         if control_path.name != traditional.source_basename:
             raise MageTraditionalEvidenceError("traditional source basename differs from control")
-        sha256, byte_count = _exact_file(control_path)
+        sha256, byte_count = verify_control_source(control_path)
         if sha256 != traditional.source_sha256 or byte_count != traditional.source_byte_count:
             raise MageTraditionalEvidenceError("traditional source bytes differ from control")
         verified.append(
@@ -345,6 +357,7 @@ def build_traditional_local_qualification_report(
     receipt: TraditionalReceiptEvidence,
     host_measurement: Mapping[str, object],
     single_receipt: TraditionalReceiptEvidence | None = None,
+    control_source_verifier: Callable[[Path], tuple[str, int]] | None = None,
     daily_camera_hours: float = DEFAULT_DAILY_CAMERA_HOURS,
     headroom: float = DEFAULT_CAPACITY_HEADROOM,
 ) -> dict[str, object]:
@@ -353,7 +366,9 @@ def build_traditional_local_qualification_report(
             "traditional receipt segment count differs from baseline"
         )
     source_proof = verify_receipt_sources(
-        receipt=receipt, baseline_report_path=baseline_report_path
+        receipt=receipt,
+        baseline_report_path=baseline_report_path,
+        control_source_verifier=control_source_verifier,
     )
     required = required_aggregate_realtime_factor(
         daily_camera_hours=daily_camera_hours, headroom=headroom

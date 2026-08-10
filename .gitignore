@@ -58,6 +58,7 @@ tmp/
 /.test-basetemp-*/
 /.test-temp-*/
 /.test-tmp/
+/.test-output-*/
 /test-run-*/
 /tmp_*/
 .patch*.txt
