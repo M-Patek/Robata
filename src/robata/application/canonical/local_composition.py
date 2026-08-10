@@ -330,6 +330,7 @@ LOCAL_CANONICAL_MODEL_BINDING_PROJECTION_VERSION: Final = "local-model-binding-v
 LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS: Final = 6
 LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE: Final = 8
 LOCAL_CANONICAL_MAX_INFERENCE_BATCH_QUEUE_DELAY_MS: Final = 5
+LOCAL_CANONICAL_NATIVE_BATCH_ADMISSION_PROJECTION_VERSION: Final = "local-native-batch-admission-v1"
 LOCAL_CANONICAL_RUN_RECEIPT_MODEL_VERSION: Final[Literal["canonical-local-run-receipt-v4"]] = (
     "canonical-local-run-receipt-v4"
 )
@@ -412,6 +413,57 @@ LocalCanonicalModelAdapterFactory = Callable[
 
 
 @dataclass(frozen=True, slots=True)
+class LocalCanonicalNativeBatchAdmission:
+    """Internal proof that a local binding may use native logical-request batching.
+
+    The projection is intentionally runtime-only.  It changes the local run/recovery
+    identity without changing any published schema or per-request inference identity.
+    """
+
+    policy_version: str
+    max_batch_size: int
+    capacity_projection_version: str
+    serial_guard_policy_version: str | None = None
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("policy_version", self.policy_version),
+            ("capacity_projection_version", self.capacity_projection_version),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field} must be a nonempty string")
+        if self.serial_guard_policy_version is not None and (
+            not isinstance(self.serial_guard_policy_version, str)
+            or not self.serial_guard_policy_version
+        ):
+            raise ValueError("serial_guard_policy_version must be a nonempty string or None")
+        if (
+            isinstance(self.max_batch_size, bool)
+            or not isinstance(self.max_batch_size, int)
+            or self.max_batch_size < 2
+            or self.max_batch_size > LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE
+        ):
+            raise ValueError(
+                f"max_batch_size must be between 2 and {LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE}"
+            )
+
+    def capacity_projection(self, *, max_concurrent_call_parts: int) -> dict[str, object]:
+        """Return the stable internal projection used for capacity and recovery identity."""
+
+        return {
+            "semantic_projection_version": (
+                LOCAL_CANONICAL_NATIVE_BATCH_ADMISSION_PROJECTION_VERSION
+            ),
+            "capacity_projection_version": self.capacity_projection_version,
+            "policy_version": self.policy_version,
+            "serial_guard_policy_version": self.serial_guard_policy_version,
+            "max_batch_size": self.max_batch_size,
+            "max_concurrent_call_parts": max_concurrent_call_parts,
+            "execution_mode": "NATIVE_BATCH_WITH_EXPLICIT_SERIAL_GUARD",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class LocalCanonicalModelBinding:
     """Explicit real-model dependencies for the local MCAP composition.
 
@@ -419,8 +471,8 @@ class LocalCanonicalModelBinding:
     to :func:`run_local_canonical_mcap` selects an adapter (or an adapter factory
     that receives the composition-owned evidence ledger and parser), an immutable
     capability snapshot, and one task policy for every canonical vision stage.
-    Real local model runs are intentionally serialized: one call part and one
-    adapter request may be active at a time.
+    Real local model runs remain serialized unless an explicit native-batch
+    admission proves the adapter method, policy, and capacity bounds.
     """
 
     capabilities: ModelCapabilities
@@ -433,6 +485,7 @@ class LocalCanonicalModelBinding:
     adapter: VisionModelAdapter | None = None
     adapter_factory: LocalCanonicalModelAdapterFactory | None = None
     normalized_output_lineage_policy: NormalizedOutputLineagePolicy | None = None
+    native_batch_admission: LocalCanonicalNativeBatchAdmission | None = None
     max_concurrent_call_parts: int = 1
     max_inference_batch_size: int = 1
 
@@ -493,12 +546,65 @@ class LocalCanonicalModelBinding:
             if task not in self.capabilities.supported_tasks:
                 raise ValueError(f"capabilities do not support {task.value}")
 
-        for field, value in (
-            ("max_concurrent_call_parts", self.max_concurrent_call_parts),
-            ("max_inference_batch_size", self.max_inference_batch_size),
+        self._validate_runtime_capacity()
+        if self.adapter is not None:
+            _validate_native_batch_adapter(self.adapter, self.native_batch_admission)
+
+    def _validate_runtime_capacity(self) -> None:
+        for field, value, upper_bound in (
+            (
+                "max_concurrent_call_parts",
+                self.max_concurrent_call_parts,
+                LOCAL_CANONICAL_MAX_CONCURRENT_CALL_PARTS,
+            ),
+            (
+                "max_inference_batch_size",
+                self.max_inference_batch_size,
+                LOCAL_CANONICAL_MAX_INFERENCE_BATCH_SIZE,
+            ),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value != 1:
-                raise ValueError(f"{field} must be 1 for a local model binding")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+                or value > upper_bound
+            ):
+                raise ValueError(f"{field} must be between 1 and {upper_bound}")
+
+        admission = self.native_batch_admission
+        if admission is None:
+            if self.max_concurrent_call_parts != 1:
+                raise ValueError(
+                    "max_concurrent_call_parts must be 1 without native batch admission"
+                )
+            if self.max_inference_batch_size != 1:
+                raise ValueError(
+                    "max_inference_batch_size must be 1 without native batch admission"
+                )
+            return
+        if not isinstance(admission, LocalCanonicalNativeBatchAdmission):
+            raise TypeError(
+                "native_batch_admission must be LocalCanonicalNativeBatchAdmission or None"
+            )
+        if self.max_inference_batch_size != admission.max_batch_size:
+            raise ValueError(
+                "max_inference_batch_size must match native batch admission max_batch_size"
+            )
+        if self.max_concurrent_call_parts < self.max_inference_batch_size:
+            raise ValueError(
+                "max_concurrent_call_parts must be sufficient to fill the native batch"
+            )
+
+    @property
+    def runtime_capacity_projection(self) -> dict[str, object] | None:
+        """Report the internal batch capacity policy without changing request identity."""
+
+        admission = self.native_batch_admission
+        if admission is None:
+            return None
+        return admission.capacity_projection(
+            max_concurrent_call_parts=self.max_concurrent_call_parts
+        )
 
     @property
     def policies(
@@ -533,6 +639,28 @@ class LocalCanonicalModelBinding:
         """Alias the pipeline's inference-batch bound."""
 
         return self.max_inference_batch_size
+
+
+def _validate_native_batch_adapter(
+    adapter: object,
+    admission: LocalCanonicalNativeBatchAdmission | None,
+) -> None:
+    """Fail closed unless an admitted adapter declares the exact native-batch contract."""
+
+    if admission is None:
+        return
+    if not callable(getattr(adapter, "infer_batch", None)):
+        raise TypeError("native batch adapter must implement callable infer_batch")
+    policy_version = getattr(adapter, "native_batch_policy_version", None)
+    if policy_version != admission.policy_version:
+        raise ValueError(
+            "native batch adapter policy does not match LocalCanonicalModelBinding admission"
+        )
+    max_batch_size = getattr(adapter, "native_batch_max_size", None)
+    if max_batch_size != admission.max_batch_size:
+        raise ValueError(
+            "native batch adapter max size does not match LocalCanonicalModelBinding admission"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,6 +715,9 @@ def local_canonical_runtime_descriptor(
         model_capabilities=None if model_binding is None else model_binding.capabilities,
         normalized_output_lineage_policy=(
             None if model_binding is None else model_binding.normalized_output_lineage_policy
+        ),
+        native_batch_capacity_projection=(
+            None if model_binding is None else model_binding.runtime_capacity_projection
         ),
     )
     return LocalCanonicalRuntimeDescriptor(
@@ -657,8 +788,13 @@ class _PinnedCapabilityVisionModelAdapter:
         return self._delegate.provider
 
     def __getattr__(self, name: str) -> object:
-        # Preserve explicitly optional local adapter capabilities such as dense
-        # coordinate reduction without weakening the pinned snapshot check.
+        # Native batching is admitted only by the explicit batch subclass.  In
+        # particular, a serial binding must not silently switch routes merely
+        # because its additive adapter implementation also exposes infer_batch.
+        if name == "infer_batch":
+            raise AttributeError(name)
+        # Preserve other explicitly optional local adapter capabilities such as
+        # dense coordinate reduction without weakening the snapshot check.
         return getattr(self._delegate, name)
 
     async def capabilities(self, model_name: str, model_version: str) -> ModelCapabilities:
@@ -1253,6 +1389,9 @@ def _run_local_canonical_inner(
         normalized_output_lineage_policy=(
             None if model_binding is None else model_binding.normalized_output_lineage_policy
         ),
+        native_batch_capacity_projection=(
+            None if model_binding is None else model_binding.runtime_capacity_projection
+        ),
     )
     run_id = _run_id(
         source_binding_sha256=source_binding_sha256,
@@ -1778,10 +1917,17 @@ def _build_runtime(
                     CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
                     "model adapter provider must match capabilities.provider",
                 )
+            try:
+                _validate_native_batch_adapter(candidate, model_binding.native_batch_admission)
+            except (TypeError, ValueError) as error:
+                raise CanonicalLocalCompositionError(
+                    CanonicalLocalCompositionErrorCode.INVALID_REQUEST,
+                    f"model native batch admission failed: {error}",
+                ) from error
             candidate_adapter = cast(VisionModelAdapter, candidate)
             pinned_type = (
                 _PinnedCapabilityBatchVisionModelAdapter
-                if callable(getattr(candidate_adapter, "infer_batch", None))
+                if model_binding.native_batch_admission is not None
                 else _PinnedCapabilityVisionModelAdapter
             )
             adapter = pinned_type(candidate_adapter, model_binding.capabilities)
@@ -2021,6 +2167,7 @@ def _local_runtime_policy_sha256(
     inference_policy: InferencePolicy,
     model_capabilities: ModelCapabilities | None = None,
     normalized_output_lineage_policy: NormalizedOutputLineagePolicy | None = None,
+    native_batch_capacity_projection: Mapping[str, object] | None = None,
 ) -> str:
     """Bind automatic recovery identity to the policies that drive the run."""
 
@@ -2068,6 +2215,8 @@ def _local_runtime_policy_sha256(
             "model_name": model_capabilities.model_name,
             "model_version": model_capabilities.model_version,
         }
+    if native_batch_capacity_projection is not None:
+        projection["native_batch_capacity"] = dict(native_batch_capacity_projection)
     return semantic_sha256(projection)
 
 
@@ -3181,12 +3330,14 @@ __all__ = [
     "LOCAL_CANONICAL_COMPOSITION_VERSION",
     "LOCAL_CANONICAL_EXECUTION_CLOCK_VERSION",
     "LOCAL_CANONICAL_EXECUTION_TIME",
+    "LOCAL_CANONICAL_NATIVE_BATCH_ADMISSION_PROJECTION_VERSION",
     "LOCAL_CANONICAL_STREAM_TERMINAL_POLICY_VERSION",
     "CanonicalLocalCompositionError",
     "CanonicalLocalCompositionErrorCode",
     "CanonicalLocalRunReceipt",
     "LocalCanonicalModelAdapterFactory",
     "LocalCanonicalModelBinding",
+    "LocalCanonicalNativeBatchAdmission",
     "LocalPreEosExecutorContext",
     "LocalPreEosExecutorFactory",
     "LocalProviderCallDispatcher",

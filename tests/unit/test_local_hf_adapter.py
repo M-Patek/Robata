@@ -43,7 +43,10 @@ from robata.inference.local_hf_adapter import (
     LOCAL_HF_COMPACT_SCALAR_VALUE_POLICY_VERSION,
     LOCAL_HF_COMPACT_SINGLE_DECISION_POLICY_VERSION,
     LOCAL_HF_COMPACT_TOKEN_ORDER_POLICY_VERSION,
+    LOCAL_HF_HYBRID_BATCH_MAX_SIZE,
+    LOCAL_HF_HYBRID_BATCH_POLICY_VERSION,
     LOCAL_HF_LOOPBACK_ADAPTER_VERSION,
+    LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL,
     LOCAL_HF_LOOPBACK_ENDPOINT_URL,
     LocalHfHttpRequest,
     LocalHfHttpResponse,
@@ -51,8 +54,11 @@ from robata.inference.local_hf_adapter import (
     LocalHfLoopbackVisionAdapter,
 )
 from robata.inference.local_hf_endpoint import (
+    LOCAL_HF_BATCH_ENDPOINT_RESPONSE_VERSION,
+    LOCAL_HF_BATCH_POLICY_VERSION,
     LOCAL_HF_ENDPOINT_IDEMPOTENCY_POLICY_VERSION,
     LOCAL_HF_ENDPOINT_RESPONSE_VERSION,
+    LocalHfBatchEndpointRequest,
     LocalHfEndpointRequest,
 )
 from robata.inference.models import (
@@ -129,12 +135,17 @@ def _fixture(
     *,
     image_count: int = 6,
     task: VisionTask = VisionTask.ACTION_EVIDENCE,
+    frame_counts_override: tuple[int, ...] | None = None,
 ) -> _Fixture:
     tmp_path.mkdir(parents=True, exist_ok=True)
     registry = SchemaRegistry()
     schema = _provider_schema(registry)
     planner = InferenceInputPlanner(INFERENCE_INPUT_PLANNER_VERSION)
-    frame_counts = tuple(2 if ordinal == 0 and image_count == 7 else 1 for ordinal in range(6))
+    frame_counts = (
+        frame_counts_override
+        if frame_counts_override is not None
+        else tuple(2 if ordinal == 0 and image_count == 7 else 1 for ordinal in range(6))
+    )
     camera_frames: list[CatalogCamera] = []
     rendered_items: list[RenderedProviderItem] = []
     paths: list[Path] = []
@@ -740,3 +751,404 @@ def test_compact_prompt_normalization_contract_digest_is_stable_and_complete() -
         "dense_coordinate_reduction": local_hf.LOCAL_HF_DENSE_COORDINATE_REDUCTION_POLICY_VERSION,
         "endpoint_idempotency": LOCAL_HF_ENDPOINT_IDEMPOTENCY_POLICY_VERSION,
     }
+
+
+class _HybridBatchTransport:
+    def __init__(
+        self,
+        *,
+        outputs: dict[str, str] | None = None,
+        reverse_batch_members: bool = False,
+        batch_status_code: int = 200,
+        malformed_batch_body: bytes | None = None,
+        batch_error: Exception | None = None,
+    ) -> None:
+        self.outputs = outputs or {}
+        self.reverse_batch_members = reverse_batch_members
+        self.batch_status_code = batch_status_code
+        self.malformed_batch_body = malformed_batch_body
+        self.batch_error = batch_error
+        self.requests: list[LocalHfHttpRequest] = []
+
+    async def post(self, request: LocalHfHttpRequest) -> LocalHfHttpResponse:
+        self.requests.append(request)
+        if request.url == LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL:
+            if self.batch_error is not None:
+                raise self.batch_error
+            if self.malformed_batch_body is not None:
+                return LocalHfHttpResponse(status_code=200, body=self.malformed_batch_body)
+            if self.batch_status_code != 200:
+                return LocalHfHttpResponse(status_code=self.batch_status_code, body=b"{}")
+            batch_request = LocalHfBatchEndpointRequest.model_validate_json(
+                request.body,
+                strict=True,
+            )
+            members = [
+                {
+                    "idempotency_key": member.idempotency_key,
+                    "request_id": member.request.request_id,
+                    "disposition": "GENERATED",
+                    "input_image_count": len(member.request.images),
+                    "rendered_image_sizes": [[640, 480] for _image in member.request.images],
+                    "prompt_tokens": 21,
+                    "output_tokens": 4,
+                    "output_text": self.outputs.get(
+                        member.request.request_id,
+                        '["SUPPORTING"]',
+                    ),
+                }
+                for member in batch_request.members
+            ]
+            if self.reverse_batch_members:
+                members.reverse()
+            response = {
+                "contract_version": LOCAL_HF_BATCH_ENDPOINT_RESPONSE_VERSION,
+                "batch_policy_version": LOCAL_HF_BATCH_POLICY_VERSION,
+                "batch_request_sha256": batch_request.batch_request_sha256,
+                "model_identifier": MODEL_NAME,
+                "model_version": MODEL_VERSION,
+                "quantization": "bnb-nf4-double-quant",
+                "precision": "bfloat16-compute",
+                "load_seconds": 0.0,
+                "gpu_name": "test-gpu",
+                "gpu_total_bytes": 1,
+                "gpu_free_before_bytes": 1,
+                "gpu_allocated_after_load_bytes": 0,
+                "physical_generation_seconds": 0.01,
+                "physical_gpu_peak_allocated_bytes": 1,
+                "generated_member_count": len(members),
+                "replay_member_count": 0,
+                "members": members,
+            }
+            return LocalHfHttpResponse(status_code=200, body=canonical_json_bytes(response))
+
+        endpoint_request = LocalHfEndpointRequest.model_validate_json(request.body, strict=True)
+        response = {
+            "contract_version": LOCAL_HF_ENDPOINT_RESPONSE_VERSION,
+            "request_id": endpoint_request.request_id,
+            "model_identifier": MODEL_NAME,
+            "model_version": MODEL_VERSION,
+            "quantization": "bnb-nf4-double-quant",
+            "precision": "bfloat16-compute",
+            "input_image_count": len(endpoint_request.images),
+            "rendered_image_sizes": [[640, 480] for _image in endpoint_request.images],
+            "prompt_tokens": 21,
+            "output_tokens": 4,
+            "load_seconds": 0.0,
+            "generation_seconds": 0.01,
+            "gpu_name": "test-gpu",
+            "gpu_total_bytes": 1,
+            "gpu_free_before_bytes": 1,
+            "gpu_allocated_after_load_bytes": 0,
+            "gpu_peak_allocated_bytes": 1,
+            "output_text": self.outputs.get(endpoint_request.request_id, '["SUPPORTING"]'),
+        }
+        return LocalHfHttpResponse(status_code=200, body=canonical_json_bytes(response))
+
+
+def _request_variant(
+    request: VisionInferenceRequest,
+    ordinal: int,
+    *,
+    provider_idempotency_key: str | None = None,
+    max_new_tokens: int = 12,
+) -> VisionInferenceRequest:
+    document = request.model_dump(mode="python")
+    document.update(
+        {
+            "logical_invocation_id": _uuid(800 + ordinal * 2),
+            "request_id": _uuid(801 + ordinal * 2),
+            "idempotency_key": f"logical-batch-{ordinal}",
+            "provider_idempotency_key": (provider_idempotency_key or f"provider-batch-{ordinal}"),
+            "generation_config": {"max_new_tokens": max_new_tokens, "temperature": 0},
+        }
+    )
+    return VisionInferenceRequest.model_validate(document, strict=True)
+
+
+def _single_claim_fixture(tmp_path: Path) -> _Fixture:
+    return _fixture(
+        tmp_path,
+        frame_counts_override=(6, 0, 0, 0, 0, 0),
+    )
+
+
+def test_loopback_batch_capability_is_explicit_and_versioned(tmp_path: Path) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    adapter = _adapter(
+        fixture,
+        transport=_HybridBatchTransport(),
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    capability = adapter.native_batch_capability
+
+    assert capability.supported is True
+    assert capability.adapter_policy_version == LOCAL_HF_HYBRID_BATCH_POLICY_VERSION
+    assert capability.max_batch_size == LOCAL_HF_HYBRID_BATCH_MAX_SIZE == 4
+    assert capability.max_dispatch_size == 8
+    assert capability.native_admission == "EXACTLY_ONE_CLAIM_GROUP"
+    assert capability.multi_claim_route == "SERIAL_V1"
+    assert capability.hidden_error_fallback is False
+    assert adapter.native_batch_policy_version == LOCAL_HF_HYBRID_BATCH_POLICY_VERSION
+    assert adapter.native_batch_max_size == 4
+
+
+def test_loopback_batch_dispatches_four_single_claim_members_once_and_preserves_order(
+    tmp_path: Path,
+) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    requests = tuple(_request_variant(fixture.request, ordinal) for ordinal in range(4))
+    outputs = {
+        request.request_id: f'["{label}"]'
+        for request, label in zip(
+            requests,
+            ("SUPPORTING", "PARTIAL", "NO_EVENT", "OCCLUDED"),
+            strict=True,
+        )
+    }
+    transport = _HybridBatchTransport(outputs=outputs)
+    raw_store = InMemoryRawProviderBytesStore()
+    adapter = _adapter(fixture, transport=transport, evidence_ledger=raw_store)
+
+    results = asyncio.run(adapter.infer_batch(requests))
+
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL
+    sent = LocalHfBatchEndpointRequest.model_validate_json(
+        transport.requests[0].body,
+        strict=True,
+    )
+    assert len(sent.members) == 4
+    assert tuple(member.request.request_id for member in sent.members) == tuple(
+        request.request_id for request in requests
+    )
+    assert all(isinstance(result, VisionInferenceSuccess) for result in results)
+    assert tuple(result.provider_request_id for result in results) == tuple(
+        request.request_id for request in requests
+    )
+    assert tuple(
+        result.normalized_output.payload["claims"][0]["observation"]
+        for result in results
+        if isinstance(result, VisionInferenceSuccess)
+    ) == ("SUPPORTING", "PARTIAL", "NO_EVENT", "OCCLUDED")
+    assert len(raw_store.list_records()) == 4
+
+
+def test_loopback_batch_mixed_partition_keeps_multi_claim_on_exact_serial_wire(
+    tmp_path: Path,
+) -> None:
+    single_fixture = _single_claim_fixture(tmp_path / "single")
+    multi_fixture = _fixture(tmp_path / "multi")
+    first = _request_variant(single_fixture.request, 10)
+    multi = _request_variant(multi_fixture.request, 11)
+    last = _request_variant(single_fixture.request, 12)
+
+    serial_transport = _CapturingTransport(output_text='["SUPPORTING"]')
+    serial_result = asyncio.run(
+        _adapter(
+            multi_fixture,
+            transport=serial_transport,
+            evidence_ledger=InMemoryRawProviderBytesStore(),
+        ).infer(multi)
+    )
+    assert isinstance(serial_result, VisionInferenceSuccess)
+
+    transport = _HybridBatchTransport()
+    adapter = _adapter(
+        single_fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+    results = asyncio.run(adapter.infer_batch((first, multi, last)))
+
+    assert all(isinstance(result, VisionInferenceSuccess) for result in results)
+    assert tuple(result.provider_request_id for result in results) == (
+        first.request_id,
+        multi.request_id,
+        last.request_id,
+    )
+    assert tuple(request.url for request in transport.requests) == (
+        LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL,
+        LOCAL_HF_LOOPBACK_ENDPOINT_URL,
+    )
+    batch_request = LocalHfBatchEndpointRequest.model_validate_json(
+        transport.requests[0].body,
+        strict=True,
+    )
+    assert tuple(member.request.request_id for member in batch_request.members) == (
+        first.request_id,
+        last.request_id,
+    )
+    assert transport.requests[1].body == serial_transport.requests[0].body
+    assert transport.requests[1].idempotency_key == multi.provider_idempotency_key
+
+
+def test_loopback_batch_member_idempotency_binds_policy_provider_key_and_exact_body(
+    tmp_path: Path,
+) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    first = _request_variant(fixture.request, 20, provider_idempotency_key="shared-provider-key")
+    second = _request_variant(fixture.request, 21, provider_idempotency_key="shared-provider-key")
+    transport = _HybridBatchTransport()
+    adapter = _adapter(
+        fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    results = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert all(isinstance(result, VisionInferenceSuccess) for result in results)
+    sent = LocalHfBatchEndpointRequest.model_validate_json(
+        transport.requests[0].body,
+        strict=True,
+    )
+    keys = tuple(member.idempotency_key for member in sent.members)
+    assert len(set(keys)) == 2
+    assert all(key.startswith(f"{LOCAL_HF_HYBRID_BATCH_POLICY_VERSION}:") for key in keys)
+    assert "shared-provider-key" not in keys
+    assert keys != (first.provider_idempotency_key, second.provider_idempotency_key)
+
+
+def test_loopback_batch_splits_at_four_and_by_max_token_compatibility(tmp_path: Path) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    requests = tuple(
+        _request_variant(
+            fixture.request,
+            30 + ordinal,
+            max_new_tokens=12 if ordinal < 4 else 16,
+        )
+        for ordinal in range(8)
+    )
+    transport = _HybridBatchTransport()
+    adapter = _adapter(
+        fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    results = asyncio.run(adapter.infer_batch(requests))
+
+    assert all(isinstance(result, VisionInferenceSuccess) for result in results)
+    assert len(transport.requests) == 2
+    batches = tuple(
+        LocalHfBatchEndpointRequest.model_validate_json(request.body, strict=True)
+        for request in transport.requests
+    )
+    assert tuple(len(batch.members) for batch in batches) == (4, 4)
+    assert tuple(batch.members[0].request.max_new_tokens for batch in batches) == (12, 16)
+
+
+def test_loopback_batch_persists_each_member_before_independent_parse(tmp_path: Path) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    first = _request_variant(fixture.request, 50)
+    second = _request_variant(fixture.request, 51)
+    transport = _HybridBatchTransport(
+        outputs={first.request_id: '["SUPPORTING"]', second.request_id: "not-json"}
+    )
+    raw_store = InMemoryRawProviderBytesStore()
+    adapter = _adapter(fixture, transport=transport, evidence_ledger=raw_store)
+
+    first_result, second_result = asyncio.run(adapter.infer_batch((first, second)))
+
+    assert isinstance(first_result, VisionInferenceSuccess)
+    assert isinstance(second_result, VisionInferenceFailure)
+    assert second_result.status is InferenceStatus.INVALID_OUTPUT
+    assert second_result.failure.code == "INVALID_JSON"
+    assert second_result.raw_output_artifact_id is not None
+    assert raw_store.get(second_result.raw_output_artifact_id).data == b"not-json"
+    assert len(raw_store.list_records()) == 2
+
+
+def test_loopback_batch_rejects_member_reordering_for_the_entire_native_chunk(
+    tmp_path: Path,
+) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    requests = tuple(_request_variant(fixture.request, 60 + ordinal) for ordinal in range(2))
+    transport = _HybridBatchTransport(reverse_batch_members=True)
+    adapter = _adapter(
+        fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    results = asyncio.run(adapter.infer_batch(requests))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in results)
+    assert {
+        result.failure.code for result in results if isinstance(result, VisionInferenceFailure)
+    } == {"LOCAL_HF_BATCH_RESPONSE_BINDING_MISMATCH"}
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected_code"),
+    (
+        (
+            _HybridBatchTransport(batch_error=local_hf.LocalHfTransportError("offline")),
+            "LOCAL_HF_BATCH_TRANSPORT_TIMEOUT",
+        ),
+        (
+            _HybridBatchTransport(batch_status_code=503),
+            "LOCAL_HF_BATCH_HTTP_REJECTED",
+        ),
+        (
+            _HybridBatchTransport(malformed_batch_body=b"{"),
+            "LOCAL_HF_BATCH_RESPONSE_INVALID_JSON",
+        ),
+    ),
+)
+def test_loopback_batch_errors_are_explicit_and_never_fall_back_to_serial(
+    tmp_path: Path,
+    transport: _HybridBatchTransport,
+    expected_code: str,
+) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    requests = tuple(_request_variant(fixture.request, 70 + ordinal) for ordinal in range(2))
+    adapter = _adapter(
+        fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    results = asyncio.run(adapter.infer_batch(requests))
+
+    assert all(isinstance(result, VisionInferenceFailure) for result in results)
+    assert {
+        result.failure.code for result in results if isinstance(result, VisionInferenceFailure)
+    } == {expected_code}
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL
+
+
+def test_loopback_batch_input_bounds_are_strict(tmp_path: Path) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    adapter = _adapter(
+        fixture,
+        transport=_HybridBatchTransport(),
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    with pytest.raises(TypeError, match="tuple"):
+        asyncio.run(adapter.infer_batch([fixture.request]))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="between one and eight"):
+        asyncio.run(adapter.infer_batch(()))
+    with pytest.raises(ValueError, match="between one and eight"):
+        asyncio.run(adapter.infer_batch(tuple(fixture.request for _ordinal in range(9))))
+
+
+def test_loopback_batch_cancellation_propagates_without_serial_retry(tmp_path: Path) -> None:
+    fixture = _single_claim_fixture(tmp_path)
+    requests = tuple(_request_variant(fixture.request, 90 + ordinal) for ordinal in range(2))
+    transport = _HybridBatchTransport(batch_error=asyncio.CancelledError())
+    adapter = _adapter(
+        fixture,
+        transport=transport,
+        evidence_ledger=InMemoryRawProviderBytesStore(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.infer_batch(requests))
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == LOCAL_HF_LOOPBACK_BATCH_ENDPOINT_URL
