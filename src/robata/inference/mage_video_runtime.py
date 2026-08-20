@@ -1,4 +1,4 @@
-﻿"""Native Mage video/codec inference runtime.
+"""Native Mage video/codec inference runtime.
 
 The runtime keeps model weights resident, but deliberately never retains or
 persists hidden, KV, or recurrent decoder state.  Those values may exist only
@@ -1340,6 +1340,7 @@ def require_mage_video_codec_dependencies(
     except MageNativeCodecError as error:
         raise MageVideoCodecDependencyError(str(error)) from error
 
+
 def _normalise_video_paths(video_paths: Sequence[Path | str]) -> tuple[Path, ...]:
     if isinstance(video_paths, (str, bytes)) or not isinstance(video_paths, Sequence):
         raise MageVideoRuntimeError("video_paths must be a nonempty sequence of paths")
@@ -1486,9 +1487,3 @@ __all__ = [
     "mage_video_codec_config_sha256",
     "require_mage_video_codec_dependencies",
 ]
-
-
-
-
-
-

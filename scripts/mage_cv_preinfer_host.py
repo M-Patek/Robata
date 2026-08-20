@@ -248,9 +248,7 @@ def _timeout_seconds() -> int:
             "MAGE_CV_PREINFER_TIMEOUT_SECONDS must be a positive integer"
         ) from error
     if value <= 0:
-        raise MageCvPreinferHostError(
-            "MAGE_CV_PREINFER_TIMEOUT_SECONDS must be a positive integer"
-        )
+        raise MageCvPreinferHostError("MAGE_CV_PREINFER_TIMEOUT_SECONDS must be a positive integer")
     return value
 
 
@@ -329,9 +327,10 @@ def _run_binary(request: HostCodecRequest) -> None:
         raise MageCvPreinferHostError(
             f"configured cv-preinfer failed with rc={completed.returncode}: {detail}"
         )
-    if not (request.out_dir / "meta.json").is_file() or not (
-        request.out_dir / "src_patch_position.npy"
-    ).is_file():
+    if (
+        not (request.out_dir / "meta.json").is_file()
+        or not (request.out_dir / "src_patch_position.npy").is_file()
+    ):
         raise MageCvPreinferHostError(
             "configured cv-preinfer returned success without Mage's required assets"
         )
@@ -365,5 +364,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

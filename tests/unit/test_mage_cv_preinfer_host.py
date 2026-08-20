@@ -92,9 +92,7 @@ def test_docker_command_is_networkless_pullless_and_digest_bound(
     manifest = json.loads((control / "jobs.json").read_text(encoding="utf-8"))
     assert manifest["jobs"][0]["video"] == "/input/segment.mp4"
     assert manifest["jobs"][0]["out_dir"] == "/output/assets"
-    assert manifest["jobs"][0]["source_content_sha256"] == module._sha256_file(
-        request.video
-    )
+    assert manifest["jobs"][0]["source_content_sha256"] == module._sha256_file(request.video)
 
 
 def test_unpinned_image_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,9 +193,7 @@ def test_native_codec_readiness_accepts_only_explicit_digest_pinned_bridge(
     bridge = ROOT / "scripts" / "mage_cv_preinfer_host.cmd"
     monkeypatch.setenv("CV_PREINFER_BIN", str(bridge))
     monkeypatch.setenv("MAGE_CV_PREINFER_BACKEND", "docker")
-    monkeypatch.setenv(
-        "MAGE_CV_PREINFER_IMAGE", "registry.example/mage@sha256:" + "a" * 64
-    )
+    monkeypatch.setenv("MAGE_CV_PREINFER_IMAGE", "registry.example/mage@sha256:" + "a" * 64)
     monkeypatch.setenv("MAGE_DOCKER_BIN", str(docker))
 
     report = inspect_mage_codec_dependencies({"engine": "hevc"})
