@@ -523,16 +523,47 @@ def _require_launch_codec_dependencies(
     codec_policy: Any,
     model_directory: Path,
     cache_family: str | None,
-) -> None:
+) -> dict[str, object]:
     # Exact traditional replay loads already-qualified assets through Mage's own
     # result loader. Requiring cv-preinfer here would make the replay endpoint
     # depend on a tool it is specifically forbidden to execute.
     if cache_family == TRADITIONAL_V1_CACHE_FAMILY:
-        return
+        return {
+            "report_version": "mage-native-codec-launch-v1",
+            "ready": True,
+            "mode": "TRADITIONAL_EXACT_CACHE_REPLAY",
+            "blocker_code": None,
+            "missing_assets": [],
+            "detail": "qualified traditional codec assets are replayed through Mage's loader",
+        }
+    native_config = codec_policy.native_codec_config()
+    inspector = getattr(runtime_module, "inspect_mage_video_codec_dependencies", None)
+    report: dict[str, object] | None = None
+    if callable(inspector):
+        observed = inspector(native_config, model_directory)
+        as_dict = getattr(observed, "as_dict", None)
+        if not callable(as_dict):
+            raise MageVideoEndpointLaunchError(
+                "Mage runtime native codec diagnostics returned no JSON projection"
+            )
+        raw_report = as_dict()
+        if not isinstance(raw_report, dict):
+            raise MageVideoEndpointLaunchError(
+                "Mage runtime native codec diagnostics returned an invalid projection"
+            )
+        report = dict(raw_report)
     codec_checker = getattr(runtime_module, "require_mage_video_codec_dependencies", None)
     if not callable(codec_checker):
         raise MageVideoEndpointLaunchError("Mage runtime does not expose native codec diagnostics")
-    codec_checker(codec_policy.native_codec_config(), model_directory)
+    codec_checker(native_config, model_directory)
+    return report or {
+        "report_version": "mage-native-codec-launch-v1",
+        "ready": True,
+        "mode": "LEGACY_RUNTIME_CHECKER",
+        "blocker_code": None,
+        "missing_assets": [],
+        "detail": "native codec dependency checker completed",
+    }
 
 
 def _codec_cache_manifest_version(path: Path) -> str:
@@ -1561,7 +1592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         codec_cache_root = codec_cache_configuration.cache_root
         codec_cache_admission = codec_cache_configuration.admission
         codec_cache_manifest = codec_cache_configuration.manifest
-        _require_launch_codec_dependencies(
+        codec_dependency_report = _require_launch_codec_dependencies(
             runtime_module=runtime_module,
             codec_policy=policy,
             model_directory=arguments.model_dir.expanduser().resolve(),
@@ -1634,6 +1665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "checkpoint_included_file_count": checkpoint_manifest.included_file_count,
                 "checkpoint_total_byte_count": checkpoint_manifest.total_byte_count,
                 "codec_policy": policy.model_dump(mode="json"),
+                "codec_dependency_report": codec_dependency_report,
                 "state_dir": str(state_root),
                 "idempotency_state_path": str(idempotency_path),
                 "result_artifact_dir": str(result_root),

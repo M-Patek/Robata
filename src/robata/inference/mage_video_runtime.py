@@ -30,7 +30,9 @@ from robata.inference.device_execution_guard import (
     ExclusiveFileDeviceGuard,
 )
 from robata.inference.mage_native_codec import (
+    MageCodecDependencyReport,
     MageNativeCodecError,
+    inspect_mage_codec_dependencies,
     require_mage_codec_dependencies,
 )
 
@@ -1329,6 +1331,15 @@ def _verify_traditional_codec_cache_assets(
         raise ValueError("traditional codec cache asset-set identity changed")
 
 
+def inspect_mage_video_codec_dependencies(
+    codec_config: Mapping[str, Any],
+    model_directory: Path,
+) -> MageCodecDependencyReport:
+    """Return the structured native codec readiness observation used by launchers."""
+
+    return inspect_mage_codec_dependencies(codec_config, model_directory=model_directory)
+
+
 def require_mage_video_codec_dependencies(
     codec_config: Mapping[str, Any],
     model_directory: Path,
@@ -1484,6 +1495,7 @@ __all__ = [
     "MageVideoRuntimeError",
     "MageVideoRuntimeIdentity",
     "MageVideoTraditionalCodecCacheBinding",
+    "inspect_mage_video_codec_dependencies",
     "mage_video_codec_config_sha256",
     "require_mage_video_codec_dependencies",
 ]
