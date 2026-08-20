@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from robata.application.canonical.mage_stream import (
     plan_mage_stream,
 )
 from robata.contracts.cameras import CAMERA_IDS, CameraId
+from robata.contracts.hashing import canonical_json_bytes
 from robata.contracts.perception_stream import CameraAbsenceReason
 
 
@@ -123,6 +125,27 @@ def test_materializer_uses_ffmpeg_stream_copy_and_context_manifest_is_honest(
         assert "-c:v" not in command
         assert "-vf" not in command
     assert commands[-1][commands[-1].index("-f") + 1] == "concat"
+    segment_receipts = sorted((tmp_path / "output" / "segments").glob("*.receipt.json"))
+    context_receipts = sorted((tmp_path / "output" / "contexts").glob("*.receipt.json"))
+    assert len(segment_receipts) == len(plan.storage_segments)
+    assert len(context_receipts) == 1
+    assert all(
+        path.is_file() and not path.is_symlink() for path in segment_receipts + context_receipts
+    )
+
+    replayed_storage = materializer.materialize_storage_segments(
+        plan=plan,
+        source_path=source,
+        output_root=tmp_path / "output",
+    )
+    replayed_context = materializer.materialize_reasoning_context(
+        context=plan.reasoning_contexts[-1],
+        camera_id=CameraId.CAM_03,
+        storage_segments=replayed_storage,
+        output_root=tmp_path / "output",
+    )
+    assert len(commands) == 3
+    assert replayed_context.content_exact_sha256 == context_media.content_exact_sha256
     selected = perception_context.cameras[CameraId.CAM_03]
     assert selected.available is True
     assert selected.selected_for_inference is True
@@ -220,4 +243,156 @@ def test_verified_materializer_rejects_packet_preroll_and_uses_output_seek(
             source_path=source,
             segment=plan.storage_segments[0],
             output_root=tmp_path / "bad",
+        )
+
+
+def test_materializer_rejects_missing_or_tampered_receipts(tmp_path: Path) -> None:
+    source = tmp_path / "camera.mp4"
+    source.write_bytes(b"codec-byte-source")
+    plan = plan_mage_stream(
+        recording=_recording(source, start_ns=0, end_ns=8_000_000_000),
+        policy=MageStreamPolicy(),
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def fake_ffmpeg(command: tuple[str, ...]) -> FfmpegCommandResult:
+        commands.append(command)
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"stream-copy")
+        return FfmpegCommandResult(returncode=0)
+
+    materializer = MageStreamMaterializer(command_runner=fake_ffmpeg)
+    output_root = tmp_path / "output"
+    materialized = materializer.materialize_storage_segment(
+        plan=plan,
+        source_path=source,
+        segment=plan.storage_segments[0],
+        output_root=output_root,
+    )
+    receipt_path = materialized.durable_path.with_name(
+        materialized.durable_path.name + ".receipt.json"
+    )
+    receipt_path.unlink()
+    with pytest.raises(MageStreamMaterializationError, match="receipt is missing"):
+        materializer.materialize_storage_segment(
+            plan=plan,
+            source_path=source,
+            segment=plan.storage_segments[0],
+            output_root=output_root,
+        )
+
+    materializer.materialize_storage_segment(
+        plan=plan,
+        source_path=source,
+        segment=plan.storage_segments[0],
+        output_root=tmp_path / "tampered",
+    )
+    tampered = next((tmp_path / "tampered" / "segments").glob("*.mp4"))
+    tampered.write_bytes(b"tampered")
+    with pytest.raises(MageStreamMaterializationError, match="bytes do not match"):
+        materializer.materialize_storage_segment(
+            plan=plan,
+            source_path=source,
+            segment=plan.storage_segments[0],
+            output_root=tmp_path / "tampered",
+        )
+
+
+def test_materializer_rejects_receipt_lineage_mismatch(tmp_path: Path) -> None:
+    source = tmp_path / "camera.mp4"
+    source.write_bytes(b"codec-byte-source")
+    plan = plan_mage_stream(
+        recording=_recording(source, start_ns=0, end_ns=8_000_000_000),
+        policy=MageStreamPolicy(),
+    )
+
+    def fake_ffmpeg(command: tuple[str, ...]) -> FfmpegCommandResult:
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"stream-copy")
+        return FfmpegCommandResult(returncode=0)
+
+    materializer = MageStreamMaterializer(command_runner=fake_ffmpeg)
+    output_root = tmp_path / "output"
+    materialized = materializer.materialize_storage_segment(
+        plan=plan,
+        source_path=source,
+        segment=plan.storage_segments[0],
+        output_root=output_root,
+    )
+    receipt_path = materialized.durable_path.with_name(
+        materialized.durable_path.name + ".receipt.json"
+    )
+    document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    document["recording_exact_sha256"] = hashlib.sha256(b"different-source").hexdigest()
+    receipt_path.write_bytes(canonical_json_bytes(document) + b"\n")
+    with pytest.raises(MageStreamMaterializationError, match="lineage mismatch"):
+        materializer.materialize_storage_segment(
+            plan=plan,
+            source_path=source,
+            segment=plan.storage_segments[0],
+            output_root=output_root,
+        )
+
+
+def test_materializer_rejects_missing_or_tampered_context_receipts(tmp_path: Path) -> None:
+    source = tmp_path / "camera.mp4"
+    source.write_bytes(b"codec-byte-source")
+    plan = plan_mage_stream(
+        recording=_recording(source, start_ns=0, end_ns=16_000_000_000),
+        policy=MageStreamPolicy(
+            scan_segment_duration_ns=8_000_000_000,
+            reasoning_horizon_duration_ns=16_000_000_000,
+        ),
+    )
+
+    def fake_ffmpeg(command: tuple[str, ...]) -> FfmpegCommandResult:
+        destination = Path(command[-1])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(f"output-{destination.parent.name}".encode())
+        return FfmpegCommandResult(returncode=0)
+
+    materializer = MageStreamMaterializer(command_runner=fake_ffmpeg)
+    output_root = tmp_path / "output"
+    storage = materializer.materialize_storage_segments(
+        plan=plan,
+        source_path=source,
+        output_root=output_root,
+    )
+    context = materializer.materialize_reasoning_context(
+        context=plan.reasoning_contexts[-1],
+        camera_id=CameraId.CAM_03,
+        storage_segments=storage,
+        output_root=output_root,
+    )
+    receipt_path = context.durable_path.with_name(context.durable_path.name + ".receipt.json")
+    receipt_path.unlink()
+    with pytest.raises(MageStreamMaterializationError, match="receipt is missing"):
+        materializer.materialize_reasoning_context(
+            context=plan.reasoning_contexts[-1],
+            camera_id=CameraId.CAM_03,
+            storage_segments=storage,
+            output_root=output_root,
+        )
+
+    context_root = tmp_path / "tampered"
+    storage_tampered = materializer.materialize_storage_segments(
+        plan=plan,
+        source_path=source,
+        output_root=context_root,
+    )
+    tampered_context = materializer.materialize_reasoning_context(
+        context=plan.reasoning_contexts[-1],
+        camera_id=CameraId.CAM_03,
+        storage_segments=storage_tampered,
+        output_root=context_root,
+    )
+    tampered_context.durable_path.write_bytes(b"tampered-context")
+    with pytest.raises(MageStreamMaterializationError, match="bytes do not match"):
+        materializer.materialize_reasoning_context(
+            context=plan.reasoning_contexts[-1],
+            camera_id=CameraId.CAM_03,
+            storage_segments=storage_tampered,
+            output_root=context_root,
         )

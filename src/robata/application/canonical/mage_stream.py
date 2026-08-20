@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -21,7 +24,7 @@ from typing import Final
 
 from robata.contracts.cameras import CAMERA_IDS, CameraId, SixCameraMap
 from robata.contracts.common import NanosecondInterval
-from robata.contracts.hashing import semantic_sha256
+from robata.contracts.hashing import canonical_json_bytes, semantic_sha256
 from robata.contracts.perception_stream import (
     CameraAbsenceReason,
     CameraContextBinding,
@@ -39,6 +42,8 @@ DEFAULT_REASONING_HORIZON_DURATION_NS: Final = 8_000_000_000
 DEFAULT_KEYFRAME_ALIGNMENT_TOLERANCE_NS: Final = 50_000_000
 NANOSECONDS_PER_SECOND: Final = 1_000_000_000
 MATERIALIZATION_END_EXCLUSION_NS: Final = 1_000
+MAGE_STREAM_MATERIALIZATION_RECEIPT_VERSION: Final = "mage-stream-materialization-receipt-v1"
+_MATERIALIZATION_RECEIPT_SUFFIX: Final = ".receipt.json"
 _SHA256_HEX_LENGTH: Final = 64
 
 
@@ -620,10 +625,16 @@ class MageMaterializedStorageSegment:
         if not isinstance(self.segment, MageStorageSegment):
             raise TypeError("segment must be MageStorageSegment")
         _require_sha256(self.source_exact_sha256, "source_exact_sha256")
+        if self.source_exact_sha256 != self.segment.recording_exact_sha256:
+            raise MageStreamMaterializationError(
+                "materialized segment source identity does not match segment lineage"
+            )
         _require_sha256(self.content_exact_sha256, "content_exact_sha256")
         _require_positive_int(self.byte_count, "byte_count")
-        if not self.durable_path.is_file():
-            raise MageStreamMaterializationError("materialized segment durable_path must be a file")
+        if self.durable_path.is_symlink() or not self.durable_path.is_file():
+            raise MageStreamMaterializationError(
+                "materialized segment durable_path must be a regular non-symlink file"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,8 +660,10 @@ class MageMaterializedReasoningContext:
             raise MageStreamMaterializationError("materialized context requires component segments")
         for digest in self.component_segment_exact_sha256_values:
             _require_sha256(digest, "component_segment_exact_sha256")
-        if not self.durable_path.is_file():
-            raise MageStreamMaterializationError("materialized context durable_path must be a file")
+        if self.durable_path.is_symlink() or not self.durable_path.is_file():
+            raise MageStreamMaterializationError(
+                "materialized context durable_path must be a regular non-symlink file"
+            )
 
 
 class MageStreamMaterializer:
@@ -710,8 +723,22 @@ class MageStreamMaterializer:
         destination = segment_root / (
             f"{segment.ordinal:06d}-{segment.segment_semantic_sha256}{extension}"
         )
+        receipt_path = _materialization_receipt_path(destination)
+        _reject_symlink_path(destination, "storage segment output")
+        _reject_symlink_path(receipt_path, "storage segment receipt")
         command: tuple[str, ...] | None = None
-        if not destination.exists():
+        if destination.exists():
+            content_digest, byte_count = _validate_storage_materialization_receipt(
+                destination=destination,
+                receipt_path=receipt_path,
+                segment=segment,
+                source_exact_sha256=source_digest,
+            )
+        else:
+            if receipt_path.exists():
+                raise MageStreamMaterializationError(
+                    "storage segment receipt exists without its materialized output"
+                )
             command = self._storage_segment_command(
                 source_path=source,
                 recording_interval=plan.recording.interval,
@@ -719,15 +746,25 @@ class MageStreamMaterializer:
                 destination=destination,
             )
             self._run_checked(command)
-        content_digest, byte_count = _require_nonempty_file_hash(
-            destination,
-            "ffmpeg did not produce a nonempty storage segment",
-        )
+            content_digest, byte_count = _require_nonempty_file_hash(
+                destination,
+                "ffmpeg did not produce a nonempty storage segment",
+            )
         if self._verify_packet_boundaries:
             self._verify_materialized_storage_segment(
                 plan=plan,
                 segment=segment,
                 destination=destination,
+            )
+        if command is not None:
+            _write_materialization_receipt(
+                receipt_path,
+                _storage_materialization_receipt(
+                    segment=segment,
+                    source_exact_sha256=source_digest,
+                    content_exact_sha256=content_digest,
+                    byte_count=byte_count,
+                ),
             )
         return MageMaterializedStorageSegment(
             segment=segment,
@@ -792,8 +829,23 @@ class MageStreamMaterializer:
             f"{context.focus_segment_ordinal:06d}-{context.context_semantic_sha256}{extension}"
         )
         component_hashes = tuple(item.content_exact_sha256 for item in selected)
+        receipt_path = _materialization_receipt_path(destination)
+        _reject_symlink_path(destination, "reasoning context output")
+        _reject_symlink_path(receipt_path, "reasoning context receipt")
         command: tuple[str, ...] | None = None
-        if not destination.exists():
+        if destination.exists():
+            content_digest, byte_count = _validate_context_materialization_receipt(
+                destination=destination,
+                receipt_path=receipt_path,
+                context=context,
+                camera_id=camera_id,
+                component_hashes=component_hashes,
+            )
+        else:
+            if receipt_path.exists():
+                raise MageStreamMaterializationError(
+                    "reasoning context receipt exists without its materialized output"
+                )
             concat_manifest = context_root / f".{context.context_semantic_sha256}.ffconcat"
             try:
                 concat_manifest.write_text(
@@ -813,10 +865,20 @@ class MageStreamMaterializer:
                     raise MageStreamMaterializationError(
                         "could not remove temporary ffmpeg concat manifest"
                     ) from error
-        content_digest, byte_count = _require_nonempty_file_hash(
-            destination,
-            "ffmpeg did not produce a nonempty reasoning context",
-        )
+            content_digest, byte_count = _require_nonempty_file_hash(
+                destination,
+                "ffmpeg did not produce a nonempty reasoning context",
+            )
+            _write_materialization_receipt(
+                receipt_path,
+                _context_materialization_receipt(
+                    context=context,
+                    camera_id=camera_id,
+                    component_hashes=component_hashes,
+                    content_exact_sha256=content_digest,
+                    byte_count=byte_count,
+                ),
+            )
         return MageMaterializedReasoningContext(
             context=context,
             camera_id=camera_id,
@@ -1218,6 +1280,7 @@ def _select_materialized_segments(
             raise MageStreamMaterializationError(
                 "materialized storage segment does not match lineage"
             )
+        _validate_materialized_storage_item(selected_item)
         selected.append(selected_item)
     return tuple(selected)
 
@@ -1270,13 +1333,266 @@ def _require_existing_file(path: Path, field: str) -> Path:
     return resolved
 
 
+def _reject_symlink_path(path: Path, field: str) -> None:
+    if path.is_symlink():
+        raise MageStreamMaterializationError(f"{field} must not be a symbolic link: {path}")
+
+
+def _materialization_receipt_path(destination: Path) -> Path:
+    return destination.with_name(destination.name + _MATERIALIZATION_RECEIPT_SUFFIX)
+
+
 def _require_nonempty_file_hash(path: Path, detail: str) -> tuple[str, int]:
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         raise MageStreamMaterializationError(detail)
     digest, byte_count = exact_file_sha256(path)
     if byte_count <= 0:
         raise MageStreamMaterializationError(detail)
     return digest, byte_count
+
+
+def _storage_materialization_receipt(
+    *,
+    segment: MageStorageSegment,
+    source_exact_sha256: str,
+    content_exact_sha256: str,
+    byte_count: int,
+) -> dict[str, object]:
+    return {
+        "receipt_version": MAGE_STREAM_MATERIALIZATION_RECEIPT_VERSION,
+        "kind": "storage_segment",
+        "recording_key": segment.recording_key,
+        "recording_exact_sha256": segment.recording_exact_sha256,
+        "segment_policy_version": segment.segment_policy_version,
+        "segment_semantic_sha256": segment.segment_semantic_sha256,
+        "segment_key": segment.segment_key,
+        "ordinal": segment.ordinal,
+        "interval": segment.interval.as_projection(),
+        "source_exact_sha256": source_exact_sha256,
+        "output_exact_sha256": content_exact_sha256,
+        "output_byte_count": byte_count,
+    }
+
+
+def _context_materialization_receipt(
+    *,
+    context: MageReasoningContext,
+    camera_id: CameraId,
+    component_hashes: tuple[str, ...],
+    content_exact_sha256: str,
+    byte_count: int,
+) -> dict[str, object]:
+    focus = context.ordered_segments[-1]
+    return {
+        "receipt_version": MAGE_STREAM_MATERIALIZATION_RECEIPT_VERSION,
+        "kind": "reasoning_context",
+        "recording_key": focus.recording_key,
+        "recording_exact_sha256": focus.recording_exact_sha256,
+        "context_policy_version": context.context_policy_version,
+        "context_semantic_sha256": context.context_semantic_sha256,
+        "context_key": context.context_key,
+        "focus_segment_ordinal": context.focus_segment_ordinal,
+        "reasoning_horizon": context.reasoning_horizon.as_projection(),
+        "materialized_interval": context.materialized_interval.as_projection(),
+        "camera_id": camera_id.value,
+        "component_segment_exact_sha256_values": list(component_hashes),
+        "output_exact_sha256": content_exact_sha256,
+        "output_byte_count": byte_count,
+    }
+
+
+def _write_materialization_receipt(path: Path, projection: dict[str, object]) -> None:
+    if not isinstance(path, Path):
+        raise MageStreamMaterializationError("materialization receipt path must be pathlib.Path")
+    _reject_symlink_path(path, "materialization receipt")
+    try:
+        payload = canonical_json_bytes(projection) + b"\n"
+    except (TypeError, ValueError) as error:
+        raise MageStreamMaterializationError(
+            "materialization receipt contains non-canonical values"
+        ) from error
+    temporary_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".r-",
+            suffix=".t",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    except OSError as error:
+        raise MageStreamMaterializationError(
+            f"could not atomically publish materialization receipt: {path}"
+        ) from error
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
+
+
+def _strict_receipt_json(path: Path) -> dict[str, object]:
+    _reject_symlink_path(path, "materialization receipt")
+    if not path.is_file():
+        raise MageStreamMaterializationError(f"materialization receipt is missing: {path}")
+    try:
+        raw = path.read_bytes()
+        document = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_receipt_object_pairs,
+            parse_constant=_reject_receipt_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise MageStreamMaterializationError(
+            f"materialization receipt is not strict canonical JSON: {path}"
+        ) from error
+    if not isinstance(document, dict):
+        raise MageStreamMaterializationError("materialization receipt root must be an object")
+    try:
+        expected_bytes = canonical_json_bytes(document) + b"\n"
+    except (TypeError, ValueError) as error:
+        raise MageStreamMaterializationError(
+            "materialization receipt is not canonical JSON"
+        ) from error
+    if raw != expected_bytes:
+        raise MageStreamMaterializationError("materialization receipt bytes are not canonical")
+    return document
+
+
+def _receipt_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate materialization receipt key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_receipt_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _strict_value_equal(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _strict_value_equal(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(actual, list) and isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _strict_value_equal(left, right) for left, right in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _validate_storage_materialization_receipt(
+    *,
+    destination: Path,
+    receipt_path: Path,
+    segment: MageStorageSegment,
+    source_exact_sha256: str,
+) -> tuple[str, int]:
+    expected = _storage_materialization_receipt(
+        segment=segment,
+        source_exact_sha256=source_exact_sha256,
+        content_exact_sha256="0" * _SHA256_HEX_LENGTH,
+        byte_count=1,
+    )
+    expected.pop("output_exact_sha256")
+    expected.pop("output_byte_count")
+    document = _strict_receipt_json(receipt_path)
+    if set(document) != set(expected) | {"output_exact_sha256", "output_byte_count"}:
+        raise MageStreamMaterializationError(
+            "materialization receipt fields do not match storage-segment v1"
+        )
+    for field, expected_value in expected.items():
+        if not _strict_value_equal(document.get(field), expected_value):
+            raise MageStreamMaterializationError(
+                f"storage segment receipt lineage mismatch for {field}"
+            )
+    content_digest, byte_count = _require_nonempty_file_hash(
+        destination,
+        "materialized storage segment is missing or empty",
+    )
+    if document.get("output_exact_sha256") != content_digest:
+        raise MageStreamMaterializationError(
+            "materialized storage segment bytes do not match its receipt"
+        )
+    if (
+        type(document.get("output_byte_count")) is not int
+        or document["output_byte_count"] != byte_count
+    ):
+        raise MageStreamMaterializationError(
+            "materialized storage segment byte count does not match its receipt"
+        )
+    return content_digest, byte_count
+
+
+def _validate_context_materialization_receipt(
+    *,
+    destination: Path,
+    receipt_path: Path,
+    context: MageReasoningContext,
+    camera_id: CameraId,
+    component_hashes: tuple[str, ...],
+) -> tuple[str, int]:
+    expected = _context_materialization_receipt(
+        context=context,
+        camera_id=camera_id,
+        component_hashes=component_hashes,
+        content_exact_sha256="0" * _SHA256_HEX_LENGTH,
+        byte_count=1,
+    )
+    expected.pop("output_exact_sha256")
+    expected.pop("output_byte_count")
+    document = _strict_receipt_json(receipt_path)
+    if set(document) != set(expected) | {"output_exact_sha256", "output_byte_count"}:
+        raise MageStreamMaterializationError(
+            "materialization receipt fields do not match reasoning-context v1"
+        )
+    for field, expected_value in expected.items():
+        if not _strict_value_equal(document.get(field), expected_value):
+            raise MageStreamMaterializationError(
+                f"reasoning context receipt lineage mismatch for {field}"
+            )
+    content_digest, byte_count = _require_nonempty_file_hash(
+        destination,
+        "materialized reasoning context is missing or empty",
+    )
+    if document.get("output_exact_sha256") != content_digest:
+        raise MageStreamMaterializationError(
+            "materialized reasoning context bytes do not match its receipt"
+        )
+    if (
+        type(document.get("output_byte_count")) is not int
+        or document["output_byte_count"] != byte_count
+    ):
+        raise MageStreamMaterializationError(
+            "materialized reasoning context byte count does not match its receipt"
+        )
+    return content_digest, byte_count
+
+
+def _validate_materialized_storage_item(item: MageMaterializedStorageSegment) -> None:
+    if item.source_exact_sha256 != item.segment.recording_exact_sha256:
+        raise MageStreamMaterializationError(
+            "materialized storage segment source identity does not match segment lineage"
+        )
+    digest, byte_count = _validate_storage_materialization_receipt(
+        destination=item.durable_path,
+        receipt_path=_materialization_receipt_path(item.durable_path),
+        segment=item.segment,
+        source_exact_sha256=item.source_exact_sha256,
+    )
+    if digest != item.content_exact_sha256 or byte_count != item.byte_count:
+        raise MageStreamMaterializationError(
+            "materialized storage segment metadata does not match its receipt"
+        )
 
 
 def _require_nonempty_text(value: object, field: str) -> None:
@@ -1308,6 +1624,7 @@ __all__ = [
     "DEFAULT_REASONING_HORIZON_DURATION_NS",
     "DEFAULT_SCAN_SEGMENT_DURATION_NS",
     "MAGE_STREAM_CONTEXT_KEY_NAMESPACE",
+    "MAGE_STREAM_MATERIALIZATION_RECEIPT_VERSION",
     "MAGE_STREAM_PLAN_KEY_NAMESPACE",
     "MAGE_STREAM_POLICY_VERSION",
     "MAGE_STREAM_SEGMENT_KEY_NAMESPACE",
