@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ class LocalHuggingFaceRuntimeError(RuntimeError):
 
 LOCAL_HF_MAX_BATCH_REQUESTS: Final = 8
 LOCAL_HF_MAX_IMAGES_PER_REQUEST: Final = 6
+LOCAL_HF_MAX_VIDEO_FRAMES: Final = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,49 @@ class LocalHfGenerationObservation:
     generation_seconds: float
     gpu_peak_allocated_bytes: int
     output_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalHfVideoGenerationRequest:
+    """Bounded complete-event input for Qwen3-VL's native ``video`` path.
+
+    This is an internal local/benchmark contract. Frame bytes remain ordered and
+    the source timeline is explicit so the processor can construct
+    ``pixel_values_videos`` and ``video_grid_thw`` instead of treating frames as
+    unrelated image messages.
+    """
+
+    video_payloads: tuple[bytes, ...]
+    frame_indices: tuple[int, ...]
+    frame_timestamps_seconds: tuple[float, ...]
+    source_fps: float
+    total_num_frames: int
+    width: int
+    height: int
+    duration_seconds: float | None
+    prompt: str
+    max_new_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class LocalHfVideoGenerationObservation:
+    """Generation output plus native-video evidence needed for replay/audit."""
+
+    rendered_frame_sizes: tuple[tuple[int, int], ...]
+    frame_indices: tuple[int, ...]
+    frame_timestamps_seconds: tuple[float, ...]
+    source_fps: float
+    total_num_frames: int
+    width: int
+    height: int
+    duration_seconds: float | None
+    prompt_tokens: int
+    output_tokens: int
+    generation_seconds: float
+    gpu_peak_allocated_bytes: int
+    output_text: str
+    frame_sha256: tuple[str, ...] = ()
+    input_mode: str = "native_video"
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +296,135 @@ class LocalHuggingFaceVisionRuntime:
                     generation_seconds=generation_seconds,
                     gpu_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
                     output_text=output_text,
+                )
+            finally:
+                for image in images:
+                    close = getattr(image, "close", None)
+                    if callable(close):
+                        close()
+
+    def generate_video(
+        self,
+        *,
+        request: LocalHfVideoGenerationRequest,
+    ) -> LocalHfVideoGenerationObservation:
+        """Generate one bounded complete event through Qwen's native video path.
+
+        Unlike :meth:`generate`, this method emits one ``video`` multimodal token
+        and passes source ``fps``/``frames_indices`` metadata to the Qwen3-VL
+        processor. It intentionally does not expose a streaming/chunked interface:
+        callers must materialize the complete bounded action window first.
+        """
+
+        _validate_video_request(request)
+        with self._lock:
+            load = self.load()
+            del load
+            assert self._torch is not None
+            assert self._processor is not None
+            assert self._model is not None
+            assert self._image_module is not None
+            torch = self._torch
+            processor = self._processor
+            model = self._model
+            images: list[Any] = []
+            rendered_sizes: list[tuple[int, int]] = []
+            try:
+                for index, payload in enumerate(request.video_payloads):
+                    try:
+                        with self._image_module.open(BytesIO(payload)) as source_image:
+                            image = source_image.convert("RGB")
+                    except (OSError, ValueError) as error:
+                        raise LocalHuggingFaceRuntimeError(
+                            f"video frame payload {index} is not decodable"
+                        ) from error
+                    image.thumbnail((self._max_image_side, self._max_image_side))
+                    images.append(image)
+                    rendered_sizes.append((int(image.width), int(image.height)))
+
+                content: list[dict[str, object]] = [
+                    {"type": "video", "video": images},
+                    {"type": "text", "text": request.prompt},
+                ]
+                text = processor.apply_chat_template(
+                    [{"role": "user", "content": content}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                metadata: dict[str, Any] = {
+                    "total_num_frames": request.total_num_frames,
+                    "fps": float(request.source_fps),
+                    "width": request.width,
+                    "height": request.height,
+                    "frames_indices": list(request.frame_indices),
+                }
+                if request.duration_seconds is not None:
+                    metadata["duration"] = float(request.duration_seconds)
+                inputs = processor(
+                    text=[text],
+                    videos=[images],
+                    video_metadata=[metadata],
+                    do_sample_frames=False,
+                    return_metadata=True,
+                    return_tensors="pt",
+                )
+                # ``video_metadata`` is processor evidence, not a model forward
+                # argument. Keep it out of generate while retaining it in the
+                # request/observation lineage above.
+                model_inputs = {
+                    key: value for key, value in inputs.items() if key != "video_metadata"
+                }
+                if "pixel_values_videos" not in model_inputs:
+                    raise LocalHuggingFaceRuntimeError(
+                        "native video processor did not return pixel_values_videos"
+                    )
+                if "video_grid_thw" not in model_inputs:
+                    raise LocalHuggingFaceRuntimeError(
+                        "native video processor did not return video_grid_thw"
+                    )
+                device = next(model.parameters()).device
+                model_inputs = {
+                    key: value.to(device)
+                    if callable(getattr(value, "to", None))
+                    else value
+                    for key, value in model_inputs.items()
+                }
+                prompt_tokens = int(model_inputs["input_ids"].shape[1])
+                torch.cuda.reset_peak_memory_stats()
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    generated = model.generate(
+                        **model_inputs,
+                        max_new_tokens=request.max_new_tokens,
+                        do_sample=False,
+                        use_cache=True,
+                    )
+                generation_seconds = float(time.perf_counter() - started)
+                generated_only = generated[:, prompt_tokens:]
+                output_tokens = int(generated_only.shape[1])
+                output_text = str(
+                    processor.batch_decode(generated_only, skip_special_tokens=True)[0]
+                ).strip()
+                if not output_text:
+                    raise LocalHuggingFaceRuntimeError("local model returned an empty output")
+                return LocalHfVideoGenerationObservation(
+                    rendered_frame_sizes=tuple(rendered_sizes),
+                    frame_indices=request.frame_indices,
+                    frame_timestamps_seconds=request.frame_timestamps_seconds,
+                    source_fps=request.source_fps,
+                    total_num_frames=request.total_num_frames,
+                    width=request.width,
+                    height=request.height,
+                    duration_seconds=request.duration_seconds,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    generation_seconds=generation_seconds,
+                    gpu_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
+                    output_text=output_text,
+                    frame_sha256=tuple(
+                        hashlib.sha256(payload).hexdigest()
+                        for payload in request.video_payloads
+                    ),
                 )
             finally:
                 for image in images:
@@ -539,6 +714,89 @@ def _pad_token_id(*, processor: Any, model: Any) -> int | None:
     return None
 
 
+def _validate_video_request(request: LocalHfVideoGenerationRequest) -> None:
+    if not isinstance(request, LocalHfVideoGenerationRequest):
+        raise LocalHuggingFaceRuntimeError("request must be LocalHfVideoGenerationRequest")
+    count = len(request.video_payloads)
+    if count <= 0:
+        raise LocalHuggingFaceRuntimeError("native video requires at least one frame")
+    if count > LOCAL_HF_MAX_VIDEO_FRAMES:
+        raise LocalHuggingFaceRuntimeError(
+            f"native video frame count must not exceed {LOCAL_HF_MAX_VIDEO_FRAMES}"
+        )
+    if len(request.frame_indices) != count:
+        raise LocalHuggingFaceRuntimeError("frame_indices count must match video_payloads")
+    if len(request.frame_timestamps_seconds) != count:
+        raise LocalHuggingFaceRuntimeError(
+            "frame_timestamps_seconds count must match video_payloads"
+        )
+    for index, payload in enumerate(request.video_payloads):
+        if not isinstance(payload, bytes) or not payload:
+            raise LocalHuggingFaceRuntimeError(
+                f"native video frame payload {index} must be nonempty bytes"
+            )
+    if isinstance(request.total_num_frames, bool) or not isinstance(request.total_num_frames, int):
+        raise LocalHuggingFaceRuntimeError("total_num_frames must be an integer")
+    if request.total_num_frames <= 0:
+        raise LocalHuggingFaceRuntimeError("total_num_frames must be positive")
+    if isinstance(request.width, bool) or not isinstance(request.width, int) or request.width <= 0:
+        raise LocalHuggingFaceRuntimeError("width must be a positive integer")
+    if (
+        isinstance(request.height, bool)
+        or not isinstance(request.height, int)
+        or request.height <= 0
+    ):
+        raise LocalHuggingFaceRuntimeError("height must be a positive integer")
+    if isinstance(request.source_fps, bool) or not isinstance(request.source_fps, (int, float)):
+        raise LocalHuggingFaceRuntimeError("source_fps must be a finite positive number")
+    if not math.isfinite(float(request.source_fps)) or float(request.source_fps) <= 0:
+        raise LocalHuggingFaceRuntimeError("source_fps must be a finite positive number")
+    previous_index = -1
+    previous_timestamp = -1.0
+    tolerance = max(1e-3, 0.5 / float(request.source_fps))
+    for index, (frame_index, timestamp) in enumerate(
+        zip(request.frame_indices, request.frame_timestamps_seconds, strict=True)
+    ):
+        if isinstance(frame_index, bool) or not isinstance(frame_index, int):
+            raise LocalHuggingFaceRuntimeError(f"frame index {index} must be an integer")
+        if frame_index < 0 or frame_index >= request.total_num_frames:
+            raise LocalHuggingFaceRuntimeError(f"frame index {index} is outside source bounds")
+        if frame_index <= previous_index:
+            raise LocalHuggingFaceRuntimeError("frame_indices must be strictly increasing")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise LocalHuggingFaceRuntimeError(
+                f"frame timestamp {index} must be a finite non-negative number"
+            )
+        if not math.isfinite(float(timestamp)) or float(timestamp) < 0:
+            raise LocalHuggingFaceRuntimeError(
+                f"frame timestamp {index} must be a finite non-negative number"
+            )
+        if float(timestamp) <= previous_timestamp:
+            raise LocalHuggingFaceRuntimeError(
+                "frame_timestamps_seconds must be strictly increasing"
+            )
+        expected = frame_index / float(request.source_fps)
+        if abs(float(timestamp) - expected) > tolerance:
+            raise LocalHuggingFaceRuntimeError(
+                f"frame timestamp {index} does not match source fps/frame index"
+            )
+        previous_index = frame_index
+        previous_timestamp = float(timestamp)
+    if request.duration_seconds is not None:
+        if isinstance(request.duration_seconds, bool) or not isinstance(
+            request.duration_seconds, (int, float)
+        ):
+            raise LocalHuggingFaceRuntimeError("duration_seconds must be positive when provided")
+        if (
+            not math.isfinite(float(request.duration_seconds))
+            or float(request.duration_seconds) <= 0
+        ):
+            raise LocalHuggingFaceRuntimeError("duration_seconds must be positive when provided")
+    if not isinstance(request.prompt, str) or not request.prompt.strip():
+        raise LocalHuggingFaceRuntimeError("prompt must be nonempty")
+    _positive_int(request.max_new_tokens, "max_new_tokens")
+
+
 def _positive_int(value: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise LocalHuggingFaceRuntimeError(f"{field} must be a positive integer")
@@ -548,11 +806,14 @@ def _positive_int(value: int, field: str) -> int:
 __all__ = [
     "LOCAL_HF_MAX_BATCH_REQUESTS",
     "LOCAL_HF_MAX_IMAGES_PER_REQUEST",
+    "LOCAL_HF_MAX_VIDEO_FRAMES",
     "LocalHfBatchGenerationObservation",
     "LocalHfBatchGenerationRequest",
     "LocalHfBatchMemberObservation",
     "LocalHfGenerationObservation",
     "LocalHfLoadObservation",
+    "LocalHfVideoGenerationObservation",
+    "LocalHfVideoGenerationRequest",
     "LocalHuggingFaceRuntimeError",
     "LocalHuggingFaceVisionRuntime",
 ]

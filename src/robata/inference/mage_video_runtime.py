@@ -1,4 +1,4 @@
-"""Native Mage video/codec inference runtime.
+﻿"""Native Mage video/codec inference runtime.
 
 The runtime keeps model weights resident, but deliberately never retains or
 persists hidden, KV, or recurrent decoder state.  Those values may exist only
@@ -25,6 +25,12 @@ from threading import Condition, Lock, RLock
 from typing import Any, Final, cast
 
 from robata.contracts.hashing import semantic_sha256
+from robata.inference.mage_native_codec import (
+    MageCodecDependencyReport,
+    MageNativeCodecError,
+    inspect_mage_codec_dependencies,
+    require_mage_codec_dependencies,
+)
 from robata.inference.device_execution_guard import (
     DeviceExecutionGuard,
     DeviceExecutionGuardBusy,
@@ -1331,59 +1337,12 @@ def require_mage_video_codec_dependencies(
     codec_config: Mapping[str, Any],
     model_directory: Path,
 ) -> None:
-    """Fail fast with an engine-specific installation error.
+    """Fail closed before model load using the shared native codec adapter."""
 
-    The native processor will execute the selected codec preprocessing engine
-    later.  Checking its executable/package entrypoints here makes missing
-    optional codec dependencies clear before model loading or generation.
-    """
-
-    engine = codec_config.get("engine")
-    if engine in {"hevc", "cv-preinfer"}:
-        executable = os.environ.get("CV_PREINFER_BIN", "cv-preinfer")
-        executable_path = Path(executable).expanduser()
-        if shutil.which(executable) is None and not executable_path.is_file():
-            raise MageVideoCodecDependencyError(
-                "Mage traditional codec preprocessing requires the 'cv-preinfer' executable "
-                "provided by codec-video-prep. Install that dependency and put it on PATH, "
-                "or set CV_PREINFER_BIN to the executable path."
-            )
-        return
-    if engine == "dcvc-rt":
-        dcvc = codec_config.get("dcvc")
-        if not isinstance(dcvc, Mapping):
-            raise MageVideoCodecDependencyError(
-                "Mage neural codec preprocessing requires a mapping at codec_config['dcvc']"
-            )
-        package_directory = Path(
-            str(dcvc.get("pkg_dir") or (Path(model_directory) / "neural_codec"))
-        ).expanduser()
-        generator = package_directory / "dcvc_readiness_gen.py"
-        source_directory = package_directory / "DCVC" / "src"
-        intra_checkpoint = Path(
-            str(dcvc.get("intra_ckpt") or (package_directory / "dcvc_rt_intra.tar"))
-        ).expanduser()
-        inter_checkpoint = Path(
-            str(dcvc.get("inter_ckpt") or (package_directory / "dcvc_rt_inter.tar"))
-        ).expanduser()
-        missing: list[str] = []
-        if not generator.is_file():
-            missing.append(str(generator))
-        if not source_directory.is_dir():
-            missing.append(str(source_directory))
-        if not intra_checkpoint.is_file():
-            missing.append(str(intra_checkpoint))
-        if not inter_checkpoint.is_file():
-            missing.append(str(inter_checkpoint))
-        if missing:
-            raise MageVideoCodecDependencyError(
-                "Mage neural codec preprocessing is unavailable; missing " + ", ".join(missing)
-            )
-        return
-    raise MageVideoCodecDependencyError(
-        "codec_config.engine must be 'hevc', 'cv-preinfer', or 'dcvc-rt'"
-    )
-
+    try:
+        require_mage_codec_dependencies(codec_config, model_directory=model_directory)
+    except MageNativeCodecError as error:
+        raise MageVideoCodecDependencyError(str(error)) from error
 
 def _normalise_video_paths(video_paths: Sequence[Path | str]) -> tuple[Path, ...]:
     if isinstance(video_paths, (str, bytes)) or not isinstance(video_paths, Sequence):
@@ -1531,3 +1490,8 @@ __all__ = [
     "mage_video_codec_config_sha256",
     "require_mage_video_codec_dependencies",
 ]
+
+
+
+
+

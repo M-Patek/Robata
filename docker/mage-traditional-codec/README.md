@@ -71,6 +71,24 @@ docker run --rm --network none --platform linux/amd64 `
   --receipt /output/container-receipt.json
 ```
 
+## Windows/developer-host bridge
+
+The pinned image can be invoked from a host where `codec-video-prep` is not installed
+locally. The bridge is an explicit adapter, not a frame or neural-codec fallback:
+
+```powershell
+$env:CV_PREINFER_BIN = (Resolve-Path scripts\mage_cv_preinfer_host.cmd)
+$env:MAGE_CV_PREINFER_IMAGE = "registry.example/robata/mage-traditional-codec@sha256:<64-lowercase-hex>"
+$env:MAGE_CV_PREINFER_BACKEND = "docker"
+```
+
+The adapter requires a locally available, digest-pinned image and runs with
+`--pull=never`, `--network none`, and `--platform linux/amd64`. It validates
+`meta.json`, `src_patch_position.npy`, and canvas output before returning to Mage.
+If Docker, the image, or the selected binary is unavailable, it exits non-zero and
+leaves no model-loader output; it never silently switches to frames or another
+backend. On Linux/macOS use `scripts/mage_cv_preinfer_host.sh`.
+
 ## Evidence boundary
 
 The receipt records exact source/config/toolchain identities, the invoked command,

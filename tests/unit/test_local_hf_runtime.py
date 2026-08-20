@@ -11,9 +11,11 @@ import pytest
 
 from robata.inference.local_hf_runtime import (
     LOCAL_HF_MAX_BATCH_REQUESTS,
+    LOCAL_HF_MAX_VIDEO_FRAMES,
     LocalHfBatchGenerationRequest,
     LocalHfGenerationObservation,
     LocalHfLoadObservation,
+    LocalHfVideoGenerationRequest,
     LocalHuggingFaceRuntimeError,
     LocalHuggingFaceVisionRuntime,
 )
@@ -145,6 +147,8 @@ class _FakeImageModule:
         return source
 
 
+
+
 class _FakeProcessor:
     def __init__(
         self,
@@ -209,6 +213,65 @@ class _FakeProcessor:
         self.decoded_rows.append(values.rows)
         return list(self.decoded)
 
+
+class _FakeNativeVideoProcessor(_FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__(
+            input_rows=[[1, 2, 3]],
+            attention_rows=[[1, 1, 1]],
+            decoded=['{"native":true}'],
+        )
+        self.video_template_seen = False
+        self.video_calls: list[dict[str, object]] = []
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        assert tokenize is False
+        assert add_generation_prompt is True
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        assert content[0]["type"] == "video"
+        assert content[0]["video"]
+        assert content[-1] == {"type": "text", "text": "native prompt"}
+        self.video_template_seen = True
+        return "template:native"
+
+    def __call__(
+        self,
+        *,
+        text: list[str],
+        videos: list[list[_FakeImage]],
+        video_metadata: list[dict[str, object]],
+        do_sample_frames: bool,
+        return_metadata: bool,
+        return_tensors: str,
+    ) -> dict[str, object]:
+        assert text == ["template:native"]
+        assert len(videos) == 1
+        assert len(videos[0]) == 2
+        assert do_sample_frames is False
+        assert return_metadata is True
+        assert return_tensors == "pt"
+        self.video_calls.append(
+            {
+                "videos": [[image.payload for image in video] for video in videos],
+                "video_metadata": video_metadata,
+                "do_sample_frames": do_sample_frames,
+                "return_metadata": return_metadata,
+            }
+        )
+        return {
+            "input_ids": _FakeTensor([[1, 2, 3]]),
+            "attention_mask": _FakeTensor([[1, 1, 1]]),
+            "pixel_values_videos": _FakeTensor([[4]]),
+            "video_grid_thw": _FakeTensor([[2, 1, 1]]),
+            "video_metadata": video_metadata,
+        }
 
 class _FakeModel:
     def __init__(
@@ -471,3 +534,132 @@ def test_existing_serial_generate_behavior_is_unchanged(tmp_path: Path) -> None:
     assert processor.decoded_rows == [[[9, 10]]]
     assert all(source.closed for source in image_module.sources)
     assert all(image.closed for image in image_module.converted_images)
+
+
+
+def _video_request(*payloads: bytes) -> LocalHfVideoGenerationRequest:
+    return LocalHfVideoGenerationRequest(
+        video_payloads=payloads,
+        frame_indices=tuple(range(len(payloads))),
+        frame_timestamps_seconds=tuple(index / 4.0 for index in range(len(payloads))),
+        source_fps=4.0,
+        total_num_frames=16,
+        width=640,
+        height=480,
+        duration_seconds=4.0,
+        prompt="native prompt",
+        max_new_tokens=8,
+    )
+
+
+def test_generate_video_uses_native_video_tokens_and_preserves_metadata(tmp_path: Path) -> None:
+    processor = _FakeNativeVideoProcessor()
+    model = _FakeModel(generated_rows=[[1, 2, 3, 9, 10]])
+    runtime, _, image_module = _loaded_runtime(
+        tmp_path,
+        processor=processor,
+        model=model,
+    )
+
+    observation = runtime.generate_video(request=_video_request(b"a", b"b"))
+
+    assert processor.video_template_seen is True
+    assert processor.video_calls == [
+        {
+            "videos": [[b"a", b"b"]],
+            "video_metadata": [
+                {
+                    "total_num_frames": 16,
+                    "fps": 4.0,
+                    "width": 640,
+                    "height": 480,
+                    "frames_indices": [0, 1],
+                    "duration": 4.0,
+                }
+            ],
+            "do_sample_frames": False,
+            "return_metadata": True,
+        }
+    ]
+    assert len(model.generate_calls) == 1
+    assert "video_metadata" not in model.generate_calls[0]
+    assert "pixel_values_videos" in model.generate_calls[0]
+    assert "video_grid_thw" in model.generate_calls[0]
+    assert observation.input_mode == "native_video"
+    assert observation.frame_indices == (0, 1)
+    assert observation.frame_timestamps_seconds == (0.0, 0.25)
+    assert observation.frame_sha256[0] == __import__("hashlib").sha256(b"a").hexdigest()
+    assert observation.output_text == '{"native":true}'
+    assert all(source.closed for source in image_module.sources)
+    assert all(image.closed for image in image_module.converted_images)
+
+
+@pytest.mark.parametrize(
+    ("video_request", "message"),
+    [
+        (_video_request(), "at least one frame"),
+        (
+            LocalHfVideoGenerationRequest(
+                video_payloads=(b"a",),
+                frame_indices=(0, 1),
+                frame_timestamps_seconds=(0.0,),
+                source_fps=4.0,
+                total_num_frames=16,
+                width=640,
+                height=480,
+                duration_seconds=4.0,
+                prompt="native prompt",
+                max_new_tokens=8,
+            ),
+            "frame_indices count",
+        ),
+        (
+            LocalHfVideoGenerationRequest(
+                video_payloads=tuple(b"a" for _ in range(LOCAL_HF_MAX_VIDEO_FRAMES + 1)),
+                frame_indices=tuple(range(LOCAL_HF_MAX_VIDEO_FRAMES + 1)),
+                frame_timestamps_seconds=tuple(
+                    index / 4.0 for index in range(LOCAL_HF_MAX_VIDEO_FRAMES + 1)
+                ),
+                source_fps=4.0,
+                total_num_frames=64,
+                width=640,
+                height=480,
+                duration_seconds=16.0,
+                prompt="native prompt",
+                max_new_tokens=8,
+            ),
+            "frame count",
+        ),
+        (
+            LocalHfVideoGenerationRequest(
+                video_payloads=(b"a", b"b"),
+                frame_indices=(0, 1),
+                frame_timestamps_seconds=(0.0, 0.5),
+                source_fps=4.0,
+                total_num_frames=16,
+                width=640,
+                height=480,
+                duration_seconds=4.0,
+                prompt="native prompt",
+                max_new_tokens=8,
+            ),
+            "does not match source fps",
+        ),
+    ],
+)
+def test_generate_video_fails_closed_before_loading_for_invalid_request(
+    tmp_path: Path,
+    video_request: LocalHfVideoGenerationRequest,
+    message: str,
+) -> None:
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    runtime = LocalHuggingFaceVisionRuntime(
+        model_directory=model_directory,
+        offload_directory=tmp_path / "offload",
+    )
+
+    with pytest.raises(LocalHuggingFaceRuntimeError, match=message):
+        runtime.generate_video(request=video_request)
+
+    assert runtime.loaded is False
