@@ -14,8 +14,6 @@ traditional-codec image.  Runtime network access is disabled and image pulling i
 disallowed, so readiness cannot silently use a different toolchain.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -30,7 +28,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _DIGEST_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
-_HEX = frozenset("0123456789abcdef")
 _DEFAULT_IMAGE_ENV = "MAGE_CV_PREINFER_IMAGE"
 _BACKEND_ENV = "MAGE_CV_PREINFER_BACKEND"
 _DOCKER_ENV = "MAGE_DOCKER_BIN"
@@ -168,7 +165,7 @@ def _pinned_image() -> str:
         )
     if not _DIGEST_IMAGE.fullmatch(image):
         raise MageCvPreinferHostError(
-            f"{_DEFAULT_IMAGE_ENV} must use repository@sha256:<64 lowercase hex>"
+            f"{_DEFAULT_IMAGE_ENV} must be digest-pinned using repository@sha256:<64 lowercase hex>"
         )
     return image
 
@@ -368,3 +365,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
