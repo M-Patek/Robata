@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib.util
 import json
@@ -180,3 +180,50 @@ def test_missing_avoid_keyframes_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(module.MageCvPreinferHostError, match="avoid_keyframes"):
         module._request_from_args(arguments)
+
+
+def test_native_codec_readiness_accepts_only_explicit_digest_pinned_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from robata.inference.mage_native_codec import inspect_mage_codec_dependencies
+
+    docker = tmp_path / "docker.exe"
+    docker.write_bytes(b"docker")
+    bridge = ROOT / "scripts" / "mage_cv_preinfer_host.cmd"
+    monkeypatch.setenv("CV_PREINFER_BIN", str(bridge))
+    monkeypatch.setenv("MAGE_CV_PREINFER_BACKEND", "docker")
+    monkeypatch.setenv(
+        "MAGE_CV_PREINFER_IMAGE", "registry.example/mage@sha256:" + "a" * 64
+    )
+    monkeypatch.setenv("MAGE_DOCKER_BIN", str(docker))
+
+    report = inspect_mage_codec_dependencies({"engine": "hevc"})
+    assert report.ready is True
+    assert report.missing_assets == ()
+
+    monkeypatch.setenv("MAGE_CV_PREINFER_IMAGE", "registry.example/mage:latest")
+    blocked = inspect_mage_codec_dependencies({"engine": "hevc"})
+    assert blocked.ready is False
+    assert blocked.blocker_code == "MAGE_CV_PREINFER_HOST_BRIDGE_NOT_READY"
+    assert "digest-pinned MAGE_CV_PREINFER_IMAGE" in blocked.missing_assets
+
+
+def test_container_publication_marker_is_not_forwarded_to_mage_loader(
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    source = tmp_path / "container-assets"
+    destination = tmp_path / "mage-assets"
+    source.mkdir()
+    (source / "meta.json").write_text("{}", encoding="utf-8")
+    (source / "src_patch_position.npy").write_bytes(b"npy")
+    (source / ".robata-publication.json").write_text("{}", encoding="utf-8")
+
+    module._copy_completed_assets(source=source, destination=destination)
+
+    assert (destination / "meta.json").is_file()
+    assert (destination / "src_patch_position.npy").is_file()
+    assert not (destination / ".robata-publication.json").exists()
