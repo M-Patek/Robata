@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,6 +33,16 @@ def _hold_shared_device_guard(path: str, ready: Any, release: Any) -> None:
         ready.set()
         if not release.wait(timeout=10.0):
             raise RuntimeError("test guard holder timed out")
+
+
+def _install_native_codec_tool_stubs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the strict traditional-codec readiness gate explicit in unit tests."""
+
+    tool_directory = tmp_path / "native-codec-tools"
+    tool_directory.mkdir()
+    for name in ("ffmpeg.exe", "ffprobe.exe"):
+        (tool_directory / name).write_bytes(b"unit-test stub")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(tool_directory), os.environ.get("PATH", ""))))
 
 
 class _FakeTensor:
@@ -289,7 +300,7 @@ def test_runtime_calls_native_codec_processor_path_with_mocked_model(
     codec_binary = tmp_path / "cv-preinfer"
     codec_binary.write_bytes(b"stub")
     monkeypatch.setenv("CV_PREINFER_BIN", str(codec_binary))
-
+    _install_native_codec_tool_stubs(tmp_path, monkeypatch)
     processor = _FakeProcessor()
     model = _FakeModel()
     transformers = _FakeTransformers(processor, model)
@@ -561,7 +572,7 @@ def test_runtime_generation_uses_cross_process_shared_device_guard(
     codec_binary = tmp_path / "cv-preinfer"
     codec_binary.write_bytes(b"stub")
     monkeypatch.setenv("CV_PREINFER_BIN", str(codec_binary))
-
+    _install_native_codec_tool_stubs(tmp_path, monkeypatch)
     processor = _FakeProcessor()
     model = _FakeModel()
     transformers = _FakeTransformers(processor, model)
@@ -637,7 +648,7 @@ def test_runtime_releases_generation_lane_before_cpu_decode(
     codec_binary = tmp_path / "cv-preinfer"
     codec_binary.write_bytes(b"stub")
     monkeypatch.setenv("CV_PREINFER_BIN", str(codec_binary))
-
+    _install_native_codec_tool_stubs(tmp_path, monkeypatch)
     processor = _OverlapProcessor()
     model = _OverlapModel()
     transformers = _FakeTransformers(processor, model)

@@ -501,33 +501,33 @@ def _inspect_traditional(**common: Any) -> MageCodecDependencyReport:
     codec_importable = _module_available("codec_video_prep")
     preinfer_importable = _module_available("compressed_video_preinfer")
     package_version = _distribution_version("codec-video-prep")
+    # Mage's processor launches ``CV_PREINFER_BIN`` as an executable.  An
+    # importable Python package is useful diagnostic evidence, but it is not a
+    # valid substitute: reporting a module command as ready would leave the
+    # processor's own subprocess lookup pointed at the missing console script.
+    # Keep the command empty until an actual executable (or the explicit host
+    # bridge wrapper) is discoverable.
     command_mode: Literal["executable", "python_module", "missing"]
     if direct is not None:
         command = (str(direct),)
         command_mode = "executable"
         executable_path = str(direct)
-    elif preinfer_importable:
-        command = (sys.executable, "-m", "compressed_video_preinfer.cli")
-        command_mode = "python_module"
-        executable_path = None
-    elif codec_importable:
-        command = (sys.executable, "-m", "codec_video_prep.cli")
-        command_mode = "python_module"
-        executable_path = None
     else:
         command = ()
         command_mode = "missing"
         executable_path = None
     missing: list[str] = []
-    if not command:
-        missing.append("cv-preinfer")
     if host_bridge:
+        if direct is None:
+            missing.append("cv-preinfer host bridge")
         docker = _resolve_executable(os.environ.get("MAGE_DOCKER_BIN", "docker"))
         image = os.environ.get("MAGE_CV_PREINFER_IMAGE", "").strip()
         if docker is None:
             missing.append("docker")
         if not _DIGEST_IMAGE.fullmatch(image):
             missing.append("digest-pinned MAGE_CV_PREINFER_IMAGE")
+    elif direct is None:
+        missing.append("cv-preinfer")
     else:
         if ffmpeg is None:
             missing.append("ffmpeg")
