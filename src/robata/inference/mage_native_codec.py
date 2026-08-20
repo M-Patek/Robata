@@ -174,13 +174,25 @@ def require_mage_codec_dependencies(
 def validate_mage_codec_assets(output_directory: Path) -> MageCodecAssetReport:
     """Validate the minimum asset contract consumed by Mage's codec loader.
 
-    Validation is deliberately independent of NumPy/Pillow.  It catches stale
-    or partial output before a model call; the model-specific loader remains the
-    authority for tensor shape and patch-grid semantics.
+    Validation is deliberately independent of Pillow.  NumPy is used when
+    available to reject a corrupt position array; if it is absent, the provider
+    bytes remain admissible and Mage's own loader remains authoritative for
+    tensor shape and patch-grid semantics.
     """
 
-    directory = Path(output_directory).expanduser().resolve()
+    requested_directory = Path(output_directory).expanduser()
     required = ("meta.json", "src_patch_position.npy")
+    if requested_directory.is_symlink():
+        return MageCodecAssetReport(
+            output_directory=str(requested_directory),
+            valid=False,
+            required_files=required,
+            canvas_files=(),
+            metadata_keys=(),
+            position_shape=None,
+            detail="output directory must not be a symlink",
+        )
+    directory = requested_directory.resolve()
     if not directory.is_dir():
         return MageCodecAssetReport(
             output_directory=str(directory),
@@ -191,17 +203,11 @@ def validate_mage_codec_assets(output_directory: Path) -> MageCodecAssetReport:
             position_shape=None,
             detail="output directory does not exist",
         )
-    if directory.is_symlink():
-        return MageCodecAssetReport(
-            output_directory=str(directory),
-            valid=False,
-            required_files=required,
-            canvas_files=(),
-            metadata_keys=(),
-            position_shape=None,
-            detail="output directory must not be a symlink",
-        )
-    missing = [name for name in required if not (directory / name).is_file()]
+    missing = [
+        name
+        for name in required
+        if not (directory / name).is_file() or (directory / name).is_symlink()
+    ]
     if missing:
         return MageCodecAssetReport(
             output_directory=str(directory),
@@ -297,16 +303,24 @@ def validate_mage_codec_assets(output_directory: Path) -> MageCodecAssetReport:
             position_shape=None,
             detail="provider output contains no canvas files",
         )
-    # Avoid importing NumPy on the core path.  If available, record shape as
-    # useful telemetry; absence does not invalidate the provider assets.
     position_shape: tuple[int, ...] | None = None
     try:
         import numpy as np  # type: ignore[import-not-found]
 
         loaded = np.load(directory / "src_patch_position.npy", mmap_mode="r", allow_pickle=False)
         position_shape = tuple(int(value) for value in loaded.shape)
-    except (ImportError, OSError, ValueError):
-        position_shape = None
+    except ImportError:
+        pass
+    except (OSError, ValueError) as error:
+        return MageCodecAssetReport(
+            output_directory=str(directory),
+            valid=False,
+            required_files=required,
+            canvas_files=tuple(safe_canvas_names),
+            metadata_keys=tuple(sorted(str(key) for key in metadata)),
+            position_shape=None,
+            detail=f"src_patch_position.npy is not a readable NumPy array: {error}",
+        )
     return MageCodecAssetReport(
         output_directory=str(directory),
         valid=True,
