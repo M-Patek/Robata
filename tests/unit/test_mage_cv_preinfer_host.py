@@ -207,6 +207,46 @@ def test_native_codec_readiness_accepts_only_explicit_digest_pinned_bridge(
     assert "digest-pinned MAGE_CV_PREINFER_IMAGE" in blocked.missing_assets
 
 
+def test_importable_codec_package_without_console_script_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import robata.inference.mage_native_codec as native_codec
+
+    monkeypatch.delenv("CV_PREINFER_BIN", raising=False)
+    monkeypatch.setattr(native_codec, "_module_available", lambda _name: True)
+    monkeypatch.setattr(native_codec, "_distribution_version", lambda _name: "0.2.5")
+
+    report = native_codec.inspect_mage_codec_dependencies({"engine": "hevc"})
+
+    assert report.ready is False
+    assert report.blocker_code == "CV_PREINFER_ENTRYPOINT_MISSING"
+    assert report.command == ()
+    assert report.command_mode == "missing"
+    assert "cv-preinfer" in report.missing_assets
+
+
+def test_missing_explicit_host_bridge_is_not_promoted_by_importable_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import robata.inference.mage_native_codec as native_codec
+
+    docker = tmp_path / "docker.exe"
+    docker.write_bytes(b"docker")
+    bridge = tmp_path / "mage_cv_preinfer_host.cmd"
+    monkeypatch.setenv("CV_PREINFER_BIN", str(bridge))
+    monkeypatch.setenv("MAGE_CV_PREINFER_BACKEND", "docker")
+    monkeypatch.setenv("MAGE_CV_PREINFER_IMAGE", "registry.example/mage@sha256:" + "a" * 64)
+    monkeypatch.setenv("MAGE_DOCKER_BIN", str(docker))
+    monkeypatch.setattr(native_codec, "_module_available", lambda _name: True)
+
+    report = native_codec.inspect_mage_codec_dependencies({"engine": "hevc"})
+
+    assert report.ready is False
+    assert report.blocker_code == "MAGE_CV_PREINFER_HOST_BRIDGE_NOT_READY"
+    assert "cv-preinfer host bridge" in report.missing_assets
+    assert report.command == ()
+
+
 def test_container_publication_marker_is_not_forwarded_to_mage_loader(
     tmp_path: Path,
 ) -> None:
