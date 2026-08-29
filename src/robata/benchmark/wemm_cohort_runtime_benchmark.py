@@ -18,6 +18,7 @@ provisional phrase catalog, not accuracy claims.
 from __future__ import annotations
 
 import gc
+import importlib
 import json
 import math
 import os
@@ -64,8 +65,7 @@ def _process_rss_bytes() -> int | None:
     """
 
     try:
-        import psutil
-
+        psutil = importlib.import_module("psutil")
         value = int(psutil.Process(os.getpid()).memory_info().rss)
     except (ImportError, OSError, AttributeError, TypeError, ValueError):
         return None
