@@ -189,15 +189,22 @@ def test_stateful_iterator_batches_windows_without_rescanning(
     fake_decoder = SimpleNamespace(DecoderFactory=lambda: object())
     fake_av = SimpleNamespace(CodecContext=_CodecContext, Packet=_Packet)
     real_import = shadow.import_module
+
+    def fake_import(name: str):
+        if name == "av":
+            return fake_av
+        if name == "mcap.reader":
+            return fake_mcap
+        if name == "mcap_protobuf.decoder":
+            return fake_decoder
+        if name == "PIL.Image":
+            return SimpleNamespace()
+        return real_import(name)
+
     monkeypatch.setattr(
         shadow,
         "import_module",
-        lambda name: {
-            "av": fake_av,
-            "mcap.reader": fake_mcap,
-            "mcap_protobuf.decoder": fake_decoder,
-            "PIL.Image": SimpleNamespace(),
-        }.get(name, real_import(name)),
+        fake_import,
     )
 
     chunks = list(

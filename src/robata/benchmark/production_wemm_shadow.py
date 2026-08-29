@@ -696,10 +696,10 @@ def iter_decode_production_window_chunks(
                 topic = getattr(channel, "topic", None)
                 if not isinstance(topic, str):
                     continue
-                camera_id = topic_to_camera.get(topic)
-                if camera_id is None:
+                mapped_camera_id = topic_to_camera.get(topic)
+                if mapped_camera_id is None:
                     continue
-                state = state_by_camera[camera_id]
+                state = state_by_camera[mapped_camera_id]
                 timestamp = int(getattr(message, "log_time", 0) or 0)
                 state["examined"] += 1
                 if getattr(schema, "name", None) != _COMPRESSED_SCHEMA:

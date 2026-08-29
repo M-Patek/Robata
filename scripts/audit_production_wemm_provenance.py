@@ -52,12 +52,16 @@ def classify(path: Path, payload: Mapping[str, Any] | None) -> dict[str, Any]:
     if fmt == OPEN_PREANNOTATION_FORMAT:
         """Recognize the current open, review-only production envelope."""
 
-        label_space = payload.get("label_space")
-        label_space = label_space if isinstance(label_space, Mapping) else {}
+        raw_label_space = payload.get("label_space")
+        label_space: Mapping[str, Any] = (
+            raw_label_space if isinstance(raw_label_space, Mapping) else {}
+        )
         raw_model_output = payload.get("raw_model_output")
-        raw_model_output = raw_model_output if isinstance(raw_model_output, Mapping) else {}
-        catalog = raw_model_output.get("catalog")
-        catalog = catalog if isinstance(catalog, Mapping) else {}
+        model_output: Mapping[str, Any] = (
+            raw_model_output if isinstance(raw_model_output, Mapping) else {}
+        )
+        raw_catalog = model_output.get("catalog")
+        catalog: Mapping[str, Any] = raw_catalog if isinstance(raw_catalog, Mapping) else {}
         if label_space.get("kind") != "OPEN_PROVISIONAL_PHRASES":
             reasons.append("UNEXPECTED_OPEN_LABEL_SPACE")
         if label_space.get("epic_ontology_used") is not False:
@@ -70,8 +74,10 @@ def classify(path: Path, payload: Mapping[str, Any] | None) -> dict[str, Any]:
             reasons.append("CATALOG_MAPPER_USED_NOT_FALSE")
         if payload.get("production_eligible") is not False:
             reasons.append("OPEN_PREANNOTATION_MUST_REMAIN_REVIEW_ONLY")
-        source = payload.get("source") if isinstance(payload.get("source"), Mapping) else {}
-        model = payload.get("model") if isinstance(payload.get("model"), Mapping) else {}
+        raw_source = payload.get("source")
+        source: Mapping[str, Any] = raw_source if isinstance(raw_source, Mapping) else {}
+        raw_model = payload.get("model")
+        model: Mapping[str, Any] = raw_model if isinstance(raw_model, Mapping) else {}
         return {
             "path": str(path),
             "format": fmt,
@@ -106,8 +112,10 @@ def classify(path: Path, payload: Mapping[str, Any] | None) -> dict[str, Any]:
         if profile != PRODUCTION_PROFILE:
             reasons.append("UNEXPECTED_PRODUCTION_PROFILE")
         classification = "PRODUCTION_TERRA_VOCABULARY" if not reasons else "QUARANTINED"
-        model = payload.get("model") if isinstance(payload.get("model"), Mapping) else {}
-        source = payload.get("source") if isinstance(payload.get("source"), Mapping) else {}
+        raw_model = payload.get("model")
+        dedicated_model: Mapping[str, Any] = raw_model if isinstance(raw_model, Mapping) else {}
+        raw_source = payload.get("source")
+        dedicated_source: Mapping[str, Any] = raw_source if isinstance(raw_source, Mapping) else {}
         return {
             "path": str(path),
             "format": fmt,
@@ -116,14 +124,14 @@ def classify(path: Path, payload: Mapping[str, Any] | None) -> dict[str, Any]:
             "epic_ontology_used": epic,
             "mapper_used": mapper,
             "vocabulary_profile": profile,
-            "label_variant": model.get("label_variant"),
-            "window_count": source.get("window_count", len(payload.get("windows", []))),
-            "camera_count": source.get("camera_count"),
+            "label_variant": dedicated_model.get("label_variant"),
+            "window_count": dedicated_source.get("window_count", len(payload.get("windows", []))),
+            "camera_count": dedicated_source.get("camera_count"),
             "production_eligible": payload.get("production_eligible"),
         }
     if fmt == LEGACY_FORMAT:
         ontology = payload.get("ontology")
-        profile = ontology.get("profile") if isinstance(ontology, Mapping) else None
+        legacy_profile = ontology.get("profile") if isinstance(ontology, Mapping) else None
         ontology_format = (
             str(ontology.get("format") or "").casefold() if isinstance(ontology, Mapping) else ""
         )
@@ -142,7 +150,7 @@ def classify(path: Path, payload: Mapping[str, Any] | None) -> dict[str, Any]:
                 "EPIC_DERIVED_QUARANTINED" if epic else "LEGACY_PRODUCTION_VOCABULARY_QUARANTINED"
             ),
             "reasons": reasons,
-            "ontology_profile": profile,
+            "ontology_profile": legacy_profile,
             "epic_ontology_used": epic,
             "mapper_used": False,
             "production_eligible": payload.get("production_eligible"),
