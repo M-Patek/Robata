@@ -15,6 +15,7 @@ persisting pixels or content digests.
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import time
@@ -163,15 +164,17 @@ def _optional_imports() -> tuple[Any, Any, Any, Any]:
     """Load optional runtime dependencies lazily with an actionable error."""
 
     try:
-        import torch
-        import torch.nn.functional as functional
-        from transformers import AutoModel, AutoProcessor
+        torch = importlib.import_module("torch")
+        functional = importlib.import_module("torch.nn.functional")
+        transformers = importlib.import_module("transformers")
+        auto_model = vars(transformers)["AutoModel"]
+        auto_processor = vars(transformers)["AutoProcessor"]
     except Exception as exc:  # pragma: no cover - depends on local environment
         raise WemmBackendUnavailable(
             "WeMM runtime requires torch and transformers; install them in the "
             "isolated benchmark environment"
         ) from exc
-    return torch, functional, AutoModel, AutoProcessor
+    return torch, functional, auto_model, auto_processor
 
 
 def _mapping_from_config(config: object) -> Mapping[str, Any]:
@@ -1263,7 +1266,9 @@ class WemmEmbeddingBackend:
         if frame_counts is not None and len(counts) != len(paths):
             raise ValueError("frame_counts must match the number of videos")
         try:
-            from qwen_vl_utils import process_vision_info  # type: ignore[import-untyped]
+            process_vision_info = importlib.import_module("qwen_vl_utils").__dict__[
+                "process_vision_info"
+            ]
         except Exception as exc:  # pragma: no cover - optional dependency
             raise WemmBackendUnavailable(
                 "native WeMM video input requires qwen-vl-utils[decord]==0.0.14"
