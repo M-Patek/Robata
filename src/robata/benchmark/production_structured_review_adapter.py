@@ -16,7 +16,7 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Final, cast
+from typing import Any, Final
 
 from robata.benchmark.production_structured_annotation import (
     MODEL_NAMES,
@@ -214,11 +214,7 @@ def _coerce_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
     declared_format = value.get("format")
     if declared_format == STRUCTURED_ANNOTATION_ENVELOPE_VERSION:
         try:
-            # ``--follow-imports=skip`` intentionally treats the shared
-            # normalizer as ``Any``; cast the already-validated JSON envelope
-            # back to this adapter's public shape so strict callers do not
-            # lose the return contract.
-            return cast(dict[str, Any], normalize_structured_annotation_envelope(value))
+            return normalize_structured_annotation_envelope(value)
         except ProductionStructuredAnnotationError as exc:
             raise StructuredReviewAdapterError(str(exc)) from exc
 
@@ -251,13 +247,10 @@ def _coerce_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(camera_count_value, int) or isinstance(camera_count_value, bool):
         camera_count_value = None
     try:
-        return cast(
-            dict[str, Any],
-            build_structured_annotation_envelope(
-                {model_key: value},
-                source_path=source_path,
-                camera_count=camera_count_value,
-            ),
+        return build_structured_annotation_envelope(
+            {model_key: value},
+            source_path=source_path,
+            camera_count=camera_count_value,
         )
     except (ProductionStructuredAnnotationError, ValueError, TypeError) as exc:
         raise StructuredReviewAdapterError(str(exc)) from exc
