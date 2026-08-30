@@ -181,6 +181,21 @@ def test_owner_overlap_honors_recommendation_alias_for_abstain_windows() -> None
     assert overlap["per_window"][0]["window_id"] == "w00"
 
 
+def test_owner_overlap_does_not_treat_omitted_decision_as_accept() -> None:
+    reference = _owner_reference()
+    reference["windows"] = [
+        {
+            "window_id": "w00",
+            "segments": [{"verb": "pick up", "noun": "garment"}],
+        }
+    ]
+    report = evaluate_production_identity_probe(_sidecar(_row("w00")), reference)
+    overlap = report["reference_overlap"]
+    assert overlap["eligible_window_count"] == 0
+    assert overlap["exact_action_hits"] == 0
+    assert overlap["prediction_coverage"] is None
+
+
 def test_owner_reference_gold_claim_is_rejected() -> None:
     reference = _owner_reference()
     reference["official_gold_status"] = "ESTABLISHED"

@@ -230,7 +230,11 @@ def _reference_windows(reference: Mapping[str, Any]) -> dict[str, dict[str, Any]
                 decision = gold.get("status")
             if segments_value is None:
                 segments_value = gold.get("segments", [])
-        decision_text = _normalise(decision or "accept")
+        # An omitted/empty decision is not an implicit acceptance.  Review
+        # artifacts may omit the field while a human decision is still
+        # pending; treating that omission as ``accept`` would make the
+        # optional surrogate overlap silently over-count eligible windows.
+        decision_text = _normalise(decision) or "not_recorded"
         segments = _sequence(segments_value or [], field=f"{window_id}.segments")
         actions: list[str] = []
         for segment_index, raw_segment in enumerate(segments):
