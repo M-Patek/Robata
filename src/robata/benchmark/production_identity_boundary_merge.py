@@ -234,6 +234,12 @@ def _boundary_for_action(
             end_rel = _finite(direct.get("end_time_sec"))
             if start_rel is not None and end_rel is not None and end_rel > start_rel:
                 source_start = window_interval[0]
+                duration = window_interval[1] - source_start
+                # Frame-ordinal claims are relative to the bounded source
+                # window.  Do not offset an out-of-window pair into a
+                # seemingly valid source-absolute interval.
+                if start_rel < 0.0 or end_rel > duration:
+                    return None, ["BOUNDARY_OUT_OF_SOURCE"]
                 return {
                     "segment": {
                         "start_time_sec": source_start + start_rel,
@@ -431,10 +437,29 @@ def _distinct_camera_ids(rows: Sequence[Mapping[str, Any]]) -> set[str]:
     }
 
 
+def _consensus_vote_count(rows: Sequence[Mapping[str, Any]]) -> int:
+    """Count camera votes without letting repeated camera rows inflate them.
+
+    Production sidecars normally contain one row per camera.  Named camera
+    rows are therefore deduplicated by camera id; rows without a camera id
+    remain individual anonymous observations instead of disappearing from the
+    denominator.
+    """
+
+    camera_ids = _distinct_camera_ids(rows)
+    anonymous_count = sum(
+        not (isinstance(row.get("camera_id"), str) and row.get("camera_id", "").strip())
+        for row in rows
+    )
+    return len(camera_ids) + anonymous_count
+
+
 def _window_candidate(
     action: str, rows: Sequence[Mapping[str, Any]], *, window_id: str
 ) -> dict[str, Any]:
     supports = [row for row in rows if row.get("label_text") == action]
+    consensus_support_count = _consensus_vote_count(supports)
+    consensus_observation_count = _consensus_vote_count(rows)
     confidence_values = [
         float(row["confidence"]) for row in supports if _finite(row.get("confidence")) is not None
     ]
@@ -448,7 +473,7 @@ def _window_candidate(
         float(row["end_seconds"]) for row in measured if _finite(row.get("end_seconds")) is not None
     ]
     reasons: list[str] = []
-    if len(supports) < 2:
+    if consensus_support_count < 2:
         reasons.append("CONSENSUS_WEAK")
     measured_camera_ids = _distinct_camera_ids(measured)
     if len(measured_camera_ids) < MIN_BOUNDARY_CONSENSUS_CAMERAS:
@@ -515,7 +540,13 @@ def _window_candidate(
         "supporting_camera_ids": [row.get("camera_id") for row in supports],
         "camera_support": len(supports),
         "camera_boundary_support": len(measured_camera_ids),
-        "consensus_fraction": len(supports),
+        "consensus_support_count": consensus_support_count,
+        "consensus_observation_count": consensus_observation_count,
+        "consensus_fraction": (
+            consensus_support_count / consensus_observation_count
+            if consensus_observation_count
+            else None
+        ),
         "raw_camera_claims": [_copy(row, field="raw_camera_claim") for row in supports],
     }
 
@@ -635,7 +666,11 @@ def merge_identity_and_boundaries(
         }
         for action in ranked[:3]:
             window["annotation_candidates"].append(
-                _window_candidate(action, observations, window_id=wid)
+                # Keep all camera observations as the denominator for the
+                # candidate consensus fraction.  ``observations`` above is
+                # intentionally filtered for ranking and therefore excludes
+                # abstentions/invalid identities.
+                _window_candidate(action, window["camera_observations"], window_id=wid)
             )
         if window["annotation_candidates"]:
             window["status"] = "REVIEW_REQUIRED"

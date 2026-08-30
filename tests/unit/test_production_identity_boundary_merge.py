@@ -142,6 +142,55 @@ def test_missing_or_unmapped_boundary_stays_null() -> None:
     assert "BOUNDARY_UNRESOLVED" in top["reason_codes"]
 
 
+def test_relative_direct_boundary_outside_window_stays_null() -> None:
+    row = {
+        "window_id": "w00",
+        "camera_id": "cam_01",
+        "parsed_boundary": {
+            "parse_status": "PARSED",
+            "boundary_status": "MEASURED",
+            "timestamp_mapping_status": "MAPPED_FROM_FRAME_ORDINAL",
+            "start_time_sec": 3.5,
+            "end_time_sec": 4.5,
+            "confidence": 0.8,
+            "evidence": "edges move inward",
+        },
+        "identity_context": {"action": "fold garment"},
+    }
+    report = merge_identity_and_boundaries(
+        {"windows": [_identity_row("fold garment")]},
+        {"windows": [row]},
+    )
+    top = report["windows"][0]["annotation_candidates"][0]
+    assert top["start_seconds"] is None
+    assert top["end_seconds"] is None
+    assert top["boundary_status"] == "NOT_MEASURED"
+    assert "BOUNDARY_OUT_OF_SOURCE" in top["reason_codes"]
+
+
+def test_consensus_fraction_is_a_bounded_ratio() -> None:
+    report = merge_identity_and_boundaries(
+        {
+            "windows": [
+                _identity_row("fold garment", "cam_01"),
+                _identity_row("spread garment", "cam_02"),
+            ]
+        },
+        {
+            "windows": [
+                _boundary_row("cam_01"),
+                _boundary_row("cam_02"),
+            ]
+        },
+    )
+    candidates = report["windows"][0]["annotation_candidates"]
+    fold = next(candidate for candidate in candidates if candidate["label_text"] == "fold garment")
+    assert fold["consensus_support_count"] == 1
+    assert fold["consensus_observation_count"] == 2
+    assert fold["consensus_fraction"] == 0.5
+    assert 0.0 <= fold["consensus_fraction"] <= 1.0
+
+
 def test_non_matching_boundary_is_not_reused() -> None:
     row = _boundary_row()
     row["segments"][0]["structured_labels"]["verb"] = "reaches"
