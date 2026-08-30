@@ -20,12 +20,8 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any, Final
 
-PROVISIONAL_VOCABULARY_VERSION: Final = (
-    "robata-production-provisional-action-vocabulary-v1"
-)
-PROVISIONAL_COMPARISON_VERSION: Final = (
-    "robata-production-provisional-vocabulary-comparison-v1"
-)
+PROVISIONAL_VOCABULARY_VERSION: Final = "robata-production-provisional-action-vocabulary-v1"
+PROVISIONAL_COMPARISON_VERSION: Final = "robata-production-provisional-vocabulary-comparison-v1"
 AUTHORITY: Final = "LOCAL_NONPRODUCTION_ONLY"
 PROVISIONAL_STATUS: Final = "PROVISIONAL_UNAPPROVED"
 MEASUREMENT_STATUS: Final = "NOT_MEASURED"
@@ -115,9 +111,7 @@ def _assert_non_gold_review_pack(pack: Mapping[str, Any]) -> None:
 
     expected = "robata-production-agent-reviewed-segment-pack-v1"
     if pack.get("format") != expected:
-        raise ProvisionalVocabularyError(
-            f"review pack format must be {expected!r}"
-        )
+        raise ProvisionalVocabularyError(f"review pack format must be {expected!r}")
     if pack.get("authority") != AUTHORITY:
         raise ProvisionalVocabularyError("review pack authority is not local-only")
     if pack.get("production_eligible") is True:
@@ -239,9 +233,7 @@ def _noun_alias_candidates(
 
     family = _noun_family(noun)
     return [
-        dict(row)
-        for row in ontology_labels
-        if _noun_family(str(row.get("noun", ""))) == family
+        dict(row) for row in ontology_labels if _noun_family(str(row.get("noun", ""))) == family
     ]
 
 
