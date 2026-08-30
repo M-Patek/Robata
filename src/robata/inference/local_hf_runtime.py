@@ -384,9 +384,7 @@ class LocalHuggingFaceVisionRuntime:
                     )
                 device = next(model.parameters()).device
                 model_inputs = {
-                    key: value.to(device)
-                    if callable(getattr(value, "to", None))
-                    else value
+                    key: value.to(device) if callable(getattr(value, "to", None)) else value
                     for key, value in model_inputs.items()
                 }
                 prompt_tokens = int(model_inputs["input_ids"].shape[1])
@@ -422,8 +420,7 @@ class LocalHuggingFaceVisionRuntime:
                     gpu_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
                     output_text=output_text,
                     frame_sha256=tuple(
-                        hashlib.sha256(payload).hexdigest()
-                        for payload in request.video_payloads
+                        hashlib.sha256(payload).hexdigest() for payload in request.video_payloads
                     ),
                 )
             finally:

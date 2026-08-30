@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Smoke/qualification command for bounded Qwen3-VL native-video inputs.
 
 The default ``--dry-run`` validates source decoding, frame timeline, and the exact

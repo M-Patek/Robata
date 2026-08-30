@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from robata.benchmark.qwen_native_video import (
     QWEN_NATIVE_VIDEO_MAX_FRAMES,

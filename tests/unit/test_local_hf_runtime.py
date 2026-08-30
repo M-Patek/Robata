@@ -147,8 +147,6 @@ class _FakeImageModule:
         return source
 
 
-
-
 class _FakeProcessor:
     def __init__(
         self,
@@ -272,6 +270,7 @@ class _FakeNativeVideoProcessor(_FakeProcessor):
             "video_grid_thw": _FakeTensor([[2, 1, 1]]),
             "video_metadata": video_metadata,
         }
+
 
 class _FakeModel:
     def __init__(
@@ -534,7 +533,6 @@ def test_existing_serial_generate_behavior_is_unchanged(tmp_path: Path) -> None:
     assert processor.decoded_rows == [[[9, 10]]]
     assert all(source.closed for source in image_module.sources)
     assert all(image.closed for image in image_module.converted_images)
-
 
 
 def _video_request(*payloads: bytes) -> LocalHfVideoGenerationRequest:

@@ -1,4 +1,4 @@
-﻿"""Bounded native-video inputs for Qwen3-VL benchmark runs.
+"""Bounded native-video inputs for Qwen3-VL benchmark runs.
 
 This module is intentionally benchmark-only.  It materializes a complete bounded
 interval as ordered frames and carries the source timeline alongside the bytes so a
@@ -229,12 +229,8 @@ def sample_qwen_native_video(
         duration = total_num_frames / source_fps
         window_start = max(0.0, start_seconds - context_before_seconds)
         window_end = min(duration, end_seconds + context_after_seconds)
-        first_index = max(
-            0, min(total_num_frames - 1, math.floor(window_start * source_fps))
-        )
-        last_index = max(
-            first_index, min(total_num_frames - 1, math.ceil(window_end * source_fps))
-        )
+        first_index = max(0, min(total_num_frames - 1, math.floor(window_start * source_fps)))
+        last_index = max(first_index, min(total_num_frames - 1, math.ceil(window_end * source_fps)))
         if first_index == last_index:
             indices = [first_index]
         else:
@@ -248,9 +244,7 @@ def sample_qwen_native_video(
             ok, frame = capture.read()
             if not ok or frame is None:
                 raise QwenNativeVideoInputError(f"unable to decode frame {frame_index}")
-            ok, encoded = cv2.imencode(
-                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
-            )
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
             if not ok:
                 raise QwenNativeVideoInputError(f"unable to encode frame {frame_index}")
             frames.append(
