@@ -145,6 +145,35 @@ Use the small reviewed diagnostic cohort first.  Keep the held-out-100 set
 frozen until a policy is selected and reviewed.  Report interval quality,
 candidate recall, accepted precision/coverage, and regressions separately.
 
+## Short model-driven refinement (new, additive)
+
+`robata.benchmark.production_wemm_temporal_refinement` provides the next
+explicit seam without changing the default runner.  Given a completed
+`dense_score` report, `plan_wemm_temporal_refinement(...)` emits one short
+source-relative request around each coarse ONSET/OFFSET transition (the
+default span is one second for a four-second context).  The request is a new
+model input, not an interval annotation:
+
+```text
+coarse 4 s contexts -> score crossing hypothesis
+                    -> 1 s short probe request
+                    -> runner decodes/re-scores probe
+                    -> apply_refined_boundaries(...)
+                    -> review-only MODEL_REFINED interval
+```
+
+The planner performs no media decode or model call and leaves the original
+`segments` untouched.  Every request carries `requires_model_recompute=true`,
+an explicit `request_relative_seconds` output clock, the source segment/window
+lineage, and a contract forbidding copying the short request edges as the
+action boundaries.  `apply_refined_boundaries` accepts only request-ID keyed
+results, converts measured request-relative intervals back to source time,
+and writes an additive `refined_segments`/`temporal_refinement` sidecar.  A
+missing, uncertain, or inverted ONSET/OFFSET pair remains unresolved and
+never silently falls back to a coarse boundary.  This makes the distinction
+between context sampling and model-selected onset/offset measurable while
+keeping the historical four-second route and production eligibility frozen.
+
 ## Commands
 
 Open-runner diagnostic:
