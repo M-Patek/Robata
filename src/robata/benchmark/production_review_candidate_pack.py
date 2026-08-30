@@ -65,15 +65,6 @@ _ACTION_VERB_ALIASES: Final = {
 }
 _NOUN_ALIASES: Final = {
     "garment": "garment",
-    "garments": "garment",
-    "cloth": "garment",
-    "clothes": "garment",
-    "clothing": "garment",
-    "fabric": "garment",
-    "shirt": "garment",
-    "pants": "garment",
-    "shorts": "garment",
-    "sheets": "garment",
 }
 _GOLD_KEYS: Final = frozenset(
     {

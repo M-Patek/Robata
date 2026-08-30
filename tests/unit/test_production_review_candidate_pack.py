@@ -34,7 +34,7 @@ def _identity_row(action: str = "fold garment", camera_id: str = "cam_01") -> di
 def _boundary_row(
     *,
     camera_id: str = "cam_01",
-    action: tuple[str, str] = ("folding", "clothing"),
+    action: tuple[str, str] = ("folding", "garment"),
     mapped: bool = True,
 ) -> dict[str, object]:
     return {
@@ -220,6 +220,20 @@ def test_rejects_gold_key_in_model_sidecar() -> None:
             {"windows": []},
             {"windows": [], "gold": {"status": "ACCEPTED"}},
         )
+
+
+def test_foreign_noun_alias_is_not_projected_to_production_label() -> None:
+    wemm = _wemm()
+    wemm["windows"][0]["model"]["predictions"][0]["label_text"] = "fold cloth"  # type: ignore[index]
+    wemm["windows"][0]["model"]["predictions"][0]["noun"] = "cloth"  # type: ignore[index]
+    report = build_production_review_candidate_pack(
+        {"windows": [_identity_row()]},
+        {"windows": []},
+        wemm,
+    )
+    top_k = report["windows"][0]["model_context"]["wemm"]["top_k"]
+    assert top_k[0]["mapped_action"] is None
+    assert top_k[0]["mapping_status"] == "UNMAPPED_EPIC_OR_FOREIGN_LABEL"
 
 
 def test_markdown_and_cli_smoke(tmp_path: Path) -> None:
