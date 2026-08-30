@@ -355,6 +355,68 @@ def _normalised_key(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
+_EPIC_MAPPER_PROVENANCE_KEYS: Final = frozenset(
+    {"epicontologyused", "mapperused"}
+)
+_FORMAT_PROVENANCE_KEYS: Final = frozenset(
+    {"format", "formatversion", "schemaformat"}
+)
+
+
+def _looks_like_epic_format(value: object) -> bool:
+    """Return whether a format label explicitly names the EPIC family.
+
+    This intentionally checks only a format *field* and a lexical token.  It
+    does not infer EPIC provenance from candidate labels, numeric action IDs,
+    paths, or arbitrary model text; those are outside this lightweight gate.
+    """
+
+    if not isinstance(value, str):
+        return False
+    tokens = "".join(character if character.isalnum() else " " for character in value.casefold())
+    return any(token == "epic" or token.startswith("epic") for token in tokens.split())
+
+
+def _assert_no_epic_mapper_provenance(value: object, *, field: str) -> None:
+    """Reject an explicitly EPIC/Mapper-derived sidecar at this boundary.
+
+    Structured annotation envelopes are label-blind and may consume the
+    production-shaped shadow formats, including their explicit ``false``
+    controls.  A producer that records either positive provenance flag, or a
+    format whose name clearly identifies EPIC, is benchmark-only and must not
+    be normalized into this production-shaped envelope.
+    """
+
+    reasons: list[str] = []
+
+    def walk(current: object, current_field: str) -> None:
+        if isinstance(current, Mapping):
+            for raw_key, child in current.items():
+                if not isinstance(raw_key, str):
+                    # ``_payload``/``_assert_no_gold_fields`` already reports
+                    # malformed keys; keep this helper focused on provenance.
+                    continue
+                key = _normalised_key(raw_key)
+                child_field = f"{current_field}.{raw_key}"
+                if key in _EPIC_MAPPER_PROVENANCE_KEYS and child is True:
+                    label = "EPIC ontology" if key == "epicontologyused" else "Mapper"
+                    reasons.append(f"{child_field} declares {label} use")
+                elif key in _FORMAT_PROVENANCE_KEYS and _looks_like_epic_format(child):
+                    reasons.append(f"{child_field} declares EPIC format")
+                walk(child, child_field)
+            return
+        if isinstance(current, Sequence) and not isinstance(current, (str, bytes, bytearray)):
+            for index, child in enumerate(current):
+                walk(child, f"{current_field}[{index}]")
+
+    walk(value, field)
+    if reasons:
+        raise ProductionStructuredAnnotationError(
+            f"{field} is benchmark-only and cannot build a production structured "
+            f"annotation envelope: {'; '.join(dict.fromkeys(reasons))}"
+        )
+
+
 _GOLD_KEY_PARTS: Final = (
     "gold",
     "groundtruth",
@@ -1635,7 +1697,13 @@ def build_structured_annotation_envelope(
 
     normalized_sidecars: dict[str, Mapping[str, Any]] = {}
     for model, raw in model_sidecars.items():
-        normalized_sidecars[model] = _payload(raw, field=f"{model}_sidecar")
+        payload = _payload(raw, field=f"{model}_sidecar")
+        # Keep the structured envelope label-blind while making the
+        # EPIC/Mapper boundary explicit.  Production-shaped shadow sidecars
+        # may declare the safe ``false`` controls; only positive declarations
+        # or a clearly EPIC-named format are benchmark-only and rejected.
+        _assert_no_epic_mapper_provenance(payload, field=f"{model}_sidecar")
+        normalized_sidecars[model] = payload
 
     manifest_payload: Mapping[str, Any] | None = None
     if source_manifest is not None:

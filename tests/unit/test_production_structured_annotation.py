@@ -132,6 +132,53 @@ def test_gold_and_review_data_are_not_accepted() -> None:
         build_structured_annotation_envelope({"wemm": broken})
 
 
+@pytest.mark.parametrize(
+    ("container", "flag"),
+    [
+        ("label_space", "epic_ontology_used"),
+        ("controls", "mapper_used"),
+    ],
+)
+def test_explicit_epic_or_mapper_use_is_benchmark_only(
+    container: str, flag: str
+) -> None:
+    sidecar = _wemm()
+    sidecar[container] = {flag: True}
+
+    with pytest.raises(
+        ProductionStructuredAnnotationError,
+        match=r"benchmark-only|EPIC|Mapper",
+    ):
+        build_structured_annotation_envelope({"wemm": sidecar})
+
+
+def test_explicit_epic_format_is_benchmark_only() -> None:
+    sidecar = _wemm()
+    sidecar["format"] = "epic-kitchens-100-sidecar-v1"
+
+    with pytest.raises(
+        ProductionStructuredAnnotationError,
+        match=r"benchmark-only|EPIC",
+    ):
+        build_structured_annotation_envelope({"wemm": sidecar})
+
+
+def test_explicit_false_epic_mapper_controls_preserve_production_fixture() -> None:
+    sidecar = _wemm()
+    sidecar["label_space"] = {
+        "kind": "OPEN_PROVISIONAL_PHRASES",
+        "epic_ontology_used": False,
+        "mapper_used": False,
+    }
+    sidecar["controls"] = {
+        "epic_ontology_used": False,
+        "mapper_used": False,
+    }
+
+    envelope = build_structured_annotation_envelope({"wemm": sidecar})
+    assert envelope["windows"][0]["models"]["wemm"]["status"] == "SUCCEEDED"
+
+
 def test_round_trip_normalizer_is_independent() -> None:
     envelope = build_structured_annotation_envelope({"wemm": _wemm()})
     copy_value = normalize_structured_annotation_envelope(envelope)
