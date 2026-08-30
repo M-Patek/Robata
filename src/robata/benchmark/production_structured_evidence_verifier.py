@@ -120,6 +120,16 @@ def _candidate_pair(value: object, *, depth: int = 0) -> tuple[str, str] | None:
     noun = _normalise_pair_token(_candidate_scalar(value.get("noun")))
     if verb and noun:
         return verb, noun
+    explicit_pair = value.get("pair")
+    if (
+        isinstance(explicit_pair, Sequence)
+        and not isinstance(explicit_pair, (str, bytes, bytearray))
+        and len(explicit_pair) == 2
+    ):
+        verb = _normalise_pair_token(_candidate_scalar(explicit_pair[0]))
+        noun = _normalise_pair_token(_candidate_scalar(explicit_pair[1]))
+        if verb and noun:
+            return verb, noun
     for key in ("candidate", "action", "prediction"):
         nested = value.get(key)
         pair = _candidate_pair(nested, depth=depth + 1)
@@ -143,29 +153,36 @@ def _available_wemm_pairs(section: Mapping[str, Any] | None) -> set[tuple[str, s
     """Return explicit non-empty WeMM Top-K pairs, if such a list exists.
 
     ``None`` means that no usable Top-K pair is available, preserving the
-    legacy Qwen-only behavior.  An available list is used as a hard lexical
-    binding for structured Qwen/Mage claims; no candidate is inferred from an
-    empty list or from opaque numeric/ontology fields.
+    legacy Qwen-only behavior.  The canonical ``candidates`` slot is the
+    source of truth, including when it is explicitly empty.  Only envelopes
+    without that slot can fall back to a ``candidate_groups`` entry explicitly
+    marked ``source_field=candidates``.  This prevents an audit-only alternate
+    ``predictions`` source from becoming a hidden Top-K candidate set.
     """
 
     if not isinstance(section, Mapping):
         return None
     values: list[object] = []
-    raw = section.get("candidates")
-    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
-        values.extend(raw)
-    # The structured envelope retains alternate candidate/prediction sources
-    # under candidate_groups.  Use them only when they provide explicit pairs.
-    groups = section.get("candidate_groups")
-    if isinstance(groups, Sequence) and not isinstance(groups, (str, bytes, bytearray)):
-        for group in groups:
-            if not isinstance(group, Mapping):
-                continue
-            group_values = group.get("candidates")
-            if isinstance(group_values, Sequence) and not isinstance(
-                group_values, (str, bytes, bytearray)
-            ):
-                values.extend(group_values)
+    if "candidates" in section:
+        raw = section.get("candidates")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            values.extend(raw)
+    else:
+        # This compatibility fallback is deliberately narrower than the
+        # envelope builder's audit retention: a recorded alternate
+        # ``predictions`` list is not the canonical Top-K delivered to Qwen.
+        groups = section.get("candidate_groups")
+        if isinstance(groups, Sequence) and not isinstance(groups, (str, bytes, bytearray)):
+            for group in groups:
+                if not isinstance(group, Mapping):
+                    continue
+                if _text(group.get("source_field")) != "candidates":
+                    continue
+                group_values = group.get("candidates")
+                if isinstance(group_values, Sequence) and not isinstance(
+                    group_values, (str, bytes, bytearray)
+                ):
+                    values.extend(group_values)
     pairs = {_candidate_pair(value) for value in values}
     usable = {pair for pair in pairs if pair is not None}
     return usable or None

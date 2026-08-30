@@ -50,6 +50,7 @@ def _envelope(
     candidates: list[dict[str, object]] | None = None,
     candidate_marker: str | None = None,
     wemm_candidates: list[dict[str, object]] | None = None,
+    wemm_predictions: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     qwen_row: dict[str, object] = {
         "window_id": "w00",
@@ -70,20 +71,21 @@ def _envelope(
             "windows": [qwen_row],
         }
     }
-    if wemm_candidates is not None:
+    if wemm_candidates is not None or wemm_predictions is not None:
+        wemm_row: dict[str, object] = {
+            "window_id": "w00",
+            "ordinal": 0,
+            "start_time_sec": 0.0,
+            "end_time_sec": 4.0,
+            "status": "SUCCEEDED",
+            "candidates": wemm_candidates if wemm_candidates is not None else [],
+        }
+        if wemm_predictions is not None:
+            wemm_row["predictions"] = wemm_predictions
         sidecars["wemm"] = {
             "format": "robata-production-wemm-shadow-v1",
             "source": {"path": "source.mcap", "camera_count": 1},
-            "windows": [
-                {
-                    "window_id": "w00",
-                    "ordinal": 0,
-                    "start_time_sec": 0.0,
-                    "end_time_sec": 4.0,
-                    "status": "SUCCEEDED",
-                    "candidates": wemm_candidates,
-                }
-            ],
+            "windows": [wemm_row],
         }
     return build_structured_annotation_envelope(
         sidecars,
@@ -164,6 +166,42 @@ def test_wemm_label_text_is_parsed_without_semantic_aliasing() -> None:
     )
     claim = report["windows"][0]["structured_claims"][0]
     assert claim["wemm_top_k_binding"] == "MATCH"
+
+
+def test_wemm_explicit_multiword_pair_binds_before_label_text() -> None:
+    report = verify_production_structured_evidence(
+        _envelope(
+            [_segment(verb="pick up")],
+            wemm_candidates=[
+                {
+                    "pair": ["pick up", "garment"],
+                    "label_text": "unrelated fallback text",
+                    "score": 0.9,
+                }
+            ],
+        )
+    )
+    window = report["windows"][0]
+    claim = window["structured_claims"][0]
+    assert window["wemm_top_k_pairs"] == [["pick up", "garment"]]
+    assert claim["wemm_top_k_binding"] == "MATCH"
+
+
+def test_empty_canonical_wemm_top_k_does_not_bind_alternate_predictions() -> None:
+    report = verify_production_structured_evidence(
+        _envelope(
+            [_segment()],
+            wemm_candidates=[],
+            wemm_predictions=[{"verb": "fold", "noun": "garment", "score": 0.9}],
+        )
+    )
+    window = report["windows"][0]
+    claim = window["structured_claims"][0]
+    assert window["retrieval_context"]["top_k"] == []
+    assert window["wemm_top_k_pairs"] == []
+    assert window["wemm_candidate_binding_checked"] is False
+    assert claim["wemm_top_k_binding"] == "NOT_MEASURED"
+    assert claim["eligible_for_review"] is True
 
 
 def test_invalid_claim_is_retained_with_explicit_reasons() -> None:
