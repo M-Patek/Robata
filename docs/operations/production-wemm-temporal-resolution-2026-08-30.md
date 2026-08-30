@@ -1,7 +1,7 @@
 # Production WeMM temporal resolution (local review path)
 
-**Date:** 2026-08-30  
-**Status:** local, non-production diagnostic  
+**Date:** 2026-08-30
+**Status:** local, non-production diagnostic
 **Scope:** WeMM production-shaped pre-annotation only
 
 ## Why this exists
