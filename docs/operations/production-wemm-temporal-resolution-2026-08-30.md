@@ -145,6 +145,31 @@ Use the small reviewed diagnostic cohort first.  Keep the held-out-100 set
 frozen until a policy is selected and reviewed.  Report interval quality,
 candidate recall, accepted precision/coverage, and regressions separately.
 
+## Fine score-boundary refinement
+
+The optional adaptive route now has a score-only refinement seam in
+`robata.benchmark.production_wemm_temporal_score_refinement`.  It does not
+pretend that WeMM emits timestamps.  Instead, each coarse ONSET/OFFSET
+request is expanded into a bounded, nested grid of `before` and `after`
+contexts (for example, two 500-ms probes on each side followed by 250-ms
+probes).  WeMM is run on those contexts, and a deterministic resolver looks
+for the expected score transition:
+
+* ONSET: score below `start_threshold` before the transition and at/above it
+  after the transition;
+* OFFSET: score at/above `stop_threshold` before the transition and below it
+  after the transition.
+
+The crossing is linearly interpolated between **probe centres**, never copied
+from a probe edge.  A parent-request-relative interval around that crossing is
+returned as `MEASURED` evidence for `apply_refined_boundaries`; missing,
+non-bracketed, camera-unsupported, or edge-clipped probes remain
+`UNCERTAIN`.  The original coarse report is preserved and the resulting
+`refined_segments` stay `review_required=true` and
+`automatic_eligible=false`.  This lets the adaptive runner test whether
+shorter model contexts actually improve temporal localization without
+changing the historical four-second path or claiming production quality.
+
 ## Short model-driven refinement (new, additive)
 
 `robata.benchmark.production_wemm_temporal_refinement` provides the next
