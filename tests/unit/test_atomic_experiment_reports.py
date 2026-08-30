@@ -103,9 +103,7 @@ def test_explicit_current_fields_are_known_without_reinterpreting_legacy_fields(
     assert case.transform_trace.availability is LegacyEvidenceAvailability.KNOWN
     assert case.final_thumbnail_geometry.availability is LegacyEvidenceAvailability.KNOWN
     assert case.processor_grid.value == [8, 16, 16]
-    assert case.processor_tensor_shape.value == {
-        "pixel_values_videos": [8, 3, 224, 224]
-    }
+    assert case.processor_tensor_shape.value == {"pixel_values_videos": [8, 3, 224, 224]}
 
 
 def test_recorded_comparison_stop_outcome_can_be_attached_without_changing_raw_reports() -> None:
