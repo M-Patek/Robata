@@ -155,9 +155,7 @@ def _decode_raw(value: object) -> dict[str, Any] | None:
 
 
 def _qwen_candidates(sidecar: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, dict[tuple[str, str], list[float]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    grouped: dict[str, dict[tuple[str, str], list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in sidecar.get("windows", []):
         if not isinstance(row, dict):
             continue
@@ -254,13 +252,10 @@ def _metrics(
     return {
         "windows": denominator,
         "top_k": top_k,
-        "strict_pair_at_1": sum(rank == 1 for rank in ranks) / denominator
-        if denominator
-        else 0.0,
+        "strict_pair_at_1": sum(rank == 1 for rank in ranks) / denominator if denominator else 0.0,
         "strict_pair_at_k": len(covered) / denominator if denominator else 0.0,
         "mrr": sum(1.0 / rank for rank in covered) / denominator if denominator else 0.0,
-        "abstention": sum(not candidates.get(window_id) for window_id in references)
-        / denominator
+        "abstention": sum(not candidates.get(window_id) for window_id in references) / denominator
         if denominator
         else 0.0,
         "ranks": ranks,

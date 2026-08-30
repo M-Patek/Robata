@@ -141,9 +141,7 @@ def test_terra_comparison_collapses_accept_edit_and_keeps_abstain_split_distinct
     assert labels["core_label_exact_matches"] == 3
     assert labels["exact_interval_matches"] == 3
     assert labels["mean_interval_iou"] == 1.0
-    abstained = next(
-        row for row in report["per_window"] if row["window_id"] == "sample-medium-w01"
-    )
+    abstained = next(row for row in report["per_window"] if row["window_id"] == "sample-medium-w01")
     assert abstained["confirmed"]["candidate_segment_count"] == 0
     assert abstained["independent"]["candidate_segment_count"] == 1
     assert abstained["segment_pairs"] == []
