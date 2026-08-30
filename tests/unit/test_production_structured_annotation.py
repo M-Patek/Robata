@@ -139,9 +139,7 @@ def test_gold_and_review_data_are_not_accepted() -> None:
         ("controls", "mapper_used"),
     ],
 )
-def test_explicit_epic_or_mapper_use_is_benchmark_only(
-    container: str, flag: str
-) -> None:
+def test_explicit_epic_or_mapper_use_is_benchmark_only(container: str, flag: str) -> None:
     sidecar = _wemm()
     sidecar[container] = {flag: True}
 
