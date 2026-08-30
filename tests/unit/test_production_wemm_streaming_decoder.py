@@ -104,6 +104,31 @@ def _manifest(tmp_path):
     }
 
 
+def _dense_manifest(tmp_path, *, window_chunk_size: int = 1):
+    """Build a tiny 4 s/1 s overlap fixture for carry regression tests."""
+
+    manifest = _manifest(tmp_path)
+    manifest["source"]["cameras"] = [
+        {
+            "camera_id": f"cam_{index:02d}",
+            "topic": f"/cam/{index}",
+            "frame_count": 20,
+            "duration_seconds": 8.0,
+        }
+        for index in range(1, 7)
+    ]
+    manifest["windows"] = [
+        {
+            "ordinal": index,
+            "window_id": f"w{index:02d}",
+            "start_seconds": float(index),
+            "end_seconds": float(index + 4),
+        }
+        for index in range(4)
+    ]
+    return manifest
+
+
 def test_stateful_iterator_scans_source_once_and_preserves_window_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -221,3 +246,118 @@ def test_stateful_iterator_batches_windows_without_rescanning(
         8_000_000_000,
         12_000_000_000,
     )
+
+
+@pytest.mark.parametrize("window_chunk_size", [1, 2])
+def test_dense_overlap_carries_one_frame_to_all_future_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, window_chunk_size: int
+) -> None:
+    """A 4 s/1 s grid must fill every window, even across chunk boundaries."""
+
+    _Decoder.instances.clear()
+    _Reader.iterations = 0
+    manifest = _dense_manifest(tmp_path, window_chunk_size=window_chunk_size)
+    messages = []
+    # Integer-second frames land exactly on all requested target timestamps:
+    # w00=[0,1,2,3], w01=[1,2,3,4], w02=[2,3,4,5], w03=[3,4,5,6].
+    for timestamp_seconds in range(8):
+        timestamp_ns = timestamp_seconds * 1_000_000_000
+        for index in range(1, 7):
+            messages.append(
+                (
+                    SimpleNamespace(name="foxglove.CompressedImage"),
+                    SimpleNamespace(topic=f"/cam/{index}"),
+                    SimpleNamespace(log_time=timestamp_ns),
+                    SimpleNamespace(data=b"h264"),
+                )
+            )
+    reader = _Reader(messages)
+    fake_mcap = SimpleNamespace(make_reader=lambda *args, **kwargs: reader)
+    fake_decoder = SimpleNamespace(DecoderFactory=lambda: object())
+    fake_av = SimpleNamespace(CodecContext=_CodecContext, Packet=_Packet)
+    real_import = shadow.import_module
+
+    def fake_import(name: str):
+        if name == "av":
+            return fake_av
+        if name == "mcap.reader":
+            return fake_mcap
+        if name == "mcap_protobuf.decoder":
+            return fake_decoder
+        if name == "PIL.Image":
+            return SimpleNamespace()
+        return real_import(name)
+
+    monkeypatch.setattr(shadow, "import_module", fake_import)
+    chunks = list(
+        shadow.iter_decode_production_window_chunks(
+            manifest,
+            frame_count=4,
+            window_chunk_size=window_chunk_size,
+        )
+    )
+
+    assert _Reader.iterations == 1
+    expected_windows = [f"w{index:02d}" for index in range(4)]
+    flattened = [window_id for chunk in chunks for window_id in chunk["cam_01"]]
+    assert flattened == expected_windows
+    assert len(chunks) == (4 + window_chunk_size - 1) // window_chunk_size
+    for chunk in chunks:
+        for group in chunk["cam_01"].values():
+            assert len(group.frames) == 4
+            assert group.selected_timestamps_ns == tuple(
+                int(value * 1_000_000_000)
+                for value in range(int(group.start_seconds), int(group.start_seconds) + 4)
+            )
+
+
+def test_dense_overlap_does_not_share_closeable_images_between_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Each overlapping destination owns an independent image object."""
+
+    _Decoder.instances.clear()
+    _Reader.iterations = 0
+    manifest = _dense_manifest(tmp_path)
+    messages = []
+    for timestamp_seconds in range(8):
+        timestamp_ns = timestamp_seconds * 1_000_000_000
+        for index in range(1, 7):
+            messages.append(
+                (
+                    SimpleNamespace(name="foxglove.CompressedImage"),
+                    SimpleNamespace(topic=f"/cam/{index}"),
+                    SimpleNamespace(log_time=timestamp_ns),
+                    SimpleNamespace(data=b"h264"),
+                )
+            )
+    reader = _Reader(messages)
+    fake_mcap = SimpleNamespace(make_reader=lambda *args, **kwargs: reader)
+    fake_decoder = SimpleNamespace(DecoderFactory=lambda: object())
+    fake_av = SimpleNamespace(CodecContext=_CodecContext, Packet=_Packet)
+    real_import = shadow.import_module
+
+    def fake_import(name: str):
+        if name == "av":
+            return fake_av
+        if name == "mcap.reader":
+            return fake_mcap
+        if name == "mcap_protobuf.decoder":
+            return fake_decoder
+        if name == "PIL.Image":
+            return SimpleNamespace()
+        return real_import(name)
+
+    monkeypatch.setattr(shadow, "import_module", fake_import)
+    chunks = list(
+        shadow.iter_decode_production_window_chunks(
+            manifest,
+            frame_count=4,
+            window_chunk_size=1,
+        )
+    )
+    first = chunks[0]["cam_01"]["w00"].frames[1]
+    second = chunks[1]["cam_01"]["w01"].frames[0]
+    assert first is not second
+    first.close()
+    assert second.closed is False

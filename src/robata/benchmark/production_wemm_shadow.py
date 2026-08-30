@@ -17,11 +17,13 @@ from __future__ import annotations
 import csv
 import json
 import math
+from bisect import bisect_right
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
 from importlib import import_module
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
@@ -496,10 +498,12 @@ def iter_decode_production_window_chunks(
             "examined": 0,
             "decoded": 0,
             "failures": [],
-            # Frames after the current chunk boundary are retained only as the
-            # nearest candidate for a target in the *next* chunk.  Keeping a
-            # target-indexed map (rather than every future frame) makes the
-            # memory bound explicit even when MCAP channel order is skewed.
+            # Frames that arrive before a future overlapping context is
+            # activated are retained as the nearest candidate for that
+            # context's targets.  The map is target-indexed rather than a raw
+            # frame queue, so memory is bounded by the number of active
+            # overlapping contexts and ``frame_count`` even when MCAP channel
+            # order is skewed.
             "carry": {},
         }
         for camera_id, _topic in camera_pairs
@@ -519,89 +523,160 @@ def iter_decode_production_window_chunks(
             for camera_id, _topic in camera_pairs
         }
 
+    def _future_index(
+        specs: Sequence[Mapping[str, Any]],
+    ) -> tuple[Sequence[Mapping[str, Any]], tuple[int, ...], tuple[int, ...], bool]:
+        """Precompute temporal bounds used by per-frame future matching.
+
+        Dense runs can contain thousands of windows.  Rebuilding integer bound
+        tuples for every decoded frame turns an otherwise bounded carry lookup
+        into an avoidable quadratic CPU cost, so this index is rebuilt only
+        when the active chunk advances.
+        """
+
+        starts = tuple(int(spec["start_ns"]) for spec in specs)
+        ends = tuple(int(spec["end_ns"]) for spec in specs)
+        monotonic_ends = all(left <= right for left, right in pairwise(ends))
+        return specs, starts, ends, monotonic_ends
+
     def _assign_frame(
         state: dict[str, Any],
         frame_ts: int,
         frame: Any,
         chunk_specs: Sequence[Mapping[str, Any]],
-        next_chunk_specs: Sequence[Mapping[str, Any]],
+        future_index: tuple[Sequence[Mapping[str, Any]], tuple[int, ...], tuple[int, ...], bool],
     ) -> None:
-        """Assign one decoded frame to the current chunk or boundary carry."""
+        """Assign one decoded frame to every matching current/future context.
 
-        if not chunk_specs:
+        Dense context windows overlap by design.  A decoded frame can therefore
+        be the nearest sample for several windows (and for several chunks), not
+        just the first matching window.  The old implementation returned after
+        the first assignment and only carried frames into the immediately next
+        chunk, which left dense windows such as ``[1, 5)`` with one selected
+        frame out of four.  We now retain target-indexed candidates for *all*
+        future windows that contain the frame and drain them when their chunk
+        becomes current.
+
+        Each destination receives its own PIL image.  Sharing one image object
+        across windows would let the consumer closing one ``ProductionFrameGroup``
+        invalidate a sibling group that still owns the same frame.
+        """
+
+        future_specs, future_starts, future_ends, monotonic_ends = future_index
+        if not chunk_specs and not future_specs:
             return
-        first_start = int(chunk_specs[0]["start_ns"])
-        chunk_end = int(chunk_specs[-1]["end_ns"])
-        if frame_ts < first_start:
-            return
-        if frame_ts >= chunk_end:
-            # Only retain a nearest target candidate for the immediately next
-            # chunk.  Do not convert or queue arbitrary post-boundary frames:
-            # a camera can be far ahead of another in physical MCAP order.
-            for spec in next_chunk_specs:
-                start_ns = int(spec["start_ns"])
-                end_ns = int(spec["end_ns"])
-                if not start_ns <= frame_ts < end_ns:
-                    continue
-                window_id = str(spec["window_id"])
-                targets = spec["targets"]
-                index = min(range(frame_count), key=lambda item: abs(frame_ts - targets[item]))
-                delta = abs(frame_ts - targets[index])
-                carry_window = state["carry"].setdefault(window_id, {})
-                previous = carry_window.get(index)
-                if previous is not None and previous["delta"] <= delta:
-                    return
+
+        # ``future_specs`` is sorted by source start in normal manifests.  Use
+        # binary search to avoid scanning all later windows for every decoded
+        # frame, while retaining a conservative linear fallback for an
+        # externally supplied manifest whose end times are not monotonic.
+        future_matches: Sequence[Mapping[str, Any]] = ()
+        if future_specs:
+            if monotonic_ends:
+                started = bisect_right(future_starts, frame_ts)
+                expired = bisect_right(future_ends, frame_ts)
+                future_matches = tuple(
+                    spec
+                    for spec in future_specs[expired:started]
+                    if int(spec["start_ns"]) <= frame_ts < int(spec["end_ns"])
+                )
+            else:
+                future_matches = tuple(
+                    spec
+                    for spec in future_specs
+                    if int(spec["start_ns"]) <= frame_ts < int(spec["end_ns"])
+                )
+
+        base_image: Any | None = None
+        base_transferred = False
+
+        def _image_for_destination() -> Any:
+            """Return an independently owned image for one window target."""
+
+            nonlocal base_image, base_transferred
+            if base_image is None:
+                base_image = _to_rgb_image(frame)
+            if not base_transferred:
+                # Transfer the first conversion directly; subsequent targets
+                # receive a copy (or a fresh conversion for lightweight test
+                # doubles without ``copy``).
+                base_transferred = True
+                return base_image
+            copy = getattr(base_image, "copy", None)
+            if callable(copy):
                 try:
-                    image = _to_rgb_image(frame)
-                except Exception as exc:
-                    state["failures"].append(f"FRAME_CONVERSION_ERROR:{type(exc).__name__}")
-                    return
-                if previous is not None:
-                    _close_image(previous["image"])
-                carry_window[index] = {
-                    "delta": delta,
-                    "timestamp_ns": frame_ts,
-                    "image": image,
-                }
-                return
-            return
+                    copied = copy()
+                    if copied is not base_image:
+                        return copied
+                except Exception:
+                    pass
+            return _to_rgb_image(frame)
 
-        selected_by_window = state["selected"]
-        for spec in chunk_specs:
-            start_ns = int(spec["start_ns"])
-            end_ns = int(spec["end_ns"])
-            if not start_ns <= frame_ts < end_ns:
-                continue
-            window_id = str(spec["window_id"])
+        def _store(
+            destination: dict[int, dict[str, Any]],
+            spec: Mapping[str, Any],
+        ) -> None:
             targets = spec["targets"]
             index = min(range(frame_count), key=lambda item: abs(frame_ts - targets[item]))
-            selected = selected_by_window[window_id]
             delta = abs(frame_ts - targets[index])
-            previous = selected.get(index)
+            previous = destination.get(index)
             if previous is not None and previous["delta"] <= delta:
                 return
             try:
-                image = _to_rgb_image(frame)
+                image = _image_for_destination()
             except Exception as exc:
                 state["failures"].append(f"FRAME_CONVERSION_ERROR:{type(exc).__name__}")
                 return
             if previous is not None:
                 _close_image(previous["image"])
-            selected[index] = {
+            destination[index] = {
                 "delta": delta,
                 "timestamp_ns": frame_ts,
                 "image": image,
             }
-            return
+
+        try:
+            selected_by_window = state["selected"]
+            for spec in chunk_specs:
+                start_ns = int(spec["start_ns"])
+                end_ns = int(spec["end_ns"])
+                if start_ns <= frame_ts < end_ns:
+                    window_id = str(spec["window_id"])
+                    selected = selected_by_window.get(window_id)
+                    if selected is not None:
+                        _store(selected, spec)
+
+            # Do not return after a current assignment: the same decoded frame
+            # may also be needed by one or more overlapping future contexts.
+            for spec in future_matches:
+                window_id = str(spec["window_id"])
+                carry_window = state["carry"].setdefault(window_id, {})
+                _store(carry_window, spec)
+        finally:
+            # If the first conversion was never transferred (for example, all
+            # candidate targets already had a closer frame), release it here.
+            if base_image is not None and not base_transferred:
+                _close_image(base_image)
 
     def _drain_carry(
         state: dict[str, Any],
         chunk_specs: Sequence[Mapping[str, Any]],
+        remaining_specs: Sequence[Mapping[str, Any]] = (),
     ) -> None:
-        carry = state.pop("carry", {})
-        state["carry"] = {}
-        for window_id, candidates in carry.items():
-            selected = state["selected"].get(str(window_id))
+        """Move candidates for the current chunk into selected windows.
+
+        Carry for later overlapping chunks must survive this transition.  Only
+        entries for the newly current windows are drained; entries whose window
+        has already fallen outside the remaining plan are closed explicitly so
+        a malformed/irregular manifest cannot leak PIL images.
+        """
+
+        carry = state.setdefault("carry", {})
+        current_ids = {str(spec["window_id"]) for spec in chunk_specs}
+        remaining_ids = {str(spec["window_id"]) for spec in remaining_specs}
+        for window_id in current_ids:
+            candidates = carry.pop(window_id, {})
+            selected = state["selected"].get(window_id)
             if selected is None:
                 for item in candidates.values():
                     _close_image(item["image"])
@@ -614,6 +689,29 @@ def iter_decode_production_window_chunks(
                 if previous is not None:
                     _close_image(previous["image"])
                 selected[index] = item
+
+        valid_ids = current_ids | remaining_ids
+        for window_id in tuple(carry):
+            if window_id in valid_ids:
+                continue
+            stale = carry.pop(window_id)
+            for item in stale.values():
+                _close_image(item["image"])
+
+    def _close_unconsumed_carry() -> None:
+        """Release future-window images when the iterator stops early."""
+
+        for state in state_by_camera.values():
+            carry = state.get("carry", {})
+            if not isinstance(carry, dict):
+                continue
+            for candidates in carry.values():
+                if not isinstance(candidates, Mapping):
+                    continue
+                for item in candidates.values():
+                    if isinstance(item, Mapping):
+                        _close_image(item.get("image"))
+            carry.clear()
 
     def _chunk_ready(
         state_by_camera: Mapping[str, Mapping[str, Any]],
@@ -670,7 +768,8 @@ def iter_decode_production_window_chunks(
     state_by_camera = camera_state
     chunk_index = 0
     current_specs: Sequence[Mapping[str, Any]] = ()
-    next_specs: Sequence[Mapping[str, Any]] = ()
+    future_specs: Sequence[Mapping[str, Any]] = ()
+    future_index = _future_index(future_specs)
     try:
         with source.open("rb") as stream:
             reader = mcap_reader.make_reader(
@@ -679,7 +778,8 @@ def iter_decode_production_window_chunks(
                 decoder_factories=[decoder_module.DecoderFactory()],
             )
             current_specs = chunk_specs_list[0]
-            next_specs = chunk_specs_list[1] if len(chunk_specs_list) > 1 else ()
+            future_specs = tuple(spec for chunk in chunk_specs_list[1:] for spec in chunk)
+            future_index = _future_index(future_specs)
             state_by_camera = {
                 camera_id: {**state, "selected": _new_selections(current_specs), "past_end": False}
                 for camera_id, state in camera_state.items()
@@ -721,7 +821,7 @@ def iter_decode_production_window_chunks(
                 state["decoded"] += len(frames or ())
                 for frame in frames or ():
                     frame_ts = _decode_frame_timestamp(frame, timestamp)
-                    _assign_frame(state, frame_ts, frame, current_specs, next_specs)
+                    _assign_frame(state, frame_ts, frame, current_specs, future_index)
                 if timestamp >= int(current_specs[-1]["end_ns"]):
                     state["past_end"] = True
 
@@ -731,21 +831,26 @@ def iter_decode_production_window_chunks(
                     del emitted
                     chunk_index += 1
                     if chunk_index >= len(chunk_specs_list):
+                        _close_unconsumed_carry()
                         return
                     current_specs = chunk_specs_list[chunk_index]
-                    next_specs = (
-                        chunk_specs_list[chunk_index + 1]
-                        if chunk_index + 1 < len(chunk_specs_list)
-                        else ()
+                    future_specs = tuple(
+                        spec for chunk in chunk_specs_list[chunk_index + 1 :] for spec in chunk
                     )
+                    future_index = _future_index(future_specs)
                     for camera_state_item in state_by_camera.values():
                         camera_state_item["selected"] = {
                             str(spec["window_id"]): {} for spec in current_specs
                         }
                         camera_state_item["past_end"] = False
-                        _drain_carry(camera_state_item, current_specs)
+                        _drain_carry(camera_state_item, current_specs, future_specs)
     except OSError as exc:
+        _close_unconsumed_carry()
         raise ProductionWemmShadowError(f"could not read MCAP source: {exc}") from exc
+    except BaseException:
+        # Includes ``GeneratorExit`` when a consumer abandons a partial run.
+        _close_unconsumed_carry()
+        raise
 
     # EOF: permit the final chunk to be emitted if all requested frames were
     # selected.  Otherwise preserve the legacy diagnostic with the first
@@ -771,13 +876,16 @@ def iter_decode_production_window_chunks(
         if chunk_index >= len(chunk_specs_list):
             break
         current_specs = chunk_specs_list[chunk_index]
-        next_specs = (
-            chunk_specs_list[chunk_index + 1] if chunk_index + 1 < len(chunk_specs_list) else ()
+        future_specs = tuple(
+            spec for chunk in chunk_specs_list[chunk_index + 1 :] for spec in chunk
         )
+        future_index = _future_index(future_specs)
         for camera_state_item in state_by_camera.values():
             camera_state_item["selected"] = {str(spec["window_id"]): {} for spec in current_specs}
             camera_state_item["past_end"] = True
-            _drain_carry(camera_state_item, current_specs)
+            _drain_carry(camera_state_item, current_specs, future_specs)
+
+    _close_unconsumed_carry()
 
 
 def _read_classes(path: Path, *, field: str) -> dict[int, str]:
