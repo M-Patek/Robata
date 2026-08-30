@@ -305,7 +305,7 @@ def validate_mage_codec_assets(output_directory: Path) -> MageCodecAssetReport:
         )
     position_shape: tuple[int, ...] | None = None
     try:
-        import numpy as np  # type: ignore[import-not-found]
+        import numpy as np
 
         loaded = np.load(directory / "src_patch_position.npy", mmap_mode="r", allow_pickle=False)
         position_shape = tuple(int(value) for value in loaded.shape)
@@ -466,7 +466,7 @@ def build_traditional_codec_command(
         value = codec_config.get(name, default)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise MageNativeCodecError(f"codec_config.{name} must be a positive integer")
-        return value
+        return int(value)
 
     executable = report.command
     return (
@@ -522,6 +522,7 @@ def _inspect_traditional(**common: Any) -> MageCodecDependencyReport:
     # Keep the command empty until an actual executable (or the explicit host
     # bridge wrapper) is discoverable.
     command_mode: Literal["executable", "python_module", "missing"]
+    command: tuple[str, ...]
     if direct is not None:
         command = (str(direct),)
         command_mode = "executable"

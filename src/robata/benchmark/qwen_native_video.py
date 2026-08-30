@@ -9,6 +9,7 @@ unrelated image tokens.  It does not alter any published Robata wire contract.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,7 +208,10 @@ def sample_qwen_native_video(
         raise QwenNativeVideoInputError(f"video path is not a file: {path}")
 
     try:
-        import cv2
+        # OpenCV is an optional runtime dependency and is not installed in the
+        # type-checking environment.  Import it dynamically so mypy does not
+        # require a cv2 stub while the runtime still reports a clear error.
+        cv2: Any = importlib.import_module("cv2")
         import numpy as np
     except ImportError as error:
         raise QwenNativeVideoInputError(
