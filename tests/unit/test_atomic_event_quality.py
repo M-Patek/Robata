@@ -52,9 +52,7 @@ def test_turn_off_does_not_credit_adjacent_washing_under_running_water() -> None
 
 
 def test_vague_motion_and_holding_state_are_not_take_or_turn_off_events() -> None:
-    vague = _score(
-        "turn-off", "extractor fan", "The hand moves toward a pot, then moves away."
-    )
+    vague = _score("turn-off", "extractor fan", "The hand moves toward a pot, then moves away.")
     holding = _score("take", "bag:cereal", "The person is holding a clear plastic bag.")
 
     assert vague.generic_or_state_only is True

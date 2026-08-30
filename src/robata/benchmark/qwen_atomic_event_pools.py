@@ -249,43 +249,43 @@ _EXPECTED_POOL_SIZES: Final[Mapping[QwenAtomicEventPoolName, int]] = MappingProx
         QwenAtomicEventPoolName.M9: 9,
     }
 )
-_EXPECTED_STRATA: Final[
-    Mapping[QwenAtomicEventPoolName, Mapping[AtomicEventStratum, int]]
-] = MappingProxyType(
-    {
-        QwenAtomicEventPoolName.H8: MappingProxyType(
-            {
-                AtomicEventStratum.SWITCH_DIRECTION: 5,
-                AtomicEventStratum.OPEN_CLOSE: 1,
-                AtomicEventStratum.TAKE_PUT: 0,
-                AtomicEventStratum.CONTINUOUS_ADJACENT: 2,
-            }
-        ),
-        QwenAtomicEventPoolName.D12: MappingProxyType(
-            {
-                AtomicEventStratum.SWITCH_DIRECTION: 3,
-                AtomicEventStratum.OPEN_CLOSE: 3,
-                AtomicEventStratum.TAKE_PUT: 3,
-                AtomicEventStratum.CONTINUOUS_ADJACENT: 3,
-            }
-        ),
-        QwenAtomicEventPoolName.C24: MappingProxyType(
-            {
-                AtomicEventStratum.SWITCH_DIRECTION: 6,
-                AtomicEventStratum.OPEN_CLOSE: 6,
-                AtomicEventStratum.TAKE_PUT: 6,
-                AtomicEventStratum.CONTINUOUS_ADJACENT: 6,
-            }
-        ),
-        QwenAtomicEventPoolName.M9: MappingProxyType(
-            {
-                AtomicEventStratum.SWITCH_DIRECTION: 2,
-                AtomicEventStratum.OPEN_CLOSE: 1,
-                AtomicEventStratum.TAKE_PUT: 3,
-                AtomicEventStratum.CONTINUOUS_ADJACENT: 3,
-            }
-        ),
-    }
+_EXPECTED_STRATA: Final[Mapping[QwenAtomicEventPoolName, Mapping[AtomicEventStratum, int]]] = (
+    MappingProxyType(
+        {
+            QwenAtomicEventPoolName.H8: MappingProxyType(
+                {
+                    AtomicEventStratum.SWITCH_DIRECTION: 5,
+                    AtomicEventStratum.OPEN_CLOSE: 1,
+                    AtomicEventStratum.TAKE_PUT: 0,
+                    AtomicEventStratum.CONTINUOUS_ADJACENT: 2,
+                }
+            ),
+            QwenAtomicEventPoolName.D12: MappingProxyType(
+                {
+                    AtomicEventStratum.SWITCH_DIRECTION: 3,
+                    AtomicEventStratum.OPEN_CLOSE: 3,
+                    AtomicEventStratum.TAKE_PUT: 3,
+                    AtomicEventStratum.CONTINUOUS_ADJACENT: 3,
+                }
+            ),
+            QwenAtomicEventPoolName.C24: MappingProxyType(
+                {
+                    AtomicEventStratum.SWITCH_DIRECTION: 6,
+                    AtomicEventStratum.OPEN_CLOSE: 6,
+                    AtomicEventStratum.TAKE_PUT: 6,
+                    AtomicEventStratum.CONTINUOUS_ADJACENT: 6,
+                }
+            ),
+            QwenAtomicEventPoolName.M9: MappingProxyType(
+                {
+                    AtomicEventStratum.SWITCH_DIRECTION: 2,
+                    AtomicEventStratum.OPEN_CLOSE: 1,
+                    AtomicEventStratum.TAKE_PUT: 3,
+                    AtomicEventStratum.CONTINUOUS_ADJACENT: 3,
+                }
+            ),
+        }
+    )
 )
 _UID_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?P<participant>P\d{2})_(?P<video>\d+)_(?P<annotation>\d+)$"
@@ -301,9 +301,7 @@ def get_frozen_pool(
 
 
 def validate_pool_partition(
-    pools: Mapping[
-        QwenAtomicEventPoolName | str, Sequence[FrozenAtomicEventPoolCase]
-    ]
+    pools: Mapping[QwenAtomicEventPoolName | str, Sequence[FrozenAtomicEventPoolCase]]
     | None = None,
 ) -> None:
     """Fail closed when a mutated frozen-pool partition loses its safeguards.
@@ -339,16 +337,14 @@ def validate_pool_partition(
     shared_participants = _shared_values(d12, c24, lambda case: case.participant_id)
     if shared_participants:
         raise FrozenPoolPartitionError(
-            "D12 and C24 must not share participants: "
-            + ", ".join(sorted(shared_participants))
+            "D12 and C24 must not share participants: " + ", ".join(sorted(shared_participants))
         )
 
     c24_by_uid = {case.uid: case for case in c24}
     missing_from_c24 = [case.uid for case in m9 if case.uid not in c24_by_uid]
     if missing_from_c24:
         raise FrozenPoolPartitionError(
-            "M9 must be a C24 UID subset; missing from C24: "
-            + ", ".join(missing_from_c24)
+            "M9 must be a C24 UID subset; missing from C24: " + ", ".join(missing_from_c24)
         )
     mismatched_m9_metadata = [
         case.uid
@@ -394,9 +390,7 @@ def resolve_pool_records[RecordT](
 def _coerce_pool_name(value: object) -> QwenAtomicEventPoolName:
     if not isinstance(value, str):
         known = ", ".join(name.value for name in _POOL_NAMES)
-        raise FrozenPoolPartitionError(
-            f"unknown frozen pool {value!r}; expected one of {known}"
-        )
+        raise FrozenPoolPartitionError(f"unknown frozen pool {value!r}; expected one of {known}")
     try:
         return QwenAtomicEventPoolName(value)
     except ValueError as error:
@@ -437,9 +431,7 @@ def _validate_pool_cases(
             )
     duplicates = _duplicate_values(case.uid for case in cases)
     if duplicates:
-        raise FrozenPoolPartitionError(
-            f"{label}: duplicate UIDs: " + ", ".join(sorted(duplicates))
-        )
+        raise FrozenPoolPartitionError(f"{label}: duplicate UIDs: " + ", ".join(sorted(duplicates)))
     for case in cases:
         _validate_case_identity(label, case)
 

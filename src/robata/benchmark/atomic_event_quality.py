@@ -161,9 +161,7 @@ _ACTION_PATTERNS: dict[AtomicActionFamily, tuple[re.Pattern[str], ...]] = {
     AtomicActionFamily.THROW: _patterns(
         r"\bthrow(?:s|ing)?\b", r"\bthrew\b", r"\bdiscard(?:s|ed|ing)?\b"
     ),
-    AtomicActionFamily.SCOOP: _patterns(
-        r"\bscoop(?:s|ed|ing)?\b", r"\bshovel(?:s|ed|ing)?\b"
-    ),
+    AtomicActionFamily.SCOOP: _patterns(r"\bscoop(?:s|ed|ing)?\b", r"\bshovel(?:s|ed|ing)?\b"),
     AtomicActionFamily.MOVE: _patterns(
         r"\bmov(?:e|es|ed|ing)\b",
         r"\breposition(?:s|ed|ing)?\b",
@@ -212,9 +210,7 @@ _DIRECTIONAL_FAMILIES = frozenset(
 )
 
 _OPPOSITES: dict[AtomicActionFamily, frozenset[AtomicActionFamily]] = {
-    AtomicActionFamily.TAKE: frozenset(
-        {AtomicActionFamily.PUT_DOWN, AtomicActionFamily.PUT_IN}
-    ),
+    AtomicActionFamily.TAKE: frozenset({AtomicActionFamily.PUT_DOWN, AtomicActionFamily.PUT_IN}),
     AtomicActionFamily.PUT_DOWN: frozenset({AtomicActionFamily.TAKE}),
     AtomicActionFamily.PUT_IN: frozenset({AtomicActionFamily.TAKE}),
     AtomicActionFamily.OPEN: frozenset({AtomicActionFamily.CLOSE}),
@@ -256,9 +252,7 @@ def _matches(patterns: Iterable[re.Pattern[str]], text: str) -> bool:
 
 def _matched_families(text: str) -> tuple[AtomicActionFamily, ...]:
     return tuple(
-        family
-        for family, patterns in _ACTION_PATTERNS.items()
-        if _matches(patterns, text)
+        family for family, patterns in _ACTION_PATTERNS.items() if _matches(patterns, text)
     )
 
 
@@ -309,8 +303,7 @@ def _contains_surface(text: str, surface: str) -> bool:
     available = tuple(_singular_token(token) for token in text.split())
     width = len(wanted)
     return any(
-        available[index : index + width] == wanted
-        for index in range(len(available) - width + 1)
+        available[index : index + width] == wanted for index in range(len(available) - width + 1)
     )
 
 

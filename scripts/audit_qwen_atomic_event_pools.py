@@ -130,9 +130,7 @@ def _record_projection(
         "historical_regression_anchor": historical,
         "frozen_posthoc_action": frozen_posthoc_action,
         "official_action_text": _action_text(row),
-        "frozen_posthoc_action_tokens_match": _expected_action_matches(
-            frozen_posthoc_action, row
-        ),
+        "frozen_posthoc_action_tokens_match": _expected_action_matches(frozen_posthoc_action, row),
         "official_reference": {
             "annotation_id": uid,
             "narration": row.get("narration", ""),
@@ -163,9 +161,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("pool names must not be repeated")
     annotations = _read_annotations(args.annotation_csv)
 
-    memberships: dict[
-        str, list[tuple[QwenAtomicEventPoolName, FrozenAtomicEventPoolCase]]
-    ] = {}
+    memberships: dict[str, list[tuple[QwenAtomicEventPoolName, FrozenAtomicEventPoolCase]]] = {}
     pool_rows: dict[str, list[str]] = {}
     for pool_name in selected_names:
         cases = get_frozen_pool(pool_name)
