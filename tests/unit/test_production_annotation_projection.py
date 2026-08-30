@@ -312,9 +312,9 @@ def test_invalid_configuration_is_rejected() -> None:
         raise AssertionError("expected invalid top_k")
 
 
-def test_cli_smoke() -> None:
+def test_cli_smoke(tmp_path: Path) -> None:
     def reserve(name: str) -> Path:
-        fd, raw = tempfile.mkstemp(prefix=f"annotation-projection-{name}-", dir=".agent_tmp")
+        fd, raw = tempfile.mkstemp(prefix=f"annotation-projection-{name}-", dir=tmp_path)
         os.close(fd)
         Path(raw).unlink()
         return Path(raw)
