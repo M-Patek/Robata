@@ -111,11 +111,13 @@ def build_windows(
     window_stride_seconds: float | None = None,
     window_prefix: str = "sample-medium",
 ) -> tuple[ProductionWindow, ...]:
-    """Build non-overlapping windows over the common camera interval.
+    """Build bounded context windows over the common camera interval.
 
-    The default five-window policy mirrors the existing 40-second Qwen/Mage
-    vertical run.  ``include_tail=True`` adds a final short window rather than
-    silently discarding the remainder.
+    The default policy is non-overlapping and mirrors the existing 40-second
+    Qwen/Mage vertical run.  Supplying a smaller stride creates dense,
+    overlapping *context* windows for temporal scoring; neither mode makes a
+    window an action boundary.  ``include_tail=True`` adds a final short
+    window rather than silently discarding the remainder.
     """
 
     if not math.isfinite(window_seconds) or window_seconds <= 0:

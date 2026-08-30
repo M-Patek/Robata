@@ -296,6 +296,9 @@ def test_runner_temporal_mode_adds_model_driven_segments_without_relabeling_wind
     )
     assert report["model"]["temporal_mode"] == "dense_score"  # type: ignore[index]
     assert report["model"]["temporal_score_policy"] == "top1"  # type: ignore[index]
+    assert report["model"]["temporal_merge_gap_seconds"] == pytest.approx(0.25)  # type: ignore[index]
+    assert report["model"]["temporal_min_duration_seconds"] == pytest.approx(0.10)  # type: ignore[index]
+    assert report["model"]["temporal_min_camera_support"] == 1  # type: ignore[index]
     assert report["windows"][0]["source_interval"]["status"] == "WINDOW_CONTEXT_ONLY"  # type: ignore[index]
     temporal = report["temporal_resolution"]  # type: ignore[index]
     assert temporal["production_eligible"] is False

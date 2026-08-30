@@ -437,13 +437,52 @@ def _temporal_sidecar_parts(
     resolution_copy: dict[str, Any] | None = None
     resolution_segments: list[dict[str, Any]] = []
 
+    def _validate_segment(raw_segment: Mapping[str, Any], *, field: str) -> dict[str, Any]:
+        """Validate one model-bound interval using the preannotation contract.
+
+        The aggregate is a read-only join, but it is also a trust boundary for
+        review clients.  Keep these checks identical to the producer-side
+        validator: a sidecar segment must carry explicit review-only flags,
+        provenance, and a finite non-degenerate source-relative interval.  Do
+        not silently accept missing flags, since omission would make a malformed
+        segment look eligible to a downstream consumer.
+        """
+
+        if raw_segment.get("review_required") is not True:
+            raise ProductionWemmReviewPackAggregateError(f"{field}.review_required must be true")
+        if raw_segment.get("automatic_eligible") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.automatic_eligible must be false"
+            )
+        if raw_segment.get("boundary_status") != "MODEL_PROBE_BOUND":
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_status must be MODEL_PROBE_BOUND"
+            )
+        start = _finite(raw_segment.get("start_seconds"))
+        end = _finite(raw_segment.get("end_seconds"))
+        if start is None or end is None or start < 0.0 or end <= start:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field} interval must satisfy 0 <= start < end"
+            )
+        boundary_source = raw_segment.get("boundary_source")
+        if boundary_source is not None and _text(boundary_source) is None:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_source must be a non-empty string when supplied"
+            )
+        boundary_method = raw_segment.get("boundary_method")
+        if boundary_method is not None and _text(boundary_method) is None:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_method must be a non-empty string when supplied"
+            )
+        return dict(raw_segment)
+
     if raw_resolution is not None:
         resolution = _mapping(raw_resolution, field=f"{path}.temporal_resolution")
         if resolution.get("status") != "PROPOSALS_ONLY":
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}: temporal_resolution.status must be PROPOSALS_ONLY"
             )
-        if resolution.get("production_eligible") is True:
+        if resolution.get("production_eligible") is not False:
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}: temporal_resolution.production_eligible must be false"
             )
@@ -462,22 +501,10 @@ def _temporal_sidecar_parts(
                 raise ProductionWemmReviewPackAggregateError(
                     f"{path}.temporal_resolution.segments[{index}] must be an object"
                 )
-            if "review_required" in raw_segment and raw_segment["review_required"] is not True:
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_resolution.segments[{index}].review_required must be true"
-                )
-            if (
-                "automatic_eligible" in raw_segment
-                and raw_segment["automatic_eligible"] is not False
-            ):
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_resolution.segments[{index}].automatic_eligible must be false"
-                )
-            if raw_segment.get("boundary_status") != "MODEL_PROBE_BOUND":
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_resolution.segments[{index}].boundary_status "
-                    "must be MODEL_PROBE_BOUND"
-                )
+            _validate_segment(
+                raw_segment,
+                field=f"{path}.temporal_resolution.segments[{index}]",
+            )
         resolution_copy = copied
         resolution_segments = [dict(segment) for segment in raw_segments]
 
@@ -494,21 +521,7 @@ def _temporal_sidecar_parts(
                 raise ProductionWemmReviewPackAggregateError(
                     f"{path}.temporal_segments[{index}] must be an object"
                 )
-            if "review_required" in raw_segment and raw_segment["review_required"] is not True:
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_segments[{index}].review_required must be true"
-                )
-            if (
-                "automatic_eligible" in raw_segment
-                and raw_segment["automatic_eligible"] is not False
-            ):
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_segments[{index}].automatic_eligible must be false"
-                )
-            if raw_segment.get("boundary_status") != "MODEL_PROBE_BOUND":
-                raise ProductionWemmReviewPackAggregateError(
-                    f"{path}.temporal_segments[{index}].boundary_status must be MODEL_PROBE_BOUND"
-                )
+            _validate_segment(raw_segment, field=f"{path}.temporal_segments[{index}]")
         alias_segments = [dict(segment) for segment in copied_alias]
 
     if (

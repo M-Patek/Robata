@@ -361,3 +361,66 @@ def test_dense_overlap_does_not_share_closeable_images_between_windows(
     assert first is not second
     first.close()
     assert second.closed is False
+
+
+def test_dense_overlap_uses_linear_future_match_for_unsorted_manifest_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """An externally composed non-monotonic manifest must not lose carry frames."""
+
+    _Decoder.instances.clear()
+    _Reader.iterations = 0
+    manifest = _dense_manifest(tmp_path)
+    # Keep the first context conventional, then deliberately put a later
+    # context before an earlier one.  The future starts and ends are both no
+    # longer monotonic; binary-search matching would be unsound.
+    manifest["windows"] = [
+        manifest["windows"][0],
+        manifest["windows"][2],
+        manifest["windows"][1],
+        manifest["windows"][3],
+    ]
+    messages = []
+    for timestamp_seconds in range(8):
+        timestamp_ns = timestamp_seconds * 1_000_000_000
+        for index in range(1, 7):
+            messages.append(
+                (
+                    SimpleNamespace(name="foxglove.CompressedImage"),
+                    SimpleNamespace(topic=f"/cam/{index}"),
+                    SimpleNamespace(log_time=timestamp_ns),
+                    SimpleNamespace(data=b"h264"),
+                )
+            )
+    reader = _Reader(messages)
+    fake_mcap = SimpleNamespace(make_reader=lambda *args, **kwargs: reader)
+    fake_decoder = SimpleNamespace(DecoderFactory=lambda: object())
+    fake_av = SimpleNamespace(CodecContext=_CodecContext, Packet=_Packet)
+    real_import = shadow.import_module
+
+    def fake_import(name: str):
+        if name == "av":
+            return fake_av
+        if name == "mcap.reader":
+            return fake_mcap
+        if name == "mcap_protobuf.decoder":
+            return fake_decoder
+        if name == "PIL.Image":
+            return SimpleNamespace()
+        return real_import(name)
+
+    monkeypatch.setattr(shadow, "import_module", fake_import)
+    chunks = list(
+        shadow.iter_decode_production_window_chunks(
+            manifest,
+            frame_count=4,
+            window_chunk_size=1,
+        )
+    )
+    groups = {window_id: group for chunk in chunks for window_id, group in chunk["cam_01"].items()}
+    assert groups["w01"].selected_timestamps_ns == (
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+        4_000_000_000,
+    )

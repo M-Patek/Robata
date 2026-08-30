@@ -536,8 +536,10 @@ def iter_decode_production_window_chunks(
 
         starts = tuple(int(spec["start_ns"]) for spec in specs)
         ends = tuple(int(spec["end_ns"]) for spec in specs)
-        monotonic_ends = all(left <= right for left, right in pairwise(ends))
-        return specs, starts, ends, monotonic_ends
+        monotonic_bounds = all(left <= right for left, right in pairwise(starts)) and all(
+            left <= right for left, right in pairwise(ends)
+        )
+        return specs, starts, ends, monotonic_bounds
 
     def _assign_frame(
         state: dict[str, Any],
@@ -562,17 +564,19 @@ def iter_decode_production_window_chunks(
         invalidate a sibling group that still owns the same frame.
         """
 
-        future_specs, future_starts, future_ends, monotonic_ends = future_index
+        future_specs, future_starts, future_ends, monotonic_bounds = future_index
         if not chunk_specs and not future_specs:
             return
 
         # ``future_specs`` is sorted by source start in normal manifests.  Use
         # binary search to avoid scanning all later windows for every decoded
         # frame, while retaining a conservative linear fallback for an
-        # externally supplied manifest whose end times are not monotonic.
+        # externally supplied manifest whose starts or end times are not
+        # monotonic.  ``bisect_right`` is valid only when both series are
+        # ordered; checking ends alone could silently omit a future context.
         future_matches: Sequence[Mapping[str, Any]] = ()
         if future_specs:
-            if monotonic_ends:
+            if monotonic_bounds:
                 started = bisect_right(future_starts, frame_ts)
                 expired = bisect_right(future_ends, frame_ts)
                 future_matches = tuple(

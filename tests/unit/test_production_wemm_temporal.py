@@ -68,6 +68,13 @@ def test_dense_context_scores_produce_model_estimated_segment_and_keep_contexts(
     assert segment["top_k"][0]["candidates"][0]["provisional_id"] == "open_cupboard"  # type: ignore[index]
     assert segment["review_required"] is True
     assert segment["automatic_eligible"] is False
+    trajectory = report["score_trajectories"][0]  # type: ignore[index]
+    probe = trajectory["probes"][0]  # type: ignore[index]
+    assert probe["camera_id"] == "__fused__"
+    assert probe["camera_ids"] == ["cam_01", "cam_02"]
+    assert probe["source_camera_ids"] == ["cam_01", "cam_02"]
+    assert probe["camera_support_count"] == 2
+    assert report["diagnostics"]["context_grid"]["score_reference"] == "context_center"  # type: ignore[index]
 
 
 def test_missing_top_k_is_a_recorded_release_signal_not_a_new_label() -> None:
@@ -114,6 +121,24 @@ def test_top1_chooses_supported_lower_rank_when_rank1_is_weak() -> None:
         score_policy="top1",
     )
     assert [segment["provisional_id"] for segment in report["segments"]] == ["open_cupboard"]
+
+
+def test_numeric_camera_support_is_retained_without_inventing_camera_ids() -> None:
+    candidate = _candidate("open_cupboard", 0.9)
+    candidate.pop("evidence")
+    candidate["camera_support"] = 6
+    report = resolve_wemm_temporal_segments(
+        [_window("w0", 0.0, 2.0, [candidate])],
+        min_camera_support=6,
+    )
+    trajectory = report["score_trajectories"][0]  # type: ignore[index]
+    probe = trajectory["probes"][0]  # type: ignore[index]
+    assert probe["source_camera_support_count"] == 6
+    assert probe["source_camera_ids"] == []
+    segment = report["segments"][0]  # type: ignore[index]
+    assert segment["camera_support"] == []
+    assert segment["camera_support_count"] == 6
+    assert segment["camera_support_ids_complete"] is False
 
 
 def test_empty_context_candidate_list_is_review_only_and_nonproduction() -> None:

@@ -576,13 +576,27 @@ def _empty_run(
     # surprising exception or silently fall back to non-overlapping windows.
     window_seconds = float(config.get("window_seconds", DEFAULT_WINDOW_SECONDS))
     window_stride_seconds: float | None = None
+    configured_mode = config.get("temporal_mode", MODE_NONE)
+    configured_stride_number: float | None = None
+    if isinstance(configured_stride, (int, float)) and not isinstance(configured_stride, bool):
+        candidate_stride = float(configured_stride)
+        if math.isfinite(candidate_stride):
+            configured_stride_number = candidate_stride
+    stride_upper_bound_ok = (
+        configured_stride_number < window_seconds - 1e-9
+        if configured_mode == MODE_DENSE_SCORE and configured_stride_number is not None
+        else (
+            configured_stride_number <= window_seconds
+            if configured_stride_number is not None
+            else False
+        )
+    )
     if (
-        isinstance(configured_stride, (int, float))
-        and not isinstance(configured_stride, bool)
-        and math.isfinite(float(configured_stride))
-        and 0.0 < float(configured_stride) <= window_seconds
+        configured_stride_number is not None
+        and configured_stride_number > 0.0
+        and stride_upper_bound_ok
     ):
-        window_stride_seconds = float(configured_stride)
+        window_stride_seconds = configured_stride_number
     estimated_windows = sum(
         _estimate_windows(
             raw.get("duration_seconds"),
@@ -807,17 +821,29 @@ def run_production_wemm_batch(
         # documented default (4 probes per context) rather than silently
         # reusing the non-overlapping production compatibility stride.
         effective_window_stride = float(window_seconds) / DEFAULT_TEMPORAL_STRIDE_DIVISOR
-    if effective_window_stride is not None and (
-        not math.isfinite(float(effective_window_stride))
-        or float(effective_window_stride) <= 0
-        or float(effective_window_stride) > float(window_seconds)
-    ):
-        raise ProductionWemmBatchRunnerError(
-            "window_stride_seconds must be positive and <= window_seconds"
-        )
     if temporal_mode not in {MODE_NONE, MODE_DENSE_SCORE}:
         raise ProductionWemmBatchRunnerError(
             f"temporal_mode must be one of {MODE_NONE!r}, {MODE_DENSE_SCORE!r}"
+        )
+    if effective_window_stride is not None and (
+        not math.isfinite(float(effective_window_stride))
+        or float(effective_window_stride) <= 0
+        or (
+            temporal_mode == MODE_DENSE_SCORE
+            and float(effective_window_stride) >= float(window_seconds) - 1e-9
+        )
+        or (
+            temporal_mode != MODE_DENSE_SCORE
+            and float(effective_window_stride) > float(window_seconds)
+        )
+    ):
+        if temporal_mode == MODE_DENSE_SCORE:
+            raise ProductionWemmBatchRunnerError(
+                "dense temporal mode requires window_stride_seconds to be positive "
+                "and strictly less than window_seconds"
+            )
+        raise ProductionWemmBatchRunnerError(
+            "window_stride_seconds must be positive and <= window_seconds"
         )
     if temporal_score_policy not in SCORE_POLICIES:
         raise ProductionWemmBatchRunnerError(

@@ -40,6 +40,9 @@ the batch runner derives `window_seconds / 4` (four probes per context).  For a
 four-second context this is a one-second stride.  The manifest records both the
 unique source coverage and the extra overlap workload.  Dense windows are
 therefore useful for temporal evidence but cost more decode/inference work.
+Dense mode requires a stride **strictly smaller** than the context width: an
+equal stride is the historical non-overlapping route, not a temporal probe
+grid.
 
 The normal compatibility route remains `--temporal-mode none`, with the
 historical non-overlapping window policy.
@@ -76,13 +79,21 @@ Temporal score policy is explicit:
 
 Boundary modes are deliberately named:
 
-* `observed_probe` uses the active probe span; and
+* `observed_probe` uses the active probe span and is retained only as an
+  explicit diagnostic/control; it reproduces a context extent rather than a
+  fine action boundary; and
 * `midpoint` places a transition between adjacent probe centres when a
   neighbouring probe exists.
 
 Both modes are estimates.  The output records transition diagnostics, whether
 the threshold was crossed, score delta, neighbouring probe, camera support,
-and contributing window IDs.
+and contributing window IDs.  In particular, a first/last active probe has no
+neighbour on one side: that edge remains `observed_probe_span` and the segment
+is labelled `mixed_probe_boundary`, rather than falsely claiming that both
+ends were localized by a crossing.  The diagnostics expose the context width,
+probe spacing, centre-reference latency and estimated grid resolution.  These
+are uncertainty metadata, not an accuracy claim: WeMM emits one embedding for
+a whole context, so it does not directly predict an onset/offset timestamp.
 
 ## Review-only contract
 

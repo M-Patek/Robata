@@ -219,6 +219,35 @@ def test_midpoint_mode_uses_score_crossings_not_context_edges() -> None:
     assert proposal["transition_diagnostics"]["onset"]["interpolated"] is True  # type: ignore[index]
 
 
+def test_midpoint_mode_marks_unbracketed_edge_boundaries_explicitly() -> None:
+    report = propose_model_intervals(
+        [
+            _probe("open_cupboard", 0.0, 4.0, 0.80, window_id="w0"),
+            _probe("open_cupboard", 1.0, 5.0, 0.80, window_id="w1"),
+            _probe("open_cupboard", 2.0, 6.0, 0.20, window_id="w2"),
+        ],
+        window_start_seconds=0.0,
+        window_end_seconds=6.0,
+        boundary_mode="midpoint",
+        merge_gap_seconds=0.0,
+        min_duration_seconds=0.1,
+    )
+    proposal = report["proposals"][0]  # type: ignore[index]
+    assert proposal["boundary_method"] == "mixed_probe_boundary"  # type: ignore[index]
+    assert proposal["boundary_method_by_side"] == {  # type: ignore[index]
+        "onset": "observed_probe_span",
+        "offset": "probe_center_midpoint",
+    }
+    assert proposal["boundary_edge"] == {"onset": True, "offset": False}  # type: ignore[index]
+    assert proposal["transition_diagnostics"]["onset"]["reason"] == "NO_PRECEDING_PROBE"  # type: ignore[index]
+    assert report["diagnostics"]["probe_grid"]["context_center_latency_seconds"] == pytest.approx(
+        2.0
+    )  # type: ignore[index]
+    assert report["diagnostics"]["probe_grid"][
+        "estimated_boundary_resolution_seconds"
+    ] == pytest.approx(1.0)  # type: ignore[index]
+
+
 def test_window_id_must_be_non_empty_when_supplied() -> None:
     with pytest.raises(ProductionWemmIntervalProposalError, match="window_id"):
         parse_temporal_probes([_probe("open_cupboard", 0.0, 1.0, 0.8, window_id=" ")])

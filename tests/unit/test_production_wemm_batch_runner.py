@@ -205,6 +205,52 @@ def test_dense_temporal_dry_run_estimates_overlapping_stride(tmp_path: Path) -> 
     assert report["summary"]["estimated_window_count"] == 4  # type: ignore[index]
 
 
+def test_dense_temporal_rejects_non_overlapping_stride(tmp_path: Path) -> None:
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    preflight["items"] = [
+        {
+            **preflight["items"][0],  # type: ignore[index]
+            "duration_seconds": 6.5,
+        }
+    ]
+
+    with pytest.raises(ProductionWemmBatchRunnerError, match="strictly less"):
+        run_production_wemm_batch(
+            preflight,
+            phrase_catalog=_catalog(),
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            window_seconds=4.0,
+            window_stride_seconds=4.0,
+            temporal_mode="dense_score",
+            dry_run=True,
+        )
+
+
+@pytest.mark.parametrize("stride", [4.0, 4.0 - 1e-10])
+def test_dense_temporal_rejects_effectively_non_overlapping_stride(
+    tmp_path: Path, stride: float
+) -> None:
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    with pytest.raises(ProductionWemmBatchRunnerError, match="strictly less"):
+        run_production_wemm_batch(
+            preflight,
+            phrase_catalog=_catalog(),
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            window_seconds=4.0,
+            window_stride_seconds=stride,
+            temporal_mode="dense_score",
+            dry_run=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("initial_kwargs", "resume_kwargs"),
     [

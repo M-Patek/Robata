@@ -9,7 +9,7 @@ the smallest deterministic seam for a later model-driven temporal pass:
 * scores are fused across cameras on the same probe grid;
 * hysteresis (an activation and release threshold) suppresses score chatter;
 * contiguous supported probes become interval proposals bounded by observed
-  probe spans; and
+  probe spans (with optional centre-midpoint transition estimates); and
 * the result remains a review-only, non-gold artifact that can be copied into
   the existing pre-annotation proposal ``start_seconds``/``end_seconds``
   fields by an explicit caller.
@@ -25,7 +25,8 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from statistics import fmean
+from itertools import pairwise
+from statistics import fmean, median
 from typing import Any, Final
 
 FORMAT: Final = "robata-production-wemm-model-driven-interval-proposal-v1"
@@ -294,6 +295,47 @@ def _clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _probe_grid_metadata(probes: Sequence[AggregatedProbe]) -> dict[str, Any]:
+    """Expose the temporal resolution represented by the observed probes."""
+
+    spans = sorted({(float(row.start_seconds), float(row.end_seconds)) for row in probes})
+    widths = [end - start for start, end in spans if end > start]
+    starts = [start for start, _end in spans]
+    centres = [(start + end) / 2.0 for start, end in spans]
+    start_deltas = [right - left for left, right in pairwise(starts) if right > left]
+    centre_deltas = [right - left for left, right in pairwise(centres) if right > left]
+
+    def _summary(values: Sequence[float]) -> dict[str, float | None]:
+        if not values:
+            return {"min": None, "max": None, "median": None}
+        return {
+            "min": float(min(values)),
+            "max": float(max(values)),
+            "median": float(median(values)),
+        }
+
+    def _uniform(values: Sequence[float]) -> float | None:
+        if not values or not all(abs(value - values[0]) <= 1e-9 for value in values):
+            return None
+        return float(values[0])
+
+    return {
+        "probe_span_count": len(spans),
+        "probe_width_seconds": _uniform(widths),
+        "probe_width_seconds_summary": _summary(widths),
+        "probe_start_spacing_seconds": _uniform(start_deltas),
+        "probe_start_spacing_seconds_summary": _summary(start_deltas),
+        "probe_center_spacing_seconds": _uniform(centre_deltas),
+        "probe_center_spacing_seconds_summary": _summary(centre_deltas),
+        "score_reference": "probe_span_center",
+        "context_center_latency_seconds": float(fmean(widths) / 2.0) if widths else None,
+        "estimated_boundary_resolution_seconds": (
+            float(median(centre_deltas)) if centre_deltas else None
+        ),
+        "edge_boundary_policy": "observed_probe_span_when_neighbour_missing",
+    }
+
+
 def _transition_diagnostic(
     *,
     side: str,
@@ -425,6 +467,17 @@ def _proposal_from_region(
         release_threshold=release_threshold,
         boundary_mode=boundary_mode,
     )
+    boundary_methods = {
+        "onset": onset["boundary_method"],
+        "offset": offset["boundary_method"],
+    }
+    if boundary_methods["onset"] == boundary_methods["offset"]:
+        boundary_method = boundary_methods["onset"]
+    else:
+        # A proposal touching the first or last probe has only one adjacent
+        # score crossing.  Do not label the whole interval as midpoint-bound
+        # when the other edge is simply the observed context span.
+        boundary_method = "mixed_probe_boundary"
     boundary_confidence = round(fmean([float(onset["confidence"]), float(offset["confidence"])]), 6)
     return {
         "proposal_id": f"{action_key}@{start:.6f}-{end:.6f}",
@@ -433,9 +486,12 @@ def _proposal_from_region(
         "end_seconds": end,
         "boundary_status": BOUNDARY_STATUS,
         "boundary_source": BOUNDARY_SOURCE,
-        "boundary_method": (
-            "probe_center_midpoint" if boundary_mode == "midpoint" else "observed_probe_span"
-        ),
+        "boundary_method": boundary_method,
+        "boundary_method_by_side": boundary_methods,
+        "boundary_edge": {
+            "onset": preceding_probe is None,
+            "offset": following_probe is None,
+        },
         "boundary_confidence": boundary_confidence,
         "confidence": max(scores),
         "mean_score": fmean(scores),
@@ -631,6 +687,7 @@ def propose_model_intervals(
             ),
             "transition_diagnostics_preserved": True,
             "boundary_mode": boundary_mode,
+            "probe_grid": _probe_grid_metadata(aggregated),
         },
         "controls": {
             "media_decoded": False,

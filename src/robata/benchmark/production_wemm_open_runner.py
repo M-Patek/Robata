@@ -1110,7 +1110,24 @@ def run_production_wemm_open(
             model_metadata["temporal_boundary_mode"] = temporal_boundary_mode
             model_metadata["temporal_start_threshold"] = temporal_start_threshold
             model_metadata["temporal_stop_threshold"] = temporal_stop_threshold
+            model_metadata["temporal_merge_gap_seconds"] = temporal_merge_gap_seconds
+            model_metadata["temporal_min_duration_seconds"] = temporal_min_duration_seconds
+            model_metadata["temporal_min_camera_support"] = temporal_min_camera_support
             model_metadata["temporal_score_policy"] = temporal_score_policy
+            raw_window_policy = manifest_doc.get("window_policy")
+            if isinstance(raw_window_policy, Mapping):
+                context_grid = {
+                    key: _json_copy(raw_window_policy[key], field=f"window_policy.{key}")
+                    for key in (
+                        "window_seconds",
+                        "window_stride_seconds",
+                        "overlap_seconds",
+                        "context_windows_not_action_boundaries",
+                    )
+                    if key in raw_window_policy
+                }
+                if context_grid:
+                    model_metadata["temporal_context_grid"] = context_grid
         prototype_stats = getattr(backend, "text_prototype_cache_stats", None)
         if callable(prototype_stats):
             model_metadata["text_prototype_cache"] = dict(prototype_stats())

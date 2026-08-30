@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
+from statistics import fmean, median
 from typing import Any, Final
 
 from .production_wemm_interval_proposal import (
@@ -175,6 +177,73 @@ def _candidate_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
 def _candidate_rank(row: Mapping[str, Any], *, field: str) -> int:
     raw_rank = row.get("rank", 1)
     return _positive_int(raw_rank, field=f"{field}.rank")
+
+
+def _context_grid_metadata(contexts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe the temporal resolution available to the score trajectory.
+
+    A WeMM score is produced for a bounded context, not for an instantaneous
+    frame.  Keeping the context width, centre reference, and probe spacing in
+    the sidecar prevents reviewers from mistaking a midpoint estimate for a
+    frame-accurate timestamp.  ``None`` is used when a spacing cannot be
+    inferred from a single context or an irregular grid.
+    """
+
+    spans = sorted(
+        {
+            (
+                float(context["start_seconds"]),
+                float(context["end_seconds"]),
+            )
+            for context in contexts
+        }
+    )
+    widths = [end - start for start, end in spans if end > start]
+    starts = [start for start, _end in spans]
+    centres = [(start + end) / 2.0 for start, end in spans]
+    start_deltas = [right - left for left, right in pairwise(starts) if right > left]
+    centre_deltas = [right - left for left, right in pairwise(centres) if right > left]
+
+    def _summary(values: Sequence[float]) -> dict[str, float | None]:
+        if not values:
+            return {"min": None, "max": None, "median": None}
+        return {
+            "min": float(min(values)),
+            "max": float(max(values)),
+            "median": float(median(values)),
+        }
+
+    width_summary = _summary(widths)
+    centre_summary = _summary(centre_deltas)
+    start_summary = _summary(start_deltas)
+    return {
+        "context_count": len(spans),
+        "context_width_seconds": (
+            float(widths[0])
+            if widths and all(abs(value - widths[0]) <= 1e-9 for value in widths)
+            else None
+        ),
+        "context_width_seconds_summary": width_summary,
+        "probe_start_spacing_seconds": (
+            float(start_deltas[0])
+            if start_deltas and all(abs(value - start_deltas[0]) <= 1e-9 for value in start_deltas)
+            else None
+        ),
+        "probe_start_spacing_seconds_summary": start_summary,
+        "probe_center_spacing_seconds": (
+            float(centre_deltas[0])
+            if centre_deltas
+            and all(abs(value - centre_deltas[0]) <= 1e-9 for value in centre_deltas)
+            else None
+        ),
+        "probe_center_spacing_seconds_summary": centre_summary,
+        "score_reference": "context_center",
+        "context_center_latency_seconds": (float(fmean(widths) / 2.0) if widths else None),
+        "estimated_boundary_resolution_seconds": (
+            float(median(centre_deltas)) if centre_deltas else None
+        ),
+        "edge_boundary_policy": "observed_probe_span_when_neighbour_missing",
+    }
 
 
 def _winner_action(
@@ -337,6 +406,10 @@ def resolve_wemm_temporal_segments(
                 "candidate_action_count": 0,
                 "temporal_probe_count": 0,
                 "segment_count": 0,
+                "context_grid": _context_grid_metadata(contexts),
+                "fused_trajectory_camera_provenance": (
+                    "source_camera_ids_from_top_k_candidate_evidence"
+                ),
             },
             "controls": {
                 "model_invoked": False,
@@ -466,12 +539,44 @@ def resolve_wemm_temporal_segments(
                 if not metadata_rows:
                     continue
                 metadata = metadata_rows[0]
+                source_camera_ids = sorted(
+                    {
+                        camera_id
+                        for metadata_row in metadata_rows
+                        for camera_id in metadata_row.get("camera_ids", [])
+                        if isinstance(camera_id, str) and camera_id.strip()
+                    }
+                )
+                source_camera_support_count = max(
+                    [
+                        len(source_camera_ids),
+                        *[
+                            int(metadata_row.get("camera_support_count", 0))
+                            for metadata_row in metadata_rows
+                            if isinstance(metadata_row.get("camera_support_count", 0), int)
+                            and not isinstance(metadata_row.get("camera_support_count", 0), bool)
+                        ],
+                    ]
+                )
                 probe.update(
                     {
+                        "camera_id": "__fused__",
                         "raw_score": metadata["raw_score"],
                         "score_policy": policy,
                         "rank": metadata["rank"],
                         "winner_for_context": metadata["winner"],
+                        # ``camera_id`` remains ``__fused__`` to make the
+                        # score stream's fusion stage explicit.  These fields
+                        # preserve the real camera provenance used by the
+                        # candidate evidence and avoid reporting a fused
+                        # probe as one-camera support.
+                        "source_camera_ids": source_camera_ids,
+                        "source_camera_support_count": source_camera_support_count,
+                        "source_camera_support_eligible": source_camera_support_count
+                        >= support_min,
+                        "camera_ids": source_camera_ids,
+                        "camera_support_count": source_camera_support_count,
+                        "camera_support_eligible": source_camera_support_count >= support_min,
                     }
                 )
 
@@ -508,6 +613,17 @@ def resolve_wemm_temporal_segments(
                     if isinstance(camera_id, str) and camera_id.strip()
                 }
             )
+        )
+        support_count = max(
+            [
+                len(support_ids),
+                *[
+                    int(candidate.get("camera_support_count", 0))
+                    for candidate in supporting_candidates
+                    if isinstance(candidate.get("camera_support_count", 0), int)
+                    and not isinstance(candidate.get("camera_support_count", 0), bool)
+                ],
+            ]
         )
         evidence = [
             {
@@ -548,6 +664,10 @@ def resolve_wemm_temporal_segments(
             "mean_score": proposal.get("mean_score"),
             "peak_score": proposal.get("peak_score"),
             "camera_support": list(support_ids),
+            "camera_support_count": support_count,
+            "camera_support_ids_complete": (
+                support_count > 0 and support_count == len(support_ids)
+            ),
             "supporting_window_ids": supporting_window_ids,
             # Keep the complete retrieval context for human review.  Each
             # context retains its original ordered Top-K list; no candidate is
@@ -603,6 +723,10 @@ def resolve_wemm_temporal_segments(
                 sum(action_count_by_context) / len(action_count_by_context)
                 if action_count_by_context
                 else 0.0
+            ),
+            "context_grid": _context_grid_metadata(contexts),
+            "fused_trajectory_camera_provenance": (
+                "source_camera_ids_from_top_k_candidate_evidence"
             ),
             "score_policy": policy,
             "winner_only_context_support": policy == SCORE_POLICY_TOP1,

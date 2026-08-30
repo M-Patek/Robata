@@ -188,6 +188,8 @@ def test_aggregate_rejects_inconsistent_temporal_sidecar_alias() -> None:
         "segments": [
             {
                 "segment_id": "one",
+                "start_seconds": 1.0,
+                "end_seconds": 2.0,
                 "review_required": True,
                 "automatic_eligible": False,
                 "boundary_status": "MODEL_PROBE_BOUND",
@@ -197,6 +199,8 @@ def test_aggregate_rejects_inconsistent_temporal_sidecar_alias() -> None:
     pack["temporal_segments"] = [
         {
             "segment_id": "two",
+            "start_seconds": 1.0,
+            "end_seconds": 2.0,
             "review_required": True,
             "automatic_eligible": False,
             "boundary_status": "MODEL_PROBE_BOUND",
@@ -219,6 +223,62 @@ def test_aggregate_rejects_automatic_temporal_segment() -> None:
     report = aggregate_production_wemm_review_packs([pack])
     assert report["status"] == "NO_VALID_REVIEW_PACKS"
     assert "review_required must be true" in report["invalid_inputs"][0]["reason"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("sidecar_key", "segment"),
+    [
+        (
+            "temporal_resolution",
+            {
+                "status": "PROPOSALS_ONLY",
+                "production_eligible": False,
+                "segments": [
+                    {
+                        "segment_id": "missing-review-flag",
+                        "start_seconds": 1.0,
+                        "end_seconds": 2.0,
+                        "automatic_eligible": False,
+                        "boundary_status": "MODEL_PROBE_BOUND",
+                    }
+                ],
+            },
+        ),
+        (
+            "temporal_segments",
+            [
+                {
+                    "segment_id": "bad-interval",
+                    "start_seconds": 2.0,
+                    "end_seconds": 2.0,
+                    "review_required": True,
+                    "automatic_eligible": False,
+                    "boundary_status": "MODEL_PROBE_BOUND",
+                }
+            ],
+        ),
+    ],
+)
+def test_aggregate_rejects_malformed_temporal_segment_contract(
+    sidecar_key: str, segment: object
+) -> None:
+    pack = _review_pack("rec-temporal-malformed")
+    pack[sidecar_key] = segment
+    report = aggregate_production_wemm_review_packs([pack])
+    assert report["status"] == "NO_VALID_REVIEW_PACKS"
+    reason = report["invalid_inputs"][0]["reason"]  # type: ignore[index]
+    assert "review_required must be true" in reason or "interval must satisfy" in reason
+
+
+def test_aggregate_requires_explicit_nonproduction_temporal_resolution() -> None:
+    pack = _review_pack("rec-temporal-production-flag")
+    pack["temporal_resolution"] = {
+        "status": "PROPOSALS_ONLY",
+        "segments": [],
+    }
+    report = aggregate_production_wemm_review_packs([pack])
+    assert report["status"] == "NO_VALID_REVIEW_PACKS"
+    assert "production_eligible must be false" in report["invalid_inputs"][0]["reason"]  # type: ignore[index]
 
 
 def test_directory_discovers_only_review_packs_and_reports_bad_inputs() -> None:
