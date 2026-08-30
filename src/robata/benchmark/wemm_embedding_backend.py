@@ -167,8 +167,13 @@ def _optional_imports() -> tuple[Any, Any, Any, Any]:
         torch = importlib.import_module("torch")
         functional = importlib.import_module("torch.nn.functional")
         transformers = importlib.import_module("transformers")
-        auto_model = vars(transformers)["AutoModel"]
-        auto_processor = vars(transformers)["AutoProcessor"]
+        # Transformers exposes many classes through a module-level lazy
+        # ``__getattr__``.  Looking in ``vars(transformers)`` bypasses that
+        # resolver and raises ``KeyError`` on otherwise valid installations.
+        # Attribute access works for both lazy module exports and ordinary
+        # test doubles while preserving the single optional-import boundary.
+        auto_model = transformers.AutoModel
+        auto_processor = transformers.AutoProcessor
     except Exception as exc:  # pragma: no cover - depends on local environment
         raise WemmBackendUnavailable(
             "WeMM runtime requires torch and transformers; install them in the "

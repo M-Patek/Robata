@@ -119,6 +119,42 @@ def _ready_backend(
     return backend, processor, model
 
 
+def test_optional_imports_resolves_lazy_transformers_exports(monkeypatch) -> None:
+    """Module-level lazy exports must be loaded through attribute access."""
+
+    fake_transformers = types.ModuleType("transformers")
+    auto_model = object()
+    auto_processor = object()
+
+    def resolve(name: str) -> object:
+        if name == "AutoModel":
+            return auto_model
+        if name == "AutoProcessor":
+            return auto_processor
+        raise AttributeError(name)
+
+    fake_transformers.__getattr__ = resolve  # type: ignore[attr-defined]
+
+    def fake_import(name: str) -> object:
+        if name == "torch":
+            return torch
+        if name == "torch.nn.functional":
+            return torch.nn.functional
+        if name == "transformers":
+            return fake_transformers
+        raise AssertionError(f"unexpected optional import: {name}")
+
+    monkeypatch.setattr(backend_module.importlib, "import_module", fake_import)
+
+    resolved_torch, resolved_functional, resolved_model, resolved_processor = (
+        backend_module._optional_imports()
+    )
+    assert resolved_torch is torch
+    assert resolved_functional is torch.nn.functional
+    assert resolved_model is auto_model
+    assert resolved_processor is auto_processor
+
+
 def test_encode_messages_drops_processor_metadata_before_embedding() -> None:
     backend, processor, model = _ready_backend()
 
