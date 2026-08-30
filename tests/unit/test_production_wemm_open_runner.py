@@ -222,6 +222,93 @@ def test_runner_builds_review_only_envelope_with_camera_top_k(monkeypatch) -> No
     json.dumps(report)
 
 
+def test_runner_temporal_mode_adds_model_driven_segments_without_relabeling_windows(
+    monkeypatch,
+) -> None:
+    import robata.benchmark.production_wemm_open_runner as route
+
+    class Group:
+        def __init__(self, window_id: str, camera_id: str) -> None:
+            self.window_id = window_id
+            self.camera_id = camera_id
+            self.frames = (f"{camera_id}-{window_id}-0", f"{camera_id}-{window_id}-1")
+
+        def metadata(self):
+            return {
+                "total_num_frames": 2,
+                "fps": 1.0,
+                "width": 10,
+                "height": 10,
+                "frames_indices": [0, 1],
+                "duration": 1.0,
+            }
+
+        def to_dict(self):
+            return {
+                "camera_id": self.camera_id,
+                "window_id": self.window_id,
+                "frame_count": 2,
+            }
+
+    def fake_decode(manifest, **kwargs):
+        del kwargs
+        return {
+            camera: {
+                window["window_id"]: Group(window["window_id"], camera)
+                for window in manifest["windows"]
+            }
+            for camera in ("cam_01", "cam_02")
+        }
+
+    monkeypatch.setattr(route, "decode_production_windows", fake_decode)
+
+    class FakeBackend:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.observations = []
+
+        def encode_texts(self, texts, *, batch_size):
+            del batch_size
+            return tuple((1.0, 0.0) if "cupboard" in text else (0.0, 1.0) for text in texts)
+
+        def encode_video_frames(self, groups, *, metadata_groups=None):
+            del metadata_groups
+            window_id = str(groups[0][0]).split("-")[1]
+            return ((1.0, 0.0) if window_id == "w00" else (0.0, 1.0),)
+
+        def observation_payload(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(route, "WemmEmbeddingBackend", FakeBackend)
+    report = run_production_wemm_open(
+        _manifest(),
+        phrase_catalog=_catalog(),
+        model_directory="model",
+        frame_count=2,
+        top_k=2,
+        dimension=2,
+        device="cpu",
+        temporal_mode="dense_score",
+        temporal_boundary_mode="midpoint",
+    )
+    assert report["model"]["temporal_mode"] == "dense_score"  # type: ignore[index]
+    assert report["model"]["temporal_score_policy"] == "top1"  # type: ignore[index]
+    assert report["windows"][0]["source_interval"]["status"] == "WINDOW_CONTEXT_ONLY"  # type: ignore[index]
+    temporal = report["temporal_resolution"]  # type: ignore[index]
+    assert temporal["production_eligible"] is False
+    assert temporal["parameters"]["score_policy"] == "top1"  # type: ignore[index]
+    assert temporal["diagnostics"]["context_window_count"] == 2
+    open_segments = [
+        segment for segment in temporal["segments"] if segment["provisional_id"] == "open_cupboard"
+    ]
+    assert open_segments
+    assert open_segments[0]["boundary_status"] == "MODEL_PROBE_BOUND"
+    assert open_segments[0]["review_required"] is True
+
+
 def test_runner_rejects_invalid_frame_count_before_model(monkeypatch) -> None:
     called = False
 

@@ -53,6 +53,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-windows", type=int)
     parser.add_argument(
+        "--temporal-mode",
+        choices=("none", "dense_score"),
+        default="none",
+        help="attach model-driven temporal interval proposals to the envelope",
+    )
+    parser.add_argument("--temporal-start-threshold", type=float, default=0.65)
+    parser.add_argument("--temporal-stop-threshold", type=float, default=0.50)
+    parser.add_argument("--temporal-merge-gap-seconds", type=float, default=0.25)
+    parser.add_argument("--temporal-min-duration-seconds", type=float, default=0.10)
+    parser.add_argument("--temporal-min-camera-support", type=int, default=1)
+    parser.add_argument(
+        "--temporal-boundary-mode",
+        choices=("observed_probe", "midpoint"),
+        default="midpoint",
+    )
+    parser.add_argument(
+        "--temporal-score-policy",
+        choices=("top1", "absolute"),
+        default="top1",
+        help=(
+            "temporal support policy; top1 avoids broad tracks from tightly "
+            "clustered raw similarities"
+        ),
+    )
+    parser.add_argument(
         "--window-chunk-size",
         type=int,
         default=1,
@@ -123,6 +148,14 @@ def main(argv: list[str] | None = None) -> int:
                 "fusion": args.fusion,
                 "score_normalization": args.score_normalization,
                 "validate_crcs": args.validate_crcs,
+                "temporal_mode": args.temporal_mode,
+                "temporal_start_threshold": args.temporal_start_threshold,
+                "temporal_stop_threshold": args.temporal_stop_threshold,
+                "temporal_merge_gap_seconds": args.temporal_merge_gap_seconds,
+                "temporal_min_duration_seconds": args.temporal_min_duration_seconds,
+                "temporal_min_camera_support": args.temporal_min_camera_support,
+                "temporal_boundary_mode": args.temporal_boundary_mode,
+                "temporal_score_policy": args.temporal_score_policy,
             }
             if args.pipeline:
                 run_kwargs.update(

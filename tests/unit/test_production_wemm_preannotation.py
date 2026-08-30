@@ -216,6 +216,94 @@ def test_review_contract_and_pack_preserve_all_review_fields_and_window_states()
     assert items["w-split"]["source_interval"]["status"] == "WINDOW_CONTEXT_ONLY"
 
 
+def test_review_pack_preserves_temporal_resolution_sidecar_without_relabeling_windows() -> None:
+    envelope = build_preannotation_envelope(
+        _source(),
+        [{"window_id": "w00", "start_seconds": 0.0, "end_seconds": 4.0, "proposals": []}],
+    )
+    envelope["temporal_resolution"] = {
+        "format": "robata-production-wemm-temporal-resolver-v1",
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "official_gold_status": "NOT_ESTABLISHED",
+        "segments": [
+            {
+                "segment_id": "open-cupboard@1.0-2.0",
+                "provisional_id": "open-cupboard",
+                "start_seconds": 1.0,
+                "end_seconds": 2.0,
+                "boundary_status": "MODEL_PROBE_BOUND",
+                "review_required": True,
+                "automatic_eligible": False,
+                "supporting_window_ids": ["w00"],
+            }
+        ],
+        "score_trajectories": [],
+    }
+
+    review = build_review_pack(envelope)
+    item = review["items"][0]  # type: ignore[index]
+    assert item["source_interval"]["status"] == "WINDOW_CONTEXT_ONLY"  # type: ignore[index]
+    assert review["temporal_resolution"]["segments"][0]["boundary_status"] == "MODEL_PROBE_BOUND"  # type: ignore[index]
+    assert review["temporal_segments"] == review["temporal_resolution"]["segments"]  # type: ignore[index]
+
+    # Both representations are detached from the caller's mutable envelope.
+    review["temporal_segments"][0]["provisional_id"] = "edited"  # type: ignore[index]
+    assert envelope["temporal_resolution"]["segments"][0]["provisional_id"] == "open-cupboard"  # type: ignore[index]
+    json.dumps(review)
+
+
+def test_review_pack_rejects_malformed_temporal_resolution_sidecar() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    envelope["temporal_resolution"] = {
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "segments": {"not": "an array"},
+    }
+    with pytest.raises(ProductionWemmPreannotationError, match="segments must be an array"):
+        build_review_pack(envelope)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("status", "MEASURED", "PROPOSALS_ONLY"),
+        ("production_eligible", True, "production_eligible"),
+    ],
+)
+def test_validate_rejects_non_review_temporal_sidecar(
+    field: str, value: object, message: str
+) -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    envelope["temporal_resolution"] = {
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "segments": [],
+        field: value,
+    }
+    with pytest.raises(ProductionWemmPreannotationError, match=message):
+        validate_preannotation_envelope(envelope)
+
+
+def test_validate_rejects_measured_temporal_segment_boundary() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    envelope["temporal_resolution"] = {
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "segments": [
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "boundary_status": "MEASURED",
+                "review_required": True,
+                "automatic_eligible": False,
+            }
+        ],
+    }
+    with pytest.raises(ProductionWemmPreannotationError, match="MODEL_PROBE_BOUND"):
+        validate_preannotation_envelope(envelope)
+
+
 @pytest.mark.parametrize(
     "bad_key, bad_value",
     [("action_key", [1, 2]), ("verb_id", 1), ("noun_key", [2]), ("epic_ontology", True)],

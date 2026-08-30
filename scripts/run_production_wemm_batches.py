@@ -63,6 +63,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--window-seconds", type=float, default=DEFAULT_WINDOW_SECONDS)
     parser.add_argument(
+        "--window-stride-seconds",
+        type=float,
+        help=(
+            "optional stride for overlapping WeMM context windows; omit to keep "
+            "non-overlapping compatibility"
+        ),
+    )
+    parser.add_argument(
         "--no-tail",
         action="store_true",
         help="do not add a final short processing window (tail is included by default)",
@@ -125,6 +133,31 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-reuse-backend", action="store_true")
     parser.add_argument("--staging-dir", type=Path)
     parser.add_argument("--keep-staging", action="store_true")
+    parser.add_argument(
+        "--temporal-mode",
+        choices=("none", "dense_score"),
+        default="none",
+        help="attach model-driven temporal interval proposals to each envelope",
+    )
+    parser.add_argument("--temporal-start-threshold", type=float, default=0.65)
+    parser.add_argument("--temporal-stop-threshold", type=float, default=0.50)
+    parser.add_argument("--temporal-merge-gap-seconds", type=float, default=0.25)
+    parser.add_argument("--temporal-min-duration-seconds", type=float, default=0.10)
+    parser.add_argument("--temporal-min-camera-support", type=int, default=1)
+    parser.add_argument(
+        "--temporal-boundary-mode",
+        choices=("observed_probe", "midpoint"),
+        default="midpoint",
+    )
+    parser.add_argument(
+        "--temporal-score-policy",
+        choices=("top1", "absolute"),
+        default="top1",
+        help=(
+            "temporal support policy; top1 avoids broad tracks from tightly "
+            "clustered raw similarities"
+        ),
+    )
     return parser
 
 
@@ -137,6 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "output_directory": args.output_dir,
             "archive_path": args.archive,
             "window_seconds": args.window_seconds,
+            "window_stride_seconds": args.window_stride_seconds,
             "include_tail": not args.no_tail,
             "frame_count": args.frame_count,
             "top_k": args.top_k,
@@ -157,6 +191,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "staging_directory": args.staging_dir,
             "keep_staging": args.keep_staging,
             "checkpoint_path": args.checkpoint,
+            "temporal_mode": args.temporal_mode,
+            "temporal_start_threshold": args.temporal_start_threshold,
+            "temporal_stop_threshold": args.temporal_stop_threshold,
+            "temporal_merge_gap_seconds": args.temporal_merge_gap_seconds,
+            "temporal_min_duration_seconds": args.temporal_min_duration_seconds,
+            "temporal_min_camera_support": args.temporal_min_camera_support,
+            "temporal_boundary_mode": args.temporal_boundary_mode,
+            "temporal_score_policy": args.temporal_score_policy,
         }
         if args.pipeline:
             run_kwargs.update(

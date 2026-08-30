@@ -39,6 +39,14 @@ from .production_wemm_shadow import (
     decode_production_windows,
     iter_decode_production_window_chunks,
 )
+from .production_wemm_temporal import (
+    DEFAULT_SCORE_POLICY,
+    MODE_DENSE_SCORE,
+    MODE_NONE,
+    SCORE_POLICIES,
+    ProductionWemmTemporalError,
+    resolve_wemm_temporal_segments,
+)
 from .wemm_action_retrieval import cosine_similarity
 from .wemm_embedding_backend import WemmEmbeddingBackend
 from .wemm_multiview_retrieval import fuse_camera_rankings
@@ -589,6 +597,14 @@ def run_production_wemm_open(
     queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
     decode_cache: ProductionWemmDecodeCache | None = None,
     decode_scope_key: Hashable | None = None,
+    temporal_mode: str = MODE_NONE,
+    temporal_start_threshold: float = 0.65,
+    temporal_stop_threshold: float = 0.50,
+    temporal_merge_gap_seconds: float = 0.25,
+    temporal_min_duration_seconds: float = 0.10,
+    temporal_min_camera_support: int = 1,
+    temporal_boundary_mode: str = "midpoint",
+    temporal_score_policy: str = DEFAULT_SCORE_POLICY,
 ) -> dict[str, Any]:
     """Run native WeMM retrieval and return a validated review envelope.
 
@@ -680,6 +696,21 @@ def run_production_wemm_open(
     if (decode_cache is None) != (decode_scope_key is None):
         raise ProductionWemmOpenRunnerError(
             "decode_cache and decode_scope_key must be supplied together"
+        )
+    if temporal_mode not in {MODE_NONE, MODE_DENSE_SCORE}:
+        raise ProductionWemmOpenRunnerError(
+            f"temporal_mode must be one of {MODE_NONE!r}, {MODE_DENSE_SCORE!r}"
+        )
+    if temporal_mode == MODE_DENSE_SCORE and temporal_boundary_mode not in {
+        "observed_probe",
+        "midpoint",
+    }:
+        raise ProductionWemmOpenRunnerError(
+            "temporal_boundary_mode must be 'observed_probe' or 'midpoint'"
+        )
+    if temporal_score_policy not in SCORE_POLICIES:
+        raise ProductionWemmOpenRunnerError(
+            f"temporal_score_policy must be one of {SCORE_POLICIES!r}"
         )
 
     manifest_doc = _load_manifest(manifest)
@@ -1074,6 +1105,12 @@ def run_production_wemm_open(
             "fusion": fusion,
             "score_normalization": score_normalization,
         }
+        if temporal_mode != MODE_NONE:
+            model_metadata["temporal_mode"] = temporal_mode
+            model_metadata["temporal_boundary_mode"] = temporal_boundary_mode
+            model_metadata["temporal_start_threshold"] = temporal_start_threshold
+            model_metadata["temporal_stop_threshold"] = temporal_stop_threshold
+            model_metadata["temporal_score_policy"] = temporal_score_policy
         prototype_stats = getattr(backend, "text_prototype_cache_stats", None)
         if callable(prototype_stats):
             model_metadata["text_prototype_cache"] = dict(prototype_stats())
@@ -1109,7 +1146,31 @@ def run_production_wemm_open(
             candidate_profile="open_phrase_catalog",
             model_invoked=True,
         )
-        return validate_preannotation_envelope(envelope)
+        if temporal_mode == MODE_DENSE_SCORE:
+            try:
+                temporal_resolution = resolve_wemm_temporal_segments(
+                    output_windows,
+                    start_threshold=temporal_start_threshold,
+                    stop_threshold=temporal_stop_threshold,
+                    merge_gap_seconds=temporal_merge_gap_seconds,
+                    min_duration_seconds=temporal_min_duration_seconds,
+                    min_camera_support=temporal_min_camera_support,
+                    boundary_mode=temporal_boundary_mode,
+                    score_policy=temporal_score_policy,
+                )
+            except ProductionWemmTemporalError as exc:
+                raise ProductionWemmOpenRunnerError(f"temporal resolution failed: {exc}") from exc
+            # Keep the historical per-context envelope intact.  The additive
+            # top-level sidecar is the only place where model-estimated action
+            # intervals appear, making the boundary provenance explicit for
+            # review consumers and preserving old readers.
+            envelope["temporal_resolution"] = temporal_resolution
+        validated = validate_preannotation_envelope(envelope)
+        if not isinstance(validated, dict):  # pragma: no cover - validator contract
+            raise ProductionWemmOpenRunnerError(
+                "pre-annotation validator returned a non-object envelope"
+            )
+        return validated
     except ProductionWemmPreannotationError as exc:
         raise ProductionWemmOpenRunnerError(f"pre-annotation envelope failed: {exc}") from exc
     finally:

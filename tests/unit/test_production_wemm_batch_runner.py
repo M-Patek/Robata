@@ -174,6 +174,95 @@ def test_batch_dry_run_writes_checkpoint_without_staging_or_model(tmp_path: Path
     assert Path(report["checkpoint_path"]).is_file()  # type: ignore[arg-type]
 
 
+def test_dense_temporal_dry_run_estimates_overlapping_stride(tmp_path: Path) -> None:
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    preflight["items"] = [
+        {
+            **preflight["items"][0],  # type: ignore[index]
+            "duration_seconds": 6.5,
+        }
+    ]
+
+    report = run_production_wemm_batch(
+        preflight,
+        phrase_catalog=_catalog(),
+        model_directory=None,
+        output_directory=tmp_path / "run",
+        window_seconds=4.0,
+        include_tail=True,
+        temporal_mode="dense_score",
+        dry_run=True,
+    )
+
+    # Dense temporal mode derives a 1 s stride (4 probes/context).  A 6.5 s
+    # source therefore plans three full contexts plus one short tail, rather
+    # than one tail per remaining stride.
+    assert report["config"]["window_stride_seconds"] == pytest.approx(1.0)  # type: ignore[index]
+    assert report["config"]["temporal_score_policy"] == "top1"  # type: ignore[index]
+    assert report["summary"]["estimated_window_count"] == 4  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("initial_kwargs", "resume_kwargs"),
+    [
+        ({}, {"temporal_mode": "dense_score"}),
+        (
+            {"temporal_mode": "dense_score"},
+            {"temporal_mode": "dense_score", "window_stride_seconds": 2.0},
+        ),
+        (
+            {"temporal_mode": "dense_score"},
+            {"temporal_mode": "dense_score", "temporal_start_threshold": 0.8},
+        ),
+        (
+            {"temporal_mode": "dense_score"},
+            {"temporal_mode": "dense_score", "temporal_score_policy": "absolute"},
+        ),
+    ],
+)
+def test_resume_rejects_temporal_configuration_changes(
+    initial_kwargs: dict[str, object],
+    resume_kwargs: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    preflight["items"] = [
+        {
+            **preflight["items"][0],  # type: ignore[index]
+            "duration_seconds": 6.5,
+        }
+    ]
+    output_directory = tmp_path / "run"
+    run_production_wemm_batch(
+        preflight,
+        phrase_catalog=_catalog(),
+        model_directory=None,
+        output_directory=output_directory,
+        window_seconds=4.0,
+        include_tail=True,
+        dry_run=True,
+        **initial_kwargs,
+    )
+
+    with pytest.raises(ProductionWemmBatchRunnerError, match="temporal configuration"):
+        run_production_wemm_batch(
+            preflight,
+            phrase_catalog=_catalog(),
+            model_directory=None,
+            output_directory=output_directory,
+            window_seconds=4.0,
+            include_tail=True,
+            dry_run=True,
+            **resume_kwargs,
+        )
+
+
 def test_batch_execution_is_serial_and_resumable(monkeypatch, tmp_path: Path) -> None:
     archive = tmp_path / "source.zip"
     with zipfile.ZipFile(archive, "w") as zf:

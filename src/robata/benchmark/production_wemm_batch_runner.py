@@ -36,6 +36,12 @@ from .production_wemm_open_runner import (
     run_production_wemm_open,
 )
 from .production_wemm_preannotation import build_review_pack
+from .production_wemm_temporal import (
+    DEFAULT_SCORE_POLICY,
+    MODE_DENSE_SCORE,
+    MODE_NONE,
+    SCORE_POLICIES,
+)
 from .wemm_embedding_backend import WemmEmbeddingBackend
 
 BATCH_RUN_FORMAT: Final = "robata-production-wemm-batch-run-v1"
@@ -55,6 +61,7 @@ DEFAULT_WINDOW_CHUNK_SIZE: Final = 1
 # without changing the review envelope or source-bound recording lifecycle.
 DEFAULT_INFERENCE_BATCH_SIZE: Final = 1
 DEFAULT_COPY_CHUNK_BYTES: Final = 8 * 1024 * 1024
+DEFAULT_TEMPORAL_STRIDE_DIVISOR: Final = 4
 
 
 class ProductionWemmBatchRunnerError(RuntimeError):
@@ -369,6 +376,7 @@ def build_recording_manifest(
     qa_status: str = "PENDING",
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
     include_tail: bool = True,
+    window_stride_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build and annotate a source-bound processing-window manifest."""
 
@@ -385,11 +393,13 @@ def build_recording_manifest(
             "qa_status must be PASS, WARNING or PENDING for execution"
         )
     try:
-        raw_manifest = build_manifest(
-            source_path,
-            window_seconds=window_seconds,
-            include_tail=include_tail,
-        )
+        manifest_kwargs: dict[str, Any] = {
+            "window_seconds": window_seconds,
+            "include_tail": include_tail,
+        }
+        if window_stride_seconds is not None:
+            manifest_kwargs["window_stride_seconds"] = window_stride_seconds
+        raw_manifest = build_manifest(source_path, **manifest_kwargs)
     except (ProductionCohortError, OSError) as exc:
         raise ProductionWemmBatchRunnerError(
             f"could not build manifest for {recording_id}: {exc}"
@@ -448,6 +458,7 @@ def _estimate_windows(
     duration_seconds: object,
     window_seconds: float,
     include_tail: bool,
+    window_stride_seconds: float | None = None,
 ) -> int:
     """Estimate processing-window count from source preflight duration."""
 
@@ -461,10 +472,93 @@ def _estimate_windows(
         return 0
     if not math.isfinite(duration) or duration <= 0:
         return 0
-    full = int(duration // window_seconds)
-    if include_tail and duration - full * window_seconds > 1e-6:
-        full += 1
-    return full
+    stride = window_seconds if window_stride_seconds is None else float(window_stride_seconds)
+    if abs(stride - window_seconds) <= 1e-9:
+        full = int(duration // window_seconds)
+        if include_tail and duration - full * window_seconds > 1e-6:
+            full += 1
+        return full
+    epsilon = 1e-9
+    max_full_start = max(0.0, duration - window_seconds)
+    count = 0
+    last_full_start: float | None = None
+    left = 0.0
+    while left <= max_full_start + epsilon:
+        if duration - left >= window_seconds - epsilon:
+            count += 1
+            last_full_start = left
+        left += stride
+    if include_tail:
+        if last_full_start is None:
+            # Match build_windows: one short tail for a source shorter than a
+            # full context, rather than one tail per stride.
+            count = 1
+        else:
+            tail_start = max(0.0, duration - window_seconds)
+            if tail_start > last_full_start + epsilon:
+                count += 1
+    return count
+
+
+def _temporal_resume_signature(
+    config: Mapping[str, Any], *, default_mode: str | None = None
+) -> tuple[object, ...]:
+    """Return the explicit temporal settings that affect a resumable run.
+
+    Older checkpoints predate temporal mode and therefore have none of these
+    fields.  Treat that shape as the historical ``none`` mode, while refusing
+    to reuse completed items when a dense run's stride or resolver parameters
+    differ.  This is a direct field comparison; no identity hash or digest is
+    introduced into the checkpoint contract.
+    """
+
+    mode_value = config.get("temporal_mode", default_mode)
+    if mode_value is None:
+        mode_value = (
+            MODE_DENSE_SCORE
+            if any(
+                key in config
+                for key in (
+                    "temporal_start_threshold",
+                    "temporal_stop_threshold",
+                    "temporal_merge_gap_seconds",
+                    "temporal_min_duration_seconds",
+                    "temporal_min_camera_support",
+                    "temporal_boundary_mode",
+                    "temporal_score_policy",
+                )
+            )
+            else MODE_NONE
+        )
+
+    def _numeric(key: str) -> object:
+        value = config.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return ("invalid", value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return ("invalid", str(value))
+        return number if math.isfinite(number) else ("invalid", str(value))
+
+    stride = _numeric("window_stride_seconds")
+    if mode_value == MODE_NONE:
+        return (MODE_NONE, stride)
+    if mode_value != MODE_DENSE_SCORE:
+        return ("invalid", str(mode_value))
+    return (
+        MODE_DENSE_SCORE,
+        stride,
+        _numeric("temporal_start_threshold"),
+        _numeric("temporal_stop_threshold"),
+        _numeric("temporal_merge_gap_seconds"),
+        _numeric("temporal_min_duration_seconds"),
+        _numeric("temporal_min_camera_support"),
+        config.get("temporal_boundary_mode"),
+        config.get("temporal_score_policy"),
+    )
 
 
 def _empty_run(
@@ -475,11 +569,26 @@ def _empty_run(
     config: Mapping[str, Any],
     checkpoint_path: Path,
 ) -> dict[str, Any]:
+    configured_stride = config.get("window_stride_seconds")
+    # ``config`` is assembled by ``run_production_wemm_batch`` after validating
+    # the stride.  Keep this small type guard for resumed/externally composed
+    # callers so a malformed checkpoint cannot turn the dry-run estimate into a
+    # surprising exception or silently fall back to non-overlapping windows.
+    window_seconds = float(config.get("window_seconds", DEFAULT_WINDOW_SECONDS))
+    window_stride_seconds: float | None = None
+    if (
+        isinstance(configured_stride, (int, float))
+        and not isinstance(configured_stride, bool)
+        and math.isfinite(float(configured_stride))
+        and 0.0 < float(configured_stride) <= window_seconds
+    ):
+        window_stride_seconds = float(configured_stride)
     estimated_windows = sum(
         _estimate_windows(
             raw.get("duration_seconds"),
-            float(config.get("window_seconds", DEFAULT_WINDOW_SECONDS)),
+            window_seconds,
             bool(config.get("include_tail", True)),
+            window_stride_seconds,
         )
         for raw in selected
     )
@@ -662,6 +771,15 @@ def run_production_wemm_batch(
     staging_directory: str | Path | None = None,
     keep_staging: bool = False,
     checkpoint_path: str | Path | None = None,
+    window_stride_seconds: float | None = None,
+    temporal_mode: str = MODE_NONE,
+    temporal_start_threshold: float = 0.65,
+    temporal_stop_threshold: float = 0.50,
+    temporal_merge_gap_seconds: float = 0.25,
+    temporal_min_duration_seconds: float = 0.10,
+    temporal_min_camera_support: int = 1,
+    temporal_boundary_mode: str = "midpoint",
+    temporal_score_policy: str = DEFAULT_SCORE_POLICY,
 ) -> dict[str, Any]:
     """Run selected source-preflight recordings serially and resumably.
 
@@ -683,6 +801,28 @@ def run_production_wemm_batch(
 
     if not math.isfinite(float(window_seconds)) or float(window_seconds) <= 0:
         raise ProductionWemmBatchRunnerError("window_seconds must be positive and finite")
+    effective_window_stride = window_stride_seconds
+    if temporal_mode == MODE_DENSE_SCORE and effective_window_stride is None:
+        # A dense temporal pass needs overlapping contexts.  Derive a
+        # documented default (4 probes per context) rather than silently
+        # reusing the non-overlapping production compatibility stride.
+        effective_window_stride = float(window_seconds) / DEFAULT_TEMPORAL_STRIDE_DIVISOR
+    if effective_window_stride is not None and (
+        not math.isfinite(float(effective_window_stride))
+        or float(effective_window_stride) <= 0
+        or float(effective_window_stride) > float(window_seconds)
+    ):
+        raise ProductionWemmBatchRunnerError(
+            "window_stride_seconds must be positive and <= window_seconds"
+        )
+    if temporal_mode not in {MODE_NONE, MODE_DENSE_SCORE}:
+        raise ProductionWemmBatchRunnerError(
+            f"temporal_mode must be one of {MODE_NONE!r}, {MODE_DENSE_SCORE!r}"
+        )
+    if temporal_score_policy not in SCORE_POLICIES:
+        raise ProductionWemmBatchRunnerError(
+            f"temporal_score_policy must be one of {SCORE_POLICIES!r}"
+        )
     if not isinstance(include_tail, bool):
         raise ProductionWemmBatchRunnerError("include_tail must be boolean")
     if (
@@ -774,6 +914,21 @@ def run_production_wemm_batch(
         ),
         "model_directory": str(model_directory) if model_directory is not None else None,
     }
+    if effective_window_stride is not None:
+        config["window_stride_seconds"] = float(effective_window_stride)
+    if temporal_mode == MODE_DENSE_SCORE:
+        config.update(
+            {
+                "temporal_mode": temporal_mode,
+                "temporal_start_threshold": temporal_start_threshold,
+                "temporal_stop_threshold": temporal_stop_threshold,
+                "temporal_merge_gap_seconds": temporal_merge_gap_seconds,
+                "temporal_min_duration_seconds": temporal_min_duration_seconds,
+                "temporal_min_camera_support": temporal_min_camera_support,
+                "temporal_boundary_mode": temporal_boundary_mode,
+                "temporal_score_policy": temporal_score_policy,
+            }
+        )
     if include_pipeline:
         config["include_pipeline"] = True
         config["queue_capacity"] = queue_capacity
@@ -799,6 +954,7 @@ def run_production_wemm_batch(
                     item.get("duration_seconds"),
                     window_seconds,
                     include_tail,
+                    effective_window_stride,
                 ),
                 "elapsed_seconds": None,
                 "error": None,
@@ -816,6 +972,15 @@ def run_production_wemm_batch(
         if prior and prior != current:
             raise ProductionWemmBatchRunnerError(
                 "checkpoint selection differs from requested source-preflight members"
+            )
+        prior_config = _mapping(report.get("config", {}), field="checkpoint.config")
+        requested_temporal = _temporal_resume_signature(config, default_mode=temporal_mode)
+        prior_temporal = _temporal_resume_signature(prior_config)
+        if prior_temporal != requested_temporal:
+            raise ProductionWemmBatchRunnerError(
+                "checkpoint temporal configuration differs from requested run; "
+                "start a fresh checkpoint or keep temporal mode, stride and resolver "
+                "parameters unchanged"
             )
         report["status"] = RUN_STATUS_RUNNING
         report["config"] = config
@@ -911,6 +1076,11 @@ def run_production_wemm_batch(
                         qa_status=str(item.get("qa_status", "PENDING")),
                         window_seconds=window_seconds,
                         include_tail=include_tail,
+                        **(
+                            {"window_stride_seconds": effective_window_stride}
+                            if effective_window_stride is not None
+                            else {}
+                        ),
                     )
                     manifest_source = dict(
                         _mapping(manifest.get("source"), field="manifest.source")
@@ -944,6 +1114,19 @@ def run_production_wemm_batch(
                         "window_chunk_size": window_chunk_size,
                         "inference_batch_size": inference_batch_size,
                     }
+                    if temporal_mode == MODE_DENSE_SCORE:
+                        open_kwargs.update(
+                            {
+                                "temporal_mode": temporal_mode,
+                                "temporal_start_threshold": temporal_start_threshold,
+                                "temporal_stop_threshold": temporal_stop_threshold,
+                                "temporal_merge_gap_seconds": temporal_merge_gap_seconds,
+                                "temporal_min_duration_seconds": temporal_min_duration_seconds,
+                                "temporal_min_camera_support": temporal_min_camera_support,
+                                "temporal_boundary_mode": temporal_boundary_mode,
+                                "temporal_score_policy": temporal_score_policy,
+                            }
+                        )
                     # Do not add new keyword arguments to the historical
                     # serial call.  Besides preserving the default checkpoint
                     # shape, this keeps older injected/open-runner adapters
@@ -968,6 +1151,13 @@ def run_production_wemm_batch(
                         encoding="utf-8",
                     )
                     item["window_count"] = len(envelope.get("windows", []))
+                    if temporal_mode == MODE_DENSE_SCORE:
+                        temporal = envelope.get("temporal_resolution", {})
+                        if isinstance(temporal, Mapping):
+                            segments = temporal.get("segments", [])
+                            item["temporal_segment_count"] = (
+                                len(segments) if isinstance(segments, Sequence) else 0
+                            )
                     item["status"] = "COMPLETE"
                     item["production_eligible"] = bool(envelope.get("production_eligible", False))
             except Exception as exc:  # keep serial batch moving; checkpoint the failure

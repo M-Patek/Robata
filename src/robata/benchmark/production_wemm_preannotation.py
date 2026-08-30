@@ -564,6 +564,9 @@ def build_preannotation_envelope(
             ],
             "accepted_as_gold": False,
             "human_review_required": True,
+            "temporal_sidecar_fields": ["temporal_resolution", "temporal_segments"],
+            "temporal_segments_review_only": True,
+            "temporal_segments_are_action_boundary_proposals": True,
         },
     }
 
@@ -595,6 +598,30 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
                 catalog_snapshot[key] = _copy_json(
                     raw_catalog[key], field=f"raw_model_output.catalog.{key}"
                 )
+    # Dense temporal resolution is an additive, review-only sidecar attached
+    # by the native WeMM runner after the historical envelope is built.  Keep
+    # it out of ``items`` so existing window-oriented consumers remain
+    # compatible, while preserving the complete resolver output for reviewers
+    # and later batch aggregation.  The resolver's detailed shape is owned by
+    # its own module; this boundary only enforces JSON compatibility and the
+    # non-production invariant so a malformed sidecar is never silently lost.
+    temporal_resolution_snapshot: dict[str, Any] | None = None
+    raw_temporal = envelope.get("temporal_resolution")
+    if raw_temporal is not None:
+        temporal = _mapping(raw_temporal, field="temporal_resolution")
+        _assert_no_epic_or_gold(temporal, field="temporal_resolution")
+        temporal_copy = _copy_json(temporal, field="temporal_resolution")
+        if not isinstance(temporal_copy, dict):  # pragma: no cover - invariant
+            raise ProductionWemmPreannotationError("temporal_resolution must be an object")
+        if temporal_copy.get("production_eligible") is True:
+            raise ProductionWemmPreannotationError(
+                "temporal_resolution.production_eligible must be false"
+            )
+        raw_segments = temporal_copy.get("segments", [])
+        if not isinstance(raw_segments, list):
+            raise ProductionWemmPreannotationError("temporal_resolution.segments must be an array")
+        temporal_resolution_snapshot = temporal_copy
+
     items: list[dict[str, Any]] = []
     for window in envelope["windows"]:
         proposals = window.get("proposals", [])
@@ -628,7 +655,7 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             "review_status": "PENDING",
         }
         items.append(item)
-    return {
+    review_pack: dict[str, Any] = {
         "format": REVIEW_FORMAT,
         "authority": AUTHORITY,
         "status": "PENDING_REVIEW",
@@ -675,6 +702,9 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             ],
             "accepted_as_gold": False,
             "human_review_required": True,
+            "temporal_sidecar_fields": ["temporal_resolution", "temporal_segments"],
+            "temporal_segments_review_only": True,
+            "temporal_segments_are_action_boundary_proposals": True,
         },
         "model_artifact": {
             "format": envelope["format"],
@@ -689,6 +719,15 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             "human_adjudication": "NOT_PERFORMED",
         },
     }
+    if temporal_resolution_snapshot is not None:
+        review_pack["temporal_resolution"] = temporal_resolution_snapshot
+        # Keep a compact alias for review clients that only need proposed
+        # segments.  It is copied from the detached sidecar, never from the
+        # caller's mutable envelope.
+        review_pack["temporal_segments"] = copy.deepcopy(
+            temporal_resolution_snapshot.get("segments", [])
+        )
+    return review_pack
 
 
 def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
@@ -703,6 +742,7 @@ def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
     label_space = _mapping(envelope.get("label_space"), field="label_space")
     if label_space.get("kind") != LABEL_SPACE or label_space.get("epic_ontology_used") is not False:
         raise ProductionWemmPreannotationError("label_space must be open and non-EPIC")
+    _validate_temporal_resolution(envelope.get("temporal_resolution"))
     windows = _sequence(envelope.get("windows"), field="windows")
     for index, raw_window in enumerate(windows):
         window = _mapping(raw_window, field=f"windows[{index}]")
@@ -722,6 +762,50 @@ def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
             if proposal.get("proposal_status") not in PROPOSAL_STATUSES:
                 raise ProductionWemmPreannotationError("proposal status is invalid")
             _assert_no_epic_or_gold(proposal, field=f"windows[{index}].proposals[{proposal_index}]")
+
+
+def _validate_temporal_resolution(value: object) -> None:
+    """Validate the optional model-driven interval sidecar invariants."""
+
+    if value is None:
+        return
+    temporal = _mapping(value, field="temporal_resolution")
+    if temporal.get("status") != "PROPOSALS_ONLY":
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.status must be 'PROPOSALS_ONLY'"
+        )
+    if temporal.get("production_eligible") is not False:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.production_eligible must be false"
+        )
+    segments = _sequence(temporal.get("segments", []), field="temporal_resolution.segments")
+    for index, raw_segment in enumerate(segments):
+        segment = _mapping(raw_segment, field=f"temporal_resolution.segments[{index}]")
+        if segment.get("review_required") is not True:
+            raise ProductionWemmPreannotationError(
+                "temporal_resolution segments must require human review"
+            )
+        if segment.get("automatic_eligible") is not False:
+            raise ProductionWemmPreannotationError(
+                "temporal_resolution segments cannot be automatic eligible"
+            )
+        if segment.get("boundary_status") != "MODEL_PROBE_BOUND":
+            raise ProductionWemmPreannotationError(
+                "temporal_resolution segments must use MODEL_PROBE_BOUND"
+            )
+        start = _finite(
+            segment.get("start_seconds"),
+            field=f"temporal_resolution.segments[{index}].start_seconds",
+        )
+        end = _finite(
+            segment.get("end_seconds"),
+            field=f"temporal_resolution.segments[{index}].end_seconds",
+        )
+        if start < 0 or end <= start:
+            raise ProductionWemmPreannotationError(
+                f"temporal_resolution.segments[{index}] interval must satisfy 0 <= start < end"
+            )
+        _assert_no_epic_or_gold(segment, field=f"temporal_resolution.segments[{index}]")
 
 
 def validate_preannotation_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:

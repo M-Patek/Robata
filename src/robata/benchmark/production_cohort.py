@@ -108,6 +108,7 @@ def build_windows(
     *,
     window_seconds: float = 8.0,
     include_tail: bool = False,
+    window_stride_seconds: float | None = None,
     window_prefix: str = "sample-medium",
 ) -> tuple[ProductionWindow, ...]:
     """Build non-overlapping windows over the common camera interval.
@@ -119,38 +120,91 @@ def build_windows(
 
     if not math.isfinite(window_seconds) or window_seconds <= 0:
         raise ProductionCohortError("window_seconds must be positive and finite")
+    stride = window_seconds if window_stride_seconds is None else float(window_stride_seconds)
+    if not math.isfinite(stride) or stride <= 0:
+        raise ProductionCohortError("window_stride_seconds must be positive and finite")
+    if stride > window_seconds:
+        raise ProductionCohortError("window_stride_seconds must be <= window_seconds")
     start_ns, end_ns = common_camera_span(spans)
     origin_ns = start_ns
     duration = (end_ns - origin_ns) / 1_000_000_000
-    full_count = int(duration // window_seconds)
+    # Retain the historical exact non-overlapping algorithm byte-for-byte when
+    # stride is omitted/equal to the context width.  Dense temporal mode uses
+    # the second branch and intentionally creates overlapping context windows;
+    # these remain processing envelopes, never action boundaries.
+    full_count = int(duration // window_seconds) if abs(stride - window_seconds) <= 1e-9 else 0
     windows: list[ProductionWindow] = []
     camera_ids = tuple(item.camera_id for item in spans)
     camera_topics = {item.camera_id: item.topic for item in spans}
-    for ordinal in range(full_count):
-        left = ordinal * window_seconds
-        right = min(duration, (ordinal + 1) * window_seconds)
-        windows.append(
-            ProductionWindow(
-                ordinal=ordinal,
-                window_id=f"{window_prefix}-w{ordinal:02d}",
-                start_seconds=left,
-                end_seconds=right,
-                camera_ids=camera_ids,
-                camera_topics=camera_topics,
+    if abs(stride - window_seconds) <= 1e-9:
+        for ordinal in range(full_count):
+            left = ordinal * window_seconds
+            right = min(duration, (ordinal + 1) * window_seconds)
+            windows.append(
+                ProductionWindow(
+                    ordinal=ordinal,
+                    window_id=f"{window_prefix}-w{ordinal:02d}",
+                    start_seconds=left,
+                    end_seconds=right,
+                    camera_ids=camera_ids,
+                    camera_topics=camera_topics,
+                )
             )
-        )
-    tail = duration - full_count * window_seconds
-    if include_tail and tail > 1e-6:
-        windows.append(
-            ProductionWindow(
-                ordinal=full_count,
-                window_id=f"{window_prefix}-w{full_count:02d}-tail",
-                start_seconds=full_count * window_seconds,
-                end_seconds=duration,
-                camera_ids=camera_ids,
-                camera_topics=camera_topics,
+        tail = duration - full_count * window_seconds
+        if include_tail and tail > 1e-6:
+            windows.append(
+                ProductionWindow(
+                    ordinal=full_count,
+                    window_id=f"{window_prefix}-w{full_count:02d}-tail",
+                    start_seconds=full_count * window_seconds,
+                    end_seconds=duration,
+                    camera_ids=camera_ids,
+                    camera_topics=camera_topics,
+                )
             )
-        )
+    else:
+        epsilon = 1e-9
+        ordinal = 0
+        # Emit every full context on the requested stride.  Once the next
+        # stride would produce a short context, keep at most one final tail
+        # envelope.  Emitting every short stride (for example starts 3, 4, 5
+        # on a 6 s source with a 4 s/1 s grid) needlessly multiplies decode and
+        # inference cost while adding no new full-width temporal evidence.
+        max_full_start = max(0.0, duration - window_seconds)
+        left = 0.0
+        emitted_full = False
+        while left <= max_full_start + epsilon:
+            right = min(duration, left + window_seconds)
+            if right - left >= window_seconds - epsilon:
+                windows.append(
+                    ProductionWindow(
+                        ordinal=ordinal,
+                        window_id=f"{window_prefix}-w{ordinal:03d}",
+                        start_seconds=left,
+                        end_seconds=right,
+                        camera_ids=camera_ids,
+                        camera_topics=camera_topics,
+                    )
+                )
+                ordinal += 1
+                emitted_full = True
+            left += stride
+        if include_tail:
+            # A source shorter than one full context still gets one explicit
+            # tail when requested, matching the legacy route.
+            tail_start = 0.0 if not emitted_full else duration - window_seconds
+            tail_start = max(0.0, tail_start)
+            if not windows or tail_start > windows[-1].start_seconds + epsilon:
+                windows.append(
+                    ProductionWindow(
+                        ordinal=ordinal,
+                        window_id=f"{window_prefix}-w{ordinal:03d}-tail",
+                        start_seconds=tail_start,
+                        end_seconds=duration,
+                        camera_ids=camera_ids,
+                        camera_topics=camera_topics,
+                    )
+                )
     if not windows:
         raise ProductionCohortError("common interval is shorter than one requested window")
     return tuple(windows)
@@ -208,6 +262,7 @@ def build_manifest(
     *,
     window_seconds: float = 8.0,
     include_tail: bool = False,
+    window_stride_seconds: float | None = None,
     camera_topics: Mapping[str, str] = DEFAULT_CAMERA_TOPICS,
 ) -> dict[str, Any]:
     """Inspect one source and return a serialisable production cohort manifest."""
@@ -218,10 +273,25 @@ def build_manifest(
         spans,
         window_seconds=window_seconds,
         include_tail=include_tail,
+        window_stride_seconds=window_stride_seconds,
     )
     start_ns, end_ns = common_camera_span(spans)
     common_duration = (end_ns - start_ns) / 1_000_000_000
     represented = sum(item.duration_seconds for item in windows)
+    ordered_intervals = sorted((item.start_seconds, item.end_seconds) for item in windows)
+    covered_seconds = 0.0
+    covered_start: float | None = None
+    covered_end: float | None = None
+    for left, right in ordered_intervals:
+        if covered_start is None or covered_end is None:
+            covered_start, covered_end = left, right
+        elif left <= covered_end + 1e-9:
+            covered_end = max(covered_end, right)
+        else:
+            covered_seconds += covered_end - covered_start
+            covered_start, covered_end = left, right
+    if covered_start is not None and covered_end is not None:
+        covered_seconds += covered_end - covered_start
     return {
         "format": "robata-production-shaped-cohort-v1",
         "authority": "LOCAL_NONPRODUCTION_ONLY",
@@ -236,8 +306,20 @@ def build_manifest(
         },
         "window_policy": {
             "window_seconds": window_seconds,
+            "window_stride_seconds": (
+                window_seconds if window_stride_seconds is None else window_stride_seconds
+            ),
+            "overlap_seconds": max(
+                0.0,
+                window_seconds
+                - (window_seconds if window_stride_seconds is None else window_stride_seconds),
+            ),
+            "context_windows_not_action_boundaries": True,
             "include_tail": include_tail,
             "represented_duration_seconds": represented,
+            "context_workload_seconds": represented,
+            "unique_context_coverage_seconds": covered_seconds,
+            "overlap_workload_seconds": max(0.0, represented - covered_seconds),
             "excluded_tail_seconds": max(0.0, common_duration - represented),
         },
         "gold": {
