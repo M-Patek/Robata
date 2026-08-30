@@ -123,6 +123,104 @@ def test_aggregate_flattens_items_and_preserves_lineage_and_retrieval() -> None:
     assert "NOT_MEASURED" in markdown
 
 
+def test_aggregate_preserves_model_temporal_sidecar_with_recording_lineage() -> None:
+    pack = _review_pack("rec-temporal")
+    temporal = {
+        "format": "robata-production-wemm-temporal-resolver-v1",
+        "status": "PROPOSALS_ONLY",
+        "mode": "dense_score",
+        "production_eligible": False,
+        "parameters": {
+            "start_threshold": 0.72,
+            "stop_threshold": 0.60,
+            "boundary_mode": "midpoint",
+        },
+        "diagnostics": {"context_window_count": 4},
+        "segments": [
+            {
+                "segment_id": "open-cupboard@1.0-2.0",
+                "provisional_id": "open-cupboard",
+                "start_seconds": 1.0,
+                "end_seconds": 2.0,
+                "boundary_status": "MODEL_PROBE_BOUND",
+                "review_required": True,
+                "automatic_eligible": False,
+                "supporting_window_ids": ["rec-temporal-w0000"],
+                "top_k": [
+                    {
+                        "window_id": "rec-temporal-w0000",
+                        "candidates": [{"provisional_id": "open-cupboard", "score": 0.8}],
+                    }
+                ],
+            }
+        ],
+    }
+    pack["temporal_resolution"] = temporal
+    pack["temporal_segments"] = list(temporal["segments"])  # type: ignore[index]
+
+    report = aggregate_production_wemm_review_packs([pack])
+    assert report["summary"]["temporal_sidecar_recording_count"] == 1  # type: ignore[index]
+    assert report["summary"]["temporal_segment_count"] == 1  # type: ignore[index]
+    assert report["summary"]["temporal_boundary_status_counts"] == {  # type: ignore[index]
+        "MODEL_PROBE_BOUND": 1
+    }
+    assert report["review_contract"]["temporal_segments_review_only"] is True  # type: ignore[index]
+    assert report["review_contract"]["temporal_segments_are_action_boundary_proposals"] is True  # type: ignore[index]
+
+    segment = report["temporal_segments"][0]  # type: ignore[index]
+    assert segment["recording_id"] == "rec-temporal"
+    assert segment["temporal_segment_key"].startswith("rec-temporal::temporal::")
+    assert segment["source_ref"]["archive_member"] == "file/rec-temporal.mcap"
+    assert segment["provenance"]["model_boundary_sidecar"] is True
+    temporal_summary = report["temporal_resolution"]  # type: ignore[index]
+    assert temporal_summary["recordings"][0]["mode"] == "dense_score"
+    assert temporal_summary["recordings"][0]["segment_count"] == 1
+    markdown = render_markdown(report)
+    assert "Temporal interval sidecar" in markdown
+    assert "Model-derived interval proposals" in markdown
+
+
+def test_aggregate_rejects_inconsistent_temporal_sidecar_alias() -> None:
+    pack = _review_pack("rec-temporal-mismatch")
+    pack["temporal_resolution"] = {
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "segments": [
+            {
+                "segment_id": "one",
+                "review_required": True,
+                "automatic_eligible": False,
+                "boundary_status": "MODEL_PROBE_BOUND",
+            }
+        ],
+    }
+    pack["temporal_segments"] = [
+        {
+            "segment_id": "two",
+            "review_required": True,
+            "automatic_eligible": False,
+            "boundary_status": "MODEL_PROBE_BOUND",
+        }
+    ]
+    report = aggregate_production_wemm_review_packs([pack])
+    assert report["status"] == "NO_VALID_REVIEW_PACKS"
+    assert "does not match temporal_resolution.segments" in report["invalid_inputs"][0]["reason"]  # type: ignore[index]
+
+
+def test_aggregate_rejects_automatic_temporal_segment() -> None:
+    pack = _review_pack("rec-temporal-automatic")
+    pack["temporal_segments"] = [
+        {
+            "segment_id": "one",
+            "review_required": False,
+            "automatic_eligible": True,
+        }
+    ]
+    report = aggregate_production_wemm_review_packs([pack])
+    assert report["status"] == "NO_VALID_REVIEW_PACKS"
+    assert "review_required must be true" in report["invalid_inputs"][0]["reason"]  # type: ignore[index]
+
+
 def test_directory_discovers_only_review_packs_and_reports_bad_inputs() -> None:
     with tempfile.TemporaryDirectory(prefix="robata-review-pack-") as temp_dir:
         root = Path(temp_dir) / "run"
