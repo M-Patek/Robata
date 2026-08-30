@@ -74,6 +74,103 @@ _NOT_MEASURED_STATES: Final = frozenset(
 )
 
 
+def _normalise_pair_token(value: object) -> str:
+    """Normalize one candidate/claim token for exact lexical binding.
+
+    This is deliberately limited to case, punctuation, and whitespace.  In
+    particular, it does not apply the exploratory ``cloth -> garment`` (or
+    any other noun) aliases used by some review diagnostics.  Candidate
+    binding must not become a hidden semantic mapper.
+    """
+
+    if not isinstance(value, str):
+        return ""
+    text = value.casefold().replace("_", " ").replace("-", " ")
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", text).split())
+
+
+def _candidate_scalar(value: object) -> object:
+    """Unwrap a structured value/status field without interpreting it."""
+
+    if isinstance(value, Mapping) and "value" in value:
+        status = _text(value.get("status")).upper()
+        if status and status != "MEASURED":
+            return None
+        return value.get("value")
+    return value
+
+
+def _candidate_pair(value: object, *, depth: int = 0) -> tuple[str, str] | None:
+    """Extract an explicit verb/noun pair from one Top-K candidate.
+
+    Candidate objects vary slightly across the recorded WeMM runners.  This
+    helper accepts only explicit pair/label fields and never maps synonyms or
+    ontology IDs.  A depth bound keeps malformed nested provenance harmless.
+    """
+
+    if depth > 4 or not isinstance(value, Mapping):
+        return None
+    labels = value.get("structured_labels", value.get("labels"))
+    if isinstance(labels, Mapping):
+        verb = _normalise_pair_token(_candidate_scalar(labels.get("verb")))
+        noun = _normalise_pair_token(_candidate_scalar(labels.get("noun")))
+        if verb and noun:
+            return verb, noun
+    verb = _normalise_pair_token(_candidate_scalar(value.get("verb")))
+    noun = _normalise_pair_token(_candidate_scalar(value.get("noun")))
+    if verb and noun:
+        return verb, noun
+    for key in ("candidate", "action", "prediction"):
+        nested = value.get(key)
+        pair = _candidate_pair(nested, depth=depth + 1)
+        if pair is not None:
+            return pair
+    label = value.get("label_text", value.get("label"))
+    if isinstance(label, str):
+        tokens = _normalise_pair_token(label).split()
+        if len(tokens) >= 3 and tokens[:2] == ["pick", "up"]:
+            pair = ("pick up", " ".join(tokens[2:]))
+        elif len(tokens) >= 2:
+            pair = (tokens[0], " ".join(tokens[1:]))
+        else:
+            pair = None
+        if pair is not None and all(pair):
+            return pair
+    return None
+
+
+def _available_wemm_pairs(section: Mapping[str, Any] | None) -> set[tuple[str, str]] | None:
+    """Return explicit non-empty WeMM Top-K pairs, if such a list exists.
+
+    ``None`` means that no usable Top-K pair is available, preserving the
+    legacy Qwen-only behavior.  An available list is used as a hard lexical
+    binding for structured Qwen/Mage claims; no candidate is inferred from an
+    empty list or from opaque numeric/ontology fields.
+    """
+
+    if not isinstance(section, Mapping):
+        return None
+    values: list[object] = []
+    raw = section.get("candidates")
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        values.extend(raw)
+    # The structured envelope retains alternate candidate/prediction sources
+    # under candidate_groups.  Use them only when they provide explicit pairs.
+    groups = section.get("candidate_groups")
+    if isinstance(groups, Sequence) and not isinstance(groups, (str, bytes, bytearray)):
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            group_values = group.get("candidates")
+            if isinstance(group_values, Sequence) and not isinstance(
+                group_values, (str, bytes, bytearray)
+            ):
+                values.extend(group_values)
+    pairs = {_candidate_pair(value) for value in values}
+    usable = {pair for pair in pairs if pair is not None}
+    return usable or None
+
+
 class StructuredEvidenceVerifierError(ValueError):
     """Raised when an input cannot be used as a structured sidecar."""
 
@@ -531,6 +628,7 @@ def _claim_check(
     segment: Mapping[str, Any],
     segment_index: int,
     model: str = "qwen",
+    available_wemm_pairs: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     window_id = _text(window.get("window_id")) or "__unknown__"
     reasons: list[str] = []
@@ -602,6 +700,24 @@ def _claim_check(
     if not noun_measured:
         reasons.append("NOUN_NOT_MEASURED")
 
+    # When the production WeMM route supplied explicit Top-K pairs, a
+    # structured Qwen/Mage claim must echo one of those pairs.  This is a
+    # lexical binding gate only: it deliberately does not normalize synonyms
+    # (for example ``cloth`` to ``garment``) or consult an ontology.  If no
+    # usable Top-K pair exists, retain the historical Qwen-only behavior and
+    # leave binding unmeasured.
+    claim_pair = (
+        _normalise_pair_token(verb),
+        _normalise_pair_token(noun),
+    ) if verb_measured and noun_measured else None
+    candidate_binding_status = "NOT_MEASURED"
+    if available_wemm_pairs and claim_pair is not None:
+        if claim_pair not in available_wemm_pairs:
+            reasons.append("CLAIM_PAIR_NOT_IN_WEMM_TOP_K")
+            candidate_binding_status = "MISMATCH"
+        else:
+            candidate_binding_status = "MATCH"
+
     evidence_values, evidence_status, evidence_present = _evidence(segment)
     evidence_present_check = bool(evidence_values)
     if not evidence_present_check:
@@ -662,6 +778,8 @@ def _claim_check(
         "noun_status": noun_status,
         "noun_present": noun_present,
         "noun_measured": noun_measured,
+        "claim_pair": list(claim_pair) if claim_pair is not None else None,
+        "wemm_top_k_binding": candidate_binding_status,
         "evidence": _copy_json(evidence_values, field=f"{claim_id}.evidence"),
         "evidence_status": evidence_status,
         "evidence_present": evidence_present,
@@ -723,6 +841,7 @@ def _model_claim_report(
     section: Mapping[str, Any],
     model: str,
     raw_marker: str | None,
+    available_wemm_pairs: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Check one model's structured claims with one shared structural gate.
 
@@ -748,6 +867,7 @@ def _model_claim_report(
                 segment=segment,
                 segment_index=index,
                 model=model,
+                available_wemm_pairs=available_wemm_pairs,
             )
         )
 
@@ -824,6 +944,12 @@ def _model_claim_report(
         "candidate_top_k_observed": candidate_state == "OBSERVED",
         "candidate_top_k_measured": candidate_state in {"OBSERVED", "OBSERVED_EMPTY"},
         "candidate_only": bool(candidate_claims),
+        "wemm_top_k_pairs": (
+            [list(pair) for pair in sorted(available_wemm_pairs)]
+            if available_wemm_pairs
+            else []
+        ),
+        "wemm_candidate_binding_checked": bool(available_wemm_pairs),
         "claims": [*structured_claims, *candidate_claims],
         "structured_claims": structured_claims,
         "candidate_only_claims": candidate_claims,
@@ -850,6 +976,14 @@ def _window_report(
     source_interval = _window_interval(window)
     models = _mapping(window.get("models"), field=f"window[{window_id}].models")
 
+    # WeMM is retrieval-only, but its explicit Top-K is the candidate set that
+    # the selective Qwen/Mage verifier is allowed to support.  A missing or
+    # opaque list yields ``None`` so legacy Qwen-only fixtures remain valid.
+    wemm_section = models.get("wemm")
+    wemm_top_k_pairs = _available_wemm_pairs(
+        wemm_section if isinstance(wemm_section, Mapping) else None
+    )
+
     # Keep the Qwen-primary fields for compatibility with existing reports.
     qwen = _mapping(models.get("qwen"), field=f"window[{window_id}].models.qwen")
     qwen_report = _model_claim_report(
@@ -857,6 +991,7 @@ def _window_report(
         section=qwen,
         model="qwen",
         raw_marker=raw_markers.get((window_id, "qwen")),
+        available_wemm_pairs=wemm_top_k_pairs,
     )
     model_reports: dict[str, dict[str, Any]] = {"qwen": qwen_report}
 
@@ -870,6 +1005,7 @@ def _window_report(
             section=mage,
             model="mage",
             raw_marker=raw_markers.get((window_id, "mage")),
+            available_wemm_pairs=wemm_top_k_pairs,
         )
 
     structured_claims_all = [
@@ -989,6 +1125,12 @@ def _window_report(
             model: report["parse_diagnostics"] for model, report in model_reports.items()
         },
         "retrieval_context": retrieval_context,
+        "wemm_top_k_pairs": (
+            [list(pair) for pair in sorted(wemm_top_k_pairs)]
+            if wemm_top_k_pairs
+            else []
+        ),
+        "wemm_candidate_binding_checked": bool(wemm_top_k_pairs),
         "reason_codes": reasons,
         "reasons": reasons,
         "review_reason_codes": list(dict.fromkeys(review_reason_codes)),
@@ -1101,6 +1243,7 @@ def verify_production_structured_evidence(
             "wemm_retrieval_context_only": True,
             "candidate_claims_are_model_only": True,
             "empty_qwen_candidates_are_not_inferred": True,
+            "structured_claims_bound_to_wemm_top_k_when_available": True,
             "fixed_window_is_not_action_boundary": True,
             "gold_is_external": True,
             "semantic_action_identity_checked": False,

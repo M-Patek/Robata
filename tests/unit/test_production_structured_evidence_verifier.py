@@ -49,6 +49,7 @@ def _envelope(
     *,
     candidates: list[dict[str, object]] | None = None,
     candidate_marker: str | None = None,
+    wemm_candidates: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     qwen_row: dict[str, object] = {
         "window_id": "w00",
@@ -62,14 +63,30 @@ def _envelope(
         qwen_row["candidates"] = candidates
     if candidate_marker is not None:
         qwen_row["candidate_state"] = candidate_marker
+    sidecars: dict[str, object] = {
+        "qwen": {
+            "format": "robata-production-qwen-structured-native-shadow-v1",
+            "source": {"manifest": "cohort.json", "camera_count": 1},
+            "windows": [qwen_row],
+        }
+    }
+    if wemm_candidates is not None:
+        sidecars["wemm"] = {
+            "format": "robata-production-wemm-shadow-v1",
+            "source": {"path": "source.mcap", "camera_count": 1},
+            "windows": [
+                {
+                    "window_id": "w00",
+                    "ordinal": 0,
+                    "start_time_sec": 0.0,
+                    "end_time_sec": 4.0,
+                    "status": "SUCCEEDED",
+                    "candidates": wemm_candidates,
+                }
+            ],
+        }
     return build_structured_annotation_envelope(
-        {
-            "qwen": {
-                "format": "robata-production-qwen-structured-native-shadow-v1",
-                "source": {"manifest": "cohort.json", "camera_count": 1},
-                "windows": [qwen_row],
-            }
-        },
+        sidecars,
         source_path="source.mcap",
         camera_count=1,
     )
@@ -91,6 +108,62 @@ def test_valid_structured_claim_is_reviewable_but_never_accepted() -> None:
     assert window["abstained"] is False
     assert report["quality"]["measurement_status"] == "NOT_MEASURED"
     assert report["controls"]["model_invoked"] is False
+
+
+def test_structured_claim_binds_to_available_wemm_top_k_pair() -> None:
+    report = verify_production_structured_evidence(
+        _envelope(
+            [_segment()],
+            wemm_candidates=[{"verb": "fold", "noun": "garment", "score": 0.9}],
+        )
+    )
+    window = report["windows"][0]
+    claim = window["structured_claims"][0]
+    assert window["wemm_top_k_pairs"] == [["fold", "garment"]]
+    assert window["wemm_candidate_binding_checked"] is True
+    assert claim["claim_pair"] == ["fold", "garment"]
+    assert claim["wemm_top_k_binding"] == "MATCH"
+    assert claim["eligible_for_review"] is True
+
+
+def test_structured_claim_outside_wemm_top_k_abstains_without_rewriting_raw_claim() -> None:
+    claim_segment = _segment(verb="take", noun="cloth")
+    report = verify_production_structured_evidence(
+        _envelope(
+            [claim_segment],
+            wemm_candidates=[{"verb": "fold", "noun": "garment", "score": 0.9}],
+        )
+    )
+    window = report["windows"][0]
+    claim = window["structured_claims"][0]
+    assert window["status"] == "ABSTAIN"
+    assert claim["wemm_top_k_binding"] == "MISMATCH"
+    assert claim["claim_pair"] == ["take", "cloth"]
+    assert claim["eligible_for_review"] is False
+    assert "CLAIM_PAIR_NOT_IN_WEMM_TOP_K" in claim["reason_codes"]
+    assert claim["raw_claim"]["structured_labels"]["verb"]["value"] == "take"
+    assert claim["raw_claim"]["structured_labels"]["noun"]["value"] == "cloth"
+
+
+def test_qwen_only_claim_keeps_wemm_binding_unmeasured() -> None:
+    report = verify_production_structured_evidence(_envelope([_segment()]))
+    window = report["windows"][0]
+    claim = window["structured_claims"][0]
+    assert window["wemm_top_k_pairs"] == []
+    assert window["wemm_candidate_binding_checked"] is False
+    assert claim["wemm_top_k_binding"] == "NOT_MEASURED"
+    assert claim["eligible_for_review"] is True
+
+
+def test_wemm_label_text_is_parsed_without_semantic_aliasing() -> None:
+    report = verify_production_structured_evidence(
+        _envelope(
+            [_segment()],
+            wemm_candidates=[{"label_text": "fold garment", "score": 0.9}],
+        )
+    )
+    claim = report["windows"][0]["structured_claims"][0]
+    assert claim["wemm_top_k_binding"] == "MATCH"
 
 
 def test_invalid_claim_is_retained_with_explicit_reasons() -> None:
