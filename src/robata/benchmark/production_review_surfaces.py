@@ -355,7 +355,7 @@ def _thumbnail_bytes(
     max_side: int,
 ) -> tuple[bytes, int, int, int, int]:
     try:
-        from PIL import Image  # type: ignore[import-not-found]
+        from PIL import Image  # type: ignore[import-not-found,unused-ignore]
     except Exception as exc:  # pragma: no cover - optional dependency boundary
         raise ProductionReviewSurfacesError("review-surface rendering requires Pillow") from exc
     try:
@@ -562,7 +562,7 @@ def _safe_component(value: str) -> str:
 
 def _load_image(data: bytes) -> Any:
     try:
-        from PIL import Image  # type: ignore[import-not-found]
+        from PIL import Image
     except Exception as exc:  # pragma: no cover - optional dependency boundary
         raise ProductionReviewSurfacesError("review-surface rendering requires Pillow") from exc
     try:
@@ -583,7 +583,7 @@ def _load_slot_image(slot: _TargetSlot) -> Any:
 
 def _draw_font() -> Any:
     try:
-        from PIL import ImageFont  # type: ignore[import-not-found]
+        from PIL import ImageFont
 
         return ImageFont.load_default()
     except Exception:  # pragma: no cover - Pillow boundary
@@ -605,7 +605,7 @@ def _render_camera_sheet(
     window_start_timestamp_ns: int,
 ) -> Any:
     try:
-        from PIL import Image, ImageDraw  # type: ignore[import-not-found]
+        from PIL import Image, ImageDraw
     except Exception as exc:  # pragma: no cover - optional dependency boundary
         raise ProductionReviewSurfacesError("review-surface rendering requires Pillow") from exc
     images = [_load_image(slot.image_bytes) for slot in slots if slot.image_bytes is not None]
@@ -652,7 +652,7 @@ def _render_overview(
     per_camera_slots: Mapping[str, Sequence[_TargetSlot]],
 ) -> Any:
     try:
-        from PIL import Image, ImageDraw  # type: ignore[import-not-found]
+        from PIL import Image, ImageDraw
     except Exception as exc:  # pragma: no cover - optional dependency boundary
         raise ProductionReviewSurfacesError("review-surface rendering requires Pillow") from exc
     rows = [
