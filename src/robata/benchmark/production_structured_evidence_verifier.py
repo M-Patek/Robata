@@ -724,9 +724,13 @@ def _claim_check(
     # usable Top-K pair exists, retain the historical Qwen-only behavior and
     # leave binding unmeasured.
     claim_pair = (
-        _normalise_pair_token(verb),
-        _normalise_pair_token(noun),
-    ) if verb_measured and noun_measured else None
+        (
+            _normalise_pair_token(verb),
+            _normalise_pair_token(noun),
+        )
+        if verb_measured and noun_measured
+        else None
+    )
     candidate_binding_status = "NOT_MEASURED"
     if available_wemm_pairs and claim_pair is not None:
         if claim_pair not in available_wemm_pairs:
@@ -962,9 +966,7 @@ def _model_claim_report(
         "candidate_top_k_measured": candidate_state in {"OBSERVED", "OBSERVED_EMPTY"},
         "candidate_only": bool(candidate_claims),
         "wemm_top_k_pairs": (
-            [list(pair) for pair in sorted(available_wemm_pairs)]
-            if available_wemm_pairs
-            else []
+            [list(pair) for pair in sorted(available_wemm_pairs)] if available_wemm_pairs else []
         ),
         "wemm_candidate_binding_checked": bool(available_wemm_pairs),
         "claims": [*structured_claims, *candidate_claims],
@@ -1143,9 +1145,7 @@ def _window_report(
         },
         "retrieval_context": retrieval_context,
         "wemm_top_k_pairs": (
-            [list(pair) for pair in sorted(wemm_top_k_pairs)]
-            if wemm_top_k_pairs
-            else []
+            [list(pair) for pair in sorted(wemm_top_k_pairs)] if wemm_top_k_pairs else []
         ),
         "wemm_candidate_binding_checked": bool(wemm_top_k_pairs),
         "reason_codes": reasons,

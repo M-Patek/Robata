@@ -355,12 +355,8 @@ def _normalised_key(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
-_EPIC_MAPPER_PROVENANCE_KEYS: Final = frozenset(
-    {"epicontologyused", "mapperused"}
-)
-_FORMAT_PROVENANCE_KEYS: Final = frozenset(
-    {"format", "formatversion", "schemaformat"}
-)
+_EPIC_MAPPER_PROVENANCE_KEYS: Final = frozenset({"epicontologyused", "mapperused"})
+_FORMAT_PROVENANCE_KEYS: Final = frozenset({"format", "formatversion", "schemaformat"})
 
 
 def _looks_like_epic_format(value: object) -> bool:
