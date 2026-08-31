@@ -47,7 +47,6 @@ from robata.benchmark.production_boundary_probe import (  # noqa: E402
 
 if TYPE_CHECKING:
     from robata.benchmark.qwen_native_video import QwenNativeVideoInput
-
     from robata.inference.local_hf_runtime import (
         LocalHfVideoGenerationRequest,
         LocalHuggingFaceVisionRuntime,
