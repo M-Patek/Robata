@@ -260,6 +260,7 @@ def test_aggregate_canonical_lineage_overrides_stale_temporal_source_ref() -> No
             "review_pack_path": "stale-pack.json",
             "archive_member": "stale-member.mcap",
             "upstream_note": "retain me",
+            "upstream_lineage": {"recording_id": "older-recording"},
         }
     )
     temporal = {

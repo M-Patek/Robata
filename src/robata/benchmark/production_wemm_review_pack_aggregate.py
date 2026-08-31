@@ -531,10 +531,20 @@ def _merge_lineage(
             upstream = _copy_json(existing_upstream, field=f"{field}.upstream_lineage")
         else:
             upstream = {}
+            if existing_upstream is not None:
+                # Preserve malformed-but-observable upstream lineage instead
+                # of dropping it while repairing a canonical conflict.
+                upstream["value"] = _copy_json(
+                    existing_upstream,
+                    field=f"{field}.upstream_lineage",
+                )
         if not isinstance(upstream, dict):  # pragma: no cover - helper invariant
             upstream = {}
         for key, previous in conflicts.items():
-            upstream.setdefault(key, previous)
+            # Prefer the most immediate upstream value when nested lineage
+            # layers disagree, so the value overridden by this aggregate is
+            # not silently hidden behind an older snapshot.
+            upstream[key] = previous
         copied["upstream_lineage"] = upstream
     return copied
 

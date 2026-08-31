@@ -118,6 +118,7 @@ def test_projection_canonicalizes_conflicting_nested_recording_lineage() -> None
     source["temporal_resolution"]["segments"][0]["source_ref"] = {  # type: ignore[index]
         "recording_id": "stale-recording",
         "path": "sample.mcap",
+        "upstream_lineage": {"recording_id": "older-recording"},
     }
 
     report = project_temporal_interval_proposals(source)

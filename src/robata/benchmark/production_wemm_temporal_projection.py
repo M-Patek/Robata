@@ -625,9 +625,7 @@ def _source_ref(
                 upstream.setdefault(
                     "value", _copy_json(existing_upstream, field="source_ref.upstream_lineage")
                 )
-            upstream.setdefault(
-                "recording_id", _copy_json(previous, field="source_ref.recording_id")
-            )
+            upstream["recording_id"] = _copy_json(previous, field="source_ref.recording_id")
             copied["upstream_lineage"] = upstream
         copied["recording_id"] = recording_id
     return {key: value for key, value in copied.items()}

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from robata.benchmark.production_cohort import CameraSpan, build_windows, common_camera_span
+from robata.benchmark import production_cohort
+from robata.benchmark.production_cohort import (
+    CameraSpan,
+    build_manifest,
+    build_windows,
+    common_camera_span,
+)
 
 
 def _spans(duration: float = 40.8335) -> tuple[CameraSpan, ...]:
@@ -81,3 +87,22 @@ def test_window_seconds_malformed_values_raise_cohort_error(value: object) -> No
 def test_window_stride_malformed_values_raise_cohort_error(value: object) -> None:
     with pytest.raises(ValueError, match="window_stride_seconds"):
         build_windows(_spans(), window_stride_seconds=value)  # type: ignore[arg-type]
+
+
+def test_manifest_normalizes_window_parameters_before_workload_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        production_cohort, "inspect_mcap_camera_spans", lambda *_args, **_kwargs: _spans(6.0)
+    )
+
+    manifest = build_manifest(
+        "sample.mcap",
+        window_seconds="4",
+        window_stride_seconds="1",
+        include_tail=True,
+    )
+
+    assert manifest["window_policy"]["window_seconds"] == pytest.approx(4.0)
+    assert manifest["window_policy"]["window_stride_seconds"] == pytest.approx(1.0)
+    assert manifest["window_policy"]["overlap_seconds"] == pytest.approx(3.0)

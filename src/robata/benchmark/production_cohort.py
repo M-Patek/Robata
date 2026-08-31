@@ -288,13 +288,29 @@ def build_manifest(
 ) -> dict[str, Any]:
     """Inspect one source and return a serialisable production cohort manifest."""
 
+    # Normalize once at the manifest boundary and reuse the validated values
+    # for both window construction and workload accounting.  This keeps direct
+    # callers from leaking string/list parameters into arithmetic below.
+    window_seconds = _finite_number(window_seconds, field="window_seconds")
+    if window_seconds <= 0:
+        raise ProductionCohortError("window_seconds must be positive and finite")
+    stride = (
+        window_seconds
+        if window_stride_seconds is None
+        else _finite_number(window_stride_seconds, field="window_stride_seconds")
+    )
+    if stride <= 0:
+        raise ProductionCohortError("window_stride_seconds must be positive and finite")
+    if stride > window_seconds:
+        raise ProductionCohortError("window_stride_seconds must be <= window_seconds")
+
     path = Path(source).expanduser().resolve()
     spans = inspect_mcap_camera_spans(path, camera_topics=camera_topics)
     windows = build_windows(
         spans,
         window_seconds=window_seconds,
         include_tail=include_tail,
-        window_stride_seconds=window_stride_seconds,
+        window_stride_seconds=stride,
     )
     start_ns, end_ns = common_camera_span(spans)
     common_duration = (end_ns - start_ns) / 1_000_000_000
@@ -327,13 +343,10 @@ def build_manifest(
         },
         "window_policy": {
             "window_seconds": window_seconds,
-            "window_stride_seconds": (
-                window_seconds if window_stride_seconds is None else window_stride_seconds
-            ),
+            "window_stride_seconds": stride,
             "overlap_seconds": max(
                 0.0,
-                window_seconds
-                - (window_seconds if window_stride_seconds is None else window_stride_seconds),
+                window_seconds - stride,
             ),
             "context_windows_not_action_boundaries": True,
             "include_tail": include_tail,
