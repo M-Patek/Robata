@@ -20,6 +20,20 @@ class ProductionCohortError(ValueError):
     """Raised for malformed source/window inputs."""
 
 
+def _finite_number(value: object, *, field: str) -> float:
+    """Coerce a window parameter without leaking Python conversion errors."""
+
+    if isinstance(value, bool):
+        raise ProductionCohortError(f"{field} must be finite")
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProductionCohortError(f"{field} must be finite") from exc
+    if not math.isfinite(result):
+        raise ProductionCohortError(f"{field} must be finite")
+    return result
+
+
 DEFAULT_CAMERA_TOPICS: dict[str, str] = {
     "cam_01": "/robot0/sensor/camera0/compressed",
     "cam_02": "/robot0/sensor/camera1/compressed",
@@ -120,10 +134,15 @@ def build_windows(
     window rather than silently discarding the remainder.
     """
 
-    if not math.isfinite(window_seconds) or window_seconds <= 0:
+    window_seconds = _finite_number(window_seconds, field="window_seconds")
+    if window_seconds <= 0:
         raise ProductionCohortError("window_seconds must be positive and finite")
-    stride = window_seconds if window_stride_seconds is None else float(window_stride_seconds)
-    if not math.isfinite(stride) or stride <= 0:
+    stride = (
+        window_seconds
+        if window_stride_seconds is None
+        else _finite_number(window_stride_seconds, field="window_stride_seconds")
+    )
+    if stride <= 0:
         raise ProductionCohortError("window_stride_seconds must be positive and finite")
     if stride > window_seconds:
         raise ProductionCohortError("window_stride_seconds must be <= window_seconds")

@@ -69,3 +69,15 @@ def test_dense_stride_adds_at_most_one_short_tail() -> None:
 def test_stride_cannot_exceed_context_width() -> None:
     with pytest.raises(ValueError, match="window_stride_seconds"):
         build_windows(_spans(), window_seconds=4.0, window_stride_seconds=5.0)
+
+
+@pytest.mark.parametrize("value", [[], {}, True, "not-a-number"])
+def test_window_seconds_malformed_values_raise_cohort_error(value: object) -> None:
+    with pytest.raises(ValueError, match="window_seconds"):
+        build_windows(_spans(), window_seconds=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [[], {}, True, "not-a-number"])
+def test_window_stride_malformed_values_raise_cohort_error(value: object) -> None:
+    with pytest.raises(ValueError, match="window_stride_seconds"):
+        build_windows(_spans(), window_stride_seconds=value)  # type: ignore[arg-type]
