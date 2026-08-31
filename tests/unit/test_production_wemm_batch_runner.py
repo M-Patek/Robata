@@ -10,12 +10,19 @@ import pytest
 import robata.benchmark.production_wemm_batch_runner as runner
 from robata.benchmark.production_wemm_batch_runner import (
     ProductionWemmBatchRunnerError,
+    _temporal_resume_signature,
     build_recording_manifest,
     load_source_preflight,
     run_production_wemm_batch,
     select_preflight_items,
     stage_zip_member,
 )
+
+
+@pytest.mark.parametrize("bad_mode", [[], {}, 1])
+def test_resume_signature_handles_malformed_temporal_mode(bad_mode) -> None:
+    signature = _temporal_resume_signature({"temporal_mode": bad_mode})
+    assert signature[0] == "invalid"
 
 
 def _preflight(archive: Path) -> dict[str, object]:
@@ -53,6 +60,77 @@ def _preflight(archive: Path) -> dict[str, object]:
 
 def _catalog() -> list[str]:
     return ["move cloth"]
+
+
+@pytest.mark.parametrize("invalid_mode", [[], {}])
+def test_batch_rejects_unhashable_temporal_mode_with_contract_error(
+    tmp_path: Path, invalid_mode
+) -> None:
+    with pytest.raises(ProductionWemmBatchRunnerError, match="temporal_mode"):
+        run_production_wemm_batch(
+            {},
+            phrase_catalog=[],
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            temporal_mode=invalid_mode,
+        )
+
+
+@pytest.mark.parametrize("invalid_boundary_mode", [[], {}, 1])
+def test_batch_rejects_malformed_temporal_boundary_mode_with_contract_error(
+    tmp_path: Path, invalid_boundary_mode
+) -> None:
+    with pytest.raises(ProductionWemmBatchRunnerError, match="temporal_boundary_mode"):
+        run_production_wemm_batch(
+            {},
+            phrase_catalog=[],
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            temporal_mode="dense_score",
+            temporal_boundary_mode=invalid_boundary_mode,
+        )
+
+
+@pytest.mark.parametrize("invalid_window_seconds", [[], {}, True, "not-a-number"])
+def test_batch_rejects_malformed_window_seconds_with_contract_error(
+    tmp_path: Path, invalid_window_seconds
+) -> None:
+    with pytest.raises(ProductionWemmBatchRunnerError, match="window_seconds"):
+        run_production_wemm_batch(
+            {},
+            phrase_catalog=[],
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            window_seconds=invalid_window_seconds,
+        )
+
+
+@pytest.mark.parametrize("invalid_stride", [[], {}, True, "not-a-number"])
+def test_batch_rejects_malformed_window_stride_with_contract_error(
+    tmp_path: Path, invalid_stride
+) -> None:
+    with pytest.raises(ProductionWemmBatchRunnerError, match="window_stride_seconds"):
+        run_production_wemm_batch(
+            {},
+            phrase_catalog=[],
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            window_stride_seconds=invalid_stride,
+        )
+
+
+@pytest.mark.parametrize("invalid_policy", [[], {}])
+def test_batch_rejects_unhashable_temporal_score_policy_with_contract_error(
+    tmp_path: Path, invalid_policy
+) -> None:
+    with pytest.raises(ProductionWemmBatchRunnerError, match="temporal_score_policy"):
+        run_production_wemm_batch(
+            {},
+            phrase_catalog=[],
+            model_directory=None,
+            output_directory=tmp_path / "run",
+            temporal_score_policy=invalid_policy,
+        )
 
 
 def test_preflight_selects_only_pass_and_supports_batch_filter(tmp_path: Path) -> None:
@@ -251,6 +329,89 @@ def test_dense_temporal_rejects_effectively_non_overlapping_stride(
         )
 
 
+def test_adaptive_temporal_dry_run_records_refinement_configuration(tmp_path: Path) -> None:
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    preflight["items"] = [
+        {
+            **preflight["items"][0],  # type: ignore[index]
+            "duration_seconds": 6.5,
+        }
+    ]
+
+    report = run_production_wemm_batch(
+        preflight,
+        phrase_catalog=_catalog(),
+        model_directory=None,
+        output_directory=tmp_path / "run",
+        window_seconds=4.0,
+        temporal_mode="adaptive_score",
+        temporal_refinement_span_seconds=1.0,
+        temporal_refinement_min_request_span_seconds=0.25,
+        temporal_refinement_max_requests=12,
+        dry_run=True,
+    )
+
+    assert report["config"]["temporal_mode"] == "adaptive_score"  # type: ignore[index]
+    assert report["config"]["window_stride_seconds"] == pytest.approx(1.0)  # type: ignore[index]
+    assert report["config"]["temporal_refinement_span_seconds"] == pytest.approx(1.0)  # type: ignore[index]
+    assert report["config"]["temporal_refinement_min_request_span_seconds"] == pytest.approx(0.25)  # type: ignore[index]
+    assert report["config"]["temporal_refinement_max_requests"] == 12  # type: ignore[index]
+
+
+def test_summary_aggregates_temporal_rows_and_replaces_stale_values() -> None:
+    report: dict[str, object] = {
+        "summary": {
+            # A resumed checkpoint may contain values from a prior item set;
+            # temporal counters must be recomputed from the current rows.
+            "temporal_segment_count": 999,
+            "temporal_refined_segment_count": 999,
+            "temporal_refined_measured_segment_count": 999,
+            "temporal_refined_pending_segment_count": 999,
+        },
+        "items": [
+            {
+                "status": "COMPLETE",
+                "window_count": 4,
+                "temporal_segment_count": 3,
+                "temporal_refined_segment_count": 2,
+                "temporal_refined_measured_segment_count": 1,
+                "temporal_refined_pending_segment_count": 1,
+                "temporal_refinement_measured_result_count": 2,
+                "temporal_refinement_unresolved_result_count": 1,
+            },
+            {
+                "status": "FAILED",
+                "window_count": 0,
+                "temporal_segment_count": 1,
+                "temporal_refined_segment_count": 1,
+                "temporal_refined_measured_segment_count": 0,
+                "temporal_refined_pending_segment_count": 1,
+                "temporal_refinement_measured_result_count": 0,
+                "temporal_refinement_unresolved_result_count": 2,
+            },
+            # Legacy/planned rows omit adaptive fields and contribute zero.
+            {"status": "PLANNED", "window_count": 0},
+        ],
+    }
+
+    runner._summary(report)  # type: ignore[arg-type]
+
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    assert summary["complete_count"] == 1
+    assert summary["failed_count"] == 1
+    assert summary["window_count"] == 4
+    assert summary["temporal_segment_count"] == 4
+    assert summary["temporal_refined_segment_count"] == 3
+    assert summary["temporal_refined_measured_segment_count"] == 1
+    assert summary["temporal_refined_pending_segment_count"] == 2
+    assert summary["temporal_refinement_measured_result_count"] == 2
+    assert summary["temporal_refinement_unresolved_result_count"] == 3
+
+
 @pytest.mark.parametrize(
     ("initial_kwargs", "resume_kwargs"),
     [
@@ -307,6 +468,47 @@ def test_resume_rejects_temporal_configuration_changes(
             dry_run=True,
             **resume_kwargs,
         )
+
+
+def test_resume_treats_score_policy_alias_as_canonical(tmp_path: Path) -> None:
+    """Equivalent score-policy aliases must not invalidate a checkpoint."""
+
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("file/a.mcap", b"mcap")
+    preflight = _preflight(archive)
+    preflight["items"] = [
+        {
+            **preflight["items"][0],  # type: ignore[index]
+            "duration_seconds": 6.5,
+        }
+    ]
+    output_directory = tmp_path / "run"
+    first = run_production_wemm_batch(
+        preflight,
+        phrase_catalog=_catalog(),
+        model_directory=None,
+        output_directory=output_directory,
+        window_seconds=4.0,
+        include_tail=True,
+        dry_run=True,
+        temporal_mode="dense_score",
+        temporal_score_policy="relative_margin",
+    )
+    assert first["config"]["temporal_score_policy"] == "relative_margin"  # type: ignore[index]
+
+    resumed = run_production_wemm_batch(
+        preflight,
+        phrase_catalog=_catalog(),
+        model_directory=None,
+        output_directory=output_directory,
+        window_seconds=4.0,
+        include_tail=True,
+        dry_run=True,
+        temporal_mode="dense_score",
+        temporal_score_policy="contrast",
+    )
+    assert resumed["config"]["temporal_score_policy"] == "relative_margin"  # type: ignore[index]
 
 
 def test_batch_execution_is_serial_and_resumable(monkeypatch, tmp_path: Path) -> None:
@@ -519,6 +721,26 @@ def test_batch_cli_exposes_and_forwards_pipeline_options(tmp_path: Path) -> None
     )
     assert calls and calls[0]["include_pipeline"] is True
     assert calls[0]["queue_capacity"] == 4
+
+
+def test_batch_cli_normalizes_temporal_score_policy_aliases() -> None:
+    script = Path(__file__).parents[2] / "scripts" / "run_production_wemm_batches.py"
+    namespace = runpy.run_path(str(script), run_name="robata_batch_cli")
+    parser = namespace["_parser"]()
+    base = [
+        "--source-preflight",
+        "preflight.json",
+        "--phrase-catalog",
+        "phrases.json",
+        "--output-dir",
+        "output",
+    ]
+    parsed = parser.parse_args([*base, "--temporal-score-policy", "candidate-relative"])
+    assert parsed.temporal_score_policy == "relative_margin"
+    parsed = parser.parse_args([*base, "--temporal-score-policy", "RAW"])
+    assert parsed.temporal_score_policy == "absolute"
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--temporal-score-policy", "margin"])
 
 
 @pytest.mark.parametrize("bad", [0, True, 1.5])
