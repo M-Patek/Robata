@@ -74,3 +74,24 @@ the current main line, has a narrow dependency surface, and passes focused tests
 Do not merge either historical PR wholesale and do not perform destructive
 worktree cleanup while any snapshot ownership is unresolved.
 
+## Current worktree inventory (read-only audit)
+
+The repository currently has 34 registered worktrees (including the root).  The
+root is on the canonical baseline but has an untracked quarantine snapshot, so a
+blanket `git add .`, `reset`, or `clean` would be unsafe.  The remaining worktrees
+fall into these groups:
+
+- **Current-line candidates:** `recovery-integration` (three commits including
+  this report), `reconciliation-candidates`, and `reconciliation-hard-negative`.
+- **Older but clean research branches:** Mage native/cold-path, WeMM, and
+  production publish worktrees; they are behind the current main line and need
+  file-level extraction rather than branch merges.
+- **Dirty snapshots:** `root-reconciliation` (hundreds of untracked files),
+  `local-core-rebase`, `local-wemm-followup`, and several production worktrees.
+  These remain untouched until ownership and file-level provenance are known.
+- **Obsolete experiments:** old Mage stream/single-route and dated production
+  readiness worktrees.  They are candidates for later archival only; no force
+  removal was performed in this phase.
+
+This inventory is descriptive, not an instruction to delete anything.  The
+canonical source of truth remains the clean `main` commit above.
