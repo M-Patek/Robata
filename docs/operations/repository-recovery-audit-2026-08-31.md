@@ -103,7 +103,7 @@ canonical source of truth remains the clean `main` commit above.
   Its three focused tests, formatting, compilation, and diff checks pass.  It
   remains isolated on this review branch and does not alter inference or
   production routing.
-- `42a55db` (`p11_state_transition_consistency.py` plus evaluator and test) was
+- `aebb4bf` (`p11_state_transition_consistency.py` plus evaluator and test) was
   extracted into a separate clean worktree and is **not** included here yet.
   It passes nine focused tests and static checks, but is substantially larger
   and contains a broader review-boundary surface.  It will be considered only
