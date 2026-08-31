@@ -218,6 +218,59 @@ def test_generate_video_rejects_content_identifier_opt_in_before_loading(tmp_pat
     assert runtime.loaded is False
 
 
+def test_generate_video_rejects_one_sampled_frame_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime, processor, model, images = _runtime(tmp_path)
+    monkeypatch.setattr(
+        runtime,
+        "load",
+        lambda: pytest.fail("native-video validation must run before runtime.load"),
+    )
+    request = _request(
+        video_payloads=(b"\x64a",),
+        frame_indices=(8,),
+        frame_timestamps_seconds=(2.0,),
+    )
+
+    with pytest.raises(LocalHuggingFaceRuntimeError, match="at least two sampled frames"):
+        runtime.generate_video(request=request)
+
+    assert processor.video_call is None
+    assert model.calls == []
+    assert images.sources == []
+
+
+def test_generate_video_rejects_single_physical_frame_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime, processor, model, images = _runtime(tmp_path)
+    monkeypatch.setattr(
+        runtime,
+        "load",
+        lambda: pytest.fail("native-video validation must run before runtime.load"),
+    )
+    request = _request(
+        video_payloads=(b"\x64a",),
+        frame_indices=(0,),
+        frame_timestamps_seconds=(0.0,),
+        source_fps=4.0,
+        total_num_frames=1,
+        duration_seconds=0.25,
+        source_window_start_seconds=0.0,
+        source_window_end_seconds=0.25,
+    )
+
+    with pytest.raises(LocalHuggingFaceRuntimeError, match="two physical frames"):
+        runtime.generate_video(request=request)
+
+    assert processor.video_call is None
+    assert model.calls == []
+    assert images.sources == []
+
+
 def test_video_grid_rows_require_qwen_thw_shape() -> None:
     with pytest.raises(LocalHuggingFaceRuntimeError, match="exactly \\[time, height, width\\]"):
         _video_grid_rows([[1, 2, 3, 4]])

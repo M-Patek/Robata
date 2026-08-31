@@ -232,7 +232,7 @@ def test_sampler_derives_missing_stream_frame_count_from_duration(
     assert video.duration_seconds == 3.0
 
 
-def test_sampler_accepts_single_frame_request_without_dividing_by_zero(
+def test_sampler_promotes_single_frame_request_to_adjacent_source_frames(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -249,4 +249,44 @@ def test_sampler_accepts_single_frame_request_without_dividing_by_zero(
         jpeg_quality=87,
     )
 
-    assert video.frame_indices == (10,)
+    assert video.frame_indices == (10, 20)
+
+
+def test_sampler_widens_quantized_single_frame_window_without_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    container = _FakeContainer(frame_count=30)
+    _patch_fake_av(monkeypatch, tmp_path, container)
+
+    video = qwen_native_video.sample_qwen_native_video(
+        tmp_path / "fixture.mp4",
+        start_seconds=1.0,
+        end_seconds=1.0,
+        frame_count=1,
+        context_before_seconds=0.0,
+        context_after_seconds=0.0,
+        jpeg_quality=87,
+    )
+
+    assert video.frame_indices == (9, 10)
+    assert video.frame_indices[0] < video.frame_indices[1]
+    assert video.frame_payloads == (b"jpeg-9", b"jpeg-10")
+
+
+def test_sampler_rejects_single_frame_physical_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    container = _FakeContainer(frame_count=1)
+    _patch_fake_av(monkeypatch, tmp_path, container)
+
+    with pytest.raises(QwenNativeVideoInputError, match=r"physical source.*two frames"):
+        qwen_native_video.sample_qwen_native_video(
+            tmp_path / "fixture.mp4",
+            start_seconds=0.0,
+            end_seconds=0.1,
+            frame_count=1,
+            context_before_seconds=0.0,
+            context_after_seconds=0.0,
+        )
