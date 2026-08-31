@@ -64,6 +64,12 @@ moved to the ignored local archive at
 `archive/local-cache-20260831/` with manifests. No source, schema, model, or
 production input directory was deleted.
 
+Two inactive directories that were no longer registered as Git worktrees,
+`mage-25x-convergence-20260809` and `wemm-qwen-verifier-lint-20260830`, were
+also moved intact to `archive/unregistered-snapshots-20260831/`. The active
+`mage-vnext-fix` alias was left in place because it shares worktree metadata
+with the temporary Qwen end-to-end checkout.
+
 ## Deliberately retained
 
 Dirty worktrees, old branches with unresolved evidence, `root-local-snapshot`,
