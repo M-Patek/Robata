@@ -116,8 +116,10 @@ or treated as source.
 
 ## Publication status
 
-The remote fetch completed and confirmed `main` is current.  Publishing the
-review branch was attempted but the environment rejected the outbound write
-because explicit destination authorization/credentials were unavailable.  No
+The remote fetch completed and confirmed `main` is current.  The user has now
+explicitly authorized publication to `M-Patek/Robata`; however, the current
+environment cannot complete the write: HTTPS connections to GitHub are being
+reset/unreachable and `gh auth status` reports an invalid keyring token.  No
 remote branch or PR was created by this phase.  The local branch and commit list
-are complete and can be pushed later after explicit authorization.
+are complete and can be pushed after GitHub connectivity and credentials are
+restored.
