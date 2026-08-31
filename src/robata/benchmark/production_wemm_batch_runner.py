@@ -36,6 +36,26 @@ from .production_wemm_open_runner import (
     run_production_wemm_open,
 )
 from .production_wemm_preannotation import build_review_pack
+from .production_wemm_temporal import (
+    DEFAULT_RELATIVE_MARGIN_SCALE,
+    DEFAULT_SCORE_POLICY,
+    MODE_ADAPTIVE_SCORE,
+    MODE_DENSE_SCORE,
+    MODE_NONE,
+    SCORE_POLICIES,
+    TEMPORAL_MODES,
+    ProductionWemmTemporalError,
+    normalize_score_policy,
+)
+from .production_wemm_temporal_refinement import (
+    DEFAULT_MAX_REQUESTS as DEFAULT_TEMPORAL_REFINEMENT_MAX_REQUESTS,
+)
+from .production_wemm_temporal_refinement import (
+    DEFAULT_MIN_REQUEST_SPAN_SECONDS as DEFAULT_TEMPORAL_REFINEMENT_MIN_SPAN_SECONDS,
+)
+from .production_wemm_temporal_refinement import (
+    DEFAULT_REFINEMENT_SPAN_SECONDS as DEFAULT_TEMPORAL_REFINEMENT_SPAN_SECONDS,
+)
 from .wemm_embedding_backend import WemmEmbeddingBackend
 
 BATCH_RUN_FORMAT: Final = "robata-production-wemm-batch-run-v1"
@@ -55,6 +75,7 @@ DEFAULT_WINDOW_CHUNK_SIZE: Final = 1
 # without changing the review envelope or source-bound recording lifecycle.
 DEFAULT_INFERENCE_BATCH_SIZE: Final = 1
 DEFAULT_COPY_CHUNK_BYTES: Final = 8 * 1024 * 1024
+DEFAULT_TEMPORAL_STRIDE_DIVISOR: Final = 4
 
 
 class ProductionWemmBatchRunnerError(RuntimeError):
@@ -369,6 +390,7 @@ def build_recording_manifest(
     qa_status: str = "PENDING",
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
     include_tail: bool = True,
+    window_stride_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build and annotate a source-bound processing-window manifest."""
 
@@ -385,11 +407,33 @@ def build_recording_manifest(
             "qa_status must be PASS, WARNING or PENDING for execution"
         )
     try:
-        raw_manifest = build_manifest(
-            source_path,
-            window_seconds=window_seconds,
-            include_tail=include_tail,
-        )
+        window_seconds = _finite(window_seconds, field="window_seconds")
+    except ProductionWemmBatchRunnerError as exc:
+        raise ProductionWemmBatchRunnerError("window_seconds must be positive and finite") from exc
+    if window_seconds <= 0:
+        raise ProductionWemmBatchRunnerError("window_seconds must be positive and finite")
+    if window_stride_seconds is not None:
+        try:
+            window_stride_seconds = _finite(
+                window_stride_seconds,
+                field="window_stride_seconds",
+            )
+        except ProductionWemmBatchRunnerError as exc:
+            raise ProductionWemmBatchRunnerError(
+                "window_stride_seconds must be positive and <= window_seconds"
+            ) from exc
+        if window_stride_seconds <= 0 or window_stride_seconds > window_seconds:
+            raise ProductionWemmBatchRunnerError(
+                "window_stride_seconds must be positive and <= window_seconds"
+            )
+    try:
+        manifest_kwargs: dict[str, Any] = {
+            "window_seconds": window_seconds,
+            "include_tail": include_tail,
+        }
+        if window_stride_seconds is not None:
+            manifest_kwargs["window_stride_seconds"] = window_stride_seconds
+        raw_manifest = build_manifest(source_path, **manifest_kwargs)
     except (ProductionCohortError, OSError) as exc:
         raise ProductionWemmBatchRunnerError(
             f"could not build manifest for {recording_id}: {exc}"
@@ -448,6 +492,7 @@ def _estimate_windows(
     duration_seconds: object,
     window_seconds: float,
     include_tail: bool,
+    window_stride_seconds: float | None = None,
 ) -> int:
     """Estimate processing-window count from source preflight duration."""
 
@@ -461,10 +506,141 @@ def _estimate_windows(
         return 0
     if not math.isfinite(duration) or duration <= 0:
         return 0
-    full = int(duration // window_seconds)
-    if include_tail and duration - full * window_seconds > 1e-6:
-        full += 1
-    return full
+    stride = window_seconds if window_stride_seconds is None else float(window_stride_seconds)
+    if abs(stride - window_seconds) <= 1e-9:
+        full = int(duration // window_seconds)
+        if include_tail and duration - full * window_seconds > 1e-6:
+            full += 1
+        return full
+    epsilon = 1e-9
+    max_full_start = max(0.0, duration - window_seconds)
+    count = 0
+    last_full_start: float | None = None
+    left = 0.0
+    while left <= max_full_start + epsilon:
+        if duration - left >= window_seconds - epsilon:
+            count += 1
+            last_full_start = left
+        left += stride
+    if include_tail:
+        if last_full_start is None:
+            # Match build_windows: one short tail for a source shorter than a
+            # full context, rather than one tail per stride.
+            count = 1
+        else:
+            tail_start = max(0.0, duration - window_seconds)
+            if tail_start > last_full_start + epsilon:
+                count += 1
+    return count
+
+
+def _temporal_resume_signature(
+    config: Mapping[str, Any], *, default_mode: str | None = None
+) -> tuple[object, ...]:
+    """Return the explicit temporal settings that affect a resumable run.
+
+    Older checkpoints predate temporal mode and therefore have none of these
+    fields.  Treat that shape as the historical ``none`` mode, while refusing
+    to reuse completed items when a dense run's stride or resolver parameters
+    differ.  This is a direct field comparison; no identity hash or digest is
+    introduced into the checkpoint contract.
+    """
+
+    mode_value = config.get("temporal_mode", default_mode)
+    if mode_value is None:
+        mode_value = (
+            MODE_ADAPTIVE_SCORE
+            if any(
+                key in config
+                for key in (
+                    "temporal_refinement_span_seconds",
+                    "temporal_refinement_min_request_span_seconds",
+                    "temporal_refinement_max_requests",
+                )
+            )
+            else (
+                MODE_DENSE_SCORE
+                if any(
+                    key in config
+                    for key in (
+                        "temporal_start_threshold",
+                        "temporal_stop_threshold",
+                        "temporal_merge_gap_seconds",
+                        "temporal_min_duration_seconds",
+                        "temporal_min_camera_support",
+                        "temporal_boundary_mode",
+                        "temporal_score_policy",
+                    )
+                )
+                else MODE_NONE
+            )
+        )
+
+    def _numeric(key: str) -> object:
+        value = config.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return ("invalid", value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return ("invalid", str(value))
+        return number if math.isfinite(number) else ("invalid", str(value))
+
+    stride = _numeric("window_stride_seconds")
+    if not isinstance(mode_value, str):
+        return ("invalid", repr(mode_value))
+    mode_value = mode_value.strip()
+    if mode_value == MODE_NONE:
+        return (MODE_NONE, stride)
+    if mode_value not in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+        return ("invalid", str(mode_value))
+    raw_score_policy = config.get("temporal_score_policy")
+    normalized_score_policy: object
+    if isinstance(raw_score_policy, str):
+        try:
+            # Checkpoint signatures must treat aliases as their canonical
+            # policy, otherwise resuming an equivalent run would appear to
+            # change configuration.  Invalid historical values remain
+            # represented as normalized text so signature generation stays a
+            # diagnostic operation rather than raising during resume checks.
+            normalized_score_policy = normalize_score_policy(raw_score_policy)
+        except ProductionWemmTemporalError:
+            normalized_score_policy = raw_score_policy.strip().casefold().replace("-", "_")
+    else:
+        normalized_score_policy = raw_score_policy
+    relative_scale = (
+        _numeric("temporal_relative_margin_scale")
+        if normalized_score_policy == "relative_margin"
+        else None
+    )
+    relative_target_floor = (
+        _numeric("temporal_relative_margin_min_target_score")
+        if normalized_score_policy == "relative_margin"
+        else None
+    )
+    base = (
+        mode_value,
+        stride,
+        _numeric("temporal_start_threshold"),
+        _numeric("temporal_stop_threshold"),
+        _numeric("temporal_merge_gap_seconds"),
+        _numeric("temporal_min_duration_seconds"),
+        _numeric("temporal_min_camera_support"),
+        config.get("temporal_boundary_mode"),
+        normalized_score_policy,
+        relative_scale,
+        relative_target_floor,
+    )
+    if mode_value == MODE_DENSE_SCORE:
+        return base
+    return (
+        *base,
+        _numeric("temporal_refinement_span_seconds"),
+        _numeric("temporal_refinement_min_request_span_seconds"),
+        _numeric("temporal_refinement_max_requests"),
+    )
 
 
 def _empty_run(
@@ -475,11 +651,42 @@ def _empty_run(
     config: Mapping[str, Any],
     checkpoint_path: Path,
 ) -> dict[str, Any]:
+    configured_stride = config.get("window_stride_seconds")
+    # ``config`` is assembled by ``run_production_wemm_batch`` after validating
+    # the stride.  Keep this small type guard for resumed/externally composed
+    # callers so a malformed checkpoint cannot turn the dry-run estimate into a
+    # surprising exception or silently fall back to non-overlapping windows.
+    window_seconds = float(config.get("window_seconds", DEFAULT_WINDOW_SECONDS))
+    window_stride_seconds: float | None = None
+    configured_mode = config.get("temporal_mode", MODE_NONE)
+    configured_temporal_mode = configured_mode if isinstance(configured_mode, str) else None
+    configured_stride_number: float | None = None
+    if isinstance(configured_stride, (int, float)) and not isinstance(configured_stride, bool):
+        candidate_stride = float(configured_stride)
+        if math.isfinite(candidate_stride):
+            configured_stride_number = candidate_stride
+    stride_upper_bound_ok = (
+        configured_stride_number < window_seconds - 1e-9
+        if configured_temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}
+        and configured_stride_number is not None
+        else (
+            configured_stride_number <= window_seconds
+            if configured_stride_number is not None
+            else False
+        )
+    )
+    if (
+        configured_stride_number is not None
+        and configured_stride_number > 0.0
+        and stride_upper_bound_ok
+    ):
+        window_stride_seconds = configured_stride_number
     estimated_windows = sum(
         _estimate_windows(
             raw.get("duration_seconds"),
-            float(config.get("window_seconds", DEFAULT_WINDOW_SECONDS)),
+            window_seconds,
             bool(config.get("include_tail", True)),
+            window_stride_seconds,
         )
         for raw in selected
     )
@@ -554,6 +761,7 @@ def render_batch_run_markdown(report: Mapping[str, Any]) -> str:
         f"- Status: **{report.get('status', 'UNKNOWN')}**",
         f"- Archive: `{source.get('archive_path', '')}`",
         f"- Selected source-preflight PASS recordings: **{summary.get('selected_count', 0)}**",
+        f"- Temporal mode: **{config.get('temporal_mode', MODE_NONE)}**",
         f"- Inference microbatch: **{inference_batch_size}**",
         (
             f"- Complete: {summary.get('complete_count', 0)}; "
@@ -563,6 +771,19 @@ def render_batch_run_markdown(report: Mapping[str, Any]) -> str:
         (
             f"- Windows completed: {summary.get('window_count', 0)}; "
             f"estimated: {summary.get('estimated_window_count', 0)}"
+        ),
+        *(
+            [
+                (
+                    "- Temporal rows: "
+                    f"coarse={summary.get('temporal_segment_count', 0)}; "
+                    f"refined={summary.get('temporal_refined_segment_count', 0)}; "
+                    f"measured={summary.get('temporal_refined_measured_segment_count', 0)}; "
+                    f"pending={summary.get('temporal_refined_pending_segment_count', 0)}"
+                )
+            ]
+            if config.get("temporal_mode") == MODE_ADAPTIVE_SCORE
+            else []
         ),
         "- Quality: **NOT_MEASURED** (source-preflight PASS is not visual QA or gold)",
         "- Production eligible: **false**",
@@ -618,7 +839,37 @@ def _summary(report: dict[str, Any]) -> None:
         "skipped_count": sum(bool(item.get("resume_skipped", False)) for item in items),
         "window_count": sum(int(item.get("window_count", 0) or 0) for item in items),
     }
-    report["summary"] = {**dict(_mapping(report.get("summary"), field="run.summary")), **counts}
+    # Temporal fields are emitted per recording by the adaptive runner.  Keep
+    # the checkpoint summary derived from those item rows rather than relying
+    # on a stale value carried by an earlier checkpoint.  Missing fields are
+    # the expected shape for ``none``/legacy runs and contribute zero.
+    temporal_count_fields = (
+        "temporal_segment_count",
+        "temporal_refined_segment_count",
+        "temporal_refined_measured_segment_count",
+        "temporal_refined_pending_segment_count",
+        "temporal_refinement_measured_result_count",
+        "temporal_refinement_unresolved_result_count",
+    )
+
+    def _count(item: Mapping[str, Any], field: str) -> int:
+        value = item.get(field, 0)
+        if isinstance(value, bool):
+            return 0
+        try:
+            number = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, number)
+
+    temporal_counts = {
+        field: sum(_count(item, field) for item in items) for field in temporal_count_fields
+    }
+    report["summary"] = {
+        **dict(_mapping(report.get("summary"), field="run.summary")),
+        **counts,
+        **temporal_counts,
+    }
 
 
 def _output_paths(output_dir: Path, item: Mapping[str, Any]) -> tuple[Path, Path, Path]:
@@ -662,6 +913,22 @@ def run_production_wemm_batch(
     staging_directory: str | Path | None = None,
     keep_staging: bool = False,
     checkpoint_path: str | Path | None = None,
+    window_stride_seconds: float | None = None,
+    temporal_mode: str = MODE_NONE,
+    temporal_start_threshold: float = 0.65,
+    temporal_stop_threshold: float = 0.50,
+    temporal_merge_gap_seconds: float = 0.25,
+    temporal_min_duration_seconds: float = 0.10,
+    temporal_min_camera_support: int = 1,
+    temporal_boundary_mode: str = "midpoint",
+    temporal_score_policy: str = DEFAULT_SCORE_POLICY,
+    temporal_relative_margin_scale: float = DEFAULT_RELATIVE_MARGIN_SCALE,
+    temporal_relative_margin_min_target_score: float = 0.60,
+    temporal_refinement_span_seconds: float = DEFAULT_TEMPORAL_REFINEMENT_SPAN_SECONDS,
+    temporal_refinement_min_request_span_seconds: float = (
+        DEFAULT_TEMPORAL_REFINEMENT_MIN_SPAN_SECONDS
+    ),
+    temporal_refinement_max_requests: int = DEFAULT_TEMPORAL_REFINEMENT_MAX_REQUESTS,
 ) -> dict[str, Any]:
     """Run selected source-preflight recordings serially and resumably.
 
@@ -681,8 +948,134 @@ def run_production_wemm_batch(
     configuration so older dry-run/resume consumers retain their shape.
     """
 
-    if not math.isfinite(float(window_seconds)) or float(window_seconds) <= 0:
+    # Guard the type before the set-membership checks below so malformed
+    # list/dict input yields a stable runner validation error, not Python's
+    # raw ``TypeError: unhashable type``.
+    if not isinstance(temporal_mode, str) or temporal_mode not in TEMPORAL_MODES:
+        raise ProductionWemmBatchRunnerError(
+            "temporal_mode must be one of " + ", ".join(repr(value) for value in TEMPORAL_MODES)
+        )
+    if not isinstance(temporal_boundary_mode, str):
+        raise ProductionWemmBatchRunnerError("temporal_boundary_mode must be a string")
+    if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE} and temporal_boundary_mode not in {
+        "observed_probe",
+        "midpoint",
+    }:
+        raise ProductionWemmBatchRunnerError(
+            "temporal_boundary_mode must be 'observed_probe' or 'midpoint'"
+        )
+    try:
+        window_seconds = _finite(window_seconds, field="window_seconds")
+    except ProductionWemmBatchRunnerError as exc:
+        raise ProductionWemmBatchRunnerError("window_seconds must be positive and finite") from exc
+    if window_seconds <= 0:
         raise ProductionWemmBatchRunnerError("window_seconds must be positive and finite")
+    effective_window_stride = window_stride_seconds
+    if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE} and effective_window_stride is None:
+        # A dense temporal pass needs overlapping contexts.  Derive a
+        # documented default (4 probes per context) rather than silently
+        # reusing the non-overlapping production compatibility stride.
+        effective_window_stride = window_seconds / DEFAULT_TEMPORAL_STRIDE_DIVISOR
+    if effective_window_stride is not None:
+        try:
+            effective_window_stride = _finite(
+                effective_window_stride,
+                field="window_stride_seconds",
+            )
+        except ProductionWemmBatchRunnerError as exc:
+            if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+                raise ProductionWemmBatchRunnerError(
+                    "dense/adaptive temporal mode requires window_stride_seconds to be positive "
+                    "and strictly less than window_seconds"
+                ) from exc
+            raise ProductionWemmBatchRunnerError(
+                "window_stride_seconds must be positive and <= window_seconds"
+            ) from exc
+    if effective_window_stride is not None and (
+        effective_window_stride <= 0
+        or (
+            temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}
+            and effective_window_stride >= window_seconds - 1e-9
+        )
+        or (
+            temporal_mode not in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}
+            and effective_window_stride > window_seconds
+        )
+    ):
+        if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+            raise ProductionWemmBatchRunnerError(
+                "dense/adaptive temporal mode requires window_stride_seconds to be positive "
+                "and strictly less than window_seconds"
+            )
+        raise ProductionWemmBatchRunnerError(
+            "window_stride_seconds must be positive and <= window_seconds"
+        )
+    # Normalize the public input through the same alias table used by the
+    # temporal resolver.  Persist and forward only the canonical policy so
+    # aliases cannot create distinct checkpoint/resume or wire-contract
+    # values.  The normalizer also guards malformed list/dict input before any
+    # set-membership operation (avoiding Python's raw unhashable TypeError).
+    try:
+        temporal_score_policy = normalize_score_policy(
+            temporal_score_policy,
+            field="temporal_score_policy",
+        )
+    except ProductionWemmTemporalError as exc:
+        # Preserve the runner's historical validation wording while the
+        # temporal helper owns alias/type normalization.
+        raise ProductionWemmBatchRunnerError(
+            f"temporal_score_policy must be one of {SCORE_POLICIES!r}"
+        ) from exc
+    if (
+        isinstance(temporal_relative_margin_scale, bool)
+        or not isinstance(temporal_relative_margin_scale, (int, float))
+        or not math.isfinite(float(temporal_relative_margin_scale))
+        or float(temporal_relative_margin_scale) <= 0.0
+    ):
+        raise ProductionWemmBatchRunnerError(
+            "temporal_relative_margin_scale must be positive and finite"
+        )
+    temporal_relative_margin_scale = float(temporal_relative_margin_scale)
+    if (
+        isinstance(temporal_relative_margin_min_target_score, bool)
+        or not isinstance(temporal_relative_margin_min_target_score, (int, float))
+        or not math.isfinite(float(temporal_relative_margin_min_target_score))
+        or not 0.0 <= float(temporal_relative_margin_min_target_score) <= 1.0
+    ):
+        raise ProductionWemmBatchRunnerError(
+            "temporal_relative_margin_min_target_score must be between 0 and 1"
+        )
+    temporal_relative_margin_min_target_score = float(temporal_relative_margin_min_target_score)
+    if temporal_mode == MODE_ADAPTIVE_SCORE:
+        if (
+            isinstance(temporal_refinement_span_seconds, bool)
+            or not isinstance(temporal_refinement_span_seconds, (int, float))
+            or not math.isfinite(float(temporal_refinement_span_seconds))
+            or float(temporal_refinement_span_seconds) <= 0.0
+        ):
+            raise ProductionWemmBatchRunnerError(
+                "temporal_refinement_span_seconds must be positive and finite"
+            )
+        if (
+            isinstance(temporal_refinement_min_request_span_seconds, bool)
+            or not isinstance(temporal_refinement_min_request_span_seconds, (int, float))
+            or not math.isfinite(float(temporal_refinement_min_request_span_seconds))
+            or float(temporal_refinement_min_request_span_seconds) <= 0.0
+            or float(temporal_refinement_min_request_span_seconds)
+            > float(temporal_refinement_span_seconds)
+        ):
+            raise ProductionWemmBatchRunnerError(
+                "temporal_refinement_min_request_span_seconds must be positive, finite, "
+                "and <= temporal_refinement_span_seconds"
+            )
+        if (
+            isinstance(temporal_refinement_max_requests, bool)
+            or not isinstance(temporal_refinement_max_requests, int)
+            or temporal_refinement_max_requests <= 0
+        ):
+            raise ProductionWemmBatchRunnerError(
+                "temporal_refinement_max_requests must be a positive integer"
+            )
     if not isinstance(include_tail, bool):
         raise ProductionWemmBatchRunnerError("include_tail must be boolean")
     if (
@@ -774,6 +1167,35 @@ def run_production_wemm_batch(
         ),
         "model_directory": str(model_directory) if model_directory is not None else None,
     }
+    if effective_window_stride is not None:
+        config["window_stride_seconds"] = float(effective_window_stride)
+    if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+        config.update(
+            {
+                "temporal_mode": temporal_mode,
+                "temporal_start_threshold": temporal_start_threshold,
+                "temporal_stop_threshold": temporal_stop_threshold,
+                "temporal_merge_gap_seconds": temporal_merge_gap_seconds,
+                "temporal_min_duration_seconds": temporal_min_duration_seconds,
+                "temporal_min_camera_support": temporal_min_camera_support,
+                "temporal_boundary_mode": temporal_boundary_mode,
+                "temporal_score_policy": temporal_score_policy,
+                "temporal_relative_margin_scale": temporal_relative_margin_scale,
+                "temporal_relative_margin_min_target_score": (
+                    temporal_relative_margin_min_target_score
+                ),
+            }
+        )
+        if temporal_mode == MODE_ADAPTIVE_SCORE:
+            config.update(
+                {
+                    "temporal_refinement_span_seconds": float(temporal_refinement_span_seconds),
+                    "temporal_refinement_min_request_span_seconds": float(
+                        temporal_refinement_min_request_span_seconds
+                    ),
+                    "temporal_refinement_max_requests": temporal_refinement_max_requests,
+                }
+            )
     if include_pipeline:
         config["include_pipeline"] = True
         config["queue_capacity"] = queue_capacity
@@ -799,6 +1221,7 @@ def run_production_wemm_batch(
                     item.get("duration_seconds"),
                     window_seconds,
                     include_tail,
+                    effective_window_stride,
                 ),
                 "elapsed_seconds": None,
                 "error": None,
@@ -816,6 +1239,15 @@ def run_production_wemm_batch(
         if prior and prior != current:
             raise ProductionWemmBatchRunnerError(
                 "checkpoint selection differs from requested source-preflight members"
+            )
+        prior_config = _mapping(report.get("config", {}), field="checkpoint.config")
+        requested_temporal = _temporal_resume_signature(config, default_mode=temporal_mode)
+        prior_temporal = _temporal_resume_signature(prior_config)
+        if prior_temporal != requested_temporal:
+            raise ProductionWemmBatchRunnerError(
+                "checkpoint temporal configuration differs from requested run; "
+                "start a fresh checkpoint or keep temporal mode, stride and resolver "
+                "parameters unchanged"
             )
         report["status"] = RUN_STATUS_RUNNING
         report["config"] = config
@@ -911,6 +1343,11 @@ def run_production_wemm_batch(
                         qa_status=str(item.get("qa_status", "PENDING")),
                         window_seconds=window_seconds,
                         include_tail=include_tail,
+                        **(
+                            {"window_stride_seconds": effective_window_stride}
+                            if effective_window_stride is not None
+                            else {}
+                        ),
                     )
                     manifest_source = dict(
                         _mapping(manifest.get("source"), field="manifest.source")
@@ -944,6 +1381,37 @@ def run_production_wemm_batch(
                         "window_chunk_size": window_chunk_size,
                         "inference_batch_size": inference_batch_size,
                     }
+                    if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+                        open_kwargs.update(
+                            {
+                                "temporal_mode": temporal_mode,
+                                "temporal_start_threshold": temporal_start_threshold,
+                                "temporal_stop_threshold": temporal_stop_threshold,
+                                "temporal_merge_gap_seconds": temporal_merge_gap_seconds,
+                                "temporal_min_duration_seconds": temporal_min_duration_seconds,
+                                "temporal_min_camera_support": temporal_min_camera_support,
+                                "temporal_boundary_mode": temporal_boundary_mode,
+                                "temporal_score_policy": temporal_score_policy,
+                                "temporal_relative_margin_scale": temporal_relative_margin_scale,
+                                "temporal_relative_margin_min_target_score": (
+                                    temporal_relative_margin_min_target_score
+                                ),
+                            }
+                        )
+                        if temporal_mode == MODE_ADAPTIVE_SCORE:
+                            open_kwargs.update(
+                                {
+                                    "temporal_refinement_span_seconds": (
+                                        temporal_refinement_span_seconds
+                                    ),
+                                    "temporal_refinement_min_request_span_seconds": (
+                                        temporal_refinement_min_request_span_seconds
+                                    ),
+                                    "temporal_refinement_max_requests": (
+                                        temporal_refinement_max_requests
+                                    ),
+                                }
+                            )
                     # Do not add new keyword arguments to the historical
                     # serial call.  Besides preserving the default checkpoint
                     # shape, this keeps older injected/open-runner adapters
@@ -968,6 +1436,51 @@ def run_production_wemm_batch(
                         encoding="utf-8",
                     )
                     item["window_count"] = len(envelope.get("windows", []))
+                    if temporal_mode in {MODE_DENSE_SCORE, MODE_ADAPTIVE_SCORE}:
+                        temporal = envelope.get("temporal_resolution", {})
+                        if isinstance(temporal, Mapping):
+                            segments = temporal.get("segments", [])
+                            item["temporal_segment_count"] = (
+                                len(segments) if isinstance(segments, Sequence) else 0
+                            )
+                    if temporal_mode == MODE_ADAPTIVE_SCORE:
+                        refined = envelope.get("refined_segments", [])
+                        refined_count = len(refined) if isinstance(refined, Sequence) else 0
+                        refinement = envelope.get("temporal_refinement", {})
+                        refinement_diagnostics = (
+                            refinement.get("diagnostics", {})
+                            if isinstance(refinement, Mapping)
+                            else {}
+                        )
+                        measured_count = (
+                            int(refinement_diagnostics.get("refined_segment_count", 0))
+                            if isinstance(refinement_diagnostics, Mapping)
+                            and isinstance(refinement_diagnostics.get("refined_segment_count"), int)
+                            else 0
+                        )
+                        item["temporal_refined_segment_count"] = refined_count
+                        item["temporal_refined_measured_segment_count"] = measured_count
+                        item["temporal_refined_pending_segment_count"] = max(
+                            0, refined_count - measured_count
+                        )
+                        score_resolution = envelope.get("temporal_refinement_score_resolution", {})
+                        score_diagnostics = (
+                            score_resolution.get("diagnostics", {})
+                            if isinstance(score_resolution, Mapping)
+                            else {}
+                        )
+                        item["temporal_refinement_measured_result_count"] = (
+                            int(score_diagnostics.get("measured_result_count", 0))
+                            if isinstance(score_diagnostics, Mapping)
+                            and isinstance(score_diagnostics.get("measured_result_count"), int)
+                            else 0
+                        )
+                        item["temporal_refinement_unresolved_result_count"] = (
+                            int(score_diagnostics.get("unresolved_result_count", 0))
+                            if isinstance(score_diagnostics, Mapping)
+                            and isinstance(score_diagnostics.get("unresolved_result_count"), int)
+                            else 0
+                        )
                     item["status"] = "COMPLETE"
                     item["production_eligible"] = bool(envelope.get("production_eligible", False))
             except Exception as exc:  # keep serial batch moving; checkpoint the failure

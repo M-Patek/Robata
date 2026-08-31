@@ -24,6 +24,26 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, cast
 
+from .production_wemm_interval_proposal import (
+    BOUNDARY_SOURCE as TEMPORAL_BOUNDARY_SOURCE,
+)
+from .production_wemm_interval_proposal import (
+    BOUNDARY_STATUS as TEMPORAL_BOUNDARY_STATUS,
+)
+from .production_wemm_temporal import FORMAT as TEMPORAL_RESOLUTION_FORMAT
+from .production_wemm_temporal_refinement import (
+    APPLIED_FORMAT as TEMPORAL_REFINEMENT_APPLIED_FORMAT,
+)
+from .production_wemm_temporal_refinement import (
+    FORMAT as TEMPORAL_REFINEMENT_PLAN_FORMAT,
+)
+from .production_wemm_temporal_score_refinement import (
+    FORMAT as TEMPORAL_SCORE_REFINEMENT_FORMAT,
+)
+from .production_wemm_temporal_score_refinement import (
+    RESULT_FORMAT as TEMPORAL_SCORE_RESULT_FORMAT,
+)
+
 FORMAT: Final = "robata-production-wemm-preannotation-v1"
 REVIEW_FORMAT: Final = "robata-production-wemm-preannotation-review-pack-v1"
 AUTHORITY: Final = "LOCAL_NONPRODUCTION_ONLY"
@@ -37,7 +57,32 @@ BOUNDARY_STATUSES: Final = (
     "NOT_MEASURED",
     "NOT_OBSERVABLE",
 )
+REFINED_BOUNDARY_STATUSES: Final = ("MODEL_REFINED", "MODEL_REFINEMENT_PENDING")
 FIELD_STATUSES: Final = ("MEASURED", "NOT_MEASURED", "NOT_OBSERVABLE")
+TEMPORAL_BOUNDARY_METHODS: Final = frozenset(
+    {"observed_probe_span", "probe_center_midpoint", "mixed_probe_boundary"}
+)
+TEMPORAL_REFINEMENT_BOUNDARY_SOURCE: Final = "wemm_short_refinement"
+TEMPORAL_REFINEMENT_BOUNDARY_METHOD: Final = "short_probe_model"
+
+# Adaptive temporal sidecars are deliberately kept separate from the dense
+# ``temporal_resolution``/``temporal_segments`` contract.  The runner emits
+# these fields only when the opt-in adaptive route is selected; older readers
+# can therefore ignore them without changing the historical window shape.
+TEMPORAL_REFINEMENT_FIELDS: Final = (
+    "temporal_refinement_plan",
+    "temporal_refinement_fine_plan",
+    "temporal_refinement_score_resolution",
+    "temporal_refinement",
+    "refined_segments",
+    "refined_temporal_segments",
+    "temporal_refinement_segments",
+)
+TEMPORAL_SIDECAR_FIELDS: Final = (
+    "temporal_resolution",
+    "temporal_segments",
+    *TEMPORAL_REFINEMENT_FIELDS,
+)
 
 # These are identity-bearing fields from the EPIC action catalog.  Production
 # proposals use a free ``provisional_id`` (or no ID); accepting an EPIC pair
@@ -564,6 +609,12 @@ def build_preannotation_envelope(
             ],
             "accepted_as_gold": False,
             "human_review_required": True,
+            "temporal_sidecar_fields": list(TEMPORAL_SIDECAR_FIELDS),
+            "temporal_segments_review_only": True,
+            "temporal_segments_are_action_boundary_proposals": True,
+            "temporal_refinement_review_only": True,
+            "refined_segments_review_only": True,
+            "refined_segments_are_action_boundary_proposals": True,
         },
     }
 
@@ -595,6 +646,23 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
                 catalog_snapshot[key] = _copy_json(
                     raw_catalog[key], field=f"raw_model_output.catalog.{key}"
                 )
+    # Dense temporal resolution is an additive, review-only sidecar attached
+    # by the native WeMM runner after the historical envelope is built.  Keep
+    # it out of ``items`` so existing window-oriented consumers remain
+    # compatible, while preserving both the canonical object and its compact
+    # alias for reviewers and later batch aggregation.
+    temporal_resolution_snapshot, temporal_segments_snapshot = _temporal_resolution_snapshots(
+        envelope
+    )
+
+    # Adaptive temporal resolution is intentionally additive.  Keep the
+    # complete request/score/applied sidecars in the review pack so a reviewer
+    # can inspect how a refined interval was obtained, while retaining the
+    # historical coarse ``temporal_resolution`` fields unchanged.  Validation
+    # below is inference-free and only enforces JSON/provenance/review-only
+    # invariants.
+    temporal_refinement_snapshots = _temporal_refinement_snapshots(envelope)
+
     items: list[dict[str, Any]] = []
     for window in envelope["windows"]:
         proposals = window.get("proposals", [])
@@ -628,7 +696,7 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             "review_status": "PENDING",
         }
         items.append(item)
-    return {
+    review_pack: dict[str, Any] = {
         "format": REVIEW_FORMAT,
         "authority": AUTHORITY,
         "status": "PENDING_REVIEW",
@@ -675,6 +743,12 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             ],
             "accepted_as_gold": False,
             "human_review_required": True,
+            "temporal_sidecar_fields": list(TEMPORAL_SIDECAR_FIELDS),
+            "temporal_segments_review_only": True,
+            "temporal_segments_are_action_boundary_proposals": True,
+            "temporal_refinement_review_only": True,
+            "refined_segments_review_only": True,
+            "refined_segments_are_action_boundary_proposals": True,
         },
         "model_artifact": {
             "format": envelope["format"],
@@ -689,6 +763,28 @@ def build_review_pack(envelope: Mapping[str, Any]) -> dict[str, Any]:
             "human_adjudication": "NOT_PERFORMED",
         },
     }
+    if temporal_resolution_snapshot is not None:
+        review_pack["temporal_resolution"] = temporal_resolution_snapshot
+        # Keep a compact alias for review clients that only need proposed
+        # segments.  It is copied from the detached sidecar, never from the
+        # caller's mutable envelope.
+        review_pack["temporal_segments"] = copy.deepcopy(
+            temporal_resolution_snapshot.get("segments", [])
+        )
+    elif temporal_segments_snapshot is not None:
+        # Alias-only envelopes are valid inputs from lightweight review tools;
+        # never silently drop their model-boundary evidence.
+        review_pack["temporal_segments"] = copy.deepcopy(temporal_segments_snapshot)
+    for key, value in temporal_refinement_snapshots.items():
+        review_pack[key] = value
+    # ``refined_temporal_segments`` is a descriptive alias used by review
+    # clients that need to distinguish the adaptive rows from coarse
+    # ``temporal_segments``.  It is always detached from the canonical list.
+    if "refined_segments" in temporal_refinement_snapshots:
+        review_pack["refined_temporal_segments"] = copy.deepcopy(
+            temporal_refinement_snapshots["refined_segments"]
+        )
+    return review_pack
 
 
 def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
@@ -703,6 +799,8 @@ def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
     label_space = _mapping(envelope.get("label_space"), field="label_space")
     if label_space.get("kind") != LABEL_SPACE or label_space.get("epic_ontology_used") is not False:
         raise ProductionWemmPreannotationError("label_space must be open and non-EPIC")
+    _temporal_resolution_snapshots(envelope)
+    _validate_temporal_refinement_fields(envelope)
     windows = _sequence(envelope.get("windows"), field="windows")
     for index, raw_window in enumerate(windows):
         window = _mapping(raw_window, field=f"windows[{index}]")
@@ -722,6 +820,380 @@ def _validate_envelope_shape(envelope: Mapping[str, Any]) -> None:
             if proposal.get("proposal_status") not in PROPOSAL_STATUSES:
                 raise ProductionWemmPreannotationError("proposal status is invalid")
             _assert_no_epic_or_gold(proposal, field=f"windows[{index}].proposals[{proposal_index}]")
+
+
+def _validate_temporal_resolution(value: object) -> None:
+    """Validate the optional model-driven interval sidecar invariants."""
+
+    if value is None:
+        return
+    temporal = _mapping(value, field="temporal_resolution")
+    if temporal.get("format") != TEMPORAL_RESOLUTION_FORMAT:
+        raise ProductionWemmPreannotationError(
+            f"temporal_resolution.format must be {TEMPORAL_RESOLUTION_FORMAT!r}"
+        )
+    if temporal.get("authority") != AUTHORITY:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.authority must remain local-only"
+        )
+    if temporal.get("status") != "PROPOSALS_ONLY":
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.status must be 'PROPOSALS_ONLY'"
+        )
+    if temporal.get("production_eligible") is not False:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.production_eligible must be false"
+        )
+    context = _mapping(
+        temporal.get("context_interval"), field="temporal_resolution.context_interval"
+    )
+    if "context_only" in context and context.get("context_only") is not True:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.context_interval.context_only must be true"
+        )
+    if "is_action_boundary" in context and context.get("is_action_boundary") is not False:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.context_interval.is_action_boundary must be false"
+        )
+    if "action_boundary" in context and context.get("action_boundary") is not False:
+        raise ProductionWemmPreannotationError(
+            "temporal_resolution.context_interval.action_boundary must be false"
+        )
+    _validate_temporal_segments(
+        temporal.get("segments", []),
+        field="temporal_resolution.segments",
+    )
+
+
+def _validate_context_markers(segment: Mapping[str, Any], *, field: str) -> None:
+    """Validate temporal markers, accepting their known legacy omission."""
+
+    for key in ("context_only", "window_context_only"):
+        if key in segment and segment.get(key) is not True:
+            raise ProductionWemmPreannotationError(f"{field}.{key} must be true")
+    for key in ("is_action_boundary", "action_boundary"):
+        if key in segment and segment.get(key) is not False:
+            raise ProductionWemmPreannotationError(f"{field}.{key} must be false")
+
+
+def _validate_boundary_provenance(
+    segment: Mapping[str, Any],
+    *,
+    field: str,
+    source: str,
+    methods: frozenset[str] | None = None,
+) -> None:
+    boundary_source = segment.get("boundary_source")
+    if boundary_source != source:
+        raise ProductionWemmPreannotationError(f"{field}.boundary_source must be {source!r}")
+    boundary_method_value = segment.get("boundary_method")
+    boundary_method = _text(boundary_method_value, field=f"{field}.boundary_method")
+    if methods is not None and boundary_method not in methods:
+        raise ProductionWemmPreannotationError(
+            f"{field}.boundary_method must be one of {', '.join(sorted(methods))}"
+        )
+
+
+def _validate_temporal_segments(value: object, *, field: str) -> list[dict[str, Any]]:
+    """Validate and detach coarse model-bound rows for either alias."""
+
+    segments = _sequence(value, field=field)
+    copied_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw_segment in enumerate(segments):
+        segment_field = f"{field}[{index}]"
+        segment = _mapping(raw_segment, field=segment_field)
+        segment_id = _text(segment.get("segment_id"), field=f"{segment_field}.segment_id")
+        if segment_id in seen_ids:
+            raise ProductionWemmPreannotationError(f"{segment_field}.segment_id must be unique")
+        seen_ids.add(segment_id)
+        if segment.get("review_required") is not True:
+            raise ProductionWemmPreannotationError(f"{segment_field} must require human review")
+        if segment.get("automatic_eligible") is not False:
+            raise ProductionWemmPreannotationError(f"{segment_field} cannot be automatic eligible")
+        if segment.get("boundary_status") != TEMPORAL_BOUNDARY_STATUS:
+            raise ProductionWemmPreannotationError(
+                f"{segment_field} must use {TEMPORAL_BOUNDARY_STATUS}"
+            )
+        _validate_context_markers(segment, field=segment_field)
+        _validate_boundary_provenance(
+            segment,
+            field=segment_field,
+            source=TEMPORAL_BOUNDARY_SOURCE,
+            methods=TEMPORAL_BOUNDARY_METHODS,
+        )
+        start = _finite(
+            segment.get("start_seconds"),
+            field=f"{segment_field}.start_seconds",
+        )
+        end = _finite(
+            segment.get("end_seconds"),
+            field=f"{segment_field}.end_seconds",
+        )
+        if start < 0 or end <= start:
+            raise ProductionWemmPreannotationError(
+                f"{segment_field} interval must satisfy 0 <= start < end"
+            )
+        _assert_no_epic_or_gold(segment, field=segment_field)
+        copied = _copy_json(segment, field=segment_field)
+        if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+            raise ProductionWemmPreannotationError(f"{segment_field} must be an object")
+        copied.setdefault("context_only", True)
+        copied.setdefault("window_context_only", True)
+        copied.setdefault("is_action_boundary", False)
+        copied.setdefault("action_boundary", False)
+        copied_rows.append(copied)
+    return copied_rows
+
+
+def _temporal_resolution_snapshots(
+    envelope: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    """Validate canonical/alias coarse temporal sidecars and require agreement."""
+
+    resolution_snapshot: dict[str, Any] | None = None
+    resolution_segments: list[dict[str, Any]] | None = None
+    raw_resolution = envelope.get("temporal_resolution")
+    if raw_resolution is not None:
+        temporal = _mapping(raw_resolution, field="temporal_resolution")
+        _validate_temporal_resolution(temporal)
+        copied = _copy_json(temporal, field="temporal_resolution")
+        if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+            raise ProductionWemmPreannotationError("temporal_resolution must be an object")
+        resolution_segments = _validate_temporal_segments(
+            copied.get("segments", []),
+            field="temporal_resolution.segments",
+        )
+        copied["segments"] = resolution_segments
+        context_copy = copied.get("context_interval")
+        if isinstance(context_copy, dict):
+            context_copy.setdefault("context_only", True)
+            context_copy.setdefault("is_action_boundary", False)
+            context_copy.setdefault("action_boundary", False)
+        resolution_snapshot = copied
+
+    alias_segments: list[dict[str, Any]] | None = None
+    raw_alias = envelope.get("temporal_segments")
+    if raw_alias is not None:
+        alias_segments = _validate_temporal_segments(
+            raw_alias,
+            field="temporal_segments",
+        )
+    if (
+        resolution_segments is not None
+        and alias_segments is not None
+        and resolution_segments != alias_segments
+    ):
+        raise ProductionWemmPreannotationError(
+            "temporal_segments does not match temporal_resolution.segments"
+        )
+    return resolution_snapshot, alias_segments
+
+
+def _validate_refined_segment(value: object, *, field: str) -> dict[str, Any]:
+    """Validate one adaptive refined row without making it production data."""
+
+    segment = _mapping(value, field=field)
+    _assert_no_epic_or_gold(segment, field=field)
+    _text(segment.get("segment_id"), field=f"{field}.segment_id")
+    _validate_context_markers(segment, field=field)
+    _validate_boundary_provenance(
+        segment,
+        field=field,
+        source=TEMPORAL_REFINEMENT_BOUNDARY_SOURCE,
+        methods=frozenset({TEMPORAL_REFINEMENT_BOUNDARY_METHOD}),
+    )
+    if segment.get("review_required") is not True:
+        raise ProductionWemmPreannotationError(f"{field}.review_required must be true")
+    if segment.get("automatic_eligible") is not False:
+        raise ProductionWemmPreannotationError(f"{field}.automatic_eligible must be false")
+    boundary_status = _text(
+        segment.get("boundary_status"), field=f"{field}.boundary_status"
+    ).upper()
+    if boundary_status not in REFINED_BOUNDARY_STATUSES:
+        raise ProductionWemmPreannotationError(
+            f"{field}.boundary_status must be one of {', '.join(REFINED_BOUNDARY_STATUSES)}"
+        )
+
+    # Every refined row must retain the coarse model interval as a separate
+    # coordinate frame.  This prevents an adaptive row from becoming an
+    # unexplained replacement for the historical dense proposal.
+    coarse = _mapping(segment.get("coarse_interval"), field=f"{field}.coarse_interval")
+    coarse_start = _finite(
+        coarse.get("start_seconds"), field=f"{field}.coarse_interval.start_seconds"
+    )
+    coarse_end = _finite(coarse.get("end_seconds"), field=f"{field}.coarse_interval.end_seconds")
+    if coarse_start < 0.0 or coarse_end <= coarse_start:
+        raise ProductionWemmPreannotationError(
+            f"{field}.coarse_interval must satisfy 0 <= start < end"
+        )
+
+    start_value = segment.get("start_seconds")
+    end_value = segment.get("end_seconds")
+    if boundary_status == "MODEL_REFINED":
+        if start_value is None or end_value is None:
+            raise ProductionWemmPreannotationError(
+                f"{field} MODEL_REFINED rows require start_seconds and end_seconds"
+            )
+        start = _finite(start_value, field=f"{field}.start_seconds")
+        end = _finite(end_value, field=f"{field}.end_seconds")
+        if start < 0.0 or end <= start:
+            raise ProductionWemmPreannotationError(
+                f"{field} interval must satisfy 0 <= start < end"
+            )
+    elif start_value is not None or end_value is not None:
+        # Pending rows are deliberately unresolved.  A half-populated row is
+        # ambiguous and must not be interpreted as a measured interval.
+        raise ProductionWemmPreannotationError(
+            f"{field} MODEL_REFINEMENT_PENDING rows must omit start/end"
+        )
+
+    copied = _copy_json(segment, field=field)
+    if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+        raise ProductionWemmPreannotationError(f"{field} must be an object")
+    copied.setdefault("context_only", True)
+    copied.setdefault("window_context_only", True)
+    copied.setdefault("is_action_boundary", False)
+    copied.setdefault("action_boundary", False)
+    # Canonicalize the status in the detached snapshot so preannotation and
+    # aggregate readers cannot disagree merely because an upstream review tool
+    # used lowercase spelling.
+    copied["boundary_status"] = boundary_status
+    return copied
+
+
+def _validate_temporal_refinement_sidecar(value: object, *, field: str) -> dict[str, Any]:
+    """Validate a plan/result/applied adaptive sidecar generically.
+
+    The planner and score resolver own their detailed schemas.  At the
+    pre-annotation boundary we intentionally validate only the fields needed
+    to keep the sidecar review-only and JSON-safe; this lets future additive
+    diagnostics pass through without a second schema fork.
+    """
+
+    sidecar = _mapping(value, field=field)
+    expected_formats = {
+        "temporal_refinement_plan": TEMPORAL_REFINEMENT_PLAN_FORMAT,
+        "temporal_refinement_fine_plan": TEMPORAL_SCORE_REFINEMENT_FORMAT,
+        "temporal_refinement_score_resolution": TEMPORAL_SCORE_RESULT_FORMAT,
+        "temporal_refinement": TEMPORAL_REFINEMENT_APPLIED_FORMAT,
+    }
+    expected_format = expected_formats.get(field)
+    if expected_format is None:
+        raise ProductionWemmPreannotationError(f"{field} is not a supported temporal sidecar")
+    if sidecar.get("format") != expected_format:
+        raise ProductionWemmPreannotationError(f"{field}.format must be {expected_format!r}")
+    if sidecar.get("authority") != AUTHORITY:
+        raise ProductionWemmPreannotationError(f"{field}.authority must remain local-only")
+    _assert_no_epic_or_gold(sidecar, field=field)
+    copied = _copy_json(sidecar, field=field)
+    if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+        raise ProductionWemmPreannotationError(f"{field} must be an object")
+    if copied.get("production_eligible") is not False:
+        raise ProductionWemmPreannotationError(f"{field}.production_eligible must be false")
+    return copied
+
+
+def _temporal_refinement_snapshots(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Return detached adaptive fields present on an envelope."""
+
+    snapshots: dict[str, Any] = {}
+
+    def _validated_rows(value: object, *, field: str) -> list[dict[str, Any]]:
+        rows = _sequence(value, field=field)
+        seen_ids: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            row_field = f"{field}[{index}]"
+            checked = _validate_refined_segment(row, field=row_field)
+            row_id = _text(checked.get("segment_id"), field=f"{row_field}.segment_id")
+            if row_id in seen_ids:
+                raise ProductionWemmPreannotationError(f"{row_field}.segment_id must be unique")
+            seen_ids.add(row_id)
+            result.append(checked)
+        return result
+
+    for key in TEMPORAL_REFINEMENT_FIELDS:
+        if key not in envelope:
+            continue
+        value = envelope[key]
+        if key in {
+            "refined_segments",
+            "refined_temporal_segments",
+            "temporal_refinement_segments",
+        }:
+            snapshots[key] = _validated_rows(value, field=key)
+        else:
+            snapshots[key] = _validate_temporal_refinement_sidecar(value, field=key)
+
+    # The applied sidecar commonly embeds the same refined rows as the
+    # top-level field.  Require equality when both are supplied so stale
+    # copies cannot silently diverge in a review pack.
+    applied = snapshots.get("temporal_refinement")
+    nested_rows_by_key: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(applied, Mapping):
+        for nested_key in (
+            "refined_segments",
+            "refined_temporal_segments",
+            "temporal_refinement_segments",
+            "segments",
+        ):
+            nested_value = applied.get(nested_key)
+            if nested_value is None:
+                continue
+            nested_rows_by_key[nested_key] = _validated_rows(
+                nested_value, field=f"temporal_refinement.{nested_key}"
+            )
+            if isinstance(applied, dict):
+                # Keep every nested alias detached; do not collapse one alias
+                # into another before comparing their source snapshots.
+                applied[nested_key] = copy.deepcopy(nested_rows_by_key[nested_key])
+    nested_rows = nested_rows_by_key.get("refined_segments")
+    top_rows = snapshots.get("refined_segments")
+    alias_rows = snapshots.get("refined_temporal_segments")
+    named_rows = snapshots.get("temporal_refinement_segments")
+    if top_rows is not None and alias_rows is not None and top_rows != alias_rows:
+        raise ProductionWemmPreannotationError(
+            "refined_temporal_segments does not match refined_segments"
+        )
+    if top_rows is not None and named_rows is not None and top_rows != named_rows:
+        raise ProductionWemmPreannotationError(
+            "temporal_refinement_segments does not match refined_segments"
+        )
+    if alias_rows is not None and named_rows is not None and alias_rows != named_rows:
+        raise ProductionWemmPreannotationError(
+            "temporal_refinement_segments does not match refined_temporal_segments"
+        )
+    canonical_rows = (
+        top_rows if top_rows is not None else alias_rows if alias_rows is not None else named_rows
+    )
+    if canonical_rows is not None:
+        for nested_key, nested_rows_value in nested_rows_by_key.items():
+            if nested_rows_value != canonical_rows:
+                raise ProductionWemmPreannotationError(
+                    f"temporal_refinement.{nested_key} does not match refined_segments"
+                )
+    # Accept a sidecar-only envelope and expose the canonical top-level row
+    # list for review consumers.  The runner normally supplies this field
+    # explicitly, but promotion here keeps rebuild/interop paths lossless.
+    if top_rows is None:
+        if nested_rows is not None:
+            snapshots["refined_segments"] = nested_rows
+        elif alias_rows is not None:
+            snapshots["refined_segments"] = alias_rows
+        elif named_rows is not None:
+            snapshots["refined_segments"] = named_rows
+        elif nested_rows_by_key:
+            snapshots["refined_segments"] = next(iter(nested_rows_by_key.values()))
+    return snapshots
+
+
+def _validate_temporal_refinement_fields(envelope: Mapping[str, Any]) -> None:
+    """Validate adaptive sidecars attached to a pre-annotation envelope."""
+
+    # Calling the same extractor used by ``build_review_pack`` keeps the two
+    # public entry points in lockstep and performs all detached JSON checks.
+    _temporal_refinement_snapshots(envelope)
 
 
 def validate_preannotation_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -751,8 +1223,11 @@ __all__ = [
     "FORMAT",
     "LABEL_SPACE",
     "PROPOSAL_STATUSES",
+    "REFINED_BOUNDARY_STATUSES",
     "REVIEW_FORMAT",
     "STATUS",
+    "TEMPORAL_REFINEMENT_FIELDS",
+    "TEMPORAL_SIDECAR_FIELDS",
     "ProductionWemmPreannotationError",
     "build_preannotation_envelope",
     "build_review_pack",

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from robata.benchmark.production_cohort import CameraSpan, build_windows, common_camera_span
+import pytest
+
+from robata.benchmark import production_cohort
+from robata.benchmark.production_cohort import (
+    CameraSpan,
+    build_manifest,
+    build_windows,
+    common_camera_span,
+)
 
 
 def _spans(duration: float = 40.8335) -> tuple[CameraSpan, ...]:
@@ -38,3 +46,63 @@ def test_include_tail_adds_short_window() -> None:
     assert len(windows) == 6
     assert windows[-1].window_id.endswith("tail")
     assert 0.8 < windows[-1].duration_seconds < 0.9
+
+
+def test_dense_stride_creates_overlapping_context_windows_not_boundaries() -> None:
+    windows = build_windows(
+        _spans(6.0), window_seconds=4.0, window_stride_seconds=1.0, include_tail=True
+    )
+    # The final full context already reaches the source end.  Dense mode must
+    # not emit redundant short contexts at starts 3, 4 and 5 merely because
+    # ``include_tail`` is enabled.
+    assert len(windows) == 3
+    assert windows[0].start_seconds == 0.0
+    assert windows[1].start_seconds == 1.0
+    assert windows[-1].end_seconds == pytest.approx(6.0)
+    assert all(item.end_seconds > item.start_seconds for item in windows)
+
+
+def test_dense_stride_adds_at_most_one_short_tail() -> None:
+    windows = build_windows(
+        _spans(6.5), window_seconds=4.0, window_stride_seconds=1.0, include_tail=True
+    )
+    assert len(windows) == 4
+    assert windows[-1].window_id.endswith("tail")
+    assert windows[-1].start_seconds == pytest.approx(2.5)
+    assert windows[-1].end_seconds == pytest.approx(6.5)
+
+
+def test_stride_cannot_exceed_context_width() -> None:
+    with pytest.raises(ValueError, match="window_stride_seconds"):
+        build_windows(_spans(), window_seconds=4.0, window_stride_seconds=5.0)
+
+
+@pytest.mark.parametrize("value", [[], {}, True, "not-a-number"])
+def test_window_seconds_malformed_values_raise_cohort_error(value: object) -> None:
+    with pytest.raises(ValueError, match="window_seconds"):
+        build_windows(_spans(), window_seconds=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [[], {}, True, "not-a-number"])
+def test_window_stride_malformed_values_raise_cohort_error(value: object) -> None:
+    with pytest.raises(ValueError, match="window_stride_seconds"):
+        build_windows(_spans(), window_stride_seconds=value)  # type: ignore[arg-type]
+
+
+def test_manifest_normalizes_window_parameters_before_workload_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        production_cohort, "inspect_mcap_camera_spans", lambda *_args, **_kwargs: _spans(6.0)
+    )
+
+    manifest = build_manifest(
+        "sample.mcap",
+        window_seconds="4",
+        window_stride_seconds="1",
+        include_tail=True,
+    )
+
+    assert manifest["window_policy"]["window_seconds"] == pytest.approx(4.0)
+    assert manifest["window_policy"]["window_stride_seconds"] == pytest.approx(1.0)
+    assert manifest["window_policy"]["overlap_seconds"] == pytest.approx(3.0)

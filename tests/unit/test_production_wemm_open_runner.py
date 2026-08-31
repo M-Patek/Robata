@@ -36,6 +36,44 @@ def test_batch_model_observations_expand_in_input_order() -> None:
     assert _expand_model_observations((Observation(2, 0),), expected_count=1) == ()
 
 
+@pytest.mark.parametrize("invalid_mode", [[], {}])
+def test_runner_rejects_unhashable_temporal_mode_with_contract_error(invalid_mode) -> None:
+    with pytest.raises(ProductionWemmOpenRunnerError, match="temporal_mode"):
+        run_production_wemm_open(
+            {},
+            phrase_catalog=[],
+            model_directory="unused",
+            temporal_mode=invalid_mode,
+        )
+
+
+@pytest.mark.parametrize("invalid_boundary_mode", [[], {}, 1])
+def test_runner_rejects_malformed_temporal_boundary_mode_with_contract_error(
+    invalid_boundary_mode,
+) -> None:
+    with pytest.raises(ProductionWemmOpenRunnerError, match="temporal_boundary_mode"):
+        run_production_wemm_open(
+            {},
+            phrase_catalog=[],
+            model_directory="unused",
+            temporal_mode="dense_score",
+            temporal_boundary_mode=invalid_boundary_mode,
+        )
+
+
+@pytest.mark.parametrize("invalid_policy", [[], {}])
+def test_runner_rejects_unhashable_temporal_score_policy_with_contract_error(
+    invalid_policy,
+) -> None:
+    with pytest.raises(ProductionWemmOpenRunnerError, match="temporal_score_policy"):
+        run_production_wemm_open(
+            {},
+            phrase_catalog=[],
+            model_directory="unused",
+            temporal_score_policy=invalid_policy,
+        )
+
+
 def _catalog() -> dict[str, object]:
     return {
         "format": PHRASE_CATALOG_FORMAT,
@@ -87,6 +125,47 @@ def _manifest() -> dict[str, object]:
             },
         ],
     }
+
+
+def _overlapping_manifest() -> dict[str, object]:
+    manifest = _manifest()
+    manifest["windows"] = [
+        {
+            "ordinal": 0,
+            "window_id": "w00",
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+        },
+        {
+            "ordinal": 1,
+            "window_id": "w01",
+            "start_seconds": 0.5,
+            "end_seconds": 1.5,
+        },
+    ]
+    return manifest
+
+
+def test_runner_rejects_margin_score_policy_alias_before_model(monkeypatch) -> None:
+    import robata.benchmark.production_wemm_open_runner as route
+
+    called = False
+
+    def fail_backend(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(route, "WemmEmbeddingBackend", fail_backend)
+    with pytest.raises(ProductionWemmOpenRunnerError, match="temporal_score_policy"):
+        run_production_wemm_open(
+            _manifest(),
+            phrase_catalog=_catalog(),
+            model_directory="model",
+            temporal_mode="adaptive_score",
+            temporal_score_policy="margin",
+        )
+    assert called is False
 
 
 def test_catalog_loads_arbitrary_phrases_and_generates_opaque_ids() -> None:
@@ -220,6 +299,171 @@ def test_runner_builds_review_only_envelope_with_camera_top_k(monkeypatch) -> No
     assert len(proposal["evidence"]) == 2
     assert proposal["proposal_interval"]["status"] == "NOT_MEASURED"
     json.dumps(report)
+
+
+def test_runner_temporal_mode_adds_model_driven_segments_without_relabeling_windows(
+    monkeypatch,
+) -> None:
+    import robata.benchmark.production_wemm_open_runner as route
+
+    class Group:
+        def __init__(self, window_id: str, camera_id: str) -> None:
+            self.window_id = window_id
+            self.camera_id = camera_id
+            self.frames = (f"{camera_id}-{window_id}-0", f"{camera_id}-{window_id}-1")
+
+        def metadata(self):
+            return {
+                "total_num_frames": 2,
+                "fps": 1.0,
+                "width": 10,
+                "height": 10,
+                "frames_indices": [0, 1],
+                "duration": 1.0,
+            }
+
+        def to_dict(self):
+            return {
+                "camera_id": self.camera_id,
+                "window_id": self.window_id,
+                "frame_count": 2,
+            }
+
+    def fake_decode(manifest, **kwargs):
+        del kwargs
+        return {
+            camera: {
+                window["window_id"]: Group(window["window_id"], camera)
+                for window in manifest["windows"]
+            }
+            for camera in ("cam_01", "cam_02")
+        }
+
+    monkeypatch.setattr(route, "decode_production_windows", fake_decode)
+
+    class FakeBackend:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.observations = []
+
+        def encode_texts(self, texts, *, batch_size):
+            del batch_size
+            return tuple((1.0, 0.0) if "cupboard" in text else (0.0, 1.0) for text in texts)
+
+        def encode_video_frames(self, groups, *, metadata_groups=None):
+            del metadata_groups
+            window_id = str(groups[0][0]).split("-")[1]
+            return ((1.0, 0.0) if window_id == "w00" else (0.0, 1.0),)
+
+        def observation_payload(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(route, "WemmEmbeddingBackend", FakeBackend)
+    report = run_production_wemm_open(
+        _overlapping_manifest(),
+        phrase_catalog=_catalog(),
+        model_directory="model",
+        frame_count=2,
+        top_k=2,
+        dimension=2,
+        device="cpu",
+        temporal_mode="dense_score",
+        temporal_boundary_mode="midpoint",
+        temporal_score_policy="winner-stability",
+    )
+    assert report["model"]["temporal_mode"] == "dense_score"  # type: ignore[index]
+    assert report["model"]["temporal_score_policy"] == "winner_stable"  # type: ignore[index]
+    assert report["model"]["temporal_merge_gap_seconds"] == pytest.approx(0.25)  # type: ignore[index]
+    assert report["model"]["temporal_min_duration_seconds"] == pytest.approx(0.10)  # type: ignore[index]
+    assert report["model"]["temporal_min_camera_support"] == 1  # type: ignore[index]
+    assert report["windows"][0]["source_interval"]["status"] == "WINDOW_CONTEXT_ONLY"  # type: ignore[index]
+    temporal = report["temporal_resolution"]  # type: ignore[index]
+    assert temporal["production_eligible"] is False
+    assert temporal["parameters"]["score_policy"] == "winner_stable"  # type: ignore[index]
+    assert temporal["diagnostics"]["context_window_count"] == 2
+    open_segments = [
+        segment for segment in temporal["segments"] if segment["provisional_id"] == "open_cupboard"
+    ]
+    assert open_segments
+    assert open_segments[0]["boundary_status"] == "MODEL_PROBE_BOUND"
+    assert open_segments[0]["review_required"] is True
+
+
+def test_runner_rejects_non_overlapping_temporal_contexts_before_model(monkeypatch) -> None:
+    import robata.benchmark.production_wemm_open_runner as route
+
+    called = False
+
+    def fail_backend(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(route, "WemmEmbeddingBackend", fail_backend)
+    with pytest.raises(ProductionWemmOpenRunnerError, match="overlapping context windows"):
+        run_production_wemm_open(
+            _manifest(),
+            phrase_catalog=_catalog(),
+            model_directory="model",
+            temporal_mode="dense_score",
+        )
+    assert called is False
+
+
+@pytest.mark.parametrize("observed_cameras", [("cam_01",), ("cam_01", "cam_02", "cam_03")])
+def test_runner_rejects_decoder_camera_set_drift(monkeypatch, observed_cameras) -> None:
+    """Decoder observations cannot redefine manifest camera membership."""
+
+    import robata.benchmark.production_wemm_open_runner as route
+
+    class Group:
+        frames = ("frame-0", "frame-1")
+
+        def metadata(self):
+            return {
+                "total_num_frames": 2,
+                "fps": 1.0,
+                "width": 10,
+                "height": 10,
+                "frames_indices": [0, 1],
+                "duration": 1.0,
+            }
+
+        def to_dict(self):
+            return {"frame_count": 2}
+
+    monkeypatch.setattr(
+        route,
+        "decode_production_windows",
+        lambda manifest, **kwargs: {camera_id: {"w00": Group()} for camera_id in observed_cameras},
+    )
+
+    class FakeBackend:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.observations = []
+
+        def encode_texts(self, texts, *, batch_size):
+            del batch_size
+            return tuple((1.0, 0.0) for _ in texts)
+
+        def close(self):
+            return None
+
+    with pytest.raises(ProductionWemmOpenRunnerError, match="camera set does not match manifest"):
+        run_production_wemm_open(
+            _manifest(),
+            phrase_catalog=_catalog(),
+            model_directory="model",
+            frame_count=2,
+            top_k=2,
+            dimension=2,
+            device="cpu",
+            backend=FakeBackend(),
+        )
 
 
 def test_runner_rejects_invalid_frame_count_before_model(monkeypatch) -> None:
@@ -389,6 +633,10 @@ def test_runner_decodes_windows_in_bounded_chunks_and_merges_in_order(monkeypatc
         def to_dict(self):
             return {"modality": "video", "frame_count": 2}
 
+    class TextObservation:
+        def to_dict(self):
+            return {"modality": "text", "item_count": 2}
+
     class FakeBackend:
         def __init__(self, **kwargs):
             del kwargs
@@ -396,6 +644,7 @@ def test_runner_decodes_windows_in_bounded_chunks_and_merges_in_order(monkeypatc
 
         def encode_texts(self, texts, *, batch_size):
             del batch_size
+            self.observations.append(TextObservation())
             return tuple((1.0, 0.0) if "cupboard" in text else (0.0, 1.0) for text in texts)
 
         def encode_video_frames(self, groups, *, metadata_groups=None):
@@ -425,6 +674,12 @@ def test_runner_decodes_windows_in_bounded_chunks_and_merges_in_order(monkeypatc
     assert [row["window_id"] for row in report["windows"]] == ["w00", "w01"]
     assert len(report["raw_model_output"]["windows"]) == 2
     assert len(report["raw_model_output"]["backend_observations"]) == 4
+    assert all(
+        row["modality"] == "video" for row in report["raw_model_output"]["backend_observations"]
+    )
+    assert report["raw_model_output"]["text_backend_observations"] == [
+        {"modality": "text", "item_count": 2}
+    ]
     assert report["model"]["window_chunk_size"] == 1  # type: ignore[index]
 
 
@@ -856,6 +1111,27 @@ def test_open_runner_cli_exposes_inference_batch_size() -> None:
     assert parser.parse_args(base).pipeline is False
     assert parser.parse_args([*base, "--pipeline", "--queue-capacity", "2"]).pipeline is True
     assert parser.parse_args([*base, "--pipeline", "--queue-capacity", "2"]).queue_capacity == 2
+
+
+def test_open_runner_cli_normalizes_temporal_score_policy_aliases() -> None:
+    script = Path(__file__).parents[2] / "scripts" / "run_production_wemm_open.py"
+    namespace = runpy.run_path(str(script), run_name="robata_open_runner_cli")
+    parser = namespace["_parser"]()
+    base = [
+        "manifest.json",
+        "--phrase-catalog",
+        "phrases.json",
+        "--model-dir",
+        "model",
+        "--output",
+        "output.json",
+    ]
+    parsed = parser.parse_args([*base, "--temporal-score-policy", "winner-stability"])
+    assert parsed.temporal_score_policy == "winner_stable"
+    parsed = parser.parse_args([*base, "--temporal-score-policy", "CONTRAST"])
+    assert parsed.temporal_score_policy == "relative_margin"
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--temporal-score-policy", "margin"])
 
 
 def test_open_runner_cli_forwards_inference_batch_size(tmp_path) -> None:

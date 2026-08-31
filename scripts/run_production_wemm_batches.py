@@ -27,12 +27,26 @@ from robata.benchmark.production_wemm_batch_runner import (  # noqa: E402
     DEFAULT_FRAME_COUNT,
     DEFAULT_INFERENCE_BATCH_SIZE,
     DEFAULT_QUEUE_CAPACITY,
+    DEFAULT_RELATIVE_MARGIN_SCALE,
     DEFAULT_TOP_K,
     DEFAULT_WINDOW_CHUNK_SIZE,
     DEFAULT_WINDOW_SECONDS,
     ProductionWemmBatchRunnerError,
     run_production_wemm_batch,
 )
+from robata.benchmark.production_wemm_temporal import (  # noqa: E402
+    ProductionWemmTemporalError,
+    normalize_score_policy,
+)
+
+
+def _temporal_score_policy(value: str) -> str:
+    """Parse a score-policy alias and return its canonical wire spelling."""
+
+    try:
+        return normalize_score_policy(value, field="--temporal-score-policy")
+    except ProductionWemmTemporalError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _ordinals(value: str | None) -> list[int] | None:
@@ -62,6 +76,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--window-seconds", type=float, default=DEFAULT_WINDOW_SECONDS)
+    parser.add_argument(
+        "--window-stride-seconds",
+        type=float,
+        help=(
+            "optional stride for overlapping WeMM context windows; omit to keep "
+            "non-overlapping compatibility"
+        ),
+    )
     parser.add_argument(
         "--no-tail",
         action="store_true",
@@ -125,6 +147,73 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-reuse-backend", action="store_true")
     parser.add_argument("--staging-dir", type=Path)
     parser.add_argument("--keep-staging", action="store_true")
+    parser.add_argument(
+        "--temporal-mode",
+        choices=("none", "dense_score", "adaptive_score"),
+        default="none",
+        help=(
+            "attach temporal interval proposals; adaptive_score adds a second "
+            "short-context WeMM review pass"
+        ),
+    )
+    parser.add_argument("--temporal-start-threshold", type=float, default=0.65)
+    parser.add_argument("--temporal-stop-threshold", type=float, default=0.50)
+    parser.add_argument("--temporal-merge-gap-seconds", type=float, default=0.25)
+    parser.add_argument("--temporal-min-duration-seconds", type=float, default=0.10)
+    parser.add_argument("--temporal-min-camera-support", type=int, default=1)
+    parser.add_argument(
+        "--temporal-boundary-mode",
+        choices=("observed_probe", "midpoint"),
+        default="midpoint",
+    )
+    parser.add_argument(
+        "--temporal-score-policy",
+        type=_temporal_score_policy,
+        default="top1",
+        help=(
+            "temporal support policy (aliases raw, winner, stable, "
+            "winner_stability, candidate_relative, relative, and contrast are "
+            "normalized to canonical values); top1 avoids broad tracks from "
+            "tightly clustered raw similarities; winner_stable additionally "
+            "repairs one-context interior winner glitches"
+        ),
+    )
+    parser.add_argument(
+        "--temporal-relative-margin-scale",
+        type=float,
+        default=DEFAULT_RELATIVE_MARGIN_SCALE,
+        help=(
+            "logistic scale for candidate-vs-runner-up temporal margins "
+            "(used by relative_margin policy)"
+        ),
+    )
+    parser.add_argument(
+        "--temporal-relative-margin-min-target-score",
+        type=float,
+        default=0.60,
+        help=(
+            "minimum target similarity required before a relative-margin "
+            "trajectory can support an interval"
+        ),
+    )
+    parser.add_argument(
+        "--temporal-refinement-span-seconds",
+        type=float,
+        default=1.0,
+        help="short context width for adaptive_score boundary probes",
+    )
+    parser.add_argument(
+        "--temporal-refinement-min-request-span-seconds",
+        type=float,
+        default=0.10,
+        help="minimum admissible adaptive refinement request width",
+    )
+    parser.add_argument(
+        "--temporal-refinement-max-requests",
+        type=int,
+        default=128,
+        help="maximum onset/offset requests in adaptive_score mode",
+    )
     return parser
 
 
@@ -137,6 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "output_directory": args.output_dir,
             "archive_path": args.archive,
             "window_seconds": args.window_seconds,
+            "window_stride_seconds": args.window_stride_seconds,
             "include_tail": not args.no_tail,
             "frame_count": args.frame_count,
             "top_k": args.top_k,
@@ -157,6 +247,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "staging_directory": args.staging_dir,
             "keep_staging": args.keep_staging,
             "checkpoint_path": args.checkpoint,
+            "temporal_mode": args.temporal_mode,
+            "temporal_start_threshold": args.temporal_start_threshold,
+            "temporal_stop_threshold": args.temporal_stop_threshold,
+            "temporal_merge_gap_seconds": args.temporal_merge_gap_seconds,
+            "temporal_min_duration_seconds": args.temporal_min_duration_seconds,
+            "temporal_min_camera_support": args.temporal_min_camera_support,
+            "temporal_boundary_mode": args.temporal_boundary_mode,
+            "temporal_score_policy": args.temporal_score_policy,
+            "temporal_relative_margin_scale": args.temporal_relative_margin_scale,
+            "temporal_relative_margin_min_target_score": (
+                args.temporal_relative_margin_min_target_score
+            ),
+            "temporal_refinement_span_seconds": args.temporal_refinement_span_seconds,
+            "temporal_refinement_min_request_span_seconds": (
+                args.temporal_refinement_min_request_span_seconds
+            ),
+            "temporal_refinement_max_requests": args.temporal_refinement_max_requests,
         }
         if args.pipeline:
             run_kwargs.update(
