@@ -58,6 +58,47 @@ def _proposal() -> dict[str, object]:
     }
 
 
+def _coarse_temporal_segment(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "segment_id": "temporal-segment",
+        "provisional_id": "open-cupboard",
+        "start_seconds": 1.0,
+        "end_seconds": 2.0,
+        "boundary_status": "MODEL_PROBE_BOUND",
+        "boundary_source": "wemm_temporal_score",
+        "boundary_method": "probe_center_midpoint",
+        "context_only": True,
+        "window_context_only": True,
+        "is_action_boundary": False,
+        "action_boundary": False,
+        "review_required": True,
+        "automatic_eligible": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def _refined_temporal_segment(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "segment_id": "refined-segment",
+        "provisional_id": "open faucet",
+        "coarse_interval": {"start_seconds": 1.0, "end_seconds": 3.0},
+        "start_seconds": 1.4,
+        "end_seconds": 2.6,
+        "boundary_status": "MODEL_REFINED",
+        "boundary_source": "wemm_short_refinement",
+        "boundary_method": "short_probe_model",
+        "context_only": True,
+        "window_context_only": True,
+        "is_action_boundary": False,
+        "action_boundary": False,
+        "review_required": True,
+        "automatic_eligible": False,
+    }
+    row.update(overrides)
+    return row
+
+
 def test_builds_open_review_only_envelope_without_inventing_boundaries() -> None:
     envelope = build_preannotation_envelope(
         _source(),
@@ -223,20 +264,22 @@ def test_review_pack_preserves_temporal_resolution_sidecar_without_relabeling_wi
     )
     envelope["temporal_resolution"] = {
         "format": "robata-production-wemm-temporal-resolver-v1",
+        "authority": "LOCAL_NONPRODUCTION_ONLY",
         "status": "PROPOSALS_ONLY",
         "production_eligible": False,
         "official_gold_status": "NOT_ESTABLISHED",
+        "context_interval": {
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "context_only": True,
+            "is_action_boundary": False,
+            "action_boundary": False,
+        },
         "segments": [
-            {
-                "segment_id": "open-cupboard@1.0-2.0",
-                "provisional_id": "open-cupboard",
-                "start_seconds": 1.0,
-                "end_seconds": 2.0,
-                "boundary_status": "MODEL_PROBE_BOUND",
-                "review_required": True,
-                "automatic_eligible": False,
-                "supporting_window_ids": ["w00"],
-            }
+            _coarse_temporal_segment(
+                segment_id="open-cupboard@1.0-2.0",
+                supporting_window_ids=["w00"],
+            )
         ],
         "score_trajectories": [],
     }
@@ -260,8 +303,45 @@ def test_review_pack_rejects_malformed_temporal_resolution_sidecar() -> None:
         "production_eligible": False,
         "segments": {"not": "an array"},
     }
-    with pytest.raises(ProductionWemmPreannotationError, match="segments must be an array"):
+    with pytest.raises(
+        ProductionWemmPreannotationError,
+        match=r"format must be|segments must be an array",
+    ):
         build_review_pack(envelope)
+
+
+def test_alias_only_temporal_segments_are_validated_and_preserved() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    envelope["temporal_segments"] = [_coarse_temporal_segment(segment_id="alias-only")]
+
+    validate_preannotation_envelope(envelope)
+    review = build_review_pack(envelope)
+    assert "temporal_resolution" not in review
+    assert review["temporal_segments"][0]["segment_id"] == "alias-only"  # type: ignore[index]
+
+
+def test_temporal_segment_alias_must_match_canonical_resolution() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    canonical = {
+        **_coarse_temporal_segment(segment_id="canonical"),
+    }
+    envelope["temporal_resolution"] = {
+        "format": "robata-production-wemm-temporal-resolver-v1",
+        "authority": "LOCAL_NONPRODUCTION_ONLY",
+        "status": "PROPOSALS_ONLY",
+        "production_eligible": False,
+        "context_interval": {
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "context_only": True,
+            "is_action_boundary": False,
+            "action_boundary": False,
+        },
+        "segments": [canonical],
+    }
+    envelope["temporal_segments"] = [{**canonical, "segment_id": "different"}]
+    with pytest.raises(ProductionWemmPreannotationError, match="does not match"):
+        validate_preannotation_envelope(envelope)
 
 
 @pytest.mark.parametrize(
@@ -276,8 +356,17 @@ def test_validate_rejects_non_review_temporal_sidecar(
 ) -> None:
     envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
     envelope["temporal_resolution"] = {
+        "format": "robata-production-wemm-temporal-resolver-v1",
+        "authority": "LOCAL_NONPRODUCTION_ONLY",
         "status": "PROPOSALS_ONLY",
         "production_eligible": False,
+        "context_interval": {
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "context_only": True,
+            "is_action_boundary": False,
+            "action_boundary": False,
+        },
         "segments": [],
         field: value,
     }
@@ -288,16 +377,24 @@ def test_validate_rejects_non_review_temporal_sidecar(
 def test_validate_rejects_measured_temporal_segment_boundary() -> None:
     envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
     envelope["temporal_resolution"] = {
+        "format": "robata-production-wemm-temporal-resolver-v1",
+        "authority": "LOCAL_NONPRODUCTION_ONLY",
         "status": "PROPOSALS_ONLY",
         "production_eligible": False,
+        "context_interval": {
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "context_only": True,
+            "is_action_boundary": False,
+            "action_boundary": False,
+        },
         "segments": [
-            {
-                "start_seconds": 0.0,
-                "end_seconds": 1.0,
-                "boundary_status": "MEASURED",
-                "review_required": True,
-                "automatic_eligible": False,
-            }
+            _coarse_temporal_segment(
+                segment_id="measured",
+                start_seconds=0.0,
+                end_seconds=1.0,
+                boundary_status="MEASURED",
+            )
         ],
     }
     with pytest.raises(ProductionWemmPreannotationError, match="MODEL_PROBE_BOUND"):
@@ -340,4 +437,96 @@ def test_validate_rejects_stale_automatic_flag() -> None:
         }
     ]
     with pytest.raises(ProductionWemmPreannotationError, match="require human review"):
+        validate_preannotation_envelope(envelope)
+
+
+def test_adaptive_refinement_sidecars_are_preserved_and_pending_is_review_only() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    refined = _refined_temporal_segment(segment_id="seg-refined")
+    pending = _refined_temporal_segment(
+        segment_id="seg-pending",
+        provisional_id="close faucet",
+        coarse_interval={"start_seconds": 4.0, "end_seconds": 6.0},
+        start_seconds=None,
+        end_seconds=None,
+        boundary_status="MODEL_REFINEMENT_PENDING",
+    )
+    envelope.update(
+        {
+            "temporal_refinement_plan": {
+                "format": "robata-production-wemm-temporal-refinement-plan-v1",
+                "authority": "LOCAL_NONPRODUCTION_ONLY",
+                "production_eligible": False,
+                "requests": [],
+            },
+            "temporal_refinement_fine_plan": {
+                "format": "robata-production-wemm-temporal-score-refinement-v1",
+                "authority": "LOCAL_NONPRODUCTION_ONLY",
+                "production_eligible": False,
+                "requests": [],
+            },
+            "temporal_refinement_score_resolution": {
+                "format": "robata-production-wemm-temporal-score-result-v1",
+                "authority": "LOCAL_NONPRODUCTION_ONLY",
+                "production_eligible": False,
+                "results": [],
+            },
+            "temporal_refinement": {
+                "format": "robata-production-wemm-temporal-refinement-review-v1",
+                "authority": "LOCAL_NONPRODUCTION_ONLY",
+                "production_eligible": False,
+                "refined_segments": [refined, pending],
+            },
+            "refined_segments": [refined, pending],
+        }
+    )
+
+    validate_preannotation_envelope(envelope)
+    review = build_review_pack(envelope)
+    assert review["refined_segments"][0]["boundary_status"] == "MODEL_REFINED"  # type: ignore[index]
+    assert review["refined_segments"][1]["start_seconds"] is None  # type: ignore[index]
+    assert review["refined_temporal_segments"] == review["refined_segments"]  # type: ignore[index]
+    assert "temporal_refinement_fine_plan" in review
+    assert review["review_contract"]["refined_segments_review_only"] is True  # type: ignore[index]
+    # All sidecars are detached from the caller's mutable envelope.
+    review["refined_segments"][0]["provisional_id"] = "edited"  # type: ignore[index]
+    assert envelope["refined_segments"][0]["provisional_id"] == "open faucet"  # type: ignore[index]
+
+
+def test_lowercase_refined_status_is_canonicalized_in_review_snapshot() -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    row = _refined_temporal_segment(segment_id="lowercase", boundary_status="model_refined")
+    envelope["refined_segments"] = [row]
+    validate_preannotation_envelope(envelope)
+    review = build_review_pack(envelope)
+    assert review["refined_segments"][0]["boundary_status"] == "MODEL_REFINED"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        {
+            "segment_id": "bad-status",
+            "coarse_interval": {"start_seconds": 0.0, "end_seconds": 1.0},
+            "boundary_status": "MODEL_PROBE_BOUND",
+            "review_required": True,
+            "automatic_eligible": False,
+            "start_seconds": 0.1,
+            "end_seconds": 0.2,
+        },
+        {
+            "segment_id": "bad-pending",
+            "coarse_interval": {"start_seconds": 0.0, "end_seconds": 1.0},
+            "boundary_status": "MODEL_REFINEMENT_PENDING",
+            "review_required": True,
+            "automatic_eligible": False,
+            "start_seconds": 0.1,
+            "end_seconds": 0.2,
+        },
+    ],
+)
+def test_validate_rejects_malformed_adaptive_refined_row(bad_row: dict[str, object]) -> None:
+    envelope = build_preannotation_envelope(_source(), [{"window_id": "w00", "proposals": []}])
+    envelope["refined_segments"] = [bad_row]
+    with pytest.raises(ProductionWemmPreannotationError):
         validate_preannotation_envelope(envelope)

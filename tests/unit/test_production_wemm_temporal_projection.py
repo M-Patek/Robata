@@ -110,6 +110,22 @@ def test_projects_model_interval_without_attaching_it_to_a_window() -> None:
         "supporting_window_ids": ["w01", "w02"],
     }
     assert report["metrics"]["automatic_eligible_count"] == 0  # type: ignore[index]
+    assert report["metrics"]["measured_interval_count"] == 0  # type: ignore[index]
+
+
+def test_projection_canonicalizes_conflicting_nested_recording_lineage() -> None:
+    source = _source()
+    source["temporal_resolution"]["segments"][0]["source_ref"] = {  # type: ignore[index]
+        "recording_id": "stale-recording",
+        "path": "sample.mcap",
+    }
+
+    report = project_temporal_interval_proposals(source)
+    proposal = report["temporal_interval_proposals"][0]  # type: ignore[index]
+
+    assert proposal["recording_id"] == "recording-01"
+    assert proposal["source_ref"]["recording_id"] == "recording-01"  # type: ignore[index]
+    assert proposal["source_ref"]["upstream_lineage"]["recording_id"] == "stale-recording"  # type: ignore[index]
 
 
 def test_aggregate_temporal_alias_is_supported_and_must_match() -> None:
@@ -139,7 +155,10 @@ def test_attach_is_additive_and_does_not_mutate_existing_draft() -> None:
     assert draft == before
     assert attached["windows"] == before["windows"]
     assert attached["temporal_interval_proposals"][0]["start_seconds"] == pytest.approx(1.25)  # type: ignore[index]
+    assert attached["coarse_temporal_interval_proposals"][0]["start_seconds"] == pytest.approx(1.25)  # type: ignore[index]
+    assert attached["temporal_interval_primary_selection"][0]["selection"] == "COARSE_FALLBACK"  # type: ignore[index]
     assert attached["metrics"]["temporal_interval_proposal_count"] == 1  # type: ignore[index]
+    assert attached["metrics"]["measured_interval_count"] == 0  # type: ignore[index]
     assert attached["review_contract"]["temporal_interval_proposals_separate"] is True  # type: ignore[index]
     assert attached["controls"]["temporal_proposals_to_gold"] is False  # type: ignore[index]
     assert validate_temporal_interval_projection(attached) == attached
@@ -173,3 +192,209 @@ def test_no_sidecar_is_an_explicit_empty_projection() -> None:
     assert report["status"] == "EMPTY"
     assert report["temporal_interval_proposals"] == []
     assert report["controls"]["temporal_sidecar_read"] is False  # type: ignore[index]
+
+
+def test_projects_refined_and_pending_rows_in_separate_namespaces() -> None:
+    source = _source()
+    source["refined_segments"] = [
+        {
+            "segment_id": "seg-measured",
+            "provisional_id": "open faucet",
+            "coarse_interval": {"start_seconds": 1.0, "end_seconds": 3.0},
+            "start_seconds": 1.4,
+            "end_seconds": 2.6,
+            "boundary_status": "MODEL_REFINED",
+            "review_required": True,
+            "automatic_eligible": False,
+        },
+        {
+            "segment_id": "seg-pending",
+            "provisional_id": "close faucet",
+            "coarse_interval": {"start_seconds": 4.0, "end_seconds": 6.0},
+            "start_seconds": None,
+            "end_seconds": None,
+            "boundary_status": "MODEL_REFINEMENT_PENDING",
+            "review_required": True,
+            "automatic_eligible": False,
+        },
+    ]
+    report = project_temporal_interval_proposals(source)
+    assert len(report["temporal_interval_proposals"]) == 1  # type: ignore[arg-type]
+    primary = report["temporal_interval_proposals"][0]  # type: ignore[index]
+    assert primary["boundary_status"] == "MODEL_REFINED"
+    assert primary["start_seconds"] == pytest.approx(1.4)
+    assert primary["end_seconds"] == pytest.approx(2.6)
+    coarse = report["coarse_temporal_interval_proposals"][0]  # type: ignore[index]
+    assert coarse["boundary_status"] == BOUNDARY_STATUS
+    assert coarse["start_seconds"] == pytest.approx(1.25)
+    assert coarse["end_seconds"] == pytest.approx(2.75)
+    assert report["temporal_interval_primary_selection"][0]["selection"] == "MODEL_REFINED"  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_primary_refined_count"] == 1  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_coarse_fallback_count"] == 0  # type: ignore[index]
+    assert report["metrics"]["measured_interval_count"] == 1  # type: ignore[index]
+    assert len(report["temporal_refinement_segments"]) == 2  # type: ignore[arg-type]
+    assert len(report["refined_temporal_interval_proposals"]) == 1  # type: ignore[arg-type]
+    rows = report["temporal_refinement_segments"]  # type: ignore[index]
+    assert rows[0]["segment_id"].startswith("recording-01::temporal-refined::")
+    assert rows[1]["boundary_status"] == "MODEL_REFINEMENT_PENDING"
+    assert rows[1]["start_seconds"] is None
+    primary["start_seconds"] = 1.9
+    assert rows[0]["start_seconds"] == pytest.approx(1.4)
+    validate_temporal_interval_projection(report)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start_seconds", "not-a-number"),
+        ("end_seconds", []),
+        ("start_seconds", True),
+    ],
+)
+def test_pending_refined_rows_reject_nonnumeric_boundary_values(field: str, value: object) -> None:
+    source = _source()
+    pending = {
+        "segment_id": "seg-pending-invalid",
+        "provisional_id": "close faucet",
+        "coarse_interval": {"start_seconds": 4.0, "end_seconds": 6.0},
+        "start_seconds": None,
+        "end_seconds": None,
+        "boundary_status": "MODEL_REFINEMENT_PENDING",
+        "review_required": True,
+        "automatic_eligible": False,
+    }
+    pending[field] = value
+    source["refined_segments"] = [pending]
+
+    with pytest.raises(ProductionWemmTemporalProjectionError, match=field):
+        project_temporal_interval_proposals(source)
+
+
+def test_projection_validation_rejects_malformed_pending_time_values() -> None:
+    report = project_temporal_interval_proposals(_source())
+    report["temporal_refinement_segments"] = [
+        {
+            "segment_id": "recording-01::temporal-refined::bad",
+            "boundary_status": "MODEL_REFINEMENT_PENDING",
+            "start_seconds": "bad",
+            "end_seconds": None,
+            "coarse_interval": {"start_seconds": 1.0, "end_seconds": 2.0},
+            "review_required": True,
+            "automatic_eligible": False,
+        }
+    ]
+    with pytest.raises(ProductionWemmTemporalProjectionError, match="start_seconds"):
+        validate_temporal_interval_projection(report)
+
+
+def test_ambiguous_refined_row_keeps_coarse_primary_and_stays_sidecar_only() -> None:
+    first = _segment("seg-a", recording_id="recording-01")
+    second = _segment("seg-b", recording_id="recording-01")
+    second["start_seconds"] = 3.25
+    second["end_seconds"] = 4.75
+    source = _source()
+    source["temporal_resolution"]["segments"] = [first, second]  # type: ignore[index]
+    source["refined_segments"] = [
+        {
+            "segment_id": "refined-ambiguous",
+            "provisional_id": "open faucet",
+            "coarse_interval": {"start_seconds": 9.0, "end_seconds": 10.0},
+            "start_seconds": 9.2,
+            "end_seconds": 9.8,
+            "boundary_status": "MODEL_REFINED",
+            "review_required": True,
+            "automatic_eligible": False,
+        }
+    ]
+
+    report = project_temporal_interval_proposals(source)
+
+    primary = report["temporal_interval_proposals"]  # type: ignore[index]
+    assert [row["boundary_status"] for row in primary] == [BOUNDARY_STATUS, BOUNDARY_STATUS]
+    assert report["metrics"]["temporal_interval_primary_refined_count"] == 0  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_unmatched_refined_count"] == 1  # type: ignore[index]
+    assert report["metrics"]["measured_interval_count"] == 0  # type: ignore[index]
+    assert report["temporal_refinement_segments"][0]["boundary_status"] == "MODEL_REFINED"  # type: ignore[index]
+    validate_temporal_interval_projection(report)
+
+
+def test_conflicting_refined_action_does_not_replace_explicit_coarse_match() -> None:
+    source = _source()
+    source["refined_segments"] = [
+        {
+            "segment_id": "seg-01",
+            "provisional_id": "close faucet",
+            "coarse_interval": {"start_seconds": 1.0, "end_seconds": 3.0},
+            "start_seconds": 1.4,
+            "end_seconds": 2.6,
+            "boundary_status": "MODEL_REFINED",
+            "review_required": True,
+            "automatic_eligible": False,
+        }
+    ]
+
+    report = project_temporal_interval_proposals(source)
+
+    assert report["temporal_interval_proposals"][0]["boundary_status"] == BOUNDARY_STATUS  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_primary_refined_count"] == 0  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_unmatched_refined_count"] == 1  # type: ignore[index]
+    validate_temporal_interval_projection(report)
+
+
+def test_aggregate_namespace_lineage_matches_refined_row_to_coarse_row() -> None:
+    source = _source(aggregate=True)
+    refined = {
+        "segment_id": "seg-01",
+        "provisional_id": "open faucet",
+        "coarse_interval": {"start_seconds": 1.25, "end_seconds": 2.75},
+        "start_seconds": 1.4,
+        "end_seconds": 2.6,
+        "boundary_status": "MODEL_REFINED",
+        "review_required": True,
+        "automatic_eligible": False,
+    }
+    source["refined_temporal_segments"] = [copy.deepcopy(refined)]
+    source["temporal_refinement_segments"] = [copy.deepcopy(refined)]
+    source["temporal_refinement"] = {
+        "review_only": True,
+        "segments": [copy.deepcopy(refined)],
+    }
+
+    report = project_temporal_interval_proposals(source)
+
+    assert report["temporal_interval_proposals"][0]["boundary_status"] == "MODEL_REFINED"  # type: ignore[index]
+    assert report["metrics"]["temporal_interval_primary_refined_count"] == 1  # type: ignore[index]
+    validate_temporal_interval_projection(report)
+
+
+def test_refined_projection_rejects_automatic_or_missing_coarse_interval() -> None:
+    source = _source()
+    source["refined_segments"] = [
+        {
+            "segment_id": "bad",
+            "start_seconds": 1.0,
+            "end_seconds": 2.0,
+            "boundary_status": "MODEL_REFINED",
+            "review_required": False,
+            "automatic_eligible": True,
+        }
+    ]
+    with pytest.raises(ProductionWemmTemporalProjectionError, match="review_required"):
+        project_temporal_interval_proposals(source)
+
+    source["refined_segments"][0]["review_required"] = True  # type: ignore[index]
+    source["refined_segments"][0]["automatic_eligible"] = False  # type: ignore[index]
+    with pytest.raises(ProductionWemmTemporalProjectionError, match="coarse_interval"):
+        project_temporal_interval_proposals(source)
+
+
+def test_validation_rejects_orphan_measured_refined_alias() -> None:
+    report = project_temporal_interval_proposals(_source())
+    orphan = copy.deepcopy(report["temporal_interval_proposals"][0])  # type: ignore[index]
+    orphan["boundary_status"] = "MODEL_REFINED"
+    orphan["coarse_interval"] = {"start_seconds": 1.0, "end_seconds": 3.0}
+    report["refined_temporal_interval_proposals"] = [orphan]
+    report["temporal_refinement_segments"] = []
+    report["refined_temporal_segments"] = []
+    with pytest.raises(ProductionWemmTemporalProjectionError, match="drawn from"):
+        validate_temporal_interval_projection(report)

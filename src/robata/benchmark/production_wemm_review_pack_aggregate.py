@@ -23,6 +23,26 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+from .production_wemm_interval_proposal import (
+    BOUNDARY_SOURCE as TEMPORAL_BOUNDARY_SOURCE,
+)
+from .production_wemm_interval_proposal import (
+    BOUNDARY_STATUS as TEMPORAL_BOUNDARY_STATUS,
+)
+from .production_wemm_temporal import FORMAT as TEMPORAL_RESOLUTION_FORMAT
+from .production_wemm_temporal_refinement import (
+    APPLIED_FORMAT as TEMPORAL_REFINEMENT_APPLIED_FORMAT,
+)
+from .production_wemm_temporal_refinement import (
+    FORMAT as TEMPORAL_REFINEMENT_PLAN_FORMAT,
+)
+from .production_wemm_temporal_score_refinement import (
+    FORMAT as TEMPORAL_SCORE_REFINEMENT_FORMAT,
+)
+from .production_wemm_temporal_score_refinement import (
+    RESULT_FORMAT as TEMPORAL_SCORE_RESULT_FORMAT,
+)
+
 REVIEW_PACK_FORMAT: Final = "robata-production-wemm-preannotation-review-pack-v1"
 # Kept local instead of importing the batch runner so this read-only module
 # cannot pull in optional media/model dependencies merely to resolve a
@@ -31,6 +51,13 @@ BATCH_RUN_FORMAT: Final = "robata-production-wemm-batch-run-v1"
 AGGREGATE_FORMAT: Final = "robata-production-wemm-review-pack-aggregate-v1"
 AUTHORITY: Final = "LOCAL_NONPRODUCTION_ONLY"
 DECISION_OPTIONS: Final = ("accept", "edit", "split", "reject", "abstain")
+REFINED_BOUNDARY_STATUSES: Final = ("MODEL_REFINED", "MODEL_REFINEMENT_PENDING")
+REFINED_BOUNDARY_STATUS: Final = "MODEL_REFINED"
+TEMPORAL_BOUNDARY_METHODS: Final = frozenset(
+    {"observed_probe_span", "probe_center_midpoint", "mixed_probe_boundary"}
+)
+TEMPORAL_REFINEMENT_BOUNDARY_SOURCE: Final = "wemm_short_refinement"
+TEMPORAL_REFINEMENT_BOUNDARY_METHOD: Final = "short_probe_model"
 _GOLD_KEYS: Final = frozenset(
     {
         "gold",
@@ -365,10 +392,64 @@ def _validate_pack(payload: Mapping[str, Any], *, path: str) -> dict[str, Any]:
             f"{path}: EPIC ontology/Mapper cannot enter production review"
         )
     items = _sequence(payload.get("items"), field=f"{path}.items")
+    # Review-pack items are still model proposals, even though they are later
+    # flattened into an aggregate.  Validate explicit routing flags here so a
+    # malformed item cannot become an apparently eligible row downstream.
+    for item_index, raw_item in enumerate(items):
+        item = _mapping(raw_item, field=f"{path}.items[{item_index}]")
+        if item.get("review_required", True) is not True:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.items[{item_index}].review_required must be true"
+            )
+        if "automatic_eligible" in item and item.get("automatic_eligible") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.items[{item_index}].automatic_eligible must be false"
+            )
+        window_id = _text(item.get("window_id"))
+        if window_id is None:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.items[{item_index}].window_id must be non-empty"
+            )
+        proposals = _sequence(
+            item.get("proposals", []),
+            field=f"{path}.items[{item_index}].proposals",
+        )
+        source_interval = item.get("source_interval")
+        if source_interval is not None:
+            source_interval_map = _mapping(
+                source_interval,
+                field=f"{path}.items[{item_index}].source_interval",
+            )
+            status = _text(source_interval_map.get("status"))
+            if status not in {"WINDOW_CONTEXT_ONLY", "NOT_MEASURED"}:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{path}.items[{item_index}].source_interval must remain context-only"
+                )
+        for proposal_index, raw_proposal in enumerate(proposals):
+            proposal = _mapping(
+                raw_proposal,
+                field=f"{path}.items[{item_index}].proposals[{proposal_index}]",
+            )
+            proposal_field = f"{path}.items[{item_index}].proposals[{proposal_index}]"
+            if proposal.get("review_required", True) is not True:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{proposal_field}.review_required must be true"
+                )
+            if proposal.get("automatic_eligible", False) is not False:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{proposal_field}.automatic_eligible must be false"
+                )
+            decision = proposal.get("decision", "pending")
+            if decision not in DECISION_OPTIONS and decision != "pending":
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{proposal_field}.decision is invalid"
+                )
+            _assert_no_gold(proposal, field=proposal_field)
     # Temporal interval estimates are optional and additive.  Validate their
     # review-only invariants here so an aggregate cannot accidentally promote
     # a model boundary to an automatic/gold result.
     _temporal_sidecar_parts(payload, path=path)
+    _temporal_refinement_sidecar_parts(payload, path=path)
     controls = payload.get("controls")
     if controls is not None:
         controls_map = _mapping(controls, field=f"{path}.controls")
@@ -420,6 +501,44 @@ def _recording_source_ref(
     return result
 
 
+def _merge_lineage(
+    value: object,
+    additions: Mapping[str, Any],
+    *,
+    field: str,
+) -> dict[str, Any]:
+    """Add canonical aggregate lineage while retaining upstream extensions.
+
+    Aggregate-owned keys must describe the pack currently being flattened.  An
+    upstream sidecar may carry stale values for those keys, so ``setdefault``
+    would make the flattened record internally inconsistent.  Preserve any
+    conflicting upstream values under ``upstream_lineage`` instead of allowing
+    them to shadow the canonical projection.
+    """
+
+    copied = _copy_json(value if isinstance(value, Mapping) else {}, field=field)
+    if not isinstance(copied, dict):  # pragma: no cover - _copy_json invariant
+        copied = {}
+    conflicts: dict[str, Any] = {}
+    for key, child in additions.items():
+        canonical = _copy_json(child, field=f"{field}.{key}")
+        if key in copied and copied[key] != canonical:
+            conflicts[key] = copied[key]
+        copied[key] = canonical
+    if conflicts:
+        existing_upstream = copied.get("upstream_lineage")
+        if isinstance(existing_upstream, Mapping):
+            upstream = _copy_json(existing_upstream, field=f"{field}.upstream_lineage")
+        else:
+            upstream = {}
+        if not isinstance(upstream, dict):  # pragma: no cover - helper invariant
+            upstream = {}
+        for key, previous in conflicts.items():
+            upstream.setdefault(key, previous)
+        copied["upstream_lineage"] = upstream
+    return copied
+
+
 def _temporal_sidecar_parts(
     payload: Mapping[str, Any], *, path: str
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -443,9 +562,9 @@ def _temporal_sidecar_parts(
         The aggregate is a read-only join, but it is also a trust boundary for
         review clients.  Keep these checks identical to the producer-side
         validator: a sidecar segment must carry explicit review-only flags,
-        provenance, and a finite non-degenerate source-relative interval.  Do
-        not silently accept missing flags, since omission would make a malformed
-        segment look eligible to a downstream consumer.
+        provenance, and a finite non-degenerate source-relative interval.
+        Marker fields introduced after the first sidecars are defaulted when
+        absent; explicit contradictory values are still rejected.
         """
 
         if raw_segment.get("review_required") is not True:
@@ -454,30 +573,62 @@ def _temporal_sidecar_parts(
             raise ProductionWemmReviewPackAggregateError(
                 f"{field}.automatic_eligible must be false"
             )
-        if raw_segment.get("boundary_status") != "MODEL_PROBE_BOUND":
+        segment_id = _text(raw_segment.get("segment_id"))
+        if segment_id is None:
             raise ProductionWemmReviewPackAggregateError(
-                f"{field}.boundary_status must be MODEL_PROBE_BOUND"
+                f"{field}.segment_id must be a non-empty string"
             )
+        if raw_segment.get("boundary_status") != TEMPORAL_BOUNDARY_STATUS:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_status must be {TEMPORAL_BOUNDARY_STATUS}"
+            )
+        # These markers were added after the first temporal sidecars were
+        # generated.  Missing values are a known legacy shape and are
+        # canonicalised below; an explicit contradictory value is still an
+        # invalid boundary claim.
+        for key in ("context_only", "window_context_only"):
+            if key in raw_segment and raw_segment[key] is not True:
+                raise ProductionWemmReviewPackAggregateError(f"{field}.{key} must be true")
+        for key in ("is_action_boundary", "action_boundary"):
+            if key in raw_segment and raw_segment[key] is not False:
+                raise ProductionWemmReviewPackAggregateError(f"{field}.{key} must be false")
         start = _finite(raw_segment.get("start_seconds"))
         end = _finite(raw_segment.get("end_seconds"))
         if start is None or end is None or start < 0.0 or end <= start:
             raise ProductionWemmReviewPackAggregateError(
                 f"{field} interval must satisfy 0 <= start < end"
             )
-        boundary_source = raw_segment.get("boundary_source")
-        if boundary_source is not None and _text(boundary_source) is None:
+        if raw_segment.get("boundary_source") != TEMPORAL_BOUNDARY_SOURCE:
             raise ProductionWemmReviewPackAggregateError(
-                f"{field}.boundary_source must be a non-empty string when supplied"
+                f"{field}.boundary_source must be {TEMPORAL_BOUNDARY_SOURCE!r}"
             )
         boundary_method = raw_segment.get("boundary_method")
-        if boundary_method is not None and _text(boundary_method) is None:
+        if _text(boundary_method) is None:
             raise ProductionWemmReviewPackAggregateError(
-                f"{field}.boundary_method must be a non-empty string when supplied"
+                f"{field}.boundary_method must be a non-empty string"
             )
-        return dict(raw_segment)
+        if str(boundary_method).strip() not in TEMPORAL_BOUNDARY_METHODS:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_method must be one of "
+                f"{', '.join(sorted(TEMPORAL_BOUNDARY_METHODS))}"
+            )
+        checked = dict(raw_segment)
+        checked.setdefault("context_only", True)
+        checked.setdefault("window_context_only", True)
+        checked.setdefault("is_action_boundary", False)
+        checked.setdefault("action_boundary", False)
+        return checked
 
     if raw_resolution is not None:
         resolution = _mapping(raw_resolution, field=f"{path}.temporal_resolution")
+        if resolution.get("format") != TEMPORAL_RESOLUTION_FORMAT:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}: temporal_resolution.format must be {TEMPORAL_RESOLUTION_FORMAT!r}"
+            )
+        if resolution.get("authority") != AUTHORITY:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}: temporal_resolution.authority must remain {AUTHORITY!r}"
+            )
         if resolution.get("status") != "PROPOSALS_ONLY":
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}: temporal_resolution.status must be PROPOSALS_ONLY"
@@ -486,27 +637,65 @@ def _temporal_sidecar_parts(
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}: temporal_resolution.production_eligible must be false"
             )
+        context = _mapping(
+            resolution.get("context_interval"),
+            field=f"{path}.temporal_resolution.context_interval",
+        )
+        if "context_only" in context and context.get("context_only") is not True:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.temporal_resolution.context_interval.context_only must be true"
+            )
+        if "is_action_boundary" in context and context.get("is_action_boundary") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.temporal_resolution.context_interval.is_action_boundary must be false"
+            )
+        if "action_boundary" in context and context.get("action_boundary") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.temporal_resolution.context_interval.action_boundary must be false"
+            )
         copied = _copy_json(resolution, field=f"{path}.temporal_resolution")
         if not isinstance(copied, dict):  # pragma: no cover - _copy_json invariant
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}.temporal_resolution must be an object"
             )
+        context_copy = copied.get("context_interval")
+        if isinstance(context_copy, dict):
+            context_copy.setdefault("context_only", True)
+            context_copy.setdefault("is_action_boundary", False)
+            context_copy.setdefault("action_boundary", False)
         raw_segments = copied.get("segments", [])
         if not isinstance(raw_segments, list):
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}.temporal_resolution.segments must be an array"
             )
+        seen_ids: set[str] = set()
+        validated_segments: list[dict[str, Any]] = []
         for index, raw_segment in enumerate(raw_segments):
             if not isinstance(raw_segment, Mapping):
                 raise ProductionWemmReviewPackAggregateError(
                     f"{path}.temporal_resolution.segments[{index}] must be an object"
                 )
-            _validate_segment(
+            checked = _validate_segment(
                 raw_segment,
                 field=f"{path}.temporal_resolution.segments[{index}]",
             )
+            segment_id = str(checked["segment_id"])
+            if segment_id in seen_ids:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{path}.temporal_resolution.segments[{index}].segment_id must be unique"
+                )
+            seen_ids.add(segment_id)
+            validated_segments.append(checked)
         resolution_copy = copied
-        resolution_segments = [dict(segment) for segment in raw_segments]
+        detached_segments = _copy_json(
+            validated_segments, field=f"{path}.temporal_resolution.segments"
+        )
+        if not isinstance(detached_segments, list):  # pragma: no cover - _copy_json invariant
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.temporal_resolution.segments must be an array"
+            )
+        copied["segments"] = detached_segments
+        resolution_segments = detached_segments
 
     alias_segments: list[dict[str, Any]] = []
     if raw_alias is not None:
@@ -516,13 +705,22 @@ def _temporal_sidecar_parts(
             raise ProductionWemmReviewPackAggregateError(
                 f"{path}.temporal_segments must be an array"
             )
+        seen_ids = set()
+        validated_alias: list[dict[str, Any]] = []
         for index, raw_segment in enumerate(copied_alias):
             if not isinstance(raw_segment, Mapping):
                 raise ProductionWemmReviewPackAggregateError(
                     f"{path}.temporal_segments[{index}] must be an object"
                 )
-            _validate_segment(raw_segment, field=f"{path}.temporal_segments[{index}]")
-        alias_segments = [dict(segment) for segment in copied_alias]
+            checked = _validate_segment(raw_segment, field=f"{path}.temporal_segments[{index}]")
+            segment_id = str(checked["segment_id"])
+            if segment_id in seen_ids:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{path}.temporal_segments[{index}].segment_id must be unique"
+                )
+            seen_ids.add(segment_id)
+            validated_alias.append(checked)
+        alias_segments = validated_alias
 
     if (
         resolution_copy is not None
@@ -533,6 +731,184 @@ def _temporal_sidecar_parts(
             f"{path}: temporal_segments does not match temporal_resolution.segments"
         )
     return resolution_copy, resolution_segments if resolution_copy is not None else alias_segments
+
+
+def _temporal_refinement_sidecar_parts(payload: Mapping[str, Any], *, path: str) -> dict[str, Any]:
+    """Validate and detach adaptive temporal sidecars from one review pack.
+
+    Adaptive fields are deliberately independent from the historical coarse
+    temporal sidecar.  The planner/fine-score schemas are owned by their
+    producer modules, so this aggregate only checks JSON safety, lineage
+    carriers, and the review-only boundary invariants.  All aliases must
+    describe the same ordered refined rows when supplied together.
+    """
+
+    sidecars: dict[str, dict[str, Any]] = {}
+    expected_formats = {
+        "temporal_refinement_plan": TEMPORAL_REFINEMENT_PLAN_FORMAT,
+        "temporal_refinement_fine_plan": TEMPORAL_SCORE_REFINEMENT_FORMAT,
+        "temporal_refinement_score_resolution": TEMPORAL_SCORE_RESULT_FORMAT,
+        "temporal_refinement": TEMPORAL_REFINEMENT_APPLIED_FORMAT,
+    }
+    for key in (
+        "temporal_refinement_plan",
+        "temporal_refinement_fine_plan",
+        "temporal_refinement_score_resolution",
+        "temporal_refinement",
+    ):
+        if key not in payload:
+            continue
+        raw = _mapping(payload.get(key), field=f"{path}.{key}")
+        expected_format = expected_formats[key]
+        if raw.get("format") != expected_format:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.{key}.format must be {expected_format!r}"
+            )
+        if raw.get("authority") != AUTHORITY:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.{key}.authority must remain {AUTHORITY!r}"
+            )
+        _assert_no_gold(raw, field=f"{path}.{key}")
+        copied = _copy_json(raw, field=f"{path}.{key}")
+        if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+            raise ProductionWemmReviewPackAggregateError(f"{path}.{key} must be an object")
+        if copied.get("production_eligible") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{path}.{key}.production_eligible must be false"
+            )
+        sidecars[key] = copied
+
+    candidates: list[tuple[str, Sequence[Any]]] = []
+    for key in (
+        "refined_segments",
+        "refined_temporal_segments",
+        "temporal_refinement_segments",
+    ):
+        if key in payload:
+            candidates.append((key, _sequence(payload.get(key), field=f"{path}.{key}")))
+    applied = sidecars.get("temporal_refinement")
+    if applied is not None:
+        for key in ("refined_segments", "temporal_refinement_segments", "segments"):
+            if key in applied:
+                candidates.append(
+                    (
+                        f"temporal_refinement.{key}",
+                        _sequence(applied.get(key), field=f"{path}.temporal_refinement.{key}"),
+                    )
+                )
+
+    def _validate_refined(raw: object, *, field: str) -> dict[str, Any]:
+        row = _mapping(raw, field=field)
+        row_id = _text(row.get("segment_id"))
+        if row_id is None:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.segment_id must be a non-empty string"
+            )
+        for key in ("context_only", "window_context_only"):
+            if key in row and row.get(key) is not True:
+                raise ProductionWemmReviewPackAggregateError(f"{field}.{key} must be true")
+        for key in ("is_action_boundary", "action_boundary"):
+            if key in row and row.get(key) is not False:
+                raise ProductionWemmReviewPackAggregateError(f"{field}.{key} must be false")
+        if row.get("boundary_source") != TEMPORAL_REFINEMENT_BOUNDARY_SOURCE:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_source must be {TEMPORAL_REFINEMENT_BOUNDARY_SOURCE!r}"
+            )
+        if row.get("boundary_method") != TEMPORAL_REFINEMENT_BOUNDARY_METHOD:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_method must be {TEMPORAL_REFINEMENT_BOUNDARY_METHOD!r}"
+            )
+        if row.get("review_required") is not True:
+            raise ProductionWemmReviewPackAggregateError(f"{field}.review_required must be true")
+        if row.get("automatic_eligible") is not False:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.automatic_eligible must be false"
+            )
+        boundary_status = _text(row.get("boundary_status"))
+        if boundary_status is not None:
+            boundary_status = boundary_status.upper()
+        if boundary_status not in REFINED_BOUNDARY_STATUSES:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.boundary_status must be one of {', '.join(REFINED_BOUNDARY_STATUSES)}"
+            )
+        coarse = _mapping(row.get("coarse_interval"), field=f"{field}.coarse_interval")
+        coarse_start = _finite(coarse.get("start_seconds"))
+        coarse_end = _finite(coarse.get("end_seconds"))
+        if (
+            coarse_start is None
+            or coarse_end is None
+            or coarse_start < 0.0
+            or coarse_end <= coarse_start
+        ):
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field}.coarse_interval must satisfy 0 <= start < end"
+            )
+        start = _finite(row.get("start_seconds"))
+        end = _finite(row.get("end_seconds"))
+        if boundary_status == REFINED_BOUNDARY_STATUS:
+            if start is None or end is None or start < 0.0 or end <= start:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{field} interval must satisfy 0 <= start < end"
+                )
+        elif start is not None or end is not None:
+            raise ProductionWemmReviewPackAggregateError(
+                f"{field} pending rows must omit start/end"
+            )
+        _assert_no_gold(row, field=field)
+        copied = _copy_json(row, field=field)
+        if not isinstance(copied, dict):  # pragma: no cover - helper invariant
+            raise ProductionWemmReviewPackAggregateError(f"{field} must be an object")
+        copied.setdefault("context_only", True)
+        copied.setdefault("window_context_only", True)
+        copied.setdefault("is_action_boundary", False)
+        copied.setdefault("action_boundary", False)
+        copied["boundary_status"] = boundary_status
+        return copied
+
+    normalised: list[tuple[str, list[dict[str, Any]]]] = []
+    for key, rows in candidates:
+        seen_ids: set[str] = set()
+        checked_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            checked = _validate_refined(row, field=f"{path}.{key}[{index}]")
+            row_id = str(checked["segment_id"])
+            if row_id in seen_ids:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{path}.{key}[{index}].segment_id must be unique"
+                )
+            seen_ids.add(row_id)
+            checked_rows.append(checked)
+        normalised.append(
+            (
+                key,
+                checked_rows,
+            )
+        )
+    if normalised:
+        first_key, refined_rows = normalised[0]
+        for key, rows in normalised[1:]:
+            if rows != refined_rows:
+                raise ProductionWemmReviewPackAggregateError(
+                    f"{path}.{key} does not match {path}.{first_key}"
+                )
+    else:
+        refined_rows = []
+
+    # Ensure the nested applied sidecar carries the same row snapshot when it
+    # exposes one.  This check catches a stale top-level alias before a batch
+    # aggregate can flatten divergent evidence.
+    if applied is not None and "refined_segments" in applied:
+        applied["refined_segments"] = _copy_json(
+            refined_rows, field=f"{path}.temporal_refinement.refined_segments"
+        )
+    return {
+        "plan": sidecars.get("temporal_refinement_plan"),
+        "fine_plan": sidecars.get("temporal_refinement_fine_plan"),
+        "score_resolution": sidecars.get("temporal_refinement_score_resolution"),
+        "applied": applied,
+        "segments": refined_rows,
+        "present": bool(sidecars or candidates),
+    }
 
 
 def aggregate_production_wemm_review_packs(
@@ -655,6 +1031,10 @@ def aggregate_production_wemm_review_packs(
     temporal_boundary_statuses: Counter[str] = Counter()
     temporal_sidecar_recordings: list[dict[str, Any]] = []
     flattened_temporal_segments: list[dict[str, Any]] = []
+    temporal_refinement_recordings: list[dict[str, Any]] = []
+    flattened_temporal_refinement_segments: list[dict[str, Any]] = []
+    flattened_refined_temporal_interval_proposals: list[dict[str, Any]] = []
+    refined_temporal_boundary_statuses: Counter[str] = Counter()
     duplicate_recordings: list[str] = []
     duplicate_window_keys: list[str] = []
 
@@ -698,21 +1078,24 @@ def aggregate_production_wemm_review_packs(
                         else "PROPOSALS_ONLY"
                     ),
                     "segment_count": len(temporal_segments),
-                    "parameters": (
-                        _copy_json(
-                            temporal_resolution.get("parameters", {}),
-                            field=f"{pack_path}.temporal_resolution.parameters",
-                        )
-                        if temporal_resolution is not None
-                        else {},
-                    ),
-                    "diagnostics": (
-                        _copy_json(
-                            temporal_resolution.get("diagnostics", {}),
-                            field=f"{pack_path}.temporal_resolution.diagnostics",
-                        )
-                        if temporal_resolution is not None
-                        else {},
+                    "parameters": _copy_json(
+                        temporal_resolution.get("parameters", {}),
+                        field=f"{pack_path}.temporal_resolution.parameters",
+                    )
+                    if temporal_resolution is not None
+                    else {},
+                    "diagnostics": _copy_json(
+                        temporal_resolution.get("diagnostics", {}),
+                        field=f"{pack_path}.temporal_resolution.diagnostics",
+                    )
+                    if temporal_resolution is not None
+                    else {},
+                    # Keep the complete detached sidecar available to audit
+                    # consumers; the compact fields above remain convenient
+                    # summary projections.
+                    "sidecar": _copy_json(
+                        temporal_resolution,
+                        field=f"{pack_path}.temporal_resolution",
                     ),
                 }
             )
@@ -725,30 +1108,114 @@ def aggregate_production_wemm_review_packs(
                     raise ProductionWemmReviewPackAggregateError(
                         f"{pack_path}.temporal_segments[{segment_index}] must be an object"
                     )
-                segment_id = _text(segment.get("segment_id")) or f"segment-{segment_index:04d}"
+                segment_id = _text(segment.get("segment_id"))
+                if segment_id is None:  # pragma: no cover - validated upstream
+                    raise ProductionWemmReviewPackAggregateError(
+                        f"{pack_path}.temporal_segments[{segment_index}].segment_id is required"
+                    )
                 temporal_key = f"{recording_id}::temporal::{segment_id}"
                 boundary_status = _text(segment.get("boundary_status"))
                 if boundary_status:
                     temporal_boundary_statuses[boundary_status.upper()] += 1
-                segment.update(
+                segment["recording_id"] = recording_id
+                segment["recording_index"] = recording_index
+                segment["temporal_segment_key"] = temporal_key
+                segment["source_ref"] = _merge_lineage(
+                    segment.get("source_ref"),
                     {
                         "recording_id": recording_id,
-                        "recording_index": recording_index,
-                        "temporal_segment_key": temporal_key,
-                        "source_ref": {
-                            "recording_id": recording_id,
-                            "review_pack_path": pack_path,
-                            "source_path": source.get("path"),
-                            "archive_member": source.get("archive_member"),
-                        },
-                        "provenance": {
-                            "review_pack_path": pack_path,
-                            "window_context_only": True,
-                            "model_boundary_sidecar": True,
-                        },
-                    }
+                        "review_pack_path": pack_path,
+                        "source_path": source.get("path"),
+                        "archive_member": source.get("archive_member"),
+                    },
+                    field=f"{pack_path}.temporal_segments[{segment_index}].source_ref",
+                )
+                segment["provenance"] = _merge_lineage(
+                    segment.get("provenance"),
+                    {
+                        "review_pack_path": pack_path,
+                        "window_context_only": True,
+                        "model_boundary_sidecar": True,
+                    },
+                    field=f"{pack_path}.temporal_segments[{segment_index}].provenance",
                 )
                 flattened_temporal_segments.append(segment)
+        temporal_refinement = _temporal_refinement_sidecar_parts(pack, path=pack_path)
+        refined_rows = temporal_refinement["segments"]
+        if temporal_refinement.get("present"):
+            refined_measured_rows: list[dict[str, Any]] = []
+            for segment_index, raw_segment in enumerate(refined_rows):
+                segment = _copy_json(
+                    raw_segment,
+                    field=f"{pack_path}.temporal_refinement_segments[{segment_index}]",
+                )
+                if not isinstance(segment, dict):  # pragma: no cover - helper invariant
+                    raise ProductionWemmReviewPackAggregateError(
+                        f"{pack_path}.temporal_refinement_segments[{segment_index}] "
+                        "must be an object"
+                    )
+                segment_id = _text(segment.get("segment_id"))
+                if segment_id is None:  # pragma: no cover - validated upstream
+                    raise ProductionWemmReviewPackAggregateError(
+                        f"{pack_path}.temporal_refinement_segments[{segment_index}].segment_id "
+                        "is required"
+                    )
+                temporal_key = f"{recording_id}::temporal-refined::{segment_id}"
+                boundary_status = _text(segment.get("boundary_status"))
+                if boundary_status:
+                    refined_temporal_boundary_statuses[boundary_status.upper()] += 1
+                segment["recording_id"] = recording_id
+                segment["recording_index"] = recording_index
+                segment["refined_temporal_segment_key"] = temporal_key
+                segment["source_ref"] = _merge_lineage(
+                    segment.get("source_ref"),
+                    {
+                        "recording_id": recording_id,
+                        "review_pack_path": pack_path,
+                        "source_path": source.get("path"),
+                        "archive_member": source.get("archive_member"),
+                    },
+                    field=(f"{pack_path}.temporal_refinement_segments[{segment_index}].source_ref"),
+                )
+                segment["provenance"] = _merge_lineage(
+                    segment.get("provenance"),
+                    {
+                        "review_pack_path": pack_path,
+                        "window_context_only": True,
+                        "model_boundary_sidecar": False,
+                        "model_refinement_sidecar": True,
+                    },
+                    field=(f"{pack_path}.temporal_refinement_segments[{segment_index}].provenance"),
+                )
+                flattened_temporal_refinement_segments.append(segment)
+                if boundary_status == REFINED_BOUNDARY_STATUS:
+                    refined_measured_rows.append(segment)
+            flattened_refined_temporal_interval_proposals.extend(refined_measured_rows)
+            temporal_refinement_recordings.append(
+                {
+                    "recording_id": recording_id,
+                    "review_pack_path": pack_path,
+                    "plan": _copy_json(
+                        temporal_refinement.get("plan"),
+                        field=f"{pack_path}.temporal_refinement_plan",
+                    ),
+                    "fine_plan": _copy_json(
+                        temporal_refinement.get("fine_plan"),
+                        field=f"{pack_path}.temporal_refinement_fine_plan",
+                    ),
+                    "score_resolution": _copy_json(
+                        temporal_refinement.get("score_resolution"),
+                        field=f"{pack_path}.temporal_refinement_score_resolution",
+                    ),
+                    "applied": _copy_json(
+                        temporal_refinement.get("applied"),
+                        field=f"{pack_path}.temporal_refinement",
+                    ),
+                    "refined_segment_count": len(refined_rows),
+                    "measured_segment_count": len(refined_measured_rows),
+                    "pending_segment_count": len(refined_rows) - len(refined_measured_rows),
+                }
+            )
         provenance = {
             "review_pack_path": pack_path,
             "recording_id": recording_id,
@@ -769,6 +1236,19 @@ def aggregate_production_wemm_review_packs(
                     if "temporal_segments" in pack
                     else None
                 )
+            ),
+            "temporal_refinement": (
+                {
+                    "segment_count": len(refined_rows),
+                    "measured_segment_count": sum(
+                        1
+                        for row in refined_rows
+                        if _text(row.get("boundary_status")) == REFINED_BOUNDARY_STATUS
+                    ),
+                    "present": bool(temporal_refinement.get("present")),
+                }
+                if temporal_refinement.get("present")
+                else None
             ),
         }
         recordings.append(provenance)
@@ -841,18 +1321,26 @@ def aggregate_production_wemm_review_packs(
                     "recording_id": recording_id,
                     "recording_index": recording_index,
                     "item_key": item_key,
-                    "source_ref": {
-                        "recording_id": recording_id,
-                        "review_pack_path": pack_path,
-                        "source_path": source.get("path"),
-                        "archive_member": source.get("archive_member"),
-                    },
-                    "provenance": {
-                        "review_pack_path": pack_path,
-                        "source_preflight_status": source.get("source_preflight_status"),
-                        "qa_status": source.get("qa_status"),
-                        "window_context_only": True,
-                    },
+                    "source_ref": _merge_lineage(
+                        copied_item.get("source_ref"),
+                        {
+                            "recording_id": recording_id,
+                            "review_pack_path": pack_path,
+                            "source_path": source.get("path"),
+                            "archive_member": source.get("archive_member"),
+                        },
+                        field=f"{pack_path}.items[{item_index}].source_ref",
+                    ),
+                    "provenance": _merge_lineage(
+                        copied_item.get("provenance"),
+                        {
+                            "review_pack_path": pack_path,
+                            "source_preflight_status": source.get("source_preflight_status"),
+                            "qa_status": source.get("qa_status"),
+                            "window_context_only": True,
+                        },
+                        field=f"{pack_path}.items[{item_index}].provenance",
+                    ),
                 }
             )
             flattened_items.append(copied_item)
@@ -889,6 +1377,14 @@ def aggregate_production_wemm_review_packs(
         "temporal_sidecar_recording_count": len(temporal_sidecar_recordings),
         "temporal_segment_count": len(flattened_temporal_segments),
         "temporal_boundary_status_counts": dict(sorted(temporal_boundary_statuses.items())),
+        "temporal_refinement_recording_count": len(temporal_refinement_recordings),
+        "refined_temporal_segment_count": len(flattened_temporal_refinement_segments),
+        "refined_temporal_interval_proposal_count": len(
+            flattened_refined_temporal_interval_proposals
+        ),
+        "refined_temporal_boundary_status_counts": dict(
+            sorted(refined_temporal_boundary_statuses.items())
+        ),
         "observed_camera_ids": sorted(observed_camera_ids),
         "input_source_count": len(input_sources),
         "checkpoint_count": len(checkpoint_sources),
@@ -937,9 +1433,23 @@ def aggregate_production_wemm_review_packs(
                 "top_k",
                 "margin",
             ],
-            "temporal_sidecar_fields": ["temporal_resolution", "temporal_segments"],
+            "temporal_sidecar_fields": [
+                "temporal_resolution",
+                "temporal_segments",
+                "temporal_refinement_plan",
+                "temporal_refinement_fine_plan",
+                "temporal_refinement_score_resolution",
+                "temporal_refinement",
+                "refined_segments",
+                "refined_temporal_segments",
+                "temporal_refinement_segments",
+                "refined_temporal_interval_proposals",
+            ],
             "temporal_segments_review_only": True,
             "temporal_segments_are_action_boundary_proposals": True,
+            "temporal_refinement_review_only": True,
+            "refined_segments_review_only": True,
+            "refined_segments_are_action_boundary_proposals": True,
         },
         "source": {
             "kind": "multi_recording",
@@ -951,14 +1461,45 @@ def aggregate_production_wemm_review_packs(
         "items": flattened_items,
         "temporal_resolution": {
             "recordings": temporal_sidecar_recordings,
-            "segments": flattened_temporal_segments,
+            "segments": _copy_json(
+                flattened_temporal_segments, field="aggregate.temporal_resolution.segments"
+            ),
             "segment_count": len(flattened_temporal_segments),
             "boundary_status_counts": dict(sorted(temporal_boundary_statuses.items())),
             "review_only": True,
         },
         # Compact alias for consumers that only need proposed intervals and
         # not per-recording temporal parameters/diagnostics.
-        "temporal_segments": flattened_temporal_segments,
+        "temporal_segments": _copy_json(
+            flattened_temporal_segments, field="aggregate.temporal_segments"
+        ),
+        "temporal_refinement": {
+            "recordings": temporal_refinement_recordings,
+            "segments": _copy_json(
+                flattened_temporal_refinement_segments,
+                field="aggregate.temporal_refinement.segments",
+            ),
+            "refined_temporal_interval_proposals": _copy_json(
+                flattened_refined_temporal_interval_proposals,
+                field="aggregate.temporal_refinement.refined_temporal_interval_proposals",
+            ),
+            "segment_count": len(flattened_temporal_refinement_segments),
+            "measured_segment_count": len(flattened_refined_temporal_interval_proposals),
+            "boundary_status_counts": dict(sorted(refined_temporal_boundary_statuses.items())),
+            "review_only": True,
+        },
+        "temporal_refinement_segments": _copy_json(
+            flattened_temporal_refinement_segments,
+            field="aggregate.temporal_refinement_segments",
+        ),
+        "refined_temporal_segments": _copy_json(
+            flattened_temporal_refinement_segments,
+            field="aggregate.refined_temporal_segments",
+        ),
+        "refined_temporal_interval_proposals": _copy_json(
+            flattened_refined_temporal_interval_proposals,
+            field="aggregate.refined_temporal_interval_proposals",
+        ),
         "summary": summary,
         "provenance": {
             "input_pack_count": len(valid),
@@ -996,6 +1537,8 @@ def aggregate_production_wemm_review_packs(
             "Processing-window intervals remain context only; action boundaries are not inferred.",
             "Temporal segments are model-derived review proposals and are not "
             "measured/gold boundaries.",
+            "Adaptive refined segments are additive review proposals; pending rows "
+            "remain unresolved.",
             "WeMM Top-K and margins are preserved as retrieval evidence, not probabilities.",
             "Qwen and Mage artifacts are intentionally not read or merged.",
             "Duplicate recording/item keys are reported and never silently collapsed.",
@@ -1014,6 +1557,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     margin_json = json.dumps(summary.get("margin_summary", {}), sort_keys=True)
     temporal_status_json = json.dumps(
         summary.get("temporal_boundary_status_counts", {}), sort_keys=True
+    )
+    refined_status_json = json.dumps(
+        summary.get("refined_temporal_boundary_status_counts", {}), sort_keys=True
     )
     lines = [
         "# Production WeMM review-pack aggregate",
@@ -1051,6 +1597,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "- Model-derived interval proposals (review only): "
         f"{summary.get('temporal_segment_count', 0)}",
         f"- Boundary statuses: `{temporal_status_json}`",
+        f"- Adaptive refined recordings: {summary.get('temporal_refinement_recording_count', 0)}",
+        "- Adaptive refined rows (review only): "
+        f"{summary.get('refined_temporal_segment_count', 0)}",
+        "- Measured refined interval proposals: "
+        f"{summary.get('refined_temporal_interval_proposal_count', 0)}",
+        f"- Refined boundary statuses: `{refined_status_json}`",
         "",
         "## Limitations",
         "",
