@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
@@ -1448,7 +1448,12 @@ def run_production_qwen_ambiguity_batch(
                         "video_root": str(native_root),
                     }
                 )
+                stage_context: AbstractContextManager[Path]
                 if source_plan.source_mode == "ARCHIVE_MEMBER":
+                    if archive is None or member is None:
+                        raise ProductionQwenAmbiguityBatchError(
+                            f"recording {rid} has no archive source/member"
+                        )
                     stage_context = stage_zip_member(
                         archive,
                         member,
@@ -1460,6 +1465,10 @@ def run_production_qwen_ambiguity_batch(
                     # A direct local MCAP is already at its source path.  The
                     # no-op context preserves the existing lifecycle while
                     # avoiding a fabricated ZIP member or a second copy.
+                    if source_plan.source_path is None:
+                        raise ProductionQwenAmbiguityBatchError(
+                            f"recording {rid} has no direct MCAP source path"
+                        )
                     stage_context = nullcontext(source_plan.source_path)
                 with stage_context as staged:
                     if source_plan.source_mode == "ARCHIVE_MEMBER":

@@ -631,7 +631,7 @@ def _optional_int(value: Any, field: str, *, default: int | None = None) -> int 
         raise QwenNativeVideoBridgeError(
             "EXPORT_FACTS_INVALID", f"export facts field {field!r} must be an integer"
         )
-    return cast(int, raw)
+    return raw
 
 
 def _require_regular_file(path: Path, label: str) -> None:
