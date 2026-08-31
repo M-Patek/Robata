@@ -70,6 +70,12 @@ also moved intact to `archive/unregistered-snapshots-20260831/`. The active
 `mage-vnext-fix` alias was left in place because it shares worktree metadata
 with the temporary Qwen end-to-end checkout.
 
+The untracked Web/UI snapshot that was outside the current product baseline was
+moved intact to `archive/untracked-web-snapshot-20260831/`; the tracked web
+baseline was not edited.  A dangling Qwen/Mage stash discovered by `git fsck`
+was preserved with local archival refs and a manifest under
+`archive/dangling-stash-20260831/` before any pruning was considered.
+
 ## Deliberately retained
 
 Dirty worktrees, old branches with unresolved evidence, `root-local-snapshot`,
@@ -82,6 +88,6 @@ that main is missing code; they are retained review material or local data.
 
 This record is intentionally a small, documentation-only synchronization
 change. It does not modify schemas, Web/API/UI, model selection, or runtime
-behavior. After GitHub connectivity/authentication is restored, publish this
-branch as a small PR and merge only this record; do not publish the rejected
+behavior. It is published as PR #42 from the repaired branch; the PR differs
+from `main` only by this documentation file. Do not publish the rejected
 WeMM/Mage snapshots wholesale.
