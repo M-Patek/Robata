@@ -23,8 +23,76 @@ class _Image:
         self.convert_called = True
         return self
 
+    def copy(self):
+        copied = _Image(self.timestamp_ns)
+        copied.convert_called = self.convert_called
+        return copied
+
     def close(self) -> None:
         self.closed = True
+
+
+def test_short_context_padding_is_explicit_and_source_bound() -> None:
+    """Only the opt-in refinement path may fill a missing target slot."""
+
+    selected = {
+        0: {"delta": 1, "timestamp_ns": 100, "image": _Image(100)},
+        2: {"delta": 2, "timestamp_ns": 200, "image": _Image(200)},
+        3: {"delta": 3, "timestamp_ns": 300, "image": _Image(300)},
+    }
+    with pytest.raises(shadow.ProductionWemmShadowError, match="yielded 3/4"):
+        shadow._complete_selected_frames(
+            selected,
+            frame_count=4,
+            allow_frame_padding=False,
+            field="camera cam_01 window probe",
+        )
+
+    rows, padding_indices, observed = shadow._complete_selected_frames(
+        selected,
+        frame_count=4,
+        allow_frame_padding=True,
+        field="camera cam_01 window probe",
+    )
+    assert observed == 3
+    assert padding_indices == (1,)
+    assert len(rows) == 4
+    assert rows[1]["timestamp_ns"] == 100
+    assert rows[1]["image"] is not rows[0]["image"]
+
+    group = shadow.ProductionFrameGroup(
+        camera_id="cam_01",
+        window_id="probe",
+        frames=tuple(row["image"] for row in rows),
+        selected_timestamps_ns=tuple(int(row["timestamp_ns"]) for row in rows),
+        messages_examined=1,
+        decoded_frames=3,
+        decode_failures=(),
+        width=10,
+        height=8,
+        fps=30.0,
+        start_seconds=0.0,
+        end_seconds=0.25,
+        frame_count_requested=4,
+        frame_count_observed=observed,
+        frame_padding_indices=padding_indices,
+    )
+    metadata = group.metadata()
+    assert metadata["frame_count_requested"] == 4
+    assert metadata["frame_count_observed"] == 3
+    assert metadata["frame_padding_used"] is True
+    assert metadata["frame_padding_indices"] == [1]
+
+
+def test_short_context_padding_requires_two_real_frames() -> None:
+    selected = {0: {"delta": 1, "timestamp_ns": 100, "image": _Image(100)}}
+    with pytest.raises(shadow.ProductionWemmShadowError, match="yielded 1/4"):
+        shadow._complete_selected_frames(
+            selected,
+            frame_count=4,
+            allow_frame_padding=True,
+            field="camera cam_01 window probe",
+        )
 
 
 class _Frame:
@@ -189,6 +257,112 @@ def test_stateful_iterator_scans_source_once_and_preserves_window_order(
     assert first.decode_failures == ()
     assert second.decode_failures == ()
     assert all(not image.convert_called for image in (*first.frames, *second.frames))
+
+
+def test_short_refinement_context_can_opt_into_edge_frame_padding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A sub-frame edge probe is padded only on the explicit refinement path."""
+
+    _Decoder.instances.clear()
+    _Reader.iterations = 0
+    manifest = _manifest(tmp_path)
+    manifest["source"]["cameras"] = [
+        {
+            "camera_id": f"cam_{index:02d}",
+            "topic": f"/cam/{index}",
+            "frame_count": 20,
+            "duration_seconds": 1.0,
+        }
+        for index in range(1, 7)
+    ]
+    manifest["windows"] = [
+        {
+            "ordinal": 0,
+            "window_id": "edge",
+            "start_seconds": 0.0,
+            "end_seconds": 0.25,
+            "temporal_refinement": True,
+            "context_only": True,
+        }
+    ]
+    messages = []
+    # Three real frames fall into the short context; the fourth WeMM slot
+    # must be a separately-owned duplicate when padding is enabled.
+    for timestamp_ns in (0, 100_000_000, 200_000_000, 300_000_000):
+        for index in range(1, 7):
+            messages.append(
+                (
+                    SimpleNamespace(name="foxglove.CompressedImage"),
+                    SimpleNamespace(topic=f"/cam/{index}"),
+                    SimpleNamespace(log_time=timestamp_ns),
+                    SimpleNamespace(data=b"h264"),
+                )
+            )
+    reader = _Reader(messages)
+    fake_mcap = SimpleNamespace(make_reader=lambda *args, **kwargs: reader)
+    fake_decoder = SimpleNamespace(DecoderFactory=lambda: object())
+    fake_av = SimpleNamespace(CodecContext=_CodecContext, Packet=_Packet)
+    real_import = shadow.import_module
+
+    def fake_import(name: str):
+        if name == "av":
+            return fake_av
+        if name == "mcap.reader":
+            return fake_mcap
+        if name == "mcap_protobuf.decoder":
+            return fake_decoder
+        if name == "PIL.Image":
+            return SimpleNamespace()
+        return real_import(name)
+
+    monkeypatch.setattr(shadow, "import_module", fake_import)
+    with pytest.raises(shadow.ProductionWemmShadowError, match="3/4"):
+        list(
+            shadow.iter_decode_production_window_chunks(
+                manifest,
+                frame_count=4,
+                window_chunk_size=1,
+                allow_frame_padding=False,
+            )
+        )
+
+    # Recreate the fake reader/decoder state because the strict attempt has
+    # consumed the reader and codec instances.
+    _Decoder.instances.clear()
+    _Reader.iterations = 0
+    reader = _Reader(messages)
+    monkeypatch.setattr(
+        shadow,
+        "import_module",
+        lambda name: (
+            fake_av
+            if name == "av"
+            else fake_mcap
+            if name == "mcap.reader"
+            else fake_decoder
+            if name == "mcap_protobuf.decoder"
+            else SimpleNamespace()
+            if name == "PIL.Image"
+            else real_import(name)
+        ),
+    )
+    groups = list(
+        shadow.iter_decode_production_window_chunks(
+            manifest,
+            frame_count=4,
+            window_chunk_size=1,
+            allow_frame_padding=True,
+        )
+    )
+    group = groups[0]["cam_01"]["edge"]
+    assert len(group.frames) == 4
+    assert group.frame_count_requested == 4
+    assert group.frame_count_observed == 3
+    assert group.frame_padding_indices
+    assert group.metadata()["frame_padding_used"] is True
+    assert group.to_dict()["frame_count_observed"] == 3
+    assert group.frames[0] is not group.frames[1]
 
 
 def test_stateful_iterator_batches_windows_without_rescanning(

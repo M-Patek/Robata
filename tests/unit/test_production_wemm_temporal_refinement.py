@@ -261,3 +261,123 @@ def test_apply_rejects_unknown_request_and_source_relative_result_clock() -> Non
                 }
             },
         )
+
+
+def test_apply_rejects_onset_request_start_edge_as_uncertain() -> None:
+    """A short probe's leading edge is context, not a model-selected onset."""
+
+    coarse = _coarse_report()
+    plan = plan_wemm_temporal_refinement(coarse, refinement_span_seconds=1.0)
+    onset = next(row for row in plan["requests"] if row["role"] == "onset")  # type: ignore[index]
+
+    projected = apply_refined_boundaries(
+        coarse,
+        plan,
+        {
+            onset["request_id"]: {
+                "status": "MEASURED",
+                "timestamp_basis": "request_relative_seconds",
+                "start_seconds": 0.0,
+                "end_seconds": 0.40,
+                "confidence": 0.95,
+                "evidence": "the handle is already moving at probe start",
+            }
+        },
+    )
+
+    result = projected["temporal_refinement"]["results"][0]  # type: ignore[index]
+    assert result["status"] == "UNCERTAIN"
+    assert result["request_edge_rejected"] is True
+    assert result["source_start_seconds"] is None
+    assert result["source_end_seconds"] is None
+    assert result["raw"]["status"] == "MEASURED"
+    assert result["raw"]["start_seconds"] == 0.0
+    assert result["evidence"]["reason"] == "REQUEST_EDGE_NOT_MODEL_SELECTED"
+    assert result["evidence"]["model_evidence"] == ("the handle is already moving at probe start")
+    assert (
+        projected["temporal_refinement"]["diagnostics"]["request_edge_rejected_result_count"] == 1
+    )  # type: ignore[index]
+
+    refined = projected["refined_segments"][0]  # type: ignore[index]
+    assert refined["refinement_status"] == "UNRESOLVED"
+    assert refined["start_seconds"] is None
+    assert refined["end_seconds"] is None
+
+
+def test_apply_rejects_offset_request_end_edge_as_uncertain() -> None:
+    """A short probe's trailing edge is context, not a model-selected offset."""
+
+    coarse = _coarse_report()
+    plan = plan_wemm_temporal_refinement(coarse, refinement_span_seconds=1.0)
+    offset = next(row for row in plan["requests"] if row["role"] == "offset")  # type: ignore[index]
+
+    projected = apply_refined_boundaries(
+        coarse,
+        plan,
+        {
+            offset["request_id"]: {
+                "status": "MEASURED",
+                "timestamp_basis": "request_relative_seconds",
+                "start_seconds": 0.20,
+                "end_seconds": 1.0,
+                "confidence": 0.90,
+                "evidence": {"observation": "water remains visible at probe end"},
+            }
+        },
+    )
+
+    result = projected["temporal_refinement"]["results"][0]  # type: ignore[index]
+    assert result["status"] == "UNCERTAIN"
+    assert result["request_edge_rejected"] is True
+    assert result["source_start_seconds"] is None
+    assert result["source_end_seconds"] is None
+    assert result["raw"]["end_seconds"] == 1.0
+    assert result["evidence"]["reason"] == "REQUEST_EDGE_NOT_MODEL_SELECTED"
+    assert result["evidence"]["model_evidence"] == {
+        "observation": "water remains visible at probe end"
+    }
+    assert (
+        projected["temporal_refinement"]["diagnostics"]["request_edge_rejected_result_count"] == 1
+    )  # type: ignore[index]
+
+    refined = projected["refined_segments"][0]  # type: ignore[index]
+    assert refined["refinement_status"] == "UNRESOLVED"
+    assert refined["start_seconds"] is None
+    assert refined["end_seconds"] is None
+
+
+def test_apply_allows_non_projected_request_edge_as_uncertainty_envelope() -> None:
+    """Only the role's projected edge is protected; the other edge may touch."""
+
+    coarse = _coarse_report()
+    plan = plan_wemm_temporal_refinement(coarse, refinement_span_seconds=1.0)
+    onset = next(row for row in plan["requests"] if row["role"] == "onset")  # type: ignore[index]
+
+    projected = apply_refined_boundaries(
+        coarse,
+        plan,
+        {
+            onset["request_id"]: {
+                "status": "MEASURED",
+                "timestamp_basis": "request_relative_seconds",
+                "start_seconds": 0.20,
+                "end_seconds": 1.0,
+                "confidence": 0.80,
+                "evidence": "action remains visible through the probe end",
+            }
+        },
+    )
+
+    result = projected["temporal_refinement"]["results"][0]  # type: ignore[index]
+    assert result["status"] == "MEASURED"
+    assert result["request_edge_rejected"] is False
+    assert result["source_start_seconds"] == pytest.approx(2.20)
+    assert result["source_end_seconds"] == pytest.approx(3.0)
+    assert (
+        projected["temporal_refinement"]["diagnostics"]["request_edge_rejected_result_count"] == 0
+    )  # type: ignore[index]
+
+    refined = projected["refined_segments"][0]  # type: ignore[index]
+    assert refined["refinement_status"] == "PARTIAL"
+    assert refined["start_seconds"] is None
+    assert refined["end_seconds"] is None

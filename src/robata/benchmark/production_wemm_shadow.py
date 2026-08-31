@@ -78,9 +78,15 @@ class ProductionFrameGroup:
     fps: float
     start_seconds: float
     end_seconds: float
+    # These fields are populated only by the explicit short-context recovery
+    # path.  The ordinary production decoder remains strict and keeps the
+    # historical wire shape by leaving them unset.
+    frame_count_requested: int | None = None
+    frame_count_observed: int | None = None
+    frame_padding_indices: tuple[int, ...] = ()
 
     def metadata(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "total_num_frames": len(self.frames),
             "fps": self.fps,
             "width": self.width,
@@ -89,9 +95,19 @@ class ProductionFrameGroup:
             "frames_indices": list(range(len(self.frames))),
             "video_backend": "mcap-h264-bounded",
         }
+        if self.frame_count_requested is not None:
+            payload.update(
+                {
+                    "frame_count_requested": self.frame_count_requested,
+                    "frame_count_observed": self.frame_count_observed,
+                    "frame_padding_used": bool(self.frame_padding_indices),
+                    "frame_padding_indices": list(self.frame_padding_indices),
+                }
+            )
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "camera_id": self.camera_id,
             "window_id": self.window_id,
             "frame_count": len(self.frames),
@@ -105,6 +121,16 @@ class ProductionFrameGroup:
             "start_seconds": self.start_seconds,
             "end_seconds": self.end_seconds,
         }
+        if self.frame_count_requested is not None:
+            payload.update(
+                {
+                    "frame_count_requested": self.frame_count_requested,
+                    "frame_count_observed": self.frame_count_observed,
+                    "frame_padding_used": bool(self.frame_padding_indices),
+                    "frame_padding_indices": list(self.frame_padding_indices),
+                }
+            )
+        return payload
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
@@ -220,17 +246,94 @@ def _to_rgb_image(frame: Any) -> Any:
     return image.convert("RGB")
 
 
+def _copy_image_for_padding(image: Any) -> Any:
+    """Return an independently owned image for an edge-frame duplicate.
+
+    Short temporal refinement contexts can contain fewer distinct source
+    frames than the fixed WeMM input width (for example a 250 ms request at
+    the first camera timestamp).  Padding is an explicit opt-in recovery
+    policy, so every duplicate must own its image object; otherwise the
+    normal group cleanup could close the same PIL image more than once.
+    """
+
+    copy = getattr(image, "copy", None)
+    if callable(copy):
+        try:
+            copied = copy()
+            if copied is not image:
+                return copied
+        except Exception:
+            pass
+    convert = getattr(image, "convert", None)
+    if callable(convert):
+        try:
+            copied = convert("RGB")
+            if copied is not image:
+                return copied
+        except Exception:
+            pass
+    raise ProductionWemmShadowError(
+        "short temporal context requires an independently copyable image for frame padding"
+    )
+
+
+def _complete_selected_frames(
+    selected: Mapping[int, Mapping[str, Any]],
+    *,
+    frame_count: int,
+    allow_frame_padding: bool,
+    field: str,
+) -> tuple[list[dict[str, Any]], tuple[int, ...], int]:
+    """Materialise exactly ``frame_count`` rows, optionally edge-padding.
+
+    Strict decoding keeps the historical failure behavior.  The adaptive
+    refinement route may opt into padding when at least two real frames were
+    observed; this handles source-edge timestamp quantisation without
+    fabricating a completely empty visual context.  Padding is nearest-index
+    duplication and is surfaced in group metadata for review.
+    """
+
+    observed = len(selected)
+    if observed == frame_count:
+        return [dict(selected[index]) for index in range(frame_count)], (), observed
+    if not allow_frame_padding or observed < 2 or observed > frame_count:
+        raise ProductionWemmShadowError(f"{field} yielded {observed}/{frame_count} frames")
+
+    available = sorted(selected)
+    rows: list[dict[str, Any]] = []
+    padding_indices: list[int] = []
+    for index in range(frame_count):
+        existing = selected.get(index)
+        if existing is not None:
+            rows.append(dict(existing))
+            continue
+        nearest_index = min(available, key=lambda candidate: abs(candidate - index))
+        source = selected[nearest_index]
+        duplicate = dict(source)
+        duplicate["image"] = _copy_image_for_padding(source["image"])
+        duplicate["padded"] = True
+        rows.append(duplicate)
+        padding_indices.append(index)
+    return rows, tuple(padding_indices), observed
+
+
 def decode_production_windows(
     manifest: Mapping[str, Any],
     *,
     frame_count: int = 4,
     validate_crcs: bool = False,
+    allow_frame_padding: bool = False,
 ) -> dict[str, dict[str, ProductionFrameGroup]]:
     """Decode a small, bounded frame set for every camera/window.
 
     Decoding is source-bound and keeps only the nearest decoded frame for each
     requested sample time.  The H.264 decoder still receives packets from the
     beginning of the recording so inter-frame dependencies are preserved.
+
+    ``allow_frame_padding`` is an explicit short-context recovery seam for
+    adaptive temporal probes.  When enabled, a context with at least two real
+    frames may repeat the nearest selected frame to satisfy the fixed WeMM
+    input width; ordinary/coarse calls remain strict by default.
     """
 
     frame_count = _positive_int(frame_count, field="frame_count")
@@ -238,6 +341,8 @@ def decode_production_windows(
         raise ProductionWemmShadowError("frame_count must be between 2 and 64")
     if not isinstance(validate_crcs, bool):
         raise ProductionWemmShadowError("validate_crcs must be boolean")
+    if not isinstance(allow_frame_padding, bool):
+        raise ProductionWemmShadowError("allow_frame_padding must be boolean")
     source, common_start, windows, camera_pairs = _load_manifest(manifest)
     try:
         av = import_module("av")
@@ -384,12 +489,12 @@ def decode_production_windows(
         for window in windows:
             window_id = window["window_id"]
             selected = state["selected"][window_id]["frames"]
-            if len(selected) != frame_count:
-                raise ProductionWemmShadowError(
-                    f"camera {camera_id} window {window_id} yielded "
-                    f"{len(selected)}/{frame_count} frames"
-                )
-            ordered = [selected[index] for index in range(frame_count)]
+            ordered, padding_indices, observed_count = _complete_selected_frames(
+                selected,
+                frame_count=frame_count,
+                allow_frame_padding=allow_frame_padding,
+                field=f"camera {camera_id} window {window_id}",
+            )
             first_image = ordered[0]["image"]
             result[camera_id][window_id] = ProductionFrameGroup(
                 camera_id=camera_id,
@@ -404,6 +509,9 @@ def decode_production_windows(
                 fps=fps_by_camera[camera_id],
                 start_seconds=float(window["start_seconds"]),
                 end_seconds=float(window["end_seconds"]),
+                frame_count_requested=frame_count if allow_frame_padding else None,
+                frame_count_observed=observed_count if allow_frame_padding else None,
+                frame_padding_indices=padding_indices,
             )
     return result
 
@@ -414,6 +522,7 @@ def iter_decode_production_window_chunks(
     frame_count: int = 4,
     validate_crcs: bool = False,
     window_chunk_size: int = 1,
+    allow_frame_padding: bool = False,
 ) -> Iterator[dict[str, dict[str, ProductionFrameGroup]]]:
     """Yield decoded windows in bounded chunks while decoding the source once.
 
@@ -429,6 +538,10 @@ def iter_decode_production_window_chunks(
     yielded group are cumulative for that camera up to the emitted chunk, which
     matches the legacy decoder's cumulative metadata semantics.  Recoverable
     codec errors are retained as warnings and never terminate the iterator.
+
+    ``allow_frame_padding`` has the same explicit adaptive-probe meaning as in
+    :func:`decode_production_windows`; when used, padding provenance is carried
+    on each affected :class:`ProductionFrameGroup`.
     """
 
     frame_count = _positive_int(frame_count, field="frame_count")
@@ -436,6 +549,8 @@ def iter_decode_production_window_chunks(
         raise ProductionWemmShadowError("frame_count must be between 2 and 64")
     if not isinstance(validate_crcs, bool):
         raise ProductionWemmShadowError("validate_crcs must be boolean")
+    if not isinstance(allow_frame_padding, bool):
+        raise ProductionWemmShadowError("allow_frame_padding must be boolean")
     window_chunk_size = _positive_int(window_chunk_size, field="window_chunk_size")
     source, common_start, windows, camera_pairs = _load_manifest(manifest)
     try:
@@ -727,7 +842,12 @@ def iter_decode_production_window_chunks(
             if not state.get("past_end", False):
                 return False
             for spec in chunk_specs:
-                if len(state["selected"][str(spec["window_id"])]) != frame_count:
+                selected_count = len(state["selected"][str(spec["window_id"])])
+                if selected_count == frame_count:
+                    continue
+                if allow_frame_padding and selected_count >= 2:
+                    continue
+                if selected_count != frame_count:
                     return False
         return True
 
@@ -742,12 +862,12 @@ def iter_decode_production_window_chunks(
             for spec in chunk_specs:
                 window_id = str(spec["window_id"])
                 selected = state["selected"][window_id]
-                if len(selected) != frame_count:
-                    raise ProductionWemmShadowError(
-                        f"camera {camera_id} window {window_id} yielded "
-                        f"{len(selected)}/{frame_count} frames"
-                    )
-                ordered = [selected[index] for index in range(frame_count)]
+                ordered, padding_indices, observed_count = _complete_selected_frames(
+                    selected,
+                    frame_count=frame_count,
+                    allow_frame_padding=allow_frame_padding,
+                    field=f"camera {camera_id} window {window_id}",
+                )
                 first_image = ordered[0]["image"]
                 result[camera_id][window_id] = ProductionFrameGroup(
                     camera_id=camera_id,
@@ -762,6 +882,9 @@ def iter_decode_production_window_chunks(
                     fps=fps_by_camera[camera_id],
                     start_seconds=float(spec["start_seconds"]),
                     end_seconds=float(spec["end_seconds"]),
+                    frame_count_requested=frame_count if allow_frame_padding else None,
+                    frame_count_observed=observed_count if allow_frame_padding else None,
+                    frame_padding_indices=padding_indices,
                 )
         return result
 

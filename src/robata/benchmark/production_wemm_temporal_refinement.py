@@ -40,6 +40,7 @@ REQUEST_TIMESTAMP_BASIS: Final = "request_relative_seconds"
 DEFAULT_REFINEMENT_SPAN_SECONDS: Final = 1.0
 DEFAULT_MAX_REQUESTS: Final = 128
 DEFAULT_MIN_REQUEST_SPAN_SECONDS: Final = 0.10
+_REQUEST_EDGE_EPSILON: Final = 1e-9
 ROLES: Final = ("onset", "offset")
 RESULT_STATUSES: Final = ("MEASURED", "UNCERTAIN", "NONE_VISIBLE", "ABSTAIN", "INVALID")
 
@@ -592,6 +593,7 @@ def _normalise_result(
     relative_end: float | None = None
     source_start: float | None = None
     source_end: float | None = None
+    request_edge_rejected = False
     if start_raw is not None and end_raw is not None:
         basis_raw = raw_result.get("timestamp_basis", raw_result.get("coordinate_mode"))
         if basis_raw is None:
@@ -623,6 +625,45 @@ def _normalise_result(
         source_start = request_start + relative_start
         source_end = request_start + relative_end
 
+        # A refinement request is a bounded visual context, never an action
+        # interval.  ``apply_refined_boundaries`` uses the leading edge of an
+        # ONSET result and the trailing edge of an OFFSET result as the
+        # proposed timestamps.  Do not let a model turn an unobserved request
+        # edge into either timestamp merely by returning a full/clipped
+        # context interval.  The non-relevant side may touch an edge because
+        # it can be an uncertainty envelope; only the role's projected edge
+        # is disallowed here.
+        role = _text(request.get("role"), field=f"request[{request_id}].role").casefold()
+        request_edge_rejected = (role == "onset" and relative_start <= _REQUEST_EDGE_EPSILON) or (
+            role == "offset" and relative_end >= request_duration - _REQUEST_EDGE_EPSILON
+        )
+        if request_edge_rejected:
+            projected_edge = "start_seconds" if role == "onset" else "end_seconds"
+            evidence = {
+                "reason": "REQUEST_EDGE_NOT_MODEL_SELECTED",
+                "role": role,
+                "projected_edge": projected_edge,
+                "request_interval": {
+                    "start_seconds": request_start,
+                    "end_seconds": request_end,
+                },
+                "reported_request_relative_interval": {
+                    "start_seconds": relative_start,
+                    "end_seconds": relative_end,
+                },
+                "model_evidence": evidence,
+                "must_not_copy_request_edges": True,
+            }
+            # Preserve the raw result/evidence, but make its normalized status
+            # unresolved so it cannot be projected as a model-selected action
+            # boundary.  This is intentionally not a hard run failure: a
+            # review pack should retain the failed localization evidence.
+            status = "UNCERTAIN"
+            relative_start = None
+            relative_end = None
+            source_start = None
+            source_end = None
+
     return {
         "request_id": request_id,
         "status": status,
@@ -633,6 +674,7 @@ def _normalise_result(
         "source_end_seconds": source_end,
         "confidence": confidence,
         "evidence": evidence,
+        "request_edge_rejected": request_edge_rejected,
         "raw": _copy_json(raw_result, field=f"results[{request_id}].raw"),
     }
 
@@ -805,6 +847,9 @@ def apply_refined_boundaries(
                     "start_seconds": segment_start,
                     "end_seconds": segment_end,
                     "status": "MODEL_PROBE_BOUND",
+                    "context_only": True,
+                    "is_action_boundary": False,
+                    "action_boundary": False,
                 },
                 "start_seconds": onset_boundary if refined_interval is not None else None,
                 "end_seconds": offset_boundary if refined_interval is not None else None,
@@ -813,6 +858,14 @@ def apply_refined_boundaries(
                 ),
                 "boundary_source": "wemm_short_refinement",
                 "boundary_method": "short_probe_model",
+                "production_eligible": False,
+                # A refined row is still model evidence for review.  These
+                # explicit markers prevent a short-probe span from being
+                # promoted as an action boundary by a generic reader.
+                "context_only": True,
+                "window_context_only": True,
+                "is_action_boundary": False,
+                "action_boundary": False,
                 "refined_interval": refined_interval,
                 "refinement_status": refinement_status,
                 "onset_request_id": (
@@ -831,6 +884,9 @@ def apply_refined_boundaries(
         refined_segments.append(refined)
 
     normalised_results = [results_by_id[key] for key in sorted(results_by_id)]
+    request_edge_rejected_count = sum(
+        result.get("request_edge_rejected") is True for result in normalised_results
+    )
     projection = {
         "format": APPLIED_FORMAT,
         "authority": AUTHORITY,
@@ -845,6 +901,8 @@ def apply_refined_boundaries(
                 "start_seconds": source_start,
                 "end_seconds": source_end,
                 "context_only": True,
+                "is_action_boundary": False,
+                "action_boundary": False,
             },
         },
         "requests": [
@@ -860,6 +918,7 @@ def apply_refined_boundaries(
             "partial_segment_count": partial_count,
             "unresolved_segment_count": unresolved_count,
             "invalid_pair_count": invalid_pair_count,
+            "request_edge_rejected_result_count": request_edge_rejected_count,
             "coarse_segments_preserved": True,
         },
         "controls": {
