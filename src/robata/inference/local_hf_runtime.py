@@ -20,6 +20,7 @@ class LocalHuggingFaceRuntimeError(RuntimeError):
 
 LOCAL_HF_MAX_BATCH_REQUESTS: Final = 8
 LOCAL_HF_MAX_IMAGES_PER_REQUEST: Final = 6
+LOCAL_HF_MIN_VIDEO_FRAMES: Final = 2
 LOCAL_HF_MAX_VIDEO_FRAMES: Final = 32
 
 
@@ -977,6 +978,15 @@ def _validate_video_request(request: LocalHfVideoGenerationRequest) -> None:
         raise LocalHuggingFaceRuntimeError("total_num_frames must be an integer")
     if request.total_num_frames <= 0:
         raise LocalHuggingFaceRuntimeError("total_num_frames must be positive")
+    if request.total_num_frames < LOCAL_HF_MIN_VIDEO_FRAMES:
+        raise LocalHuggingFaceRuntimeError(
+            "native video source must contain at least two physical frames for "
+            "Qwen temporal patches"
+        )
+    if count < LOCAL_HF_MIN_VIDEO_FRAMES:
+        raise LocalHuggingFaceRuntimeError(
+            "native video requires at least two sampled frames for Qwen temporal patches"
+        )
     if isinstance(request.width, bool) or not isinstance(request.width, int) or request.width <= 0:
         raise LocalHuggingFaceRuntimeError("width must be a positive integer")
     if (
@@ -1138,6 +1148,7 @@ __all__ = [
     "LOCAL_HF_MAX_BATCH_REQUESTS",
     "LOCAL_HF_MAX_IMAGES_PER_REQUEST",
     "LOCAL_HF_MAX_VIDEO_FRAMES",
+    "LOCAL_HF_MIN_VIDEO_FRAMES",
     "LocalHfBatchGenerationObservation",
     "LocalHfBatchGenerationRequest",
     "LocalHfBatchMemberObservation",
