@@ -11,8 +11,9 @@ from __future__ import annotations
 import importlib
 import math
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 QWEN_NATIVE_VIDEO_INPUT_VERSION = "qwen-native-video-input-v1"
 QWEN_NATIVE_VIDEO_MAX_FRAMES = 32
@@ -200,71 +201,220 @@ def sample_qwen_native_video(
         raise QwenNativeVideoInputError(f"video path is not a file: {path}")
 
     try:
-        # OpenCV is an optional runtime dependency and is not installed in the
-        # type-checking environment.  Import it dynamically so mypy does not
-        # require a cv2 stub while the runtime still reports a clear error.
-        cv2: Any = importlib.import_module("cv2")
-        import numpy as np
+        # PyAV is already the repository's canonical optional codec dependency.
+        # Import it dynamically so the core package remains importable without
+        # media extras while this benchmark reports a useful runtime error.
+        av: Any = importlib.import_module("av")
     except ImportError as error:
-        raise QwenNativeVideoInputError(
-            "native-video sampling requires opencv-python and numpy"
-        ) from error
+        raise QwenNativeVideoInputError("native-video sampling requires the av package") from error
 
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise QwenNativeVideoInputError(f"unable to open video: {path}")
     try:
-        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
-        total_num_frames = round(float(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-        width = round(float(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        height = round(float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not math.isfinite(source_fps) or source_fps <= 0:
-            raise QwenNativeVideoInputError("video does not expose a positive source FPS")
-        if total_num_frames <= 0 or width <= 0 or height <= 0:
-            raise QwenNativeVideoInputError("video metadata is incomplete")
+        container = av.open(str(path), mode="r")
+    except Exception as error:
+        raise QwenNativeVideoInputError(f"unable to open video: {path}") from error
+    try:
+        streams = list(container.streams.video)
+        if not streams:
+            raise QwenNativeVideoInputError("video does not contain a video stream")
+        stream = streams[0]
+        source_fps = _stream_frame_rate(stream)
+        width, height = _stream_dimensions(stream)
+        total_num_frames = _stream_frame_count(stream, source_fps)
         duration = total_num_frames / source_fps
+        if start_seconds >= duration:
+            raise QwenNativeVideoInputError(
+                "requested interval does not overlap the video duration "
+                f"({start_seconds:.6f}s >= {duration:.6f}s)"
+            )
+        # A candidate interval may run a little past the physical recording
+        # tail.  Clamp its semantic endpoint before constructing the runtime
+        # request; otherwise the sampler would return an object that the native
+        # runtime correctly rejects as outside ``duration_seconds``.
+        interval_end = min(end_seconds, duration)
         window_start = max(0.0, start_seconds - context_before_seconds)
-        window_end = min(duration, end_seconds + context_after_seconds)
+        window_end = min(duration, interval_end + context_after_seconds)
         first_index = max(0, min(total_num_frames - 1, math.floor(window_start * source_fps)))
         last_index = max(first_index, min(total_num_frames - 1, math.ceil(window_end * source_fps)))
-        if first_index == last_index:
+        if first_index == last_index or frame_count == 1:
             indices = [first_index]
         else:
-            raw = np.linspace(first_index, last_index, num=frame_count)
+            raw = [
+                first_index + (last_index - first_index) * position / (frame_count - 1)
+                for position in range(frame_count)
+            ]
             indices = _unique_bounded_indices(raw, first_index, last_index)
             if len(indices) < frame_count:
                 indices = _fill_indices(indices, first_index, last_index, frame_count)
-        frames: list[QwenVideoFrame] = []
-        for frame_index in indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                raise QwenNativeVideoInputError(f"unable to decode frame {frame_index}")
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-            if not ok:
-                raise QwenNativeVideoInputError(f"unable to encode frame {frame_index}")
-            frames.append(
-                QwenVideoFrame(
-                    payload=bytes(encoded.tobytes()),
-                    frame_index=frame_index,
-                    timestamp_seconds=frame_index / source_fps,
+        seek_applied = False
+        seek = getattr(container, "seek", None)
+        time_base = getattr(stream, "time_base", None)
+        if first_index > 0 and callable(seek) and time_base is not None:
+            try:
+                seek_position = int((first_index / source_fps) / float(time_base))
+                seek(seek_position, stream=stream, any_frame=False, backward=True)
+                seek_applied = True
+            except Exception as error:
+                raise QwenNativeVideoInputError(
+                    f"unable to seek video to requested window: {type(error).__name__}: {error}"
+                ) from error
+
+        selected: dict[int, bytes] = {}
+        wanted = set(indices)
+        try:
+            for decoded_offset, frame in enumerate(container.decode(stream)):
+                decoded_index = _decoded_frame_index(
+                    frame,
+                    source_fps=source_fps,
+                    fallback_index=(
+                        first_index + decoded_offset if seek_applied else decoded_offset
+                    ),
                 )
+                if decoded_index < first_index:
+                    continue
+                if decoded_index > last_index:
+                    break
+                if decoded_index not in wanted:
+                    continue
+                selected[decoded_index] = _encode_jpeg_frame(frame, jpeg_quality, decoded_index)
+                if len(selected) == len(wanted):
+                    break
+        except QwenNativeVideoInputError:
+            raise
+        except Exception as error:
+            raise QwenNativeVideoInputError(
+                f"unable to decode video frames from {path}: {type(error).__name__}: {error}"
+            ) from error
+        if len(selected) != len(wanted):
+            missing = [index for index in indices if index not in selected]
+            raise QwenNativeVideoInputError(f"unable to decode requested frame(s): {missing!r}")
+        frames = tuple(
+            QwenVideoFrame(
+                payload=selected[frame_index],
+                frame_index=frame_index,
+                timestamp_seconds=frame_index / source_fps,
             )
+            for frame_index in indices
+        )
         return QwenNativeVideoInput(
-            frames=tuple(frames),
+            frames=frames,
             source_fps=source_fps,
             total_num_frames=total_num_frames,
             width=width,
             height=height,
             duration_seconds=duration,
             interval_start_seconds=start_seconds,
-            interval_end_seconds=end_seconds,
+            interval_end_seconds=interval_end,
             context_before_seconds=context_before_seconds,
             context_after_seconds=context_after_seconds,
             source_path=str(path.resolve()),
         )
     finally:
-        capture.release()
+        close = getattr(container, "close", None)
+        if callable(close):
+            close()
+
+
+def _stream_frame_rate(stream: Any) -> float:
+    """Read a positive constant frame rate from a PyAV video stream."""
+
+    for name in ("average_rate", "guessed_rate", "base_rate"):
+        value = cast(Any, getattr(stream, name, None))
+        try:
+            rate = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(rate) and rate > 0:
+            return rate
+    raise QwenNativeVideoInputError("video does not expose a positive source FPS")
+
+
+def _stream_dimensions(stream: Any) -> tuple[int, int]:
+    """Read positive source dimensions from a PyAV stream or codec context."""
+
+    context = getattr(stream, "codec_context", None)
+    values: list[tuple[Any, Any]] = [
+        (getattr(context, "width", None), getattr(context, "height", None)),
+        (getattr(stream, "width", None), getattr(stream, "height", None)),
+    ]
+    for raw_width, raw_height in values:
+        try:
+            width, height = int(raw_width), int(raw_height)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if width > 0 and height > 0:
+            return width, height
+    raise QwenNativeVideoInputError("video metadata is incomplete")
+
+
+def _stream_frame_count(stream: Any, source_fps: float) -> int:
+    """Read or derive a positive frame count needed for native timeline metadata."""
+
+    raw_count = cast(Any, getattr(stream, "frames", None))
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+    if count > 0:
+        return count
+
+    # Some containers omit ``nb_frames`` but expose a stream duration.  The
+    # native route is intentionally constant-FPS; derive the count only when
+    # the duration and time base provide a finite, positive estimate.
+    raw_duration = cast(Any, getattr(stream, "duration", None))
+    time_base = cast(Any, getattr(stream, "time_base", None))
+    try:
+        duration_seconds = float(raw_duration * time_base)
+        estimated = round(duration_seconds * source_fps)
+    except (TypeError, ValueError, OverflowError):
+        estimated = 0
+    if estimated > 0:
+        return estimated
+    raise QwenNativeVideoInputError("video does not expose a positive frame count")
+
+
+def _encode_jpeg_frame(frame: Any, quality: int, frame_index: int) -> bytes:
+    """Convert one decoded PyAV frame to the JPEG payload expected by Qwen."""
+
+    try:
+        image = frame.to_image()
+        try:
+            with BytesIO() as output:
+                image.save(output, format="JPEG", quality=quality)
+                payload = output.getvalue()
+        finally:
+            close = getattr(image, "close", None)
+            if callable(close):
+                close()
+    except Exception as error:
+        raise QwenNativeVideoInputError(
+            f"unable to encode frame {frame_index}: {type(error).__name__}: {error}"
+        ) from error
+    if not payload:
+        raise QwenNativeVideoInputError(f"unable to encode frame {frame_index}: empty JPEG")
+    return payload
+
+
+def _decoded_frame_index(frame: Any, *, source_fps: float, fallback_index: int) -> int:
+    """Recover an absolute constant-FPS index from a decoded frame's PTS."""
+
+    raw_pts = getattr(frame, "pts", None)
+    raw_time_base = getattr(frame, "time_base", None)
+    if raw_pts is not None and raw_time_base is not None:
+        try:
+            timestamp_seconds = float(raw_pts * raw_time_base)
+            if math.isfinite(timestamp_seconds) and timestamp_seconds >= 0:
+                return max(0, round(timestamp_seconds * source_fps))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    raw_time = getattr(frame, "time", None)
+    if raw_time is not None:
+        try:
+            timestamp_seconds = float(raw_time)
+            if math.isfinite(timestamp_seconds) and timestamp_seconds >= 0:
+                return max(0, round(timestamp_seconds * source_fps))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return fallback_index
 
 
 def _unique_bounded_indices(values: Any, lower: int, upper: int) -> list[int]:
