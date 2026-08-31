@@ -13,6 +13,7 @@ from robata.inference.local_hf_runtime import (
     LocalHfVideoGenerationRequest,
     LocalHuggingFaceRuntimeError,
     LocalHuggingFaceVisionRuntime,
+    _video_grid_rows,
 )
 
 
@@ -215,6 +216,11 @@ def test_generate_video_rejects_content_identifier_opt_in_before_loading(tmp_pat
     with pytest.raises(LocalHuggingFaceRuntimeError, match="identifiers are disabled"):
         runtime.generate_video(request=_request(compute_frame_sha256=True))
     assert runtime.loaded is False
+
+
+def test_video_grid_rows_require_qwen_thw_shape() -> None:
+    with pytest.raises(LocalHuggingFaceRuntimeError, match="exactly \\[time, height, width\\]"):
+        _video_grid_rows([[1, 2, 3, 4]])
 
 
 def test_generate_video_rejects_uncovered_explicit_window(tmp_path: Path) -> None:

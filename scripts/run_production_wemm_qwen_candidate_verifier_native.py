@@ -293,8 +293,12 @@ def _request(
         width=video.width,
         height=video.height,
         duration_seconds=video.duration_seconds,
-        source_window_start_seconds=video.interval_start_seconds,
-        source_window_end_seconds=video.interval_end_seconds,
+        source_window_start_seconds=getattr(
+            video, "source_window_start_seconds", video.interval_start_seconds
+        ),
+        source_window_end_seconds=getattr(
+            video, "source_window_end_seconds", video.interval_end_seconds
+        ),
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         stop_after_first_complete_json_object=True,
@@ -341,6 +345,8 @@ def _run_with_runtime(
         selected = selected[: args.limit]
     requested = set(args.camera_id or [])
     rows: list[dict[str, Any]] = []
+    model_invoked = False
+    source_media_decoded = False
     started = time.perf_counter()
     if load_observation is None:
         # The concrete runtime exposes ``loaded``/``load_observation`` so a
@@ -399,6 +405,8 @@ def _run_with_runtime(
                         context_after_seconds=0.0,
                         jpeg_quality=args.jpeg_quality,
                     )
+                    source_media_decoded = True
+                    model_invoked = True
                     observation = runtime.generate_video(
                         request=_request(
                             video,
@@ -497,8 +505,8 @@ def _run_with_runtime(
         },
         "windows": rows,
         "controls": {
-            "model_invoked": True,
-            "source_media_decoded": True,
+            "model_invoked": model_invoked,
+            "source_media_decoded": source_media_decoded,
             "gold_included": False,
             "epic_ontology_used": False,
             "mapper_used": False,

@@ -911,7 +911,11 @@ def _video_grid_rows(value: Any) -> tuple[tuple[int, ...], ...]:
             normalized = tuple(int(item) for item in row)
         except (TypeError, ValueError) as error:
             raise LocalHuggingFaceRuntimeError("video_grid_thw values must be integers") from error
-        if not normalized or any(item <= 0 for item in normalized):
+        if len(normalized) != 3:
+            raise LocalHuggingFaceRuntimeError(
+                "video_grid_thw rows must contain exactly [time, height, width]"
+            )
+        if any(item <= 0 for item in normalized):
             raise LocalHuggingFaceRuntimeError("video_grid_thw values must be positive")
         result.append(normalized)
     if not result:
