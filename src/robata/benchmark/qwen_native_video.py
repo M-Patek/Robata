@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 QWEN_NATIVE_VIDEO_INPUT_VERSION = "qwen-native-video-input-v1"
+QWEN_NATIVE_VIDEO_MIN_FRAMES = 2
 QWEN_NATIVE_VIDEO_MAX_FRAMES = 32
 
 
@@ -221,6 +222,10 @@ def sample_qwen_native_video(
         width, height = _stream_dimensions(stream)
         total_num_frames = _stream_frame_count(stream, source_fps)
         duration = total_num_frames / source_fps
+        if total_num_frames < QWEN_NATIVE_VIDEO_MIN_FRAMES:
+            raise QwenNativeVideoInputError(
+                "Qwen native video requires a physical source with at least two frames"
+            )
         if start_seconds >= duration:
             raise QwenNativeVideoInputError(
                 "requested interval does not overlap the video duration "
@@ -235,16 +240,24 @@ def sample_qwen_native_video(
         window_end = min(duration, interval_end + context_after_seconds)
         first_index = max(0, min(total_num_frames - 1, math.floor(window_start * source_fps)))
         last_index = max(first_index, min(total_num_frames - 1, math.ceil(window_end * source_fps)))
-        if first_index == last_index or frame_count == 1:
-            indices = [first_index]
-        else:
-            raw = [
-                first_index + (last_index - first_index) * position / (frame_count - 1)
-                for position in range(frame_count)
-            ]
-            indices = _unique_bounded_indices(raw, first_index, last_index)
-            if len(indices) < frame_count:
-                indices = _fill_indices(indices, first_index, last_index, frame_count)
+        # Qwen3-VL's temporal patching path requires at least two real frames.
+        # A one-frame request or a quantized zero-width interval must therefore
+        # be widened to the nearest adjacent source frame.  Never duplicate a
+        # payload: the resulting indices remain actual, strictly increasing
+        # source-frame ordinals.
+        sample_count = max(frame_count, QWEN_NATIVE_VIDEO_MIN_FRAMES)
+        if first_index == last_index:
+            if first_index == 0:
+                last_index = 1
+            else:
+                first_index -= 1
+        raw = [
+            first_index + (last_index - first_index) * position / (sample_count - 1)
+            for position in range(sample_count)
+        ]
+        indices = _unique_bounded_indices(raw, first_index, last_index)
+        if len(indices) < sample_count:
+            indices = _fill_indices(indices, first_index, last_index, sample_count)
         seek_applied = False
         seek = getattr(container, "seek", None)
         time_base = getattr(stream, "time_base", None)
@@ -455,6 +468,7 @@ def _finite_positive(value: float, field: str) -> None:
 __all__ = [
     "QWEN_NATIVE_VIDEO_INPUT_VERSION",
     "QWEN_NATIVE_VIDEO_MAX_FRAMES",
+    "QWEN_NATIVE_VIDEO_MIN_FRAMES",
     "QwenNativeVideoInput",
     "QwenNativeVideoInputError",
     "QwenVideoFrame",
