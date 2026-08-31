@@ -47,6 +47,27 @@ grid.
 The normal compatibility route remains `--temporal-mode none`, with the
 historical non-overlapping window policy.
 
+`--temporal-mode adaptive_score` is the opt-in two-pass route.  It keeps the
+same dense coarse pass, then asks WeMM for short, nested before/after contexts
+around each coarse onset/offset hypothesis.  The short contexts are still
+visual input only; their edges are never copied as timestamps.  A threshold
+crossing between probe centres can produce an additive `MODEL_REFINED` review
+row.  Missing, edge-clipped, or non-bracketed evidence produces
+`MODEL_REFINEMENT_PENDING` instead.  The coarse `temporal_resolution` sidecar
+is preserved verbatim, and every adaptive field remains
+`review_required=true`, `automatic_eligible=false`, and
+`production_eligible=false`.
+
+Adaptive coarse resolution also suppresses a narrow failure mode in the
+winner-gated `top1` stream: if an action remains above the raw hysteresis
+threshold on both sides of a transition and only loses/gains rank-1 status,
+the apparent boundary is **unresolved**, not `MODEL_PROBE_BOUND`.  Such a
+proposal is omitted from adaptive refinement requests and retained under
+`temporal_resolution.diagnostics.ranking_switch_unresolved_segments` with its
+raw/effective scores, winner IDs, and transition evidence.  The default dense
+resolver keeps this guard disabled for compatibility with historical `top1`
+output.
+
 ## Resolver semantics
 
 For every action appearing in any context Top-K list, the resolver creates a
@@ -76,6 +97,27 @@ Temporal score policy is explicit:
 * `absolute` uses the raw fused similarity for controlled comparisons.  It is
   intentionally opt-in because current production artifacts cluster around
   0.70--0.74 and therefore do not provide a useful absolute boundary signal.
+* `relative_margin` compares each target candidate with the strongest
+  camera-supported runner-up and projects the signed margin through a
+  configurable logistic scale (`--temporal-relative-margin-scale`).  A target
+  below `--temporal-relative-margin-min-target-score`, a missing competitor,
+  or incompatible camera provenance contributes no relative temporal support;
+  it is not treated as a zero-valued visual negative.
+
+The open and batch runner APIs, as well as their command-line entry points,
+normalize the descriptive aliases `raw` -> `absolute`, `winner` -> `top1`,
+`stable`/`winner_stability` -> `winner_stable`, and
+`candidate_relative`/`relative`/`contrast` -> `relative_margin`.  Normalized
+values are what the resolver, model metadata, and resumable checkpoint record.
+The ambiguous spelling `margin` is intentionally rejected; choose
+`absolute` or `relative_margin` explicitly instead.
+
+In adaptive mode, a rank switch without a raw score crossing is not treated as
+an action transition.  The resolver requires an observed raw candidate on both
+sides.  For `relative_margin`, adaptive rank-switch suppression additionally
+requires known camera IDs for both target and runner-up.  Missing or
+camera-unsupported rows remain ordinary unresolved ranking support rather than
+being reinterpreted as visual negatives.
 
 Boundary modes are deliberately named:
 
@@ -97,12 +139,18 @@ a whole context, so it does not directly predict an onset/offset timestamp.
 
 ## Review-only contract
 
-Every temporal segment has:
+Every coarse temporal segment has:
 
 * `boundary_status: MODEL_PROBE_BOUND`;
 * `boundary_source: wemm_temporal_score`;
 * `review_required: true`; and
 * `automatic_eligible: false`.
+
+Adaptive refinement rows are a separate additive surface.  A row with
+`boundary_status: MODEL_REFINED` has a score crossing from the short probe
+pass; `MODEL_REFINEMENT_PENDING` means that the crossing was not established.
+Both remain review-only and are never counted as measured/gold unless a
+reviewer accepts them through the normal annotation workflow.
 
 The top-level temporal result also remains `production_eligible: false`, with
 quality and official-gold status unmeasured/unestablished.  A reviewer may
@@ -138,7 +186,7 @@ than silently changing thresholds:
 
 1. the implemented `top1` winner-gated policy;
 2. `absolute` score with the current hysteresis;
-3. a future relative prominence or rank-margin policy; and
+3. the implemented `relative_margin` candidate-vs-runner-up policy; and
 4. camera-consensus variants on the same context grid.
 
 Use the small reviewed diagnostic cohort first.  Keep the held-out-100 set
@@ -199,6 +247,16 @@ never silently falls back to a coarse boundary.  This makes the distinction
 between context sampling and model-selected onset/offset measurable while
 keeping the historical four-second route and production eligibility frozen.
 
+The projection enforces the edge rule as well as documenting it: for an
+ONSET request, a measured interval whose **start** is exactly at the request
+start is treated as `UNCERTAIN`; for an OFFSET request, an interval whose
+**end** is exactly at the request end is treated as `UNCERTAIN`.  Those edges
+are unobserved context limits, not timestamps selected by the model.  The
+original result and its evidence are retained under `raw`/`evidence`, with a
+`REQUEST_EDGE_NOT_MODEL_SELECTED` reason and a rejection diagnostic.  The
+non-projected edge may still touch a request limit because it can describe an
+uncertainty envelope around a genuinely localized side.
+
 ## Commands
 
 Open-runner diagnostic:
@@ -225,6 +283,22 @@ python scripts/run_production_wemm_batches.py `
   --window-stride-seconds 1 `
   --temporal-score-policy top1
 ```
+
+Adaptive score-boundary diagnostic (review-only):
+
+```powershell
+python scripts/run_production_wemm_open.py `
+  --manifest <manifest.json> `
+  --phrase-catalog <catalog.json> `
+  --model-dir <local-WeMM-snapshot> `
+  --temporal-mode adaptive_score `
+  --temporal-refinement-span-seconds 1 `
+  --temporal-refinement-min-request-span-seconds 0.10 `
+  --temporal-refinement-max-requests 128
+```
+
+Use a fresh batch output directory when changing any adaptive parameter; the
+batch checkpoint records these values and rejects an incompatible resume.
 
 Changing temporal mode, stride, thresholds, camera support, or boundary mode
 on a resumed batch is rejected.  Start a fresh diagnostic output directory for
