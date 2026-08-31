@@ -309,7 +309,9 @@ def _expected_for_variant(oracle: Mapping[str, Any], variant: str) -> dict[str, 
     if variant == "reverse":
         return {
             "relation": "change" if normal_direction in _DIRECTIONS else "unclear",
-            "direction": _INVERSE_DIRECTION.get(normal_direction),
+            "direction": (
+                _INVERSE_DIRECTION.get(normal_direction) if normal_direction is not None else None
+            ),
             "pre": normal_post,
             "post": normal_pre,
         }
